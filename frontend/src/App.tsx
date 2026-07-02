@@ -223,7 +223,7 @@ const parameterExplanations: Record<string, string> = {
   开始日期: "该工资阶段从哪天开始生效；税费和公积金会按月份匹配阶段。",
   结束日期: "该工资阶段结束日期；留空表示一直持续。",
   月工资税前: "每月税前工资，是社保、公积金、个税预扣和现金流收入的基础。",
-  年终奖年额: "预计全年年终奖金额。系统会按单独计税或并入综合所得择优测算。",
+  年终奖年额: "预计全年年终奖金额。现金流默认在 4 月一次性入账，不均摊到每个月；系统会按单独计税或并入综合所得择优测算。",
   "非税收入/月": "每月进入现金流但不并入工资薪金计税的收入，例如失业金、基础养老金等估算项。",
   "额外现金支出/月": "该收入阶段每月额外发生的现金支出，例如灵活就业自缴社保。",
   工资社保扣缴: "开启时按工资薪金自动估算北京社保、公积金和个税；失业金、养老金等阶段应关闭。",
@@ -694,6 +694,24 @@ function stageIsActiveInMonth(stage: IncomeStageData, targetDate: Date) {
   return true;
 }
 
+function activeMonthsInStageYear(stage: IncomeStageData, year: number) {
+  const start = parseMonthValue(stage.start_date.slice(0, 7)) ?? { year, month: 1 };
+  const end = parseMonthValue(stage.end_date?.slice(0, 7)) ?? { year, month: 12 };
+  const startMonth = Math.max(1, start.year < year ? 1 : start.year > year ? 13 : start.month);
+  const endMonth = Math.min(12, end.year > year ? 12 : end.year < year ? 0 : end.month);
+  return Math.max(0, endMonth - startMonth + 1);
+}
+
+function stageBonusPayoutMonth(stage: IncomeStageData, year: number) {
+  if (stage.annual_bonus <= 0 || activeMonthsInStageYear(stage, year) <= 0) return null;
+  return stageIsActiveInMonth(stage, new Date(year, 3, 1)) ? 4 : null;
+}
+
+function stageBonusPayoutAmount(stage: IncomeStageData, year: number, month: number) {
+  if (stageBonusPayoutMonth(stage, year) !== month) return 0;
+  return stage.annual_bonus * activeMonthsInStageYear(stage, year) / 12;
+}
+
 function selectedStageBonusMethod(stage: IncomeStageData, rulePack: RulePackData): BonusTaxMethod {
   if (stage.bonus_tax_method === "merged" || stage.bonus_tax_method === "separate") return stage.bonus_tax_method;
   const annualBrackets = ruleBrackets(rulePack, "comprehensive_tax_brackets", defaultComprehensiveTaxBrackets);
@@ -734,7 +752,7 @@ function cumulativeSalaryTax(
     activeMonths += 1;
     cumulativeIncome += stage.monthly_salary_gross + stage.other_annual_taxable_income / 12;
     if (selectedStageBonusMethod(stage, rulePack) === "merged") {
-      cumulativeIncome += stage.annual_bonus / 12;
+      cumulativeIncome += stageBonusPayoutAmount(stage, year, month);
     }
     cumulativeSocialAndFund += estimated.personalSocial + estimated.personalHousingFund;
     cumulativeSpecialDeduction += stage.monthly_special_additional_deduction;
@@ -806,30 +824,30 @@ function memberMonthlyIncomeRow(
     household
   );
   const salaryTax = Math.max(0, currentCumulativeTax - previousCumulativeTax);
-  const bonusTaxSpread =
+  const bonusPayout = stageBonusPayoutAmount(stage, targetDate.getFullYear(), targetDate.getMonth() + 1);
+  const bonusTaxDue =
     selectedMethod === "separate"
-      ? bonusTax(stage.annual_bonus, ruleBrackets(rulePack, "monthly_converted_bonus_tax_brackets", defaultBonusTaxBrackets)) / 12
+      ? bonusTax(bonusPayout, ruleBrackets(rulePack, "monthly_converted_bonus_tax_brackets", defaultBonusTaxBrackets))
       : 0;
-  const bonusMonthly = stage.annual_bonus / 12;
   const otherMonthly = stage.other_annual_taxable_income / 12;
   const nonTaxableMonthly = stage.monthly_non_taxable_income ?? 0;
   const extraCashExpense = stage.monthly_extra_cash_expense ?? 0;
-  const incomeTax = salaryTax + bonusTaxSpread;
-  const taxableCashBeforeTax = stage.monthly_salary_gross + bonusMonthly + otherMonthly;
+  const incomeTax = salaryTax + bonusTaxDue;
+  const taxableCashBeforeTax = stage.monthly_salary_gross + bonusPayout + otherMonthly;
   const salaryTaxShare = taxableCashBeforeTax > 0 ? stage.monthly_salary_gross / taxableCashBeforeTax : 0;
-  const bonusTaxShare = taxableCashBeforeTax > 0 ? bonusMonthly / taxableCashBeforeTax : 0;
+  const bonusTaxShare = taxableCashBeforeTax > 0 ? bonusPayout / taxableCashBeforeTax : 0;
   const otherTaxShare = taxableCashBeforeTax > 0 ? otherMonthly / taxableCashBeforeTax : 0;
   const salaryNetMonthly = Math.max(
     0,
     stage.monthly_salary_gross - estimated.personalSocial - estimated.personalHousingFund - incomeTax * salaryTaxShare
   );
-  const bonusNetMonthly = Math.max(0, bonusMonthly - incomeTax * bonusTaxShare);
+  const bonusNetMonthly = Math.max(0, bonusPayout - incomeTax * bonusTaxShare);
   const otherNetMonthly = Math.max(0, otherMonthly - incomeTax * otherTaxShare);
   return {
     name: member.name,
     stageName: stage.name,
     grossMonthly: stage.monthly_salary_gross,
-    bonusMonthly,
+    bonusMonthly: bonusPayout,
     otherMonthly,
     nonTaxableMonthly,
     salaryNetMonthly,
@@ -839,7 +857,7 @@ function memberMonthlyIncomeRow(
     extraCashExpense,
     netMonthly: Math.max(
       -999999,
-      stage.monthly_salary_gross + bonusMonthly + otherMonthly + nonTaxableMonthly - estimated.personalSocial - estimated.personalHousingFund - incomeTax - extraCashExpense
+      stage.monthly_salary_gross + bonusPayout + otherMonthly + nonTaxableMonthly - estimated.personalSocial - estimated.personalHousingFund - incomeTax - extraCashExpense
     ),
     personalSocial: estimated.personalSocial,
     personalHousingFund: estimated.personalHousingFund,
@@ -4158,7 +4176,7 @@ function SelectedPlanVisualization({
       ? selectedMemberIncomeRows.flatMap((member) => [
           { name: `${member.name}税前工资`, amount: Math.round(member.grossMonthly), kind: "income" },
           ...(member.bonusMonthly > 0
-            ? [{ name: `${member.name}奖金折月`, amount: Math.round(member.bonusMonthly), kind: "income" }]
+            ? [{ name: `${member.name}年终奖入账`, amount: Math.round(member.bonusMonthly), kind: "income" }]
             : []),
           ...(member.otherMonthly > 0
             ? [{ name: `${member.name}其他收入`, amount: Math.round(member.otherMonthly), kind: "income" }]
@@ -4286,7 +4304,7 @@ function SelectedPlanVisualization({
         ...(selectedMonth.cashIncome > 0
           ? selectedMemberIncomeRows.flatMap((member): Array<[string, number]> => [
               [`${member.name}月税前工资`, member.grossMonthly],
-              ...(member.bonusMonthly > 0 ? [[`${member.name}奖金折月`, member.bonusMonthly] as [string, number]] : []),
+              ...(member.bonusMonthly > 0 ? [[`${member.name}年终奖入账`, member.bonusMonthly] as [string, number]] : []),
               ...(member.otherMonthly > 0 ? [[`${member.name}其他收入折月`, member.otherMonthly] as [string, number]] : []),
               ...(member.nonTaxableMonthly > 0 ? [[`${member.name}非税收入`, member.nonTaxableMonthly] as [string, number]] : []),
               [`${member.name}税后现金工资`, member.netMonthly]

@@ -132,6 +132,30 @@ def test_member_income_tax_is_calculated_from_configured_salary_and_bonus() -> N
     assert summaries[0].selected_bonus_method in {"separate", "merged"}
 
 
+def test_annual_bonus_is_paid_in_april_not_spread_monthly() -> None:
+    household = HouseholdData(
+        members=[
+            IncomeMember(
+                name="测试成员",
+                monthly_salary_gross=30_000,
+                annual_bonus=120_000,
+                employment_start_date="2026-07-01",
+                bonus_tax_method="separate",
+            )
+        ]
+    )
+    rule = _zero_contribution_rule()
+
+    march = household_monthly_income_profile_at(household, rule, as_of=date(2027, 3, 1))
+    april = household_monthly_income_profile_at(household, rule, as_of=date(2027, 4, 1))
+    may = household_monthly_income_profile_at(household, rule, as_of=date(2027, 5, 1))
+
+    assert march.gross_income == 30_000
+    assert april.gross_income == 150_000
+    assert april.income_tax > march.income_tax
+    assert may.gross_income == 30_000
+
+
 def test_income_member_defaults_to_one_income_stage() -> None:
     member = IncomeMember(
         monthly_salary_gross=30_000,

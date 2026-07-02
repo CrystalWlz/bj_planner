@@ -151,6 +151,21 @@ def _active_months_in_period(start_date: str, end_date: str | None, projection_y
     return (period_end.year - period_start.year) * 12 + period_end.month - period_start.month + 1
 
 
+def _stage_bonus_payout_month(stage: IncomeStageData, projection_year: int) -> int | None:
+    if stage.annual_bonus <= 0:
+        return None
+    if _active_months_in_period(stage.start_date, stage.end_date, projection_year) <= 0:
+        return None
+    return 4 if _stage_active_in_month(stage, projection_year, 4) else None
+
+
+def _stage_bonus_payout_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
+    if _stage_bonus_payout_month(stage, projection_year) != month:
+        return 0.0
+    active_months = _active_months_in_period(stage.start_date, stage.end_date, projection_year)
+    return stage.annual_bonus * active_months / 12
+
+
 def _clamp(value: float, floor: float, ceiling: float) -> float:
     return max(floor, min(value, ceiling))
 
@@ -461,7 +476,7 @@ def _member_cumulative_salary_tax(
         cumulative_income += stage.monthly_salary_gross
         cumulative_income += stage.other_annual_taxable_income / 12
         if selected_bonus_method == "merged":
-            cumulative_income += stage.annual_bonus / 12
+            cumulative_income += _stage_bonus_payout_amount(stage, year, month)
         cumulative_social_and_fund += personal_social + personal_housing_fund
         cumulative_special_deduction += stage.monthly_special_additional_deduction
         cumulative_special_deduction += _elderly_care_deduction_for_member_at(
@@ -509,14 +524,15 @@ def _member_monthly_income_profile(
         household,
     )
     salary_tax = max(0.0, cumulative_tax - previous_cumulative_tax)
-    bonus_tax_spread = 0.0
+    bonus_payout = _stage_bonus_payout_amount(stage, target_month.year, target_month.month)
+    bonus_tax_due = 0.0
     if selected_bonus_method == "separate":
         bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
-        bonus_tax_spread = _bonus_tax(stage.annual_bonus, bonus_brackets) / 12
+        bonus_tax_due = _bonus_tax(bonus_payout, bonus_brackets) if bonus_payout > 0 else 0.0
 
-    taxable_cash_income = stage.monthly_salary_gross + stage.annual_bonus / 12 + stage.other_annual_taxable_income / 12
+    taxable_cash_income = stage.monthly_salary_gross + bonus_payout + stage.other_annual_taxable_income / 12
     gross_income = taxable_cash_income + stage.monthly_non_taxable_income
-    income_tax = salary_tax + bonus_tax_spread
+    income_tax = salary_tax + bonus_tax_due
     net_income = gross_income - personal_social - personal_housing_fund - income_tax - stage.monthly_extra_cash_expense
     return MonthlyIncomeProfile(
         gross_income=round(gross_income, 2),
