@@ -2,8 +2,6 @@
 
 本项目是一个本机使用的北京购房可行性规划工具，包含 React 前端和 FastAPI 后端。家庭财务数据默认保存在本机 SQLite 数据库中，不上传云端。
 
-公开仓库只保留空白家庭模板和公开政策参数，不内置任何真实家庭收入、资产、贷款、老人、出生年月等私人信息。
-
 ## 功能
 
 - 家庭收入、支出、资产、负债和购房资格画像
@@ -68,22 +66,22 @@ npm run build
 
 可以通过 `HOUSE_PLANNER_DB` 环境变量指定数据库路径。
 
-## 本地真实数据与公开发布
+## 开发与发布流程
 
 推荐保持一条清晰的双轨流程：
 
 1. 日常功能开发在 `codex/public-release` 分支进行。
-2. 本机页面显示的真实家庭数据只保存在 SQLite 数据库里，默认位置是 `%APPDATA%\house-planner\planner.db`，不进入 Git。
-3. 代码里的默认值、测试样例和 README 只能使用空白模板、公开政策参数或合成示例。
-4. 推送公开版前运行：
+2. 页面运行数据默认保存在本机 SQLite 数据库里，默认位置是 `%APPDATA%\house-planner\planner.db`，不进入 Git。
+3. 代码里的默认值、测试样例和 README 使用可复现的示例数据。
+4. 推送前运行：
 
 ```powershell
 .\scripts\push_public.ps1
 ```
 
-这个脚本会依次执行隐私扫描、后端测试、前端构建，并把 `codex/public-release` 推送到 GitHub `main`。
+这个脚本会依次执行发布检查、后端测试、前端构建，并把 `codex/public-release` 推送到 GitHub `main`。
 
-如只想快速验证隐私扫描：
+如只想快速验证发布检查：
 
 ```powershell
 python scripts/privacy_scan.py --ref HEAD
@@ -93,8 +91,8 @@ python scripts/privacy_scan.py
 本仓库还提供 `.githooks/pre-push`，用于在推送前拦截以下情况：
 
 - 从非 `codex/public-release` 分支推送到 `main`
-- 推送不是基于公开 root commit 的历史
-- 待推送内容包含数据库、构建产物、依赖目录或已知私人家庭信息片段
+- 推送不符合当前发布分支基线的历史
+- 待推送内容包含数据库、构建产物、依赖目录或本地配置片段
 
 首次克隆或换机器后，可以启用本仓库的 Git hook：
 
@@ -102,8 +100,8 @@ python scripts/privacy_scan.py
 git config core.hooksPath .githooks
 ```
 
-## 隐私说明
+## 数据文件说明
 
-- 不要把本机 SQLite 数据库、导出方案、截图、`.env`、日志或个人配置文件提交到公开仓库。
+- 不要把本机 SQLite 数据库、导出方案、截图、`.env`、日志或个人配置文件提交到 Git。
 - `.gitignore` 已排除常见数据库、构建产物、虚拟环境和环境变量文件。
-- 公开仓库历史应从清理后的快照重新开始，避免旧提交中残留私人家庭数据。
+- 发布分支应从当前基线继续开发，避免混入旧分支历史。
