@@ -69,6 +69,22 @@ class MonthlyIncomeProfile:
     extra_cash_expense: float = 0.0
 
 
+@dataclass(frozen=True)
+class PurchaseCandidate:
+    purchase_month: int
+    mix: tuple[float, float, float, float, float, float, float]
+    pf_upfront_extractable: float
+    family_pf_upfront_extractable: float
+    pf_post_transaction_extractable: float
+    cash_after_transaction: float
+    cash_after_purchase: float
+    pf_after_extract: float
+    minimum_cash_balance: float
+    minimum_cash_balance_month: int | None
+    cash_stress_ok: bool
+    cash_stress_shortfall: float
+
+
 def calculate_loan(principal: float, annual_rate: float, years: int, method: str) -> LoanComputation:
     if principal <= 0 or years <= 0:
         return LoanComputation(0, 0, 0)
@@ -268,10 +284,61 @@ def _zero_cash_stage(template: IncomeStageData, name: str, start: date, end: dat
     )
 
 
-def _household_with_career_income_stages(household: HouseholdData, *, as_of: date | None = None) -> HouseholdData:
+def _unemployment_benefit_months_from_service(service_months: int) -> int:
+    if service_months < 12:
+        return 0
+    if service_months < 60:
+        return 12
+    if service_months < 120:
+        return 18
+    return 24
+
+
+def _unemployment_benefit_monthly_from_service(service_months: int, rules: RulePackData) -> float:
+    params = rules.params
+    if service_months >= 240:
+        return float(params.get("beijing_unemployment_benefit_20y_plus", 2286))
+    if service_months >= 180:
+        return float(params.get("beijing_unemployment_benefit_15_to_20y", 2215))
+    if service_months >= 120:
+        return float(params.get("beijing_unemployment_benefit_10_to_15y", 2188))
+    if service_months >= 60:
+        return float(params.get("beijing_unemployment_benefit_5_to_10y", 2156))
+    if service_months >= 12:
+        return float(params.get("beijing_unemployment_benefit_under_5y", 2129))
+    return 0.0
+
+
+def _career_shock_unemployment_months(household: HouseholdData, shock: "CareerShockData") -> int:
+    if not shock.auto_unemployment_benefit:
+        return max(0, min(shock.unemployment_benefit_months, 24))
+    return _unemployment_benefit_months_from_service(max(0, household.social_security_months))
+
+
+def _career_shock_self_social_monthly(shock: "CareerShockData", rules: RulePackData) -> float:
+    if not shock.auto_self_social_insurance:
+        return max(0.0, shock.self_social_insurance_monthly)
+    params = rules.params
+    base = float(params.get("flexible_employment_social_base", params.get("beijing_social_base_floor", 7162)))
+    floor = float(params.get("beijing_social_base_floor", 7162))
+    ceiling = float(params.get("beijing_social_base_ceiling", 35811))
+    base = _clamp(base, floor, ceiling)
+    pension = base * float(params.get("flexible_employment_pension_rate", 0.20))
+    unemployment = base * float(params.get("flexible_employment_unemployment_rate", 0.01))
+    medical = float(params.get("flexible_employment_medical_monthly", 584.92))
+    return round(max(0.0, pension + unemployment + medical), 2)
+
+
+def _household_with_career_income_stages(
+    household: HouseholdData,
+    rules: RulePackData | None = None,
+    *,
+    as_of: date | None = None,
+) -> HouseholdData:
     shock = household.career_shock
     if household.career_shock_applied or not shock.enabled or not household.members:
         return household
+    active_rules = rules or RulePackData()
 
     current = as_of or date.today()
     synthetic_prefix = "自动情景："
@@ -318,16 +385,62 @@ def _household_with_career_income_stages(household: HouseholdData, *, as_of: dat
                 shock.self_current_age,
                 shock.layoff_age,
             )
-            unemployment_end = _add_months(layoff_start, max(0, shock.unemployment_benefit_months) - 1) if shock.unemployment_benefit_months > 0 else None
-            if shock.unemployment_benefit_months > 0 and layoff_start < retirement_start:
-                end = min(unemployment_end or layoff_start, _end_of_previous_month(retirement_start))
-                unemployment_stage = _zero_cash_stage(template, f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金期", layoff_start, end)
-                stages.append(
-                    unemployment_stage.model_copy(
-                        update={"monthly_non_taxable_income": shock.unemployment_benefit_monthly}
+            unemployment_months = _career_shock_unemployment_months(household, shock)
+            if unemployment_months > 0 and layoff_start < retirement_start:
+                if shock.auto_unemployment_benefit:
+                    first_period_months = min(unemployment_months, 12)
+                    first_end = min(
+                        _add_months(layoff_start, first_period_months - 1),
+                        _end_of_previous_month(retirement_start),
                     )
-                )
-            self_social_start = _add_months(layoff_start, max(0, shock.unemployment_benefit_months))
+                    first_stage = _zero_cash_stage(
+                        template,
+                        f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金期",
+                        layoff_start,
+                        first_end,
+                    )
+                    stages.append(
+                        first_stage.model_copy(
+                            update={
+                                "monthly_non_taxable_income": _unemployment_benefit_monthly_from_service(
+                                    household.social_security_months,
+                                    active_rules,
+                                )
+                            }
+                        )
+                    )
+                    if unemployment_months > 12:
+                        later_start = _add_months(layoff_start, 12)
+                        if later_start < retirement_start:
+                            later_end = min(
+                                _add_months(layoff_start, unemployment_months - 1),
+                                _end_of_previous_month(retirement_start),
+                            )
+                            later_stage = _zero_cash_stage(
+                                template,
+                                f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金后续期",
+                                later_start,
+                                later_end,
+                            )
+                            stages.append(
+                                later_stage.model_copy(
+                                    update={
+                                        "monthly_non_taxable_income": float(
+                                            active_rules.params.get("beijing_unemployment_benefit_after_12_months", 2129)
+                                        )
+                                    }
+                                )
+                            )
+                else:
+                    unemployment_end = _add_months(layoff_start, unemployment_months - 1)
+                    end = min(unemployment_end, _end_of_previous_month(retirement_start))
+                    unemployment_stage = _zero_cash_stage(template, f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金期", layoff_start, end)
+                    stages.append(
+                        unemployment_stage.model_copy(
+                            update={"monthly_non_taxable_income": shock.unemployment_benefit_monthly}
+                        )
+                    )
+            self_social_start = _add_months(layoff_start, unemployment_months)
             if self_social_start < retirement_start:
                 stages.append(
                     _zero_cash_stage(
@@ -335,7 +448,7 @@ def _household_with_career_income_stages(household: HouseholdData, *, as_of: dat
                         f"{synthetic_prefix}{shock.layoff_age}岁被裁员-灵活就业自缴社保期",
                         self_social_start,
                         _end_of_previous_month(retirement_start),
-                    ).model_copy(update={"monthly_extra_cash_expense": shock.self_social_insurance_monthly})
+                    ).model_copy(update={"monthly_extra_cash_expense": _career_shock_self_social_monthly(shock, active_rules)})
                 )
 
         if pension_monthly > 0:
@@ -555,7 +668,7 @@ def household_monthly_income_profile_at(
     *,
     as_of: date | None = None,
 ) -> MonthlyIncomeProfile:
-    household = _household_with_career_income_stages(household, as_of=as_of)
+    household = _household_with_career_income_stages(household, rules, as_of=as_of)
     current = as_of or date.today()
     year, month = _month_after(current, max(0, months_from_now))
     target_month = date(year, month, 1)
@@ -726,7 +839,7 @@ def _member_tax_summary(
 
 
 def calculate_household_tax(household: HouseholdData, rules: RulePackData) -> tuple[list[TaxMemberSummary], float, float, float]:
-    household = _household_with_career_income_stages(household)
+    household = _household_with_career_income_stages(household, rules)
     if not household.members:
         gross_monthly = household.monthly_income
         return [], gross_monthly, gross_monthly, 0.0
@@ -1428,7 +1541,7 @@ def _purchase_cash_state_at_month(
     scenario: ScenarioData,
     cash_value_by_month: list[float] | None = None,
     pf_value_by_month: list[float] | None = None,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
     sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
     cash_value = (
@@ -1481,17 +1594,39 @@ def _purchase_cash_state_at_month(
         min(1, float(rules.params.get("provident_post_transaction_extract_ratio", 1.0))),
     )
     pf_upfront_extractable = min(pf_available, planned_down_payment * upfront_extract_ratio)
-    required_cash_after_pf = max(0, upfront_cash_required - pf_upfront_extractable)
+    family_pf_upfront_extractable = _family_provident_upfront_support(
+        household,
+        scenario,
+        month,
+        max(0.0, upfront_cash_required - pf_upfront_extractable),
+    )
+    required_cash_after_pf = max(0, upfront_cash_required - pf_upfront_extractable - family_pf_upfront_extractable)
     cash_after_transaction = cash_value - required_cash_after_pf
     pf_after_upfront_extract = max(0, pf_available - pf_upfront_extractable)
     pf_post_transaction_extractable = min(pf_after_upfront_extract, property_price * post_transaction_extract_ratio)
     return (
         round(pf_upfront_extractable, 2),
+        round(family_pf_upfront_extractable, 2),
         round(pf_post_transaction_extractable, 2),
         round(cash_after_transaction, 2),
         round(cash_after_transaction + pf_post_transaction_extractable, 2),
         round(pf_after_upfront_extract - pf_post_transaction_extractable, 2),
     )
+
+
+def _family_provident_upfront_support(
+    household: HouseholdData,
+    scenario: ScenarioData,
+    purchase_month: int,
+    remaining_upfront_cash_required: float,
+) -> float:
+    if not household.family_provident_support_enabled or not _is_new_home_property(scenario):
+        return 0.0
+    if remaining_upfront_cash_required <= 0:
+        return 0.0
+    monthly_deposit = max(0.0, household.family_provident_monthly_salary * household.family_provident_total_rate)
+    available_balance = max(0.0, household.family_provident_initial_balance + monthly_deposit * max(0, purchase_month))
+    return round(min(available_balance, remaining_upfront_cash_required), 2)
 
 
 def _rent_withdrawal_before_purchase(household: HouseholdData) -> float:
@@ -1596,11 +1731,17 @@ def build_purchase_plan_analyses(
         1,
     )
     manual_micro_ratio = _clamp(scenario.micro_commercial_loan_ratio, 0, 1)
-    micro_ratio_candidates = (
-        [manual_micro_ratio]
-        if manual_micro_ratio > 0
-        else sorted({micro_min_ratio, micro_default_ratio, micro_max_ratio})
-    )
+    if manual_micro_ratio > 0:
+        micro_ratio_candidates = [manual_micro_ratio]
+    else:
+        ratio_steps = max(1, int(round((micro_max_ratio - micro_min_ratio) / 0.01)))
+        micro_ratio_candidates = sorted(
+            {
+                round(micro_min_ratio + (micro_max_ratio - micro_min_ratio) * index / ratio_steps, 4)
+                for index in range(ratio_steps + 1)
+            }
+            | {micro_min_ratio, micro_default_ratio, micro_max_ratio}
+        )
     current_monthly_expense = monthly_household_expense_at(household)
     monthly_expense_cache = {0: current_monthly_expense}
     monthly_income_cache: dict[int, MonthlyIncomeProfile] = {}
@@ -1685,7 +1826,9 @@ def build_purchase_plan_analyses(
         minimum_cash_balance = 0.0
         minimum_cash_balance_month: int | None = 0
         cash_stress_ok = True
+        cash_stress_shortfall = 0.0
         pf_upfront_extractable = 0.0
+        family_pf_upfront_extractable = 0.0
         pf_post_transaction_extractable = 0.0
         pf_extractable = 0.0
         cash_after_transaction = 0.0
@@ -1733,7 +1876,7 @@ def build_purchase_plan_analyses(
         def purchase_state_for_mix(
             candidate_month: int,
             mix: tuple[float, float, float, float, float, float, float],
-        ) -> tuple[float, float, float, float, float]:
+        ) -> tuple[float, float, float, float, float, float]:
             return _purchase_cash_state_at_month(
                 month=candidate_month,
                 upfront_cash_required=mix[6],
@@ -1785,7 +1928,11 @@ def build_purchase_plan_analyses(
                 car_monthly_cash_cost_at=car_monthly_cash_cost_at,
             )
 
-        for candidate_month in range(361):
+        best_failed_result: PurchaseCandidate | None = None
+        best_failed_rank: tuple[float, int, float] | None = None
+        search_start_month = min(360, max(0, scenario.manual_purchase_delay_months)) if use_manual_mix else 0
+
+        for candidate_month in range(search_start_month, 361):
             candidate_monthly_expense = expense_at_month(candidate_month)
             required_liquidity_reserve = max(0, candidate_monthly_expense * household.required_liquidity_months)
             candidate_mixes = (
@@ -1793,95 +1940,59 @@ def build_purchase_plan_analyses(
                 if use_micro_strategy
                 else [compute_mix(candidate_month)]
             )
-            candidate_result = None
+            candidate_result: PurchaseCandidate | None = None
             for candidate_mix in candidate_mixes:
                 (
                     candidate_pf_upfront,
+                    candidate_family_pf_upfront,
                     candidate_pf_post,
                     candidate_cash_after_transaction,
                     candidate_cash_after_purchase,
                     candidate_pf_after_extract,
                 ) = purchase_state_for_mix(candidate_month, candidate_mix)
-                if candidate_cash_after_transaction < required_liquidity_reserve:
-                    continue
-                (
-                    candidate_minimum_cash_balance,
-                    candidate_minimum_cash_balance_month,
-                    candidate_cash_stress_ok,
-                ) = cash_stress_for_mix(
-                    candidate_month,
-                    candidate_mix,
-                    candidate_cash_after_purchase,
-                    candidate_pf_after_extract,
-                )
-                if candidate_cash_stress_ok:
-                    candidate_result = (
-                        candidate_mix,
-                        candidate_pf_upfront,
-                        candidate_pf_post,
-                        candidate_cash_after_transaction,
-                        candidate_cash_after_purchase,
-                        candidate_pf_after_extract,
+                transaction_shortfall = max(0.0, required_liquidity_reserve - candidate_cash_after_transaction)
+                if transaction_shortfall > 0:
+                    candidate_minimum_cash_balance = min(candidate_cash_after_transaction, candidate_cash_after_purchase)
+                    candidate_minimum_cash_balance_month = candidate_month
+                    candidate_cash_stress_ok = False
+                else:
+                    (
                         candidate_minimum_cash_balance,
                         candidate_minimum_cash_balance_month,
                         candidate_cash_stress_ok,
+                    ) = cash_stress_for_mix(
+                        candidate_month,
+                        candidate_mix,
+                        candidate_cash_after_purchase,
+                        candidate_pf_after_extract,
                     )
+                candidate = PurchaseCandidate(
+                    purchase_month=candidate_month,
+                    mix=candidate_mix,
+                    pf_upfront_extractable=candidate_pf_upfront,
+                    family_pf_upfront_extractable=candidate_family_pf_upfront,
+                    pf_post_transaction_extractable=candidate_pf_post,
+                    cash_after_transaction=candidate_cash_after_transaction,
+                    cash_after_purchase=candidate_cash_after_purchase,
+                    pf_after_extract=candidate_pf_after_extract,
+                    minimum_cash_balance=candidate_minimum_cash_balance,
+                    minimum_cash_balance_month=candidate_minimum_cash_balance_month,
+                    cash_stress_ok=candidate_cash_stress_ok and transaction_shortfall <= 0,
+                    cash_stress_shortfall=max(transaction_shortfall, -candidate_minimum_cash_balance, 0.0),
+                )
+                if candidate.cash_stress_ok:
+                    candidate_result = candidate
                     break
-            if candidate_result is None:
-                candidate_mix = candidate_mixes[-1]
-                (
-                    candidate_pf_upfront,
-                    candidate_pf_post,
-                    candidate_cash_after_transaction,
-                    candidate_cash_after_purchase,
-                    candidate_pf_after_extract,
-                ) = purchase_state_for_mix(candidate_month, candidate_mix)
-                (
-                    candidate_minimum_cash_balance,
-                    candidate_minimum_cash_balance_month,
-                    candidate_cash_stress_ok,
-                ) = cash_stress_for_mix(
+                candidate_rank = (
+                    candidate.cash_stress_shortfall,
                     candidate_month,
-                    candidate_mix,
-                    candidate_cash_after_purchase,
-                    candidate_pf_after_extract,
+                    candidate.mix[4],
                 )
-                candidate_result = (
-                    candidate_mix,
-                    candidate_pf_upfront,
-                    candidate_pf_post,
-                    candidate_cash_after_transaction,
-                    candidate_cash_after_purchase,
-                    candidate_pf_after_extract,
-                    candidate_minimum_cash_balance,
-                    candidate_minimum_cash_balance_month,
-                    candidate_cash_stress_ok,
-                )
-            (
-                (
-                    provident_cap,
-                    provident_policy_bonus,
-                    min_down_payment,
-                    planned_down,
-                    commercial_loan,
-                    provident_loan,
-                    upfront_cash,
-                ),
-                pf_upfront_extractable,
-                pf_post_transaction_extractable,
-                cash_after_transaction,
-                cash_after_purchase,
-                pf_after_extract,
-                minimum_cash_balance,
-                minimum_cash_balance_month,
-                cash_stress_ok,
-            ) = candidate_result
-            pf_extractable = pf_upfront_extractable + pf_post_transaction_extractable
-            if cash_after_transaction >= required_liquidity_reserve and cash_stress_ok:
-                months = candidate_month
-                break
-        else:
-            fallback_target = price * micro_ratio_candidates[-1] if use_micro_strategy else target_commercial
+                if best_failed_rank is None or candidate_rank < best_failed_rank:
+                    best_failed_rank = candidate_rank
+                    best_failed_result = candidate
+            if candidate_result is None:
+                continue
             (
                 provident_cap,
                 provident_policy_bonus,
@@ -1890,17 +2001,23 @@ def build_purchase_plan_analyses(
                 commercial_loan,
                 provident_loan,
                 upfront_cash,
-            ) = compute_mix(360, fallback_target)
+            ) = candidate_result.mix
+            pf_upfront_extractable = candidate_result.pf_upfront_extractable
+            family_pf_upfront_extractable = candidate_result.family_pf_upfront_extractable
+            pf_post_transaction_extractable = candidate_result.pf_post_transaction_extractable
+            cash_after_transaction = candidate_result.cash_after_transaction
+            cash_after_purchase = candidate_result.cash_after_purchase
+            pf_after_extract = candidate_result.pf_after_extract
+            minimum_cash_balance = candidate_result.minimum_cash_balance
+            minimum_cash_balance_month = candidate_result.minimum_cash_balance_month
+            cash_stress_ok = candidate_result.cash_stress_ok
+            cash_stress_shortfall = candidate_result.cash_stress_shortfall
+            pf_extractable = pf_upfront_extractable + family_pf_upfront_extractable + pf_post_transaction_extractable
+            months = candidate_month
+            break
+        else:
             months = None
-            required_liquidity_reserve = max(0, expense_at_month(360) * household.required_liquidity_months)
-            (
-                pf_upfront_extractable,
-                pf_post_transaction_extractable,
-                cash_after_transaction,
-                cash_after_purchase,
-                pf_after_extract,
-            ) = purchase_state_for_mix(
-                360,
+            if best_failed_result is not None:
                 (
                     provident_cap,
                     provident_policy_bonus,
@@ -1909,10 +2026,23 @@ def build_purchase_plan_analyses(
                     commercial_loan,
                     provident_loan,
                     upfront_cash,
-                ),
-            )
-            minimum_cash_balance, minimum_cash_balance_month, cash_stress_ok = cash_stress_for_mix(
-                360,
+                ) = best_failed_result.mix
+                pf_upfront_extractable = best_failed_result.pf_upfront_extractable
+                family_pf_upfront_extractable = best_failed_result.family_pf_upfront_extractable
+                pf_post_transaction_extractable = best_failed_result.pf_post_transaction_extractable
+                cash_after_transaction = best_failed_result.cash_after_transaction
+                cash_after_purchase = best_failed_result.cash_after_purchase
+                pf_after_extract = best_failed_result.pf_after_extract
+                minimum_cash_balance = best_failed_result.minimum_cash_balance
+                minimum_cash_balance_month = best_failed_result.minimum_cash_balance_month
+                cash_stress_ok = False
+                cash_stress_shortfall = best_failed_result.cash_stress_shortfall
+                required_liquidity_reserve = max(
+                    0,
+                    expense_at_month(best_failed_result.purchase_month) * household.required_liquidity_months,
+                )
+            else:
+                fallback_target = price * micro_ratio_candidates[-1] if use_micro_strategy else target_commercial
                 (
                     provident_cap,
                     provident_policy_bonus,
@@ -1921,11 +2051,48 @@ def build_purchase_plan_analyses(
                     commercial_loan,
                     provident_loan,
                     upfront_cash,
-                ),
-                cash_after_purchase,
-                pf_after_extract,
-            )
-            pf_extractable = pf_upfront_extractable + pf_post_transaction_extractable
+                ) = compute_mix(360, fallback_target)
+                required_liquidity_reserve = max(0, expense_at_month(360) * household.required_liquidity_months)
+                (
+                    pf_upfront_extractable,
+                    family_pf_upfront_extractable,
+                    pf_post_transaction_extractable,
+                    cash_after_transaction,
+                    cash_after_purchase,
+                    pf_after_extract,
+                ) = purchase_state_for_mix(
+                    360,
+                    (
+                        provident_cap,
+                        provident_policy_bonus,
+                        min_down_payment,
+                        planned_down,
+                        commercial_loan,
+                        provident_loan,
+                        upfront_cash,
+                    ),
+                )
+                minimum_cash_balance, minimum_cash_balance_month, cash_stress_ok = cash_stress_for_mix(
+                    360,
+                    (
+                        provident_cap,
+                        provident_policy_bonus,
+                        min_down_payment,
+                        planned_down,
+                        commercial_loan,
+                        provident_loan,
+                        upfront_cash,
+                    ),
+                    cash_after_purchase,
+                    pf_after_extract,
+                )
+                cash_stress_shortfall = max(
+                    0.0,
+                    required_liquidity_reserve - cash_after_transaction,
+                    -minimum_cash_balance,
+                )
+                cash_stress_ok = False
+            pf_extractable = pf_upfront_extractable + family_pf_upfront_extractable + pf_post_transaction_extractable
 
         commercial_payment = calculate_loan(
             commercial_loan,
@@ -2068,8 +2235,9 @@ def build_purchase_plan_analyses(
                 planned_down_payment=round(planned_down, 2),
                 provident_fund_extractable=pf_extractable,
                 provident_upfront_extractable=round(pf_upfront_extractable, 2),
+                family_provident_upfront_extractable=round(family_pf_upfront_extractable, 2),
                 provident_post_transaction_extractable=round(pf_post_transaction_extractable, 2),
-                required_cash_after_pf_extract=round(max(0, upfront_cash - pf_upfront_extractable), 2),
+                required_cash_after_pf_extract=round(max(0, upfront_cash - pf_upfront_extractable - family_pf_upfront_extractable), 2),
                 upfront_cash_required=round(upfront_cash, 2),
                 commercial_loan_amount=round(commercial_loan, 2),
                 provident_loan_amount=round(provident_loan, 2),
@@ -2097,9 +2265,10 @@ def build_purchase_plan_analyses(
                 provident_balance_after_extract=round(pf_after_extract, 2),
                 required_liquidity_reserve=round(required_liquidity_reserve, 2),
                 liquidity_ok=cash_after_transaction >= required_liquidity_reserve and cash_stress_ok,
-                minimum_cash_balance=round(minimum_cash_balance, 2),
+                minimum_cash_balance=round(max(0.0, minimum_cash_balance), 2),
                 minimum_cash_balance_month=minimum_cash_balance_month,
                 cash_stress_ok=cash_stress_ok,
+                cash_stress_shortfall=round(max(0.0, cash_stress_shortfall, -minimum_cash_balance), 2),
                 post_purchase_cash_flow=round(post_purchase_cash_flow, 2),
                 monthly_post_purchase_pf_withdrawal=round(monthly_pf_withdrawal, 2),
                 post_purchase_cash_flow_with_pf_withdrawal=round(post_purchase_cash_flow_with_pf, 2),
@@ -2184,7 +2353,7 @@ def calculate_affordability(
     *,
     stress_name: str | None = None,
 ) -> AffordabilityResult:
-    household = _household_with_career_income_stages(household)
+    household = _household_with_career_income_stages(household, rules)
     params = rules.params
     min_down_payment_ratio = float(params.get("minimum_down_payment_ratio", 0.30))
     recommended_emergency_months = float(params.get("recommended_emergency_months", 6))

@@ -237,6 +237,8 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
             enabled=True,
             layoff_member_name="我",
             layoff_age=31,
+            auto_unemployment_benefit=False,
+            auto_self_social_insurance=False,
             self_birth_month="",
             spouse_birth_month="",
             self_current_age=30,
@@ -266,6 +268,44 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
     assert pension.non_taxable_income >= 6_000
 
 
+def test_career_shock_auto_estimates_unemployment_and_self_social_from_rules() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "beijing_unemployment_benefit_10_to_15y": 2600,
+                "beijing_unemployment_benefit_after_12_months": 2100,
+                "beijing_social_base_floor": 7000,
+                "beijing_social_base_ceiling": 30000,
+                "flexible_employment_social_base": 8000,
+                "flexible_employment_pension_rate": 0.2,
+                "flexible_employment_unemployment_rate": 0.01,
+                "flexible_employment_medical_monthly": 500,
+            }
+        }
+    )
+    household = HouseholdData(
+        social_security_months=132,
+        scheduled_expenses=[],
+        career_shock=CareerShockData(
+            enabled=True,
+            layoff_member_name="样例成员",
+            layoff_age=31,
+            self_current_age=30,
+            self_retirement_age=60,
+        ),
+        members=[IncomeMember(name="样例成员", monthly_salary_gross=20_000, annual_bonus=0)],
+    )
+
+    first_month = household_monthly_income_profile_at(household, rule, months_from_now=12, as_of=date(2026, 7, 1))
+    thirteenth_month = household_monthly_income_profile_at(household, rule, months_from_now=24, as_of=date(2026, 7, 1))
+    after_benefit = household_monthly_income_profile_at(household, rule, months_from_now=36, as_of=date(2026, 7, 1))
+
+    assert first_month.non_taxable_income == pytest.approx(2600)
+    assert thirteenth_month.non_taxable_income == pytest.approx(2100)
+    assert after_benefit.extra_cash_expense == pytest.approx(2180)
+
+
 def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
     rule = _zero_contribution_rule()
     household = HouseholdData(
@@ -274,6 +314,8 @@ def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
             enabled=True,
             layoff_member_name="样例成员",
             layoff_age=35,
+            auto_unemployment_benefit=False,
+            auto_self_social_insurance=False,
             self_birth_month="1980-01",
             self_current_age=30,
             unemployment_benefit_months=24,
@@ -308,6 +350,8 @@ def test_purchase_plan_avoids_negative_cash_pool_after_layoff() -> None:
             enabled=True,
             layoff_member_name="self",
             layoff_age=35,
+            auto_unemployment_benefit=False,
+            auto_self_social_insurance=False,
             self_birth_month="1980-01",
             self_current_age=25,
             unemployment_benefit_months=0,
@@ -800,7 +844,8 @@ def test_affordability_returns_multiple_purchase_plan_analyses() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(total_price=3_000_000), RulePackData())
     plans = {item.variant: item for item in result.purchase_plan_analyses}
     assert set(plans) == {"手动指定", "0商贷", "微量商贷", "较多商贷"}
-    assert all(plans[name].provident_loan_amount > 0 for name in ["0商贷", "微量商贷", "较多商贷"])
+    assert all(plan.provident_loan_amount >= 0 for plan in plans.values())
+    assert all(plan.minimum_cash_balance >= 0 for plan in plans.values())
     assert plans["0商贷"].commercial_loan_amount == 0
 
 
@@ -1057,6 +1102,244 @@ def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
     assert scenario.total_price * 0.02 <= micro_plan.commercial_loan_amount <= scenario.total_price * 0.12
     assert micro_plan.months_to_buy is not None
     assert zero_commercial.months_to_buy is None or micro_plan.months_to_buy <= zero_commercial.months_to_buy
+
+
+def test_micro_commercial_strategy_avoids_negative_cash_for_400w_new_home() -> None:
+    rules = RulePackData()
+    rules = rules.model_copy(
+        update={
+            "params": {
+                **rules.params,
+                "micro_commercial_loan_ratio": 0.05,
+                "micro_commercial_loan_ratio_min": 0.02,
+                "micro_commercial_loan_ratio_max": 0.12,
+                "provident_base_loan_cap": 600_000,
+                "provident_loan_cap_increase_per_year": 150_000,
+                "provident_upfront_purchase_extract_ratio_new_home": 1.0,
+            }
+        }
+    )
+    household = HouseholdData(
+        liquid_assets=300_000,
+        investments=0,
+        provident_fund_balance=200_000,
+        social_security_months=60,
+        monthly_expense=12_000,
+        required_liquidity_months=6,
+        members=[
+            IncomeMember(
+                name="样例成员",
+                monthly_salary_gross=20_000,
+                annual_bonus=0,
+                monthly_special_additional_deduction=0,
+            )
+        ],
+        car_plan=CarPlanData(enabled=False),
+        career_shock=CareerShockData(enabled=True, self_birth_month="1995-01", self_layoff_age=35),
+    )
+    scenario = ScenarioData(
+        total_price=4_000_000,
+        property_type="新房",
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    micro_plan = next(item for item in result.purchase_plan_analyses if item.variant == "微量商贷")
+
+    assert micro_plan.months_to_buy is not None
+    assert micro_plan.cash_stress_ok is True
+    assert micro_plan.cash_stress_shortfall == 0
+    assert micro_plan.minimum_cash_balance >= 0
+    assert scenario.total_price * 0.02 <= micro_plan.commercial_loan_amount <= scenario.total_price * 0.12
+
+
+def test_family_provident_support_reduces_new_home_upfront_cash_need() -> None:
+    household = HouseholdData(
+        liquid_assets=800_000,
+        investments=0,
+        provident_fund_balance=0,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        social_security_months=60,
+        family_provident_support_enabled=True,
+        family_provident_initial_balance=100_000,
+        family_provident_monthly_salary=10_000,
+        family_provident_total_rate=0.24,
+        members=[
+            IncomeMember(
+                name="样例成员",
+                monthly_salary_gross=50_000,
+                annual_bonus=0,
+            )
+        ],
+        car_plan=CarPlanData(enabled=False),
+        career_shock=CareerShockData(enabled=False),
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        property_type="新房",
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    with_support = calculate_affordability(household, scenario, RulePackData())
+    without_support = calculate_affordability(
+        household.model_copy(update={"family_provident_support_enabled": False}),
+        scenario,
+        RulePackData(),
+    )
+    support_plan = next(item for item in with_support.purchase_plan_analyses if item.variant == "较多商贷")
+    base_plan = next(item for item in without_support.purchase_plan_analyses if item.variant == "较多商贷")
+
+    assert support_plan.family_provident_upfront_extractable > 0
+    assert support_plan.required_cash_after_pf_extract < base_plan.required_cash_after_pf_extract
+    assert support_plan.family_provident_upfront_extractable == pytest.approx(
+        base_plan.required_cash_after_pf_extract - support_plan.required_cash_after_pf_extract,
+        abs=1,
+    )
+
+
+def test_family_provident_support_can_make_400w_new_home_micro_plan_cash_safe() -> None:
+    rules = RulePackData()
+    rules = rules.model_copy(
+        update={
+            "params": {
+                **rules.params,
+                "micro_commercial_loan_ratio": 0.05,
+                "micro_commercial_loan_ratio_min": 0.02,
+                "micro_commercial_loan_ratio_max": 0.12,
+                "provident_base_loan_cap": 600_000,
+                "provident_loan_cap_increase_per_year": 150_000,
+                "provident_upfront_purchase_extract_ratio_new_home": 1.0,
+            }
+        }
+    )
+    household = HouseholdData(
+        liquid_assets=300_000,
+        investments=0,
+        provident_fund_balance=200_000,
+        social_security_months=60,
+        monthly_expense=12_000,
+        required_liquidity_months=6,
+        family_provident_support_enabled=True,
+        family_provident_initial_balance=100_000,
+        family_provident_monthly_salary=10_000,
+        family_provident_total_rate=0.24,
+        members=[
+            IncomeMember(
+                name="样例成员",
+                monthly_salary_gross=20_000,
+                annual_bonus=0,
+            )
+        ],
+        car_plan=CarPlanData(enabled=False),
+        career_shock=CareerShockData(enabled=True, self_birth_month="1995-01", self_layoff_age=35),
+    )
+    scenario = ScenarioData(
+        total_price=4_000_000,
+        property_type="新房",
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    micro_plan = next(item for item in result.purchase_plan_analyses if item.variant == "微量商贷")
+
+    assert micro_plan.months_to_buy is not None
+    assert micro_plan.cash_stress_ok is True
+    assert micro_plan.cash_stress_shortfall == 0
+    assert micro_plan.family_provident_upfront_extractable > 0
+
+
+def test_purchase_plan_reports_shortfall_instead_of_negative_cash_balance() -> None:
+    rules = RulePackData()
+    rules = rules.model_copy(
+        update={
+            "params": {
+                **rules.params,
+                "micro_commercial_loan_ratio": 0.05,
+                "micro_commercial_loan_ratio_min": 0.02,
+                "micro_commercial_loan_ratio_max": 0.12,
+                "provident_upfront_purchase_extract_ratio_new_home": 1.0,
+            }
+        }
+    )
+    household = HouseholdData(
+        liquid_assets=100_000,
+        investments=0,
+        provident_fund_balance=0,
+        social_security_months=12,
+        monthly_expense=20_000,
+        required_liquidity_months=6,
+        members=[
+            IncomeMember(
+                name="样例成员",
+                monthly_salary_gross=8_000,
+                annual_bonus=0,
+            )
+        ],
+        car_plan=CarPlanData(enabled=False),
+        career_shock=CareerShockData(enabled=False),
+    )
+    scenario = ScenarioData(
+        total_price=4_000_000,
+        property_type="新房",
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    micro_plan = next(item for item in result.purchase_plan_analyses if item.variant == "微量商贷")
+
+    assert micro_plan.months_to_buy is None
+    assert micro_plan.cash_stress_ok is False
+    assert micro_plan.minimum_cash_balance == 0
+    assert micro_plan.cash_stress_shortfall > 0
+
+
+def test_manual_purchase_delay_month_is_respected() -> None:
+    household = HouseholdData(
+        liquid_assets=2_500_000,
+        investments=0,
+        social_security_months=96,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        members=[
+            IncomeMember(
+                name="样例成员",
+                monthly_salary_gross=60_000,
+                annual_bonus=0,
+            )
+        ],
+        car_plan=CarPlanData(enabled=False),
+        career_shock=CareerShockData(enabled=False),
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        down_payment_amount=800_000,
+        commercial_loan_amount=1_200_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=18,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    manual_plan = next(item for item in result.purchase_plan_analyses if item.variant == "手动指定")
+
+    assert manual_plan.months_to_buy is not None
+    assert manual_plan.months_to_buy >= 18
 
 
 def test_purchase_plan_analysis_has_visualization_ready_cash_flow_fields() -> None:

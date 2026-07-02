@@ -83,6 +83,8 @@ class CareerShockData(BaseModel):
     spouse_birth_month: str = ""
     self_current_age: int = Field(30, ge=18, le=80)
     spouse_current_age: int = Field(30, ge=18, le=80)
+    auto_unemployment_benefit: bool = True
+    auto_self_social_insurance: bool = True
     unemployment_benefit_months: int = Field(24, ge=0, le=24)
     unemployment_benefit_monthly: float = Field(0, ge=0)
     self_social_insurance_monthly: float = Field(0, ge=0)
@@ -180,6 +182,11 @@ class HouseholdData(BaseModel):
     investments: float = Field(0, ge=0)
     income_projection_year: int = Field(2027, ge=2024, le=2050)
     monthly_rent_from_housing_fund: float = Field(0, ge=0)
+    family_provident_support_enabled: bool = False
+    family_provident_support_label: str = "亲属异地公积金首付支持"
+    family_provident_initial_balance: float = Field(100000, ge=0)
+    family_provident_monthly_salary: float = Field(10000, ge=0)
+    family_provident_total_rate: float = Field(0.24, ge=0, le=0.5)
     investment_plan_name: str = "conservative_monthly_investment"
     investment_risk_level: str = "conservative"
     monthly_investment_amount: float = Field(0, ge=0)
@@ -192,6 +199,7 @@ class HouseholdData(BaseModel):
     investment_sell_fee_rate: float = Field(0.005, ge=0, le=0.05)
     required_liquidity_months: float = Field(6, ge=0, le=36)
     borrower_age: int = Field(30, ge=18, le=68)
+    borrower_member_index: int = Field(0, ge=0, le=20)
     career_shock: CareerShockData = Field(default_factory=CareerShockData)
     career_shock_applied: bool = False
     car_plan: CarPlanData = Field(default_factory=CarPlanData)
@@ -241,6 +249,7 @@ class ScenarioData(BaseModel):
     down_payment_amount: float = Field(0, ge=0)
     commercial_loan_amount: float = Field(0, ge=0)
     provident_loan_amount: float = Field(0, ge=0)
+    manual_purchase_delay_months: int = Field(0, ge=0, le=360)
     micro_commercial_loan_ratio: float = Field(0, ge=0, le=1)
     commercial_rate: float = Field(0.035, ge=0, le=0.2)
     provident_rate: float = Field(0.0285, ge=0, le=0.2)
@@ -341,6 +350,16 @@ class RulePackData(BaseModel):
             "employer_medical_maternity_rate": 0.098,
             "employer_unemployment_rate": 0.005,
             "employer_work_injury_rate": 0.002,
+            "beijing_unemployment_benefit_under_5y": 2129,
+            "beijing_unemployment_benefit_5_to_10y": 2156,
+            "beijing_unemployment_benefit_10_to_15y": 2188,
+            "beijing_unemployment_benefit_15_to_20y": 2215,
+            "beijing_unemployment_benefit_20y_plus": 2286,
+            "beijing_unemployment_benefit_after_12_months": 2129,
+            "flexible_employment_social_base": 7162,
+            "flexible_employment_pension_rate": 0.20,
+            "flexible_employment_unemployment_rate": 0.01,
+            "flexible_employment_medical_monthly": 584.92,
             "comprehensive_tax_brackets": [
                 {"threshold": 36000, "rate": 0.03, "quick_deduction": 0},
                 {"threshold": 144000, "rate": 0.10, "quick_deduction": 2520},
@@ -488,6 +507,7 @@ class PurchasePlanAnalysis(BaseModel):
     planned_down_payment: float
     provident_fund_extractable: float
     provident_upfront_extractable: float
+    family_provident_upfront_extractable: float = 0.0
     provident_post_transaction_extractable: float
     required_cash_after_pf_extract: float
     upfront_cash_required: float
@@ -518,6 +538,7 @@ class PurchasePlanAnalysis(BaseModel):
     minimum_cash_balance: float = 0.0
     minimum_cash_balance_month: int | None = None
     cash_stress_ok: bool = True
+    cash_stress_shortfall: float = 0.0
     post_purchase_cash_flow: float
     monthly_post_purchase_pf_withdrawal: float
     post_purchase_cash_flow_with_pf_withdrawal: float

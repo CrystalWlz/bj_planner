@@ -49,6 +49,8 @@ export interface CareerShockData {
   spouse_birth_month: string;
   self_current_age: number;
   spouse_current_age: number;
+  auto_unemployment_benefit: boolean;
+  auto_self_social_insurance: boolean;
   unemployment_benefit_months: number;
   unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
@@ -133,6 +135,11 @@ export interface HouseholdData {
   investments: number;
   income_projection_year: number;
   monthly_rent_from_housing_fund: number;
+  family_provident_support_enabled: boolean;
+  family_provident_support_label: string;
+  family_provident_initial_balance: number;
+  family_provident_monthly_salary: number;
+  family_provident_total_rate: number;
   investment_plan_name: string;
   investment_risk_level: string;
   monthly_investment_amount: number;
@@ -145,6 +152,7 @@ export interface HouseholdData {
   investment_sell_fee_rate: number;
   required_liquidity_months: number;
   borrower_age: number;
+  borrower_member_index: number;
   career_shock: CareerShockData;
   career_shock_applied?: boolean;
   car_plan: CarPlanData;
@@ -179,6 +187,7 @@ export interface ScenarioData {
   down_payment_amount: number;
   commercial_loan_amount: number;
   provident_loan_amount: number;
+  manual_purchase_delay_months: number;
   micro_commercial_loan_ratio: number;
   commercial_rate: number;
   provident_rate: number;
@@ -334,6 +343,7 @@ export interface PurchasePlanAnalysis {
   planned_down_payment: number;
   provident_fund_extractable: number;
   provident_upfront_extractable: number;
+  family_provident_upfront_extractable?: number;
   provident_post_transaction_extractable: number;
   required_cash_after_pf_extract: number;
   upfront_cash_required: number;
@@ -364,6 +374,7 @@ export interface PurchasePlanAnalysis {
   minimum_cash_balance?: number;
   minimum_cash_balance_month?: number | null;
   cash_stress_ok?: boolean;
+  cash_stress_shortfall?: number;
   post_purchase_cash_flow: number;
   monthly_post_purchase_pf_withdrawal: number;
   post_purchase_cash_flow_with_pf_withdrawal: number;
