@@ -20,8 +20,8 @@ from .schemas import (
     RulePackData,
     ScenarioData,
     StressResult,
-    StudentLoanData,
-    StudentLoanSummary,
+    PhasedLoanData,
+    PhasedLoanSummary,
     TaxMemberSummary,
     YieldSensitivityPoint,
 )
@@ -829,14 +829,14 @@ def _provident_repayment_method(scenario: ScenarioData) -> str:
     return scenario.provident_repayment_method or scenario.repayment_method
 
 
-def summarize_student_loans(
-    loans: list[StudentLoanData],
+def summarize_phased_loans(
+    loans: list[PhasedLoanData],
     *,
     as_of: date | None = None,
-) -> list[StudentLoanSummary]:
+) -> list[PhasedLoanSummary]:
     current = as_of or date.today()
     current_month = (current.year, current.month)
-    summaries: list[StudentLoanSummary] = []
+    summaries: list[PhasedLoanSummary] = []
 
     for loan in loans:
         start_month = _parse_month(loan.interest_start_month)
@@ -862,7 +862,7 @@ def summarize_student_loans(
             )
 
         summaries.append(
-            StudentLoanSummary(
+            PhasedLoanSummary(
                 borrower=loan.borrower,
                 name=loan.name,
                 principal=round(loan.principal, 2),
@@ -2194,9 +2194,9 @@ def calculate_affordability(
         household,
         rules,
     )
-    student_loan_summaries = summarize_student_loans(household.student_loans)
-    student_loan_monthly_payment = sum(item.current_monthly_payment for item in student_loan_summaries)
-    effective_monthly_debt_payment = household.monthly_debt_payment + student_loan_monthly_payment
+    phased_loan_summaries = summarize_phased_loans(household.phased_loans)
+    phased_loan_monthly_payment = sum(item.current_monthly_payment for item in phased_loan_summaries)
+    effective_monthly_debt_payment = household.monthly_debt_payment + phased_loan_monthly_payment
     cashflow_household = household.model_copy(
         update={"monthly_debt_payment": effective_monthly_debt_payment}
     )
@@ -2330,9 +2330,9 @@ def calculate_affordability(
         household_gross_monthly_income=round(gross_monthly_income, 2),
         household_net_monthly_income=round(net_monthly_income, 2),
         annual_income_tax=round(annual_income_tax, 2),
-        student_loan_monthly_payment=round(student_loan_monthly_payment, 2),
+        phased_loan_monthly_payment=round(phased_loan_monthly_payment, 2),
         effective_monthly_debt_payment=round(effective_monthly_debt_payment, 2),
-        student_loan_summaries=student_loan_summaries,
+        phased_loan_summaries=phased_loan_summaries,
         car_loan=car_loan,
         car_plan_analyses=car_plan_analyses,
         monthly_payment=round(monthly_payment, 2),
@@ -2351,7 +2351,7 @@ def calculate_affordability(
             "北京公积金贷款额度按当前规则包的每缴存年额度估算；夫妻分别缴存时，现阶段用家庭录入的社保/个税月数近似代表较长缴存年限。",
             f"北京公积金贷款期限按设定年限、30 年上限、借款人年龄和二手房房龄/土地剩余年限取短；当前测算：{'；'.join(provident_year_reasons)}。",
             "公积金提取区分交易前现金与交易后回流：默认不把余额直接抵扣首付，交易后购房提取和买后公积金提取/冲还贷作为买后现金与现金流改善项估算。",
-            "助学贷款在只还利息阶段按本金乘年利率除以 12 计入有效月债务，到期后按剩余期数转为等额本息估算。",
+            "阶段性贷款在只还利息阶段按本金乘年利率除以 12 计入有效月债务，到期后按剩余期数转为等额本息或等额本金估算。",
             "等额本金场景使用首月月供评估现金流压力。",
             "工资薪金和全年一次性奖金按规则包税率表估算，未覆盖劳务报酬、经营所得等复杂申报情形。",
             "家庭支出按基础月支出叠加定时月支出测算；不符合税收养老条件的家庭支持支出只进入现金流，不进入个税专项附加扣除。",

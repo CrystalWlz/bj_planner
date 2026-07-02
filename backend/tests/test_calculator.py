@@ -10,9 +10,9 @@ from app.calculator import (
     calculate_loan,
     household_monthly_income_profile_at,
     monthly_household_expense_at,
-    summarize_student_loans,
+    summarize_phased_loans,
 )
-from app.schemas import CareerShockData, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, StudentLoanData
+from app.schemas import CareerShockData, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -35,35 +35,35 @@ def _zero_contribution_rule() -> RulePackData:
     )
 
 
-def _sample_student_loans() -> list[StudentLoanData]:
+def _sample_phased_loans() -> list[PhasedLoanData]:
     return [
-        StudentLoanData(
+        PhasedLoanData(
             borrower="样例成员A",
-            name="助学贷款A",
+            name="阶段性贷款A",
             principal=30_000,
             remaining_months=120,
             interest_start_month="2026-07",
             interest_only_until="2028-07",
         ),
-        StudentLoanData(
+        PhasedLoanData(
             borrower="样例成员A",
-            name="助学贷款B",
+            name="阶段性贷款B",
             principal=40_000,
             remaining_months=120,
             interest_start_month="2026-07",
             interest_only_until="2028-06",
         ),
-        StudentLoanData(
+        PhasedLoanData(
             borrower="样例成员B",
-            name="助学贷款C",
+            name="阶段性贷款C",
             principal=35_000,
             remaining_months=120,
             interest_start_month="2027-07",
             interest_only_until="2028-07",
         ),
-        StudentLoanData(
+        PhasedLoanData(
             borrower="样例成员B",
-            name="助学贷款D",
+            name="阶段性贷款D",
             principal=45_000,
             remaining_months=120,
             interest_start_month="2027-07",
@@ -354,7 +354,7 @@ def test_purchase_plan_avoids_negative_cash_pool_after_layoff() -> None:
 
 def test_second_car_down_payment_is_counted_in_current_cash_need() -> None:
     household_without_second = HouseholdData(
-        student_loans=[],
+        phased_loans=[],
         car_plan=CarPlanData(enabled=False, no_car_monthly_commute_cost=0, second_car_enabled=False),
     )
     household_with_second = household_without_second.model_copy(
@@ -628,18 +628,18 @@ def test_car_operating_cost_estimate_responds_to_price_and_mileage() -> None:
     assert expensive_high_mileage.monthly_total_ownership_cost > modest.monthly_total_ownership_cost
 
 
-def test_student_loans_use_current_interest_only_policy() -> None:
-    summaries = summarize_student_loans(_sample_student_loans(), as_of=date(2026, 7, 1))
+def test_phased_loans_use_current_interest_only_policy() -> None:
+    summaries = summarize_phased_loans(_sample_phased_loans(), as_of=date(2026, 7, 1))
     monthly_payment = sum(item.current_monthly_payment for item in summaries)
 
     assert monthly_payment == pytest.approx((30_000 + 40_000) * 0.028 / 12, abs=0.01)
     assert [item.phase for item in summaries] == ["只还利息", "只还利息", "未开始计息", "未开始计息"]
 
 
-def test_student_loans_switch_to_equal_installment_after_interest_only_period() -> None:
-    summaries = summarize_student_loans(
+def test_phased_loans_switch_to_equal_installment_after_interest_only_period() -> None:
+    summaries = summarize_phased_loans(
         [
-            StudentLoanData(
+            PhasedLoanData(
                 principal=20_000,
                 annual_rate=0.028,
                 remaining_months=120,
@@ -654,10 +654,10 @@ def test_student_loans_switch_to_equal_installment_after_interest_only_period() 
     assert summaries[0].current_monthly_payment > 20_000 * 0.028 / 12
 
 
-def test_student_loans_can_use_equal_principal_after_interest_only_period() -> None:
-    equal_installment = summarize_student_loans(
+def test_phased_loans_can_use_equal_principal_after_interest_only_period() -> None:
+    equal_installment = summarize_phased_loans(
         [
-            StudentLoanData(
+            PhasedLoanData(
                 principal=20_000,
                 annual_rate=0.028,
                 repayment_method="equal_installment",
@@ -668,9 +668,9 @@ def test_student_loans_can_use_equal_principal_after_interest_only_period() -> N
         ],
         as_of=date(2028, 8, 1),
     )[0]
-    equal_principal = summarize_student_loans(
+    equal_principal = summarize_phased_loans(
         [
-            StudentLoanData(
+            PhasedLoanData(
                 principal=20_000,
                 annual_rate=0.028,
                 repayment_method="equal_principal",
@@ -699,7 +699,7 @@ def test_car_plan_is_included_in_affordability_cash_flow() -> None:
 
 
 def test_no_car_commute_cost_is_included_when_car_plan_disabled() -> None:
-    base = HouseholdData(student_loans=[], car_plan=CarPlanData(enabled=False, no_car_monthly_commute_cost=0))
+    base = HouseholdData(phased_loans=[], car_plan=CarPlanData(enabled=False, no_car_monthly_commute_cost=0))
     with_commute = base.model_copy(
         update={"car_plan": CarPlanData(enabled=False, no_car_monthly_commute_cost=1800)}
     )
@@ -710,21 +710,21 @@ def test_no_car_commute_cost_is_included_when_car_plan_disabled() -> None:
     assert commute_result.post_purchase_cash_flow == pytest.approx(no_commute_result.post_purchase_cash_flow - 1800)
 
 
-def test_affordability_counts_student_loans_as_effective_debt() -> None:
-    household_without_loans = HouseholdData(student_loans=[], monthly_debt_payment=1_000)
-    household_with_loans = household_without_loans.model_copy(update={"student_loans": _sample_student_loans()[:1]})
-    without_student_loans = calculate_affordability(
+def test_affordability_counts_phased_loans_as_effective_debt() -> None:
+    household_without_loans = HouseholdData(phased_loans=[], monthly_debt_payment=1_000)
+    household_with_loans = household_without_loans.model_copy(update={"phased_loans": _sample_phased_loans()[:1]})
+    without_phased_loans = calculate_affordability(
         household_without_loans,
         ScenarioData(),
         RulePackData(),
     )
-    with_student_loans = calculate_affordability(household_with_loans, ScenarioData(), RulePackData())
+    with_phased_loans = calculate_affordability(household_with_loans, ScenarioData(), RulePackData())
 
-    assert with_student_loans.student_loan_monthly_payment > 0
-    assert with_student_loans.effective_monthly_debt_payment == pytest.approx(
-        with_student_loans.student_loan_monthly_payment + household_with_loans.monthly_debt_payment
+    assert with_phased_loans.phased_loan_monthly_payment > 0
+    assert with_phased_loans.effective_monthly_debt_payment == pytest.approx(
+        with_phased_loans.phased_loan_monthly_payment + household_with_loans.monthly_debt_payment
     )
-    assert with_student_loans.post_purchase_cash_flow < without_student_loans.post_purchase_cash_flow
+    assert with_phased_loans.post_purchase_cash_flow < without_phased_loans.post_purchase_cash_flow
 
 
 def test_affordability_generates_multiple_car_purchase_strategies() -> None:

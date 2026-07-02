@@ -130,9 +130,9 @@ class CarPlanData(BaseModel):
     notes: str = ""
 
 
-class StudentLoanData(BaseModel):
+class PhasedLoanData(BaseModel):
     borrower: str = "成员 1"
-    name: str = "助学贷款"
+    name: str = "阶段性贷款"
     principal: float = Field(0, ge=0)
     annual_rate: float = Field(0.028, ge=0, le=0.2)
     repayment_method: RepaymentMethod = "equal_installment"
@@ -141,7 +141,7 @@ class StudentLoanData(BaseModel):
     interest_only_until: str = "2028-07"
 
 
-class StudentLoanSummary(BaseModel):
+class PhasedLoanSummary(BaseModel):
     borrower: str
     name: str
     principal: float
@@ -195,7 +195,7 @@ class HouseholdData(BaseModel):
     career_shock: CareerShockData = Field(default_factory=CareerShockData)
     career_shock_applied: bool = False
     car_plan: CarPlanData = Field(default_factory=CarPlanData)
-    student_loans: list[StudentLoanData] = Field(default_factory=list)
+    phased_loans: list[PhasedLoanData] = Field(default_factory=list)
     scheduled_expenses: list[ScheduledExpenseData] = Field(default_factory=list)
     elderly_dependents: list[ElderlyDependentData] = Field(default_factory=list)
     existing_home_count: int = Field(0, ge=0, le=10)
@@ -580,9 +580,9 @@ class AffordabilityResult(BaseModel):
     household_gross_monthly_income: float
     household_net_monthly_income: float
     annual_income_tax: float
-    student_loan_monthly_payment: float
+    phased_loan_monthly_payment: float
     effective_monthly_debt_payment: float
-    student_loan_summaries: list[StudentLoanSummary]
+    phased_loan_summaries: list[PhasedLoanSummary]
     car_loan: CarLoanSummary
     car_plan_analyses: list[CarPlanAnalysis]
     monthly_payment: float

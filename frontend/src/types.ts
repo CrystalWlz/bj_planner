@@ -96,7 +96,7 @@ export interface CarPlanData {
   notes: string;
 }
 
-export interface StudentLoanData {
+export interface PhasedLoanData {
   borrower: string;
   name: string;
   principal: number;
@@ -148,7 +148,7 @@ export interface HouseholdData {
   career_shock: CareerShockData;
   career_shock_applied?: boolean;
   car_plan: CarPlanData;
-  student_loans: StudentLoanData[];
+  phased_loans: PhasedLoanData[];
   scheduled_expenses: ScheduledExpenseData[];
   elderly_dependents: ElderlyDependentData[];
   existing_home_count: number;
@@ -286,7 +286,7 @@ export interface CarPlanAnalysis {
   notes: string[];
 }
 
-export interface StudentLoanSummary {
+export interface PhasedLoanSummary {
   borrower: string;
   name: string;
   principal: number;
@@ -399,9 +399,9 @@ export interface AffordabilityResult {
   household_gross_monthly_income: number;
   household_net_monthly_income: number;
   annual_income_tax: number;
-  student_loan_monthly_payment: number;
+  phased_loan_monthly_payment: number;
   effective_monthly_debt_payment: number;
-  student_loan_summaries: StudentLoanSummary[];
+  phased_loan_summaries: PhasedLoanSummary[];
   car_loan: CarLoanSummary;
   car_plan_analyses: CarPlanAnalysis[];
   monthly_payment: number;

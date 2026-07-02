@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   AlertTriangle,
@@ -65,7 +65,7 @@ import type {
   ScenarioData,
   ScheduledExpenseData,
   SourceDocumentRecord,
-  StudentLoanData
+  PhasedLoanData
 } from "./types";
 
 const sourceDefaults = [
@@ -156,6 +156,7 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         ...record.data.car_plan,
         no_car_monthly_commute_cost: record.data.car_plan.no_car_monthly_commute_cost ?? 0
       },
+      phased_loans: record.data.phased_loans ?? [],
       scheduled_expenses: record.data.scheduled_expenses ?? [],
       elderly_dependents: record.data.elderly_dependents ?? [],
       investment_buy_fee_rate: record.data.investment_buy_fee_rate ?? 0.0015,
@@ -207,9 +208,9 @@ const parameterExplanations: Record<string, string> = {
   预估年收益: "按当前投资资产和测算年化粗略估算的一年收益，用于直觉参考。",
   折合月收益: "把预估年收益平均到每个月，仅用于展示；真实收益会波动。",
   当前可动用现金: "今天可随时用于首付、应急和日常支出的现金，不包含已投入理财的资产。",
-  基础月支出: "从现在起每月固定发生的生活支出，不含家庭支持支出、房贷、车贷和助学贷款等单独项目。",
+  基础月支出: "从现在起每月固定发生的生活支出，不含家庭支持支出、房贷、车贷和阶段性贷款等单独项目。",
   当前实际月支出: "基础月支出加上当前已经生效的定时支出，用于判断现金安全垫。",
-  月债务: "除助学贷款外的每月既有债务。助学贷款在下方单独建模后会自动加进测算。",
+  月债务: "除下方单独建模的阶段性贷款外的每月既有债务；阶段性贷款会自动加进测算。",
   支出名称: "定时支出的名称，会直接显示在月现金流里，例如家庭支持支出。",
   定时月支出: "从开始月份起每月发生的额外家庭支出。用于现金流，不一定能抵扣个税。",
   开始月份: "该项支出从哪个月份开始计入现金流。",
@@ -246,7 +247,7 @@ const parameterExplanations: Record<string, string> = {
   "第一成员养老金/月": "第一位成员退休后每月养老金估算，按非税现金收入进入收入阶段。实际养老金取决于缴费年限、基数和个人账户。",
   "第二成员养老金/月": "第二位成员退休后每月养老金估算，按非税现金收入进入收入阶段。",
   借款人: "贷款归属人，只用于展示和汇总，不改变还款计算公式。",
-  贷款名称: "用于区分多笔贷款，例如助学贷款 A。",
+  贷款名称: "用于区分多笔贷款，例如低息贷款 A、教育贷款 A 或亲友借款 A。",
   本金: "当前仍需偿还或进入测算的贷款本金。",
   年利率: "贷款年化利率。等额本息/本金会按该利率计算还款。",
   还款方式: "等额本息月供较稳定，等额本金前期压力更高但总利息更少。",
@@ -1152,7 +1153,7 @@ export function App() {
   const activeRulePack = rulePacks.find((item) => item.data.status === "active") ?? rulePacks[0];
   const incomeMembers = household?.data.members ?? [];
   const carPlan = household?.data.car_plan ?? defaultCarPlan;
-  const studentLoans = household?.data.student_loans ?? [];
+  const phasedLoans = household?.data.phased_loans ?? [];
   const scheduledExpenses = household?.data.scheduled_expenses ?? [];
   const elderlyDependents = household?.data.elderly_dependents ?? [];
   const selectedPlanVariant = selectedScenario
@@ -1408,21 +1409,21 @@ export function App() {
     updateHousehold("members", nextMembers);
   };
 
-  const updateStudentLoan = <K extends keyof StudentLoanData>(
+  const updatePhasedLoan = <K extends keyof PhasedLoanData>(
     index: number,
     key: K,
-    value: StudentLoanData[K]
+    value: PhasedLoanData[K]
   ) => {
-    const nextLoans = studentLoans.map((loan, loanIndex) =>
+    const nextLoans = phasedLoans.map((loan, loanIndex) =>
       loanIndex === index ? { ...loan, [key]: value } : loan
     );
-    updateHousehold("student_loans", nextLoans);
+    updateHousehold("phased_loans", nextLoans);
   };
 
-  const addStudentLoan = () => {
-    const nextLoan: StudentLoanData = {
+  const addPhasedLoan = () => {
+    const nextLoan: PhasedLoanData = {
       borrower: incomeMembers[0]?.name ?? "成员 1",
-      name: `助学贷款 ${studentLoans.length + 1}`,
+      name: `阶段性贷款 ${phasedLoans.length + 1}`,
       principal: 0,
       annual_rate: 0.028,
       repayment_method: "equal_installment",
@@ -1430,13 +1431,13 @@ export function App() {
       interest_start_month: "2026-07",
       interest_only_until: "2028-07"
     };
-    updateHousehold("student_loans", [...studentLoans, nextLoan]);
+    updateHousehold("phased_loans", [...phasedLoans, nextLoan]);
   };
 
-  const removeStudentLoan = (index: number) => {
+  const removePhasedLoan = (index: number) => {
     updateHousehold(
-      "student_loans",
-      studentLoans.filter((_, loanIndex) => loanIndex !== index)
+      "phased_loans",
+      phasedLoans.filter((_, loanIndex) => loanIndex !== index)
     );
   };
 
@@ -1622,7 +1623,7 @@ export function App() {
         household={household.data}
         scenario={selectedScenario.data}
         incomeMembers={incomeMembers}
-        studentLoans={studentLoans}
+        phasedLoans={phasedLoans}
         scheduledExpenses={scheduledExpenses}
         elderlyDependents={elderlyDependents}
         result={result}
@@ -1633,9 +1634,9 @@ export function App() {
         updateIncomeStage={updateIncomeStage}
         addIncomeStage={addIncomeStage}
         removeIncomeStage={removeIncomeStage}
-        updateStudentLoan={updateStudentLoan}
-        addStudentLoan={addStudentLoan}
-        removeStudentLoan={removeStudentLoan}
+        updatePhasedLoan={updatePhasedLoan}
+        addPhasedLoan={addPhasedLoan}
+        removePhasedLoan={removePhasedLoan}
         updateScheduledExpense={updateScheduledExpense}
         addScheduledExpense={addScheduledExpense}
         removeScheduledExpense={removeScheduledExpense}
@@ -1764,7 +1765,7 @@ function HouseholdPage({
   household,
   scenario,
   incomeMembers,
-  studentLoans,
+  phasedLoans,
   scheduledExpenses,
   elderlyDependents,
   result,
@@ -1775,9 +1776,9 @@ function HouseholdPage({
   updateIncomeStage,
   addIncomeStage,
   removeIncomeStage,
-  updateStudentLoan,
-  addStudentLoan,
-  removeStudentLoan,
+  updatePhasedLoan,
+  addPhasedLoan,
+  removePhasedLoan,
   updateScheduledExpense,
   addScheduledExpense,
   removeScheduledExpense,
@@ -1788,7 +1789,7 @@ function HouseholdPage({
   household: HouseholdData;
   scenario: ScenarioData;
   incomeMembers: IncomeMember[];
-  studentLoans: StudentLoanData[];
+  phasedLoans: PhasedLoanData[];
   scheduledExpenses: ScheduledExpenseData[];
   elderlyDependents: ElderlyDependentData[];
   result: AffordabilityResult | null;
@@ -1808,13 +1809,13 @@ function HouseholdPage({
   ) => void;
   addIncomeStage: (memberIndex: number) => void;
   removeIncomeStage: (memberIndex: number, stageIndex: number) => void;
-  updateStudentLoan: <K extends keyof StudentLoanData>(
+  updatePhasedLoan: <K extends keyof PhasedLoanData>(
     index: number,
     key: K,
-    value: StudentLoanData[K]
+    value: PhasedLoanData[K]
   ) => void;
-  addStudentLoan: () => void;
-  removeStudentLoan: (index: number) => void;
+  addPhasedLoan: () => void;
+  removePhasedLoan: (index: number) => void;
   updateScheduledExpense: <K extends keyof ScheduledExpenseData>(
     index: number,
     key: K,
@@ -1899,7 +1900,7 @@ function HouseholdPage({
     { label: "家庭成员与工资阶段", done: incomeMembers.some((member) => incomeStagesForMember(member).some((stage) => stage.monthly_salary_gross > 0 || stage.annual_bonus > 0)) },
     { label: "基础支出与定时支出", done: household.monthly_expense > 0 || scheduledExpenses.some((expense) => expense.monthly_amount > 0) },
     { label: "现金、投资和公积金余额", done: household.liquid_assets > 0 || household.investments > 0 || household.provident_fund_balance > 0 },
-    { label: "贷款、老人扣除和职业冲击", done: studentLoans.length > 0 || elderlyDependents.length > 0 || Boolean(household.career_shock?.enabled) },
+    { label: "贷款、老人扣除和职业冲击", done: phasedLoans.length > 0 || elderlyDependents.length > 0 || Boolean(household.career_shock?.enabled) },
   ];
   const memberIncomeSection = (
     <section className="form-panel">
@@ -2366,26 +2367,26 @@ function HouseholdPage({
 
       <section className="form-panel">
         <div className="member-header">
-          <PanelTitle icon={<WalletCards size={18} />} title="助学贷款" />
-          <button className="ghost-button" onClick={addStudentLoan}>
+          <PanelTitle icon={<WalletCards size={18} />} title="阶段性贷款" />
+          <button className="ghost-button" onClick={addPhasedLoan}>
             <Plus size={16} /> 新增贷款
           </button>
         </div>
         <div className="loan-summary-strip">
-          <Metric label="助学贷款本月应还" value={money(result?.student_loan_monthly_payment ?? 0)} />
+          <Metric label="阶段性贷款本月应还" value={money(result?.phased_loan_monthly_payment ?? 0)} />
           <Metric label="计入测算的月债务" value={money(result?.effective_monthly_debt_payment ?? household.monthly_debt_payment)} />
         </div>
         <div className="member-list compact-list">
-          {studentLoans.map((loan, index) => {
-            const summary = result?.student_loan_summaries?.[index];
+          {phasedLoans.map((loan, index) => {
+            const summary = result?.phased_loan_summaries?.[index];
             return (
-              <section className="member-card loan-card" key={`student-loan-${index}`}>
+              <section className="member-card loan-card" key={`phased-loan-${index}`}>
                 <div className="member-card-head">
                   <strong>{summary?.phase ?? "待计算"}</strong>
                   <button
                     className="icon-button"
-                    onClick={() => removeStudentLoan(index)}
-                    aria-label="删除助学贷款"
+                    onClick={() => removePhasedLoan(index)}
+                    aria-label="删除阶段性贷款"
                     type="button"
                   >
                     <Trash2 size={16} />
@@ -2395,13 +2396,13 @@ function HouseholdPage({
                   <Field label="借款人">
                     <input
                       value={loan.borrower}
-                      onChange={(event) => updateStudentLoan(index, "borrower", event.target.value)}
+                      onChange={(event) => updatePhasedLoan(index, "borrower", event.target.value)}
                     />
                   </Field>
                   <Field label="贷款名称">
                     <input
                       value={loan.name}
-                      onChange={(event) => updateStudentLoan(index, "name", event.target.value)}
+                      onChange={(event) => updatePhasedLoan(index, "name", event.target.value)}
                     />
                   </Field>
                   <NumberField
@@ -2409,7 +2410,7 @@ function HouseholdPage({
                     value={loan.principal}
                     min={0}
                     step={1000}
-                    onChange={(value) => updateStudentLoan(index, "principal", value)}
+                    onChange={(value) => updatePhasedLoan(index, "principal", value)}
                   />
                   <NumberField
                     label="年利率"
@@ -2417,13 +2418,13 @@ function HouseholdPage({
                     min={0}
                     max={0.2}
                     step={0.0005}
-                    onChange={(value) => updateStudentLoan(index, "annual_rate", value)}
+                    onChange={(value) => updatePhasedLoan(index, "annual_rate", value)}
                   />
                   <Field label="宽限后还款">
                     <select
                       value={loan.repayment_method ?? "equal_installment"}
                       onChange={(event) =>
-                        updateStudentLoan(index, "repayment_method", event.target.value as RepaymentMethod)
+                        updatePhasedLoan(index, "repayment_method", event.target.value as RepaymentMethod)
                       }
                     >
                       <option value="equal_installment">等额本息</option>
@@ -2436,19 +2437,19 @@ function HouseholdPage({
                     min={1}
                     max={360}
                     step={1}
-                    onChange={(value) => updateStudentLoan(index, "remaining_months", value)}
+                    onChange={(value) => updatePhasedLoan(index, "remaining_months", value)}
                   />
                   <Field label="计息开始月">
                     <input
                       value={loan.interest_start_month}
-                      onChange={(event) => updateStudentLoan(index, "interest_start_month", event.target.value)}
+                      onChange={(event) => updatePhasedLoan(index, "interest_start_month", event.target.value)}
                       placeholder="2026-07"
                     />
                   </Field>
                   <Field label="只还利息至">
                     <input
                       value={loan.interest_only_until}
-                      onChange={(event) => updateStudentLoan(index, "interest_only_until", event.target.value)}
+                      onChange={(event) => updatePhasedLoan(index, "interest_only_until", event.target.value)}
                       placeholder="2028-07"
                     />
                   </Field>
@@ -2463,7 +2464,7 @@ function HouseholdPage({
           })}
         </div>
         <p className="field-hint">
-          “月债务”保留为普通既有债务；助学贷款会按当前日期自动折算本月应还，并额外计入有效月债务。
+          “月债务”保留为普通既有债务；阶段性贷款会按当前日期自动折算本月应还，并额外计入有效月债务。
         </p>
       </section>
 
@@ -3874,7 +3875,7 @@ function SelectedPlanVisualization({
     let livingExpense = 0;
     let debtPayment = 0;
     let regularDebtPayment = 0;
-    let studentLoanPayment = 0;
+    let phasedLoanPayment = 0;
     let carCost = 0;
     let firstCarLoanPayment = 0;
     let firstCarEnergyCost = 0;
@@ -3969,8 +3970,8 @@ function SelectedPlanVisualization({
         scheduledLivingExpense = scheduledExpenseRows.reduce((sum, item) => sum + item.amount, 0);
         livingExpense = baseLivingExpense + scheduledLivingExpense;
         debtPayment = result.effective_monthly_debt_payment;
-        studentLoanPayment = result.student_loan_monthly_payment;
-        regularDebtPayment = Math.max(0, debtPayment - studentLoanPayment);
+        phasedLoanPayment = result.phased_loan_monthly_payment;
+        regularDebtPayment = Math.max(0, debtPayment - phasedLoanPayment);
         carCost = carMonthlyCostAt(absoluteMonth);
         housePayment = isAfterPurchase ? plan.total_monthly_payment : 0;
         providentHousePayment = isAfterPurchase ? plan.provident_monthly_payment : 0;
@@ -4074,7 +4075,7 @@ function SelectedPlanVisualization({
       livingExpense,
       debtPayment,
       regularDebtPayment,
-      studentLoanPayment,
+      phasedLoanPayment,
       carCost,
       firstCarLoanPayment,
       firstCarEnergyCost,
@@ -4276,7 +4277,7 @@ function SelectedPlanVisualization({
     { name: "基础生活支出", value: selectedMonth.baseLivingExpense },
     ...selectedMonth.scheduledExpenseRows.map((item) => ({ name: item.name, value: item.amount })),
     { name: "普通既有债务", value: selectedMonth.regularDebtPayment },
-    { name: "助学贷款", value: selectedMonth.studentLoanPayment },
+    { name: "阶段性贷款", value: selectedMonth.phasedLoanPayment },
     { name: "无车通勤成本", value: selectedMonth.noCarCommuteCost },
     { name: "第一辆车车贷", value: selectedMonth.firstCarLoanPayment },
     { name: "第一辆车电费", value: selectedMonth.firstCarEnergyCost },
@@ -4337,7 +4338,7 @@ function SelectedPlanVisualization({
       rows: [
         ["基础生活支出", -selectedMonth.baseLivingExpense],
         ...selectedMonth.scheduledExpenseRows.map((item): [string, number] => [item.name, -item.amount]),
-        ["债务与助学贷款", -selectedMonth.debtPayment],
+        ["债务与阶段性贷款", -selectedMonth.debtPayment],
         ["通勤/用车", -selectedMonth.carCost],
         ["购房月供", -selectedMonth.housePayment],
         ["基础定投现金支出", -selectedMonth.monthlyInvestmentBase],
@@ -4945,7 +4946,7 @@ function exportText(result: AffordabilityResult, scenario: ScenarioData, plan: P
     "",
     `税后月收入：${money(result.household_net_monthly_income)}`,
     `年度个税：${money(result.annual_income_tax)}`,
-    `助学贷款月供：${money(result.student_loan_monthly_payment)}`,
+    `阶段性贷款月供：${money(result.phased_loan_monthly_payment)}`,
     "",
     "当前方案购房路径：",
     `预计买入时间：${plan.months_to_buy === null ? "30 年内暂不可达" : formatMonthDate(new Date(), plan.months_to_buy)}（约 ${plan.years_to_buy ?? "超过30"} 年）`,
