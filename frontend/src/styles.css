@@ -358,6 +358,10 @@ select:focus {
   line-height: 1.5;
 }
 
+.danger-text {
+  color: #a13d3d;
+}
+
 .setup-guide {
   border-color: #cfe0f3;
   background: #f8fbff;

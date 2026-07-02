@@ -4132,6 +4132,18 @@ function SelectedPlanVisualization({
       ? formatMonthDate(timelineBaseDate, plan.minimum_cash_balance_month)
       : visualMinimumCashPoint.name;
   const cashStressOk = plan.cash_stress_ok ?? minimumCashBalance >= 0;
+  const stressCashShortfall = Math.max(0, -minimumCashBalance);
+  const stressCashMetricLabel = cashStressOk ? "压力最低现金" : "压力现金缺口";
+  const stressCashMetricValue = cashStressOk ? money(minimumCashBalance) : money(stressCashShortfall);
+  const stressCashSummary = cashStressOk
+    ? `压力情景下最低现金出现在 ${minimumCashMonth}，仍保留 ${money(minimumCashBalance)}。`
+    : `压力情景下 ${minimumCashMonth} 会出现 ${money(stressCashShortfall)} 资金缺口；现金不能为负，这表示该方案需要延后买入、降低目标、增加可用现金或重新调整贷款结构。`;
+  const purchaseTimelineText =
+    plan.months_to_buy === null
+      ? "暂无法达到购房现金要求"
+      : cashStressOk
+        ? `${purchaseYearText} 可执行购房`
+        : `${purchaseYearText} 交易现金可达，但压力情景有 ${money(stressCashShortfall)} 现金缺口`;
   const investmentEffectAtPurchase =
     plan.months_to_buy === null
       ? investmentEffectAtEnd
@@ -4482,7 +4494,7 @@ function SelectedPlanVisualization({
     {
       month: plan.months_to_buy ?? 360,
       label: plan.months_to_buy === null ? "30年内" : `${formatMonthDate(timelineBaseDate, plan.months_to_buy)} · 购房`,
-      value: plan.months_to_buy === null ? "暂无法达到购房现金要求" : `${purchaseYearText} 可执行购房`,
+      value: purchaseTimelineText,
     },
     { month: plan.months_to_buy ?? 360, label: `${plan.months_to_buy === null ? "待定" : formatMonthDate(timelineBaseDate, plan.months_to_buy)} · 首付策略`, value: `首付 ${money(plan.planned_down_payment)}，交易前可提 ${money(plan.provident_upfront_extractable)}，交易后预计回流 ${money(plan.provident_post_transaction_extractable)}` },
     { month: plan.months_to_buy ?? 360, label: `${plan.months_to_buy === null ? "待定" : formatMonthDate(timelineBaseDate, plan.months_to_buy)} · 理财变现`, value: `买房前累计定投约 ${money(displayedInvestmentContribution)}，累计投资收益约 ${money(displayedInvestmentReturn)}，累计交易手续费约 ${money(displayedInvestmentFees)}；交易时投资资产扣除卖出手续费后进入首付现金。` },
@@ -4513,7 +4525,7 @@ function SelectedPlanVisualization({
         <Metric label="交易当下现金" value={money(plan.cash_after_transaction)} tone={plan.liquidity_ok ? "good" : "warn"} />
         <Metric label="交易后回流" value={money(plan.provident_post_transaction_extractable)} />
         <Metric label="回流后现金" value={money(plan.cash_after_purchase)} tone={plan.liquidity_ok ? "good" : "warn"} />
-        <Metric label="压力最低现金池" value={money(minimumCashBalance)} tone={cashStressOk ? "good" : "bad"} />
+        <Metric label={stressCashMetricLabel} value={stressCashMetricValue} tone={cashStressOk ? "good" : "bad"} />
         <Metric label="含公积金提取月结余" value={money(plan.post_purchase_cash_flow_with_pf_withdrawal)} tone={plan.post_purchase_cash_flow_with_pf_withdrawal >= 0 ? "good" : "bad"} />
         <Metric label="装修资金" value={renovationTimingText} tone={plan.months_to_renovation === null ? "warn" : "good"} />
         <Metric label="负债收入比" value={percent(plan.debt_to_income_ratio)} tone={plan.debt_to_income_ratio > 0.5 ? "bad" : "warn"} />
@@ -4524,6 +4536,9 @@ function SelectedPlanVisualization({
         <Metric label="累计投资收益" value={money(displayedInvestmentReturn)} tone={displayedInvestmentReturn >= 0 ? "good" : "warn"} />
         <Metric label="累计交易手续费" value={money(displayedInvestmentFees)} tone={displayedInvestmentFees > 0 ? "warn" : undefined} />
       </div>
+      <p className={cashStressOk ? "field-hint" : "field-hint danger-text"}>
+        {stressCashSummary}
+      </p>
 
       <section className="loan-structure">
         <PanelTitle icon={<WalletCards size={18} />} title="资金结构" compact />
@@ -4583,7 +4598,7 @@ function SelectedPlanVisualization({
             <div>
               <span>现金池</span>
               <strong>{money(selectedMonth.现金池)}</strong>
-              <small>当月净流入 {money(selectedMonth.monthlyCashDelta)}，最低点 {minimumCashMonth} {money(minimumCashBalance)}</small>
+              <small>当月净流入 {money(selectedMonth.monthlyCashDelta)}，{stressCashSummary}</small>
             </div>
             <div>
               <span>投资资产</span>
@@ -4884,9 +4899,16 @@ function getPlanStatus(plan: PurchasePlanAnalysis) {
       reason: "当前收入、资产和现金流路径下，30 年内无法达到该方案的购房现金要求。"
     };
   }
+  if (plan.cash_stress_ok === false) {
+    const shortfall = Math.max(0, -(plan.minimum_cash_balance ?? 0));
+    return {
+      status: "不可行",
+      statusClass: "bad",
+      reason: `${formatMonthDate(new Date(), plan.months_to_buy)} 虽然可达到交易现金要求，但压力情景下会出现 ${money(shortfall)} 现金缺口；现金不能为负，需要延后买入、降低目标或重新调整贷款结构。`
+    };
+  }
   const riskNotes = [
     !plan.liquidity_ok ? "交易当下现金低于安全垫" : "",
-    plan.cash_stress_ok === false ? `被裁员等压力情景下现金池最低到 ${money(plan.minimum_cash_balance ?? 0)}` : "",
     plan.post_purchase_cash_flow_with_pf_withdrawal < 0 ? "含买后公积金提取后月现金流为负" : "",
     plan.debt_to_income_ratio > 0.5 ? "负债收入比较高" : ""
   ].filter(Boolean);
