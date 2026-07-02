@@ -26,9 +26,9 @@
 - 不要频繁推送。除非用户明确要求，完成工作后只做本地提交。
 - 推送只能走 `codex/public-release` 分支到 GitHub `main`，优先使用 `.\scripts\push_public.ps1`。
 
-## 常用命令
+## 开发验证命令
 
-后端测试：
+后端计算和 API 验证：
 
 ```powershell
 $Env:PYTHONPATH = "backend"

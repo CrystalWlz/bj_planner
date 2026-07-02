@@ -45,18 +45,6 @@ npm run dev -- --host 127.0.0.1
 
 如果你已经在本机使用过旧版本，原有数据库不会自动清空。需要重新初始化时，请先备份后删除本机数据库文件，或设置新的 `HOUSE_PLANNER_DB` 路径。
 
-## 测试
-
-```powershell
-cd backend
-.\.venv\Scripts\python -m pytest -n auto
-```
-
-```powershell
-cd frontend
-npm run build
-```
-
 ## 数据位置
 
 默认 SQLite 数据库位于系统应用数据目录：
