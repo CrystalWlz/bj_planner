@@ -1854,6 +1854,17 @@ function HouseholdPage({
   const spouseAgeFromBirthMonth = ageYearsFromBirthMonth(careerShock.spouse_birth_month, today);
   const displayedSelfCurrentAge = selfAgeFromBirthMonth ?? careerShock.self_current_age;
   const displayedSpouseCurrentAge = spouseAgeFromBirthMonth ?? careerShock.spouse_current_age;
+  const memberCompositionText = incomeMembers.length > 0
+    ? `${incomeMembers.length} 人：${incomeMembers.map((member) => member.name || "未命名成员").join("、")}`
+    : "待添加成员";
+  const memberAgeText = incomeMembers.length > 0
+    ? incomeMembers
+        .map((member, index) => {
+          const age = index === 0 ? displayedSelfCurrentAge : index === 1 ? displayedSpouseCurrentAge : null;
+          return `${member.name || `成员 ${index + 1}`} ${age !== null && age !== undefined ? `${age} 岁` : "年龄待填"}`;
+        })
+        .join("、")
+    : "待填写";
   const updateSelfBirthMonth = (birthMonth: string) => {
     updateCareerShock({ self_birth_month: birthMonth });
   };
@@ -1909,6 +1920,16 @@ function HouseholdPage({
         <button className="ghost-button" onClick={addIncomeMember}>
           <Plus size={16} /> 新增成员
         </button>
+      </div>
+      <div className="form-grid compact-form-grid">
+        <NumberField
+          label="收入测算年度"
+          value={household.income_projection_year ?? 2027}
+          step={1}
+          min={2024}
+          max={2050}
+          onChange={(value) => updateHousehold("income_projection_year", value)}
+        />
       </div>
       <div className="member-list roomy">
         {incomeMembers.map((member, index) => (
@@ -2090,32 +2111,59 @@ function HouseholdPage({
               onChange={(event) => updateHousehold("name", event.target.value)}
             />
           </Field>
+          <Metric label="成员组成" value={memberCompositionText} />
+          <Metric label="成员年龄" value={memberAgeText} />
+          <Metric label="赡养老人对象" value={`${elderlyDependents.length} 人`} />
           <NumberField
-            label="收入测算年度"
-            value={household.income_projection_year ?? 2027}
+            label="借款申请人年龄"
+            value={household.borrower_age ?? 30}
+            min={18}
+            max={68}
             step={1}
-            min={2024}
-            max={2050}
-            onChange={(value) => updateHousehold("income_projection_year", value)}
+            onChange={(value) => updateHousehold("borrower_age", value)}
           />
           <NumberField
-            label="租房公积金月额度"
-            value={household.monthly_rent_from_housing_fund ?? 0}
+            label="子女数"
+            value={household.child_count}
             min={0}
-            step={100}
-            onChange={(value) => updateHousehold("monthly_rent_from_housing_fund", value)}
+            max={10}
+            step={1}
+            onChange={(value) => updateHousehold("child_count", value)}
           />
+          <label className="check-row inline-check">
+            <input
+              type="checkbox"
+              checked={household.has_beijing_hukou}
+              onChange={(event) => updateHousehold("has_beijing_hukou", event.target.checked)}
+            />
+            北京户籍家庭
+          </label>
           <NumberField
-            label="购后安全垫月数"
-            value={household.required_liquidity_months ?? 6}
+            label="社保/个税月数"
+            value={household.social_security_months}
             step={1}
             min={0}
-            max={36}
-            onChange={(value) => updateHousehold("required_liquidity_months", value)}
+            onChange={(value) => updateHousehold("social_security_months", value)}
+          />
+          <NumberField
+            label="现有住房套数"
+            value={household.existing_home_count}
+            min={0}
+            max={10}
+            step={1}
+            onChange={(value) => updateHousehold("existing_home_count", value)}
+          />
+          <NumberField
+            label="现有房贷笔数"
+            value={household.existing_mortgage_count}
+            min={0}
+            max={10}
+            step={1}
+            onChange={(value) => updateHousehold("existing_mortgage_count", value)}
           />
         </div>
         <p className="field-hint">
-          租房公积金按月额度录入，但可视化和现金流按季度到账处理；购后安全垫月数 = 买房后希望至少保留的生活费月数。
+          家庭画像只放家庭成员、年龄、子女和购房资格相关信息；收入、支出、资产和公积金参数在下方分区单独配置。
         </p>
       </section>
 
@@ -2469,15 +2517,7 @@ function HouseholdPage({
       </section>
 
       <section className="form-panel">
-        <PanelTitle icon={<ShieldCheck size={18} />} title="现金流与资格" />
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={household.has_beijing_hukou}
-            onChange={(event) => updateHousehold("has_beijing_hukou", event.target.checked)}
-          />
-          北京户籍家庭
-        </label>
+        <PanelTitle icon={<ShieldCheck size={18} />} title="资产与现金流参数" />
         <div className="form-grid">
           <NumberField
             label="当前可动用现金"
@@ -2501,47 +2541,23 @@ function HouseholdPage({
             onChange={(value) => updateHousehold("provident_fund_balance", value)}
           />
           <NumberField
-            label="社保/个税月数"
-            value={household.social_security_months}
+            label="租房公积金月额度"
+            value={household.monthly_rent_from_housing_fund ?? 0}
             min={0}
-            step={1}
-            onChange={(value) => updateHousehold("social_security_months", value)}
+            step={100}
+            onChange={(value) => updateHousehold("monthly_rent_from_housing_fund", value)}
           />
           <NumberField
-            label="借款申请人年龄"
-            value={household.borrower_age ?? 30}
-            min={18}
-            max={68}
+            label="购后安全垫月数"
+            value={household.required_liquidity_months ?? 6}
             step={1}
-            onChange={(value) => updateHousehold("borrower_age", value)}
-          />
-          <NumberField
-            label="子女数"
-            value={household.child_count}
             min={0}
-            max={10}
-            step={1}
-            onChange={(value) => updateHousehold("child_count", value)}
-          />
-          <NumberField
-            label="现有住房套数"
-            value={household.existing_home_count}
-            min={0}
-            max={10}
-            step={1}
-            onChange={(value) => updateHousehold("existing_home_count", value)}
-          />
-          <NumberField
-            label="现有房贷笔数"
-            value={household.existing_mortgage_count}
-            min={0}
-            max={10}
-            step={1}
-            onChange={(value) => updateHousehold("existing_mortgage_count", value)}
+            max={36}
+            onChange={(value) => updateHousehold("required_liquidity_months", value)}
           />
         </div>
         <p className="field-hint">
-          当前可动用现金和当前投资资产是今天手动录入的资产快照；后续测算会在此基础上叠加每月结余和理财年化。
+          当前可动用现金和当前投资资产是今天手动录入的资产快照；租房公积金按月额度录入，但可视化和现金流按季度到账；购后安全垫月数 = 买房后希望至少保留的生活费月数。
         </p>
       </section>
     </div>

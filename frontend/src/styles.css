@@ -239,6 +239,11 @@ select:focus {
   gap: 10px;
 }
 
+.form-grid.compact-form-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 14px;
+}
+
 .form-grid.wide {
   grid-template-columns: 2fr 1fr 1fr 1fr;
   margin-bottom: 16px;
@@ -795,6 +800,7 @@ select:focus {
   font-size: 18px;
   line-height: 1.2;
   color: #1f2e3f;
+  overflow-wrap: anywhere;
 }
 
 .metric.good strong {
