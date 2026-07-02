@@ -1812,10 +1812,6 @@ function HouseholdPage({
   addElderlyDependent: () => void;
   removeElderlyDependent: (index: number) => void;
 }) {
-  const annualInvestmentReturn = scenario.annual_investment_return ?? 0;
-  const expectedInvestmentAnnualIncome =
-    (household.investment_plan_name === "cash_only" ? 0 : household.investments * annualInvestmentReturn);
-  const expectedInvestmentMonthlyIncome = expectedInvestmentAnnualIncome / 12;
   const currentMonthlyExpense = householdExpenseAt(household, new Date(), 0);
   const careerShock = { ...defaultCareerShock, ...(household.career_shock ?? {}) };
   const updateCareerShock = (patch: Partial<typeof defaultCareerShock>) => {
@@ -2098,28 +2094,10 @@ function HouseholdPage({
             max={36}
             onChange={(value) => updateHousehold("required_liquidity_months", value)}
           />
-          <Field label="理财计划">
-            <select
-              value={household.investment_plan_name ?? "conservative_monthly_investment"}
-              onChange={(event) => updateHousehold("investment_plan_name", event.target.value)}
-            >
-              {investmentPlanOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </Field>
         </div>
         <p className="field-hint">
           租房公积金按月额度录入，但可视化和现金流按季度到账处理；购后安全垫月数 = 买房后希望至少保留的生活费月数。
         </p>
-        <div className="loan-summary-strip">
-          <Metric label="当前投资资产" value={money(household.investments)} />
-          <Metric label="测算年化" value={percent(household.investment_plan_name === "cash_only" ? 0 : annualInvestmentReturn)} />
-          <Metric label="预估年收益" value={money(expectedInvestmentAnnualIncome)} tone={expectedInvestmentAnnualIncome >= 0 ? "good" : "bad"} />
-          <Metric label="折合月收益" value={money(expectedInvestmentMonthlyIncome)} tone={expectedInvestmentMonthlyIncome >= 0 ? "good" : "bad"} />
-        </div>
       </section>
 
       {memberIncomeSection}
@@ -3764,6 +3742,10 @@ function SelectedPlanVisualization({
       firstPhaseMonthlyPayment,
       laterPhaseMonthlyPayment,
       monthlyCashOperatingCost: monthlyEnergyCost + monthlyInsuranceCost + monthlyMaintenanceCost + monthlyParkingCost,
+      monthlyEnergyCost,
+      monthlyInsuranceCost,
+      monthlyMaintenanceCost,
+      monthlyParkingCost,
       annualMileageKm: car.second_car_annual_mileage_km ?? 8000
     };
   }, [household.car_plan]);
@@ -3873,8 +3855,23 @@ function SelectedPlanVisualization({
     let scheduledExpenseRows: Array<{ name: string; amount: number }> = [];
     let livingExpense = 0;
     let debtPayment = 0;
+    let regularDebtPayment = 0;
+    let studentLoanPayment = 0;
     let carCost = 0;
+    let firstCarLoanPayment = 0;
+    let firstCarEnergyCost = 0;
+    let firstCarInsuranceCost = 0;
+    let firstCarMaintenanceCost = 0;
+    let firstCarParkingCost = 0;
+    let secondCarLoanPayment = 0;
+    let secondCarEnergyCost = 0;
+    let secondCarInsuranceCost = 0;
+    let secondCarMaintenanceCost = 0;
+    let secondCarParkingCost = 0;
+    let noCarCommuteCost = 0;
     let housePayment = 0;
+    let providentHousePayment = 0;
+    let commercialHousePayment = 0;
     let monthlyInvestment = 0;
     let monthlyInvestmentBase = 0;
     let monthlyInvestmentCashSweep = 0;
@@ -3885,6 +3882,9 @@ function SelectedPlanVisualization({
     let investmentSellProceeds = 0;
     let purchaseCashOut = 0;
     let purchaseCashIn = 0;
+    let houseTransactionCashOut = 0;
+    let carDownPaymentCashOut = 0;
+    let secondCarDownPaymentCashOut = 0;
     let providentInterest = 0;
     let providentDeposit = 0;
     let providentRentWithdrawal = 0;
@@ -3915,11 +3915,13 @@ function SelectedPlanVisualization({
         cashValue -= result.car_loan.down_payment;
         noInvestmentValue -= result.car_loan.down_payment;
         purchaseCashOut += result.car_loan.down_payment;
+        carDownPaymentCashOut += result.car_loan.down_payment;
       }
       if (secondCarLoan && secondCarLoan.purchaseMonth === 0 && absoluteMonth === 1) {
         cashValue -= secondCarLoan.downPayment;
         noInvestmentValue -= secondCarLoan.downPayment;
         purchaseCashOut += secondCarLoan.downPayment;
+        secondCarDownPaymentCashOut += secondCarLoan.downPayment;
       }
 
       if (isPurchaseMonth) {
@@ -3932,6 +3934,7 @@ function SelectedPlanVisualization({
         purchaseInvestmentContribution = cumulativeInvestmentContribution;
         purchaseInvestmentFees = cumulativeInvestmentFees + investmentSellFee;
         purchaseCashOut += plan.required_cash_after_pf_extract;
+        houseTransactionCashOut += plan.required_cash_after_pf_extract;
         purchaseCashIn += investmentSellProceeds + plan.provident_post_transaction_extractable;
         providentUpfrontWithdrawal = Math.min(providentBalance, plan.provident_upfront_extractable);
         providentBalance -= providentUpfrontWithdrawal;
@@ -3948,8 +3951,45 @@ function SelectedPlanVisualization({
         scheduledLivingExpense = scheduledExpenseRows.reduce((sum, item) => sum + item.amount, 0);
         livingExpense = baseLivingExpense + scheduledLivingExpense;
         debtPayment = result.effective_monthly_debt_payment;
+        studentLoanPayment = result.student_loan_monthly_payment;
+        regularDebtPayment = Math.max(0, debtPayment - studentLoanPayment);
         carCost = carMonthlyCostAt(absoluteMonth);
         housePayment = isAfterPurchase ? plan.total_monthly_payment : 0;
+        providentHousePayment = isAfterPurchase ? plan.provident_monthly_payment : 0;
+        commercialHousePayment = isAfterPurchase ? plan.commercial_monthly_payment : 0;
+        const firstCarMonthAfterPurchase =
+          carEnabled && carPurchaseMonth !== null && absoluteMonth > carPurchaseMonth
+            ? absoluteMonth - carPurchaseMonth
+            : 0;
+        const firstCarLoanActive = firstCarMonthAfterPurchase > 0 && firstCarMonthAfterPurchase <= result.car_loan.total_months;
+        firstCarLoanPayment = firstCarLoanActive
+          ? firstCarMonthAfterPurchase <= result.car_loan.interest_free_months
+            ? result.car_loan.first_phase_monthly_payment
+            : result.car_loan.later_phase_monthly_payment
+          : 0;
+        const firstCarOwned = carEnabled && carPurchaseMonth !== null && absoluteMonth > carPurchaseMonth;
+        firstCarEnergyCost = firstCarOwned ? result.car_loan.monthly_energy_cost : 0;
+        firstCarInsuranceCost = firstCarOwned ? result.car_loan.monthly_insurance_cost : 0;
+        firstCarMaintenanceCost = firstCarOwned ? result.car_loan.monthly_maintenance_cost : 0;
+        firstCarParkingCost = firstCarOwned ? result.car_loan.monthly_parking_cost : 0;
+        if (secondCarLoan) {
+          const secondCarMonthAfterPurchase = absoluteMonth > secondCarLoan.purchaseMonth ? absoluteMonth - secondCarLoan.purchaseMonth : 0;
+          const secondCarLoanActive = secondCarMonthAfterPurchase > 0 && secondCarMonthAfterPurchase <= secondCarLoan.totalMonths;
+          secondCarLoanPayment = secondCarLoanActive
+            ? secondCarMonthAfterPurchase <= secondCarLoan.interestFreeMonths
+              ? secondCarLoan.firstPhaseMonthlyPayment
+              : secondCarLoan.laterPhaseMonthlyPayment
+            : 0;
+          const secondCarOwned = absoluteMonth > secondCarLoan.purchaseMonth;
+          secondCarEnergyCost = secondCarOwned ? secondCarLoan.monthlyEnergyCost : 0;
+          secondCarInsuranceCost = secondCarOwned ? secondCarLoan.monthlyInsuranceCost : 0;
+          secondCarMaintenanceCost = secondCarOwned ? secondCarLoan.monthlyMaintenanceCost : 0;
+          secondCarParkingCost = secondCarOwned ? secondCarLoan.monthlyParkingCost : 0;
+        }
+        noCarCommuteCost =
+          !firstCarOwned && (!secondCarLoan || absoluteMonth <= secondCarLoan.purchaseMonth)
+            ? household.car_plan.no_car_monthly_commute_cost ?? 0
+            : 0;
         providentMonthlyWithdrawal = isAfterPurchase
           ? Math.min(providentBalance, plan.monthly_post_purchase_pf_withdrawal)
           : 0;
@@ -3986,12 +4026,14 @@ function SelectedPlanVisualization({
           cashValue -= result.car_loan.down_payment;
           noInvestmentValue -= result.car_loan.down_payment;
           purchaseCashOut += result.car_loan.down_payment;
+          carDownPaymentCashOut += result.car_loan.down_payment;
           monthlyCashDelta -= result.car_loan.down_payment;
         }
         if (secondCarLoan && absoluteMonth === secondCarLoan.purchaseMonth && secondCarLoan.purchaseMonth > 0) {
           cashValue -= secondCarLoan.downPayment;
           noInvestmentValue -= secondCarLoan.downPayment;
           purchaseCashOut += secondCarLoan.downPayment;
+          secondCarDownPaymentCashOut += secondCarLoan.downPayment;
           monthlyCashDelta -= secondCarLoan.downPayment;
         }
       }
@@ -4013,8 +4055,23 @@ function SelectedPlanVisualization({
       scheduledExpenseRows,
       livingExpense,
       debtPayment,
+      regularDebtPayment,
+      studentLoanPayment,
       carCost,
+      firstCarLoanPayment,
+      firstCarEnergyCost,
+      firstCarInsuranceCost,
+      firstCarMaintenanceCost,
+      firstCarParkingCost,
+      secondCarLoanPayment,
+      secondCarEnergyCost,
+      secondCarInsuranceCost,
+      secondCarMaintenanceCost,
+      secondCarParkingCost,
+      noCarCommuteCost,
       housePayment,
+      providentHousePayment,
+      commercialHousePayment,
       monthlyInvestment,
       monthlyInvestmentBase,
       monthlyInvestmentCashSweep,
@@ -4025,6 +4082,9 @@ function SelectedPlanVisualization({
       investmentSellProceeds,
       purchaseCashOut,
       purchaseCashIn,
+      houseTransactionCashOut,
+      carDownPaymentCashOut,
+      secondCarDownPaymentCashOut,
       monthlyCashDelta,
       providentInterest,
       providentDeposit,
@@ -4163,13 +4223,9 @@ function SelectedPlanVisualization({
   ]);
   const incomeHouseholdFlowData = [
     { name: "复利收益", value: selectedMonth.investmentReturn },
-    {
-      name: "公积金到账",
-      value:
-        selectedMonth.providentRentWithdrawal +
-        selectedMonth.providentMonthlyWithdrawal +
-        selectedMonth.providentPostTransactionWithdrawal
-    },
+    { name: "租房公积金提取", value: selectedMonth.providentRentWithdrawal },
+    { name: "购后公积金提取", value: selectedMonth.providentMonthlyWithdrawal },
+    { name: "交易后公积金回流", value: selectedMonth.providentPostTransactionWithdrawal },
     { name: "投资卖出到账", value: selectedMonth.investmentSellProceeds },
     { name: "交易现金流入", value: Math.max(0, selectedMonth.purchaseCashIn - selectedMonth.investmentSellProceeds) }
   ];
@@ -4192,20 +4248,35 @@ function SelectedPlanVisualization({
     ]),
     ...incomeHouseholdFlowData
   ].filter((item) => item.value > 0);
-  const deductionTotal = selectedMemberIncomeRows.reduce(
-    (sum, member) => sum + member.personalSocial + member.personalHousingFund + member.incomeTax,
-    0
-  );
   const expensePieData = [
-    { name: "工资扣缴", value: deductionTotal },
+    ...selectedMemberIncomeRows.flatMap((member) => [
+      { name: `${member.name}个人社保`, value: member.personalSocial },
+      { name: `${member.name}个人公积金`, value: member.personalHousingFund },
+      { name: `${member.name}个税`, value: member.incomeTax },
+      { name: `${member.name}阶段额外支出`, value: member.extraCashExpense }
+    ]),
     { name: "基础生活支出", value: selectedMonth.baseLivingExpense },
     ...selectedMonth.scheduledExpenseRows.map((item) => ({ name: item.name, value: item.amount })),
-    { name: "债务与助学贷款", value: selectedMonth.debtPayment },
-    { name: "车贷/养车", value: selectedMonth.carCost },
-    { name: "购房月供", value: selectedMonth.housePayment },
+    { name: "普通既有债务", value: selectedMonth.regularDebtPayment },
+    { name: "助学贷款", value: selectedMonth.studentLoanPayment },
+    { name: "无车通勤成本", value: selectedMonth.noCarCommuteCost },
+    { name: "第一辆车车贷", value: selectedMonth.firstCarLoanPayment },
+    { name: "第一辆车电费", value: selectedMonth.firstCarEnergyCost },
+    { name: "第一辆车保险", value: selectedMonth.firstCarInsuranceCost },
+    { name: "第一辆车保养", value: selectedMonth.firstCarMaintenanceCost },
+    { name: "第一辆车停车", value: selectedMonth.firstCarParkingCost },
+    { name: "第二辆车车贷", value: selectedMonth.secondCarLoanPayment },
+    { name: "第二辆车电费", value: selectedMonth.secondCarEnergyCost },
+    { name: "第二辆车保险", value: selectedMonth.secondCarInsuranceCost },
+    { name: "第二辆车保养", value: selectedMonth.secondCarMaintenanceCost },
+    { name: "第二辆车停车", value: selectedMonth.secondCarParkingCost },
+    { name: "公积金贷月供", value: selectedMonth.providentHousePayment },
+    { name: "商贷月供", value: selectedMonth.commercialHousePayment },
     { name: "理财买入净额", value: selectedMonth.monthlyInvestmentNet },
     { name: "理财手续费", value: selectedMonth.monthlyInvestmentBuyFee + selectedMonth.investmentSellFee },
-    { name: "交易现金支出", value: selectedMonth.purchaseCashOut }
+    { name: "购房交易现金", value: selectedMonth.houseTransactionCashOut },
+    { name: "第一辆车首付", value: selectedMonth.carDownPaymentCashOut },
+    { name: "第二辆车首付", value: selectedMonth.secondCarDownPaymentCashOut }
   ].filter((item) => item.value > 0);
   const pieTooltipFormatter = (value: unknown) => money(Number(value));
   const cashFlowGroups: Array<{ title: string; rows: Array<[string, number]> }> = [
