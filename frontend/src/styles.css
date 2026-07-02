@@ -715,6 +715,12 @@ select:focus {
   cursor: not-allowed;
 }
 
+.sub-plan-panel {
+  margin-top: 14px;
+  padding: 12px 0 12px 14px;
+  border-left: 3px solid #d7dee9;
+}
+
 .result-panel {
   min-height: 0;
 }

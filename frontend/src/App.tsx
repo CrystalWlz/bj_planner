@@ -3316,6 +3316,32 @@ function CarPlanPage({
       down_payment: Math.round(value * (carPlan.down_payment_ratio ?? 0)),
     });
   };
+  const addSecondCar = () => {
+    updateCarPlanPatch({
+      selected_strategy_variant: "手动设置",
+      second_car_enabled: true,
+      second_car_total_price: carPlan.second_car_total_price && carPlan.second_car_total_price > 0
+        ? carPlan.second_car_total_price
+        : 200000,
+      second_car_down_payment_ratio: carPlan.second_car_down_payment_ratio ?? 0.4,
+      second_car_purchase_delay_months: carPlan.second_car_purchase_delay_months ?? 60,
+      second_car_total_months: carPlan.second_car_total_months ?? 60,
+      second_car_interest_free_months: carPlan.second_car_interest_free_months ?? 24,
+      second_car_later_annual_rate: carPlan.second_car_later_annual_rate ?? 0.0199,
+      second_car_annual_mileage_km: carPlan.second_car_annual_mileage_km && carPlan.second_car_annual_mileage_km > 0
+        ? carPlan.second_car_annual_mileage_km
+        : 8000,
+      second_car_monthly_parking_cost: carPlan.second_car_monthly_parking_cost && carPlan.second_car_monthly_parking_cost > 0
+        ? carPlan.second_car_monthly_parking_cost
+        : 400,
+    });
+  };
+  const removeSecondCar = () => {
+    updateCarPlanPatch({
+      selected_strategy_variant: "手动设置",
+      second_car_enabled: false,
+    });
+  };
   const selectedCarStrategy = carPlan.selected_strategy_variant ?? "手动设置";
   const carLoan = result?.car_loan;
 
@@ -3368,25 +3394,40 @@ function CarPlanPage({
               onChange={(event) => updateCarPlan("saving_start_date", event.target.value)}
             />
           </Field>
-          <label className="check-row inline-check">
-            <input
-              type="checkbox"
-              checked={carPlan.second_car_enabled ?? false}
-              onChange={(event) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_enabled: event.target.checked })}
-            />
-            第二辆车
-          </label>
-          <NumberField label="第二辆车总价" value={carPlan.second_car_total_price ?? 200000} min={0} step={10000} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_total_price: value })} />
-          <NumberField label="第二车首付比例" value={carPlan.second_car_down_payment_ratio ?? 0.4} min={0} max={1} step={0.05} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_down_payment_ratio: value })} />
-          <NumberField label="第二车延后月数" value={carPlan.second_car_purchase_delay_months ?? 60} min={0} max={240} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_purchase_delay_months: value })} />
-          <NumberField label="第二车总期数" value={carPlan.second_car_total_months ?? 60} min={1} max={120} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_total_months: value })} />
-          <NumberField label="第二车0息期数" value={carPlan.second_car_interest_free_months ?? 24} min={0} max={120} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_interest_free_months: value })} />
-          <NumberField label="第二车后段利率" value={carPlan.second_car_later_annual_rate ?? 0.0199} min={0} max={0.5} step={0.0001} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_later_annual_rate: value })} />
-          <NumberField label="第二车年里程" value={carPlan.second_car_annual_mileage_km ?? 8000} min={0} max={100000} step={1000} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_annual_mileage_km: value })} />
-          <NumberField label="第二车月停车费" value={carPlan.second_car_monthly_parking_cost ?? 400} min={0} step={100} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_monthly_parking_cost: value })} />
         </div>
+        <section className="sub-plan-panel">
+          <div className="member-header compact-heading">
+            <strong>第二辆车</strong>
+            {carPlan.second_car_enabled ? (
+              <button className="ghost-button" onClick={removeSecondCar} type="button">
+                <Trash2 size={15} /> 移除第二辆车
+              </button>
+            ) : (
+              <button className="ghost-button" onClick={addSecondCar} type="button">
+                <Plus size={15} /> 添加第二辆车
+              </button>
+            )}
+          </div>
+          {carPlan.second_car_enabled ? (
+            <>
+              <div className="form-grid">
+                <NumberField label="第二辆车总价" value={carPlan.second_car_total_price ?? 200000} min={0} step={10000} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_total_price: value })} />
+                <NumberField label="第二车首付比例" value={carPlan.second_car_down_payment_ratio ?? 0.4} min={0} max={1} step={0.05} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_down_payment_ratio: value })} />
+                <NumberField label="第二车延后月数" value={carPlan.second_car_purchase_delay_months ?? 60} min={0} max={240} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_purchase_delay_months: value })} />
+                <NumberField label="第二车总期数" value={carPlan.second_car_total_months ?? 60} min={1} max={120} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_total_months: value })} />
+                <NumberField label="第二车0息期数" value={carPlan.second_car_interest_free_months ?? 24} min={0} max={120} step={1} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_interest_free_months: value })} />
+                <NumberField label="第二车后段利率" value={carPlan.second_car_later_annual_rate ?? 0.0199} min={0} max={0.5} step={0.0001} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_later_annual_rate: value })} />
+                <NumberField label="第二车年里程" value={carPlan.second_car_annual_mileage_km ?? 8000} min={0} max={100000} step={1000} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_annual_mileage_km: value })} />
+                <NumberField label="第二车月停车费" value={carPlan.second_car_monthly_parking_cost ?? 400} min={0} step={100} onChange={(value) => updateCarPlanPatch({ selected_strategy_variant: "手动设置", second_car_monthly_parking_cost: value })} />
+              </div>
+              <p className="field-hint">第二辆车会从指定月份起叠加首付、车贷、电费、保险、保养和停车费，并同步进入购房现金流、事件时间线和可视化。</p>
+            </>
+          ) : (
+            <p className="field-hint">当前没有第二辆车计划。需要时点击添加，系统才会把第二辆车纳入后续现金流。</p>
+          )}
+        </section>
         <p className="field-hint">
-          这里是买车目标、贷款参数和使用假设；不买车时系统会把无车通勤月成本计入现金流，延后买车时买车前也先按无车通勤测算。第二辆车默认关闭，启用后会在指定月份后叠加第二辆车的首付、贷款和养车成本。
+          这里是买车目标、贷款参数和使用假设；不买车时系统会把无车通勤月成本计入现金流，延后买车时买车前也先按无车通勤测算。
         </p>
         {carLoan ? (
           <div className="car-cost-breakdown">
