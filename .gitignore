@@ -5,10 +5,15 @@ backend/tests/__pycache__/
 backend/.pytest_cache/
 frontend/node_modules/
 frontend/dist/
+frontend/output/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 *.pyc
 *.db
 *.sqlite
+*.sqlite3
 .env
+.env.*
+exports/
+screenshots/

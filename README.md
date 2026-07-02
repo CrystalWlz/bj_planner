@@ -68,6 +68,40 @@ npm run build
 
 可以通过 `HOUSE_PLANNER_DB` 环境变量指定数据库路径。
 
+## 本地真实数据与公开发布
+
+推荐保持一条清晰的双轨流程：
+
+1. 日常功能开发在 `codex/public-release` 分支进行。
+2. 本机页面显示的真实家庭数据只保存在 SQLite 数据库里，默认位置是 `%APPDATA%\house-planner\planner.db`，不进入 Git。
+3. 代码里的默认值、测试样例和 README 只能使用空白模板、公开政策参数或合成示例。
+4. 推送公开版前运行：
+
+```powershell
+.\scripts\push_public.ps1
+```
+
+这个脚本会依次执行隐私扫描、后端测试、前端构建，并把 `codex/public-release` 推送到 GitHub `main`。
+
+如只想快速验证隐私扫描：
+
+```powershell
+python scripts/privacy_scan.py --ref HEAD
+python scripts/privacy_scan.py
+```
+
+本仓库还提供 `.githooks/pre-push`，用于在推送前拦截以下情况：
+
+- 从非 `codex/public-release` 分支推送到 `main`
+- 推送不是基于公开 root commit 的历史
+- 待推送内容包含数据库、构建产物、依赖目录或已知私人家庭信息片段
+
+首次克隆或换机器后，可以启用本仓库的 Git hook：
+
+```powershell
+git config core.hooksPath .githooks
+```
+
 ## 隐私说明
 
 - 不要把本机 SQLite 数据库、导出方案、截图、`.env`、日志或个人配置文件提交到公开仓库。

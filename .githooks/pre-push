@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+public_root="63e4f4391d97dcb1b960d05d3936662f69746fa7"
+
+while read local_ref local_sha remote_ref remote_sha
+do
+  case "$local_sha" in
+    0000000000000000000000000000000000000000)
+      continue
+      ;;
+  esac
+
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    if [ "$local_ref" != "refs/heads/codex/public-release" ]; then
+      echo "Refusing to push $local_ref to main. Push public releases from codex/public-release." >&2
+      exit 1
+    fi
+
+    if ! git merge-base --is-ancestor "$public_root" "$local_sha"; then
+      echo "Refusing to push history that is not based on the public root commit." >&2
+      exit 1
+    fi
+  fi
+
+  python scripts/privacy_scan.py --ref "$local_sha"
+done
