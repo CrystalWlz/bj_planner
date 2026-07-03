@@ -20,6 +20,10 @@
   --shadow: 0 14px 36px rgba(24, 39, 75, 0.08);
   --shadow-soft: 0 8px 22px rgba(24, 39, 75, 0.055);
   --radius: 8px;
+  --topbar-height: 76px;
+  --page-nav-height: 61px;
+  --sticky-gap: 10px;
+  --linked-month-sticky-top: calc(var(--topbar-height) + var(--page-nav-height) + var(--sticky-gap));
 }
 
 * {
@@ -262,6 +266,22 @@ select:focus {
   align-items: start;
 }
 
+.income-span-full {
+  grid-column: 1 / -1;
+}
+
+.income-workbench-card {
+  min-width: 0;
+}
+
+.income-workbench-card .panel-title {
+  margin-bottom: 12px;
+}
+
+.income-workbench-card > .field-hint {
+  max-width: 980px;
+}
+
 .income-overview-panel {
   min-height: 100%;
 }
@@ -341,6 +361,18 @@ select:focus {
   margin-bottom: 0;
 }
 
+.expense-panel .member-list.compact-list,
+.elderly-panel .member-list.compact-list,
+.current-loans-panel .member-list.compact-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.current-loans-panel .member-list.compact-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .member-card {
   border: 1px solid var(--border);
   background: var(--surface-soft);
@@ -355,6 +387,13 @@ select:focus {
 .loan-card .member-card-head {
   align-items: center;
   margin-bottom: 10px;
+}
+
+.loan-card .member-card-head strong {
+  color: #243241;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .loan-card .metric {
@@ -391,7 +430,7 @@ select:focus {
 
 .loan-summary-strip {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -402,6 +441,11 @@ select:focus {
 
 .loan-summary-strip {
   margin-top: 12px;
+}
+
+.expense-panel .loan-summary-strip,
+.career-panel .loan-summary-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .field-hint {
@@ -911,10 +955,6 @@ select:focus {
   background: #111827;
 }
 
-.investment-legend .baseline-line {
-  background: #7c3aed;
-}
-
 .fixed-asset-legend .home-asset-line {
   background: #8b5cf6;
 }
@@ -928,6 +968,26 @@ select:focus {
 }
 
 .fixed-asset-legend .net-asset-line {
+  background: #111827;
+}
+
+.loan-balance-legend .total-loan-line {
+  background: #dc6b35;
+}
+
+.loan-balance-legend .home-loan-line {
+  background: #8b5cf6;
+}
+
+.loan-balance-legend .vehicle-loan-line {
+  background: #d97706;
+}
+
+.loan-balance-legend .existing-loan-line {
+  background: #c65d5d;
+}
+
+.loan-balance-legend .cash-payment-line {
   background: #111827;
 }
 
@@ -984,6 +1044,31 @@ select:focus {
   margin: 5px 0;
 }
 
+.chart-empty-state {
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+  padding: 22px;
+  border: 1px dashed #ccd6e3;
+  border-radius: 7px;
+  background: #fbfdff;
+  text-align: center;
+}
+
+.chart-empty-state strong {
+  display: block;
+  color: #26374a;
+  font-size: 14px;
+  margin-bottom: 7px;
+}
+
+.chart-empty-state span {
+  max-width: 620px;
+  color: #637184;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .month-slider {
   display: grid;
   grid-template-columns: auto minmax(160px, 1fr) auto;
@@ -1033,8 +1118,12 @@ select:focus {
   order: 3;
 }
 
-.provident-chart {
+.loan-balance-chart {
   order: 4;
+}
+
+.provident-chart {
+  order: 5;
 }
 
 .cash-flow-sections {
@@ -1138,6 +1227,35 @@ select:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.explanation-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.explanation-grid article {
+  min-width: 0;
+  border: 1px solid #e3e9f1;
+  border-radius: 7px;
+  background: #fbfdff;
+  padding: 11px 12px;
+}
+
+.explanation-grid strong {
+  display: block;
+  color: #26374a;
+  font-size: 13px;
+  margin-bottom: 5px;
+}
+
+.explanation-grid p {
+  margin: 0;
+  color: #5b6878;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .breakdown,
@@ -1366,10 +1484,77 @@ select:focus {
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   margin-top: 14px;
+  position: sticky;
+  top: var(--linked-month-sticky-top);
+  z-index: 12;
+  background: rgba(255, 255, 255, 0.97);
+  backdrop-filter: blur(10px);
 }
 
 .linked-month-panel .month-slider {
   margin-top: 0;
+}
+
+.month-control-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(240px, 1.2fr) minmax(220px, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.month-picker,
+.chart-window-control {
+  display: grid;
+  gap: 6px;
+}
+
+.month-picker span,
+.chart-window-control > span {
+  color: #6b7788;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.month-picker input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid #ccd6e3;
+  border-radius: 7px;
+  padding: 0 10px;
+  color: #243241;
+  background: #fbfdff;
+  font-size: 13px;
+}
+
+.segmented-control {
+  display: inline-grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #d9e2ee;
+  border-radius: 8px;
+  background: #f7f9fc;
+}
+
+.segmented-control button {
+  min-height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #586779;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.segmented-control button.active {
+  background: #ffffff;
+  color: #1f4f7a;
+  box-shadow: 0 1px 5px rgba(24, 39, 75, 0.08);
+}
+
+.window-slider {
+  grid-column: 1 / -1;
 }
 
 .month-driver-list {
@@ -1422,6 +1607,20 @@ select:focus {
 .comparison-row.active {
   border-color: #7da2d3;
   background: #f3f8ff;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid #c7d7ea;
+  border-radius: 6px;
+  background: #f4f8fd;
+  color: #1f4f7a;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .comparison-head {
@@ -1936,6 +2135,9 @@ select:focus {
 }
 
 .save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: #687586;
   font-size: 12px;
   white-space: nowrap;
@@ -1951,6 +2153,10 @@ select:focus {
 
 .save-state.saved {
   color: #28724f;
+}
+
+.save-state.calculating {
+  color: #315e95;
 }
 
 .loading-screen {
@@ -1974,6 +2180,12 @@ select:focus {
 }
 
 @media (max-width: 900px) {
+  :root {
+    --topbar-height: 0px;
+    --page-nav-height: 57px;
+    --sticky-gap: 8px;
+  }
+
   .topbar {
     height: auto;
     align-items: flex-start;
@@ -2023,6 +2235,7 @@ select:focus {
   .attribution-grid,
   .attribution-bars,
   .cash-flow-sections,
+  .explanation-grid,
   .cash-flow-pies,
   .pie-layout {
     grid-template-columns: 1fr;
@@ -2030,8 +2243,13 @@ select:focus {
 
   .form-grid.two,
   .metric-grid,
+  .loan-summary-strip,
+  .expense-panel .loan-summary-strip,
+  .career-panel .loan-summary-strip,
+  .current-loans-panel .member-list.compact-list,
   .month-inspector,
   .month-driver-list,
+  .month-control-grid,
   .strategy-hero-side,
   .car-cost-breakdown {
     grid-template-columns: 1fr;

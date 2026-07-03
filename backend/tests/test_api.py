@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -62,6 +63,43 @@ def test_household_update_is_persisted(tmp_path: Path, monkeypatch) -> None:
     assert persisted["liquid_assets"] == 345_678
     assert persisted["investments"] == 0
     assert persisted["investment_plan_name"] == "稳健月度理财"
+
+
+def test_initialize_database_migrates_legacy_json_records(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+
+    database.DB_PATH = database.default_db_path()
+    with database.get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE households (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO households (id, data, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                "legacy-household",
+                json.dumps({"liquid_assets": 100000, "car_plan": {"enabled": False}}, ensure_ascii=False),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    database.initialize_database()
+    migrated = database.get_record("households", "legacy-household")
+
+    assert migrated is not None
+    assert migrated["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
+    assert migrated["data"]["family_down_payment_support_mode"] == "provident"
+    assert migrated["data"]["investment_buy_fee_rate"] > 0
+    assert migrated["data"]["car_plan"]["second_car_enabled"] is False
 
 
 def test_invalid_household_payload_is_rejected(tmp_path: Path, monkeypatch) -> None:

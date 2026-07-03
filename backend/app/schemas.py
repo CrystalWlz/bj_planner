@@ -41,6 +41,7 @@ class IncomeMember(BaseModel):
                     start_date=self.employment_start_date,
                     monthly_salary_gross=self.monthly_salary_gross,
                     annual_bonus=self.annual_bonus,
+                    annual_bonus_payout_month=4,
                     monthly_non_taxable_income=self.monthly_non_taxable_income,
                     monthly_extra_cash_expense=self.monthly_extra_cash_expense,
                     monthly_social_insurance=self.monthly_social_insurance,
@@ -62,6 +63,7 @@ class IncomeStageData(BaseModel):
     end_date: str | None = None
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
+    annual_bonus_payout_month: int = Field(4, ge=1, le=12)
     monthly_non_taxable_income: float = Field(0, ge=0)
     monthly_extra_cash_expense: float = Field(0, ge=0)
     monthly_social_insurance: float = Field(0, ge=0)
@@ -114,8 +116,10 @@ class CarPlanData(BaseModel):
     electricity_price_per_kwh: float = Field(0.8, ge=0, le=5)
     monthly_parking_cost: float = Field(0, ge=0)
     annual_maintenance_cost: float = Field(0, ge=0)
+    annual_maintenance_growth_rate: float = Field(0.03, ge=0, le=0.2)
     annual_insurance_rate: float = Field(0.018, ge=0, le=0.2)
     annual_insurance_min: float = Field(0, ge=0)
+    annual_insurance_growth_rate: float = Field(0.02, ge=0, le=0.2)
     depreciation_years: int = Field(8, ge=1, le=20)
     vehicle_service_years: int = Field(15, ge=1, le=30)
     vehicle_retirement_mileage_km: float = Field(600000, ge=0, le=1000000)
@@ -134,7 +138,8 @@ class CarPlanData(BaseModel):
 
 class PhasedLoanData(BaseModel):
     borrower: str = "成员 1"
-    name: str = "阶段性贷款"
+    name: str = "目前贷款"
+    loan_type: Literal["mortgage", "car", "education", "consumer", "other"] = "other"
     principal: float = Field(0, ge=0)
     annual_rate: float = Field(0.028, ge=0, le=0.2)
     repayment_method: RepaymentMethod = "equal_installment"
@@ -174,6 +179,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
+    schema_version: int = Field(3, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -184,8 +190,10 @@ class HouseholdData(BaseModel):
     monthly_rent_from_housing_fund: float = Field(0, ge=0)
     family_provident_support_enabled: bool = False
     family_provident_support_label: str = "亲属异地公积金首付支持"
-    family_provident_initial_balance: float = Field(100000, ge=0)
-    family_provident_monthly_salary: float = Field(10000, ge=0)
+    family_down_payment_support_mode: str = "provident"
+    family_savings_support_amount: float = Field(0, ge=0)
+    family_provident_initial_balance: float = Field(0, ge=0)
+    family_provident_monthly_salary: float = Field(0, ge=0)
     family_provident_total_rate: float = Field(0.24, ge=0, le=0.5)
     investment_plan_name: str = "conservative_monthly_investment"
     investment_risk_level: str = "conservative"
@@ -233,6 +241,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
+    schema_version: int = Field(3, ge=1)
     name: str = "示例房源（请修改）"
     district: str = "未设置"
     ring_area: str = "未设置"
@@ -285,6 +294,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
+    schema_version: int = Field(3, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -311,6 +321,9 @@ class RulePackData(BaseModel):
             "provident_prefab_aaa_bonus": 300000,
             "provident_ultra_low_energy_bonus": 400000,
             "provident_policy_bonus_cap": 400000,
+            "provident_repayment_capacity_enabled": True,
+            "provident_repayment_income_ratio": 0.60,
+            "provident_basic_living_cost_per_person": 1778,
             "provident_max_loan_years": 30,
             "provident_max_borrower_age": 68,
             "provident_brick_mixed_total_life_years": 50,
@@ -320,7 +333,9 @@ class RulePackData(BaseModel):
             "provident_upfront_purchase_extract_ratio_new_home": 1.0,
             "provident_upfront_purchase_extract_ratio_second_hand": 0.0,
             "provident_post_transaction_extract_ratio": 1.0,
-            "provident_monthly_withdrawal_after_purchase_enabled": True,
+            "provident_monthly_withdrawal_after_purchase_enabled": False,
+            "provident_post_purchase_cashflow_enabled": False,
+            "provident_post_purchase_strategy_mode": "auto",
             "provident_post_purchase_withdrawal_mode": "purchase_agreed",
             "provident_balance_annual_interest_rate": 0.015,
             "micro_commercial_loan_ratio": 0.05,
@@ -334,6 +349,7 @@ class RulePackData(BaseModel):
             "rate_stress_add": 0.005,
             "income_stress_factor": 0.90,
             "price_stress_factor": 1.05,
+            "backend_parallel_workers": 4,
             "personal_standard_deduction_annual": 60000,
             "annual_bonus_separate_tax_valid_until": "2027-12-31",
             "beijing_social_base_floor": 7162,
@@ -394,6 +410,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
+    schema_version: int = Field(3, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -508,6 +525,9 @@ class PurchasePlanAnalysis(BaseModel):
     provident_fund_extractable: float
     provident_upfront_extractable: float
     family_provident_upfront_extractable: float = 0.0
+    family_down_payment_support_amount: float = 0.0
+    family_down_payment_support_mode: str = "none"
+    family_down_payment_support_label: str = ""
     provident_post_transaction_extractable: float
     required_cash_after_pf_extract: float
     upfront_cash_required: float
@@ -524,6 +544,11 @@ class PurchasePlanAnalysis(BaseModel):
     provident_monthly_payment: float
     total_monthly_payment: float
     total_interest: float
+    provident_contract_months: int = 0
+    provident_interest_saving_if_equal_principal: float = 0.0
+    provident_equal_principal_first_payment: float = 0.0
+    provident_equal_installment_payment: float = 0.0
+    provident_repayment_advice: str = ""
     renovation_cost: float
     renovation_funding_mode: RenovationFundingMode
     renovation_included_in_upfront_cash: bool
@@ -540,6 +565,8 @@ class PurchasePlanAnalysis(BaseModel):
     cash_stress_ok: bool = True
     cash_stress_shortfall: float = 0.0
     post_purchase_cash_flow: float
+    post_purchase_pf_strategy: str = "keep_in_account"
+    post_purchase_pf_strategy_label: str = "留存在公积金账户"
     monthly_post_purchase_pf_withdrawal: float
     post_purchase_cash_flow_with_pf_withdrawal: float
     debt_to_income_ratio: float
@@ -553,6 +580,164 @@ class YieldSensitivityPoint(BaseModel):
     months_to_buy: int | None
     years_to_buy: float | None
     cash_after_purchase: float
+
+
+class LoanVisualizationPoint(BaseModel):
+    plan_variant: str
+    month: int
+    commercial_loan_balance: float
+    provident_loan_balance: float
+    home_loan_balance: float
+    vehicle_loan_balance: float
+    existing_loan_balance: float
+    total_loan_balance: float
+    commercial_monthly_payment: float
+    provident_monthly_payment: float
+    home_monthly_payment: float
+    vehicle_monthly_payment: float
+    existing_monthly_payment: float
+    total_monthly_payment: float
+    cash_monthly_payment: float
+    provident_offset_payment: float = 0.0
+
+
+class ProvidentVisualizationPoint(BaseModel):
+    plan_variant: str
+    month: int
+    balance_start: float
+    personal_deposit: float
+    employer_deposit: float
+    total_deposit: float
+    interest: float
+    rent_withdrawal: float
+    upfront_withdrawal: float
+    post_transaction_withdrawal: float
+    agreed_withdrawal: float
+    loan_offset_payment: float
+    total_inflow: float
+    total_outflow: float
+    balance_end: float
+    strategy_label: str
+
+
+class MonthlyLedgerEntry(BaseModel):
+    plan_variant: str
+    month: int
+    account: str
+    category: str
+    label: str
+    amount: float
+    direction: Literal["inflow", "outflow", "transfer", "valuation"]
+    source: str = "backend"
+
+
+class AccountSnapshotPoint(BaseModel):
+    plan_variant: str
+    month: int
+    cash_balance: float
+    investment_balance: float
+    provident_balance: float
+    property_asset_value: float = 0.0
+    vehicle_asset_value: float = 0.0
+    first_vehicle_asset_value: float = 0.0
+    second_vehicle_asset_value: float = 0.0
+    fixed_asset_value: float
+    total_asset_value: float
+    total_loan_balance: float
+    net_worth: float
+
+
+class MonthlyCashflowPoint(BaseModel):
+    plan_variant: str
+    month: int
+    cash_balance: float
+    investment_balance: float
+    provident_balance: float
+    fixed_asset_value: float
+    total_asset_value: float
+    total_loan_balance: float
+    net_worth: float
+    monthly_cash_delta: float
+    cash_income: float
+    living_expense: float
+    scheduled_expense: float
+    debt_payment: float
+    regular_debt_payment: float = 0.0
+    phased_loan_payment: float = 0.0
+    house_payment: float
+    house_contract_payment: float = 0.0
+    provident_house_offset_payment: float = 0.0
+    vehicle_payment: float
+    first_vehicle_payment: float = 0.0
+    second_vehicle_payment: float = 0.0
+    vehicle_operating_cost: float
+    first_vehicle_energy_cost: float = 0.0
+    first_vehicle_insurance_cost: float = 0.0
+    first_vehicle_maintenance_cost: float = 0.0
+    first_vehicle_parking_cost: float = 0.0
+    second_vehicle_energy_cost: float = 0.0
+    second_vehicle_insurance_cost: float = 0.0
+    second_vehicle_maintenance_cost: float = 0.0
+    second_vehicle_parking_cost: float = 0.0
+    no_car_commute_cost: float = 0.0
+    first_vehicle_down_payment: float = 0.0
+    second_vehicle_down_payment: float = 0.0
+    vehicle_down_payment: float = 0.0
+    investment_contribution: float
+    investment_contribution_base: float = 0.0
+    investment_contribution_cash_sweep: float = 0.0
+    investment_return: float
+    investment_fee: float
+    investment_buy_fee: float = 0.0
+    investment_sell_fee: float = 0.0
+    investment_sell_proceeds: float = 0.0
+    provident_deposit: float
+    provident_withdrawal: float
+    transaction_cash_out: float
+    transaction_cash_in: float
+    property_asset_value: float = 0.0
+    vehicle_asset_value: float = 0.0
+    first_vehicle_asset_value: float = 0.0
+    second_vehicle_asset_value: float = 0.0
+    phase: str
+    ledger_entries: list[MonthlyLedgerEntry] = Field(default_factory=list)
+
+
+class AccountConceptSummary(BaseModel):
+    code: str
+    name: str
+    category: Literal["cash", "investment", "provident", "fixed_asset", "loan", "policy"]
+    description: str
+    managed_by: Literal["backend", "user_input", "policy"]
+
+
+class StrategyExplanationPoint(BaseModel):
+    plan_variant: str
+    section: str
+    title: str
+    body: str
+    priority: int = Field(100, ge=0)
+
+
+class PlanEventPoint(BaseModel):
+    plan_variant: str
+    month: int
+    category: Literal[
+        "account",
+        "income",
+        "investment",
+        "home_purchase",
+        "loan",
+        "provident",
+        "vehicle",
+        "renovation",
+        "risk",
+    ]
+    title: str
+    detail: str
+    amount: float | None = None
+    severity: Literal["info", "success", "warning", "danger"] = "info"
+    source: str = "backend"
 
 
 class TaxMemberSummary(BaseModel):
@@ -615,5 +800,13 @@ class AffordabilityResult(BaseModel):
     tax_summaries: list[TaxMemberSummary]
     purchase_plan_analyses: list[PurchasePlanAnalysis]
     yield_sensitivity: list[YieldSensitivityPoint]
+    monthly_cashflow_visualization: list[MonthlyCashflowPoint] = []
+    account_snapshots: list[AccountSnapshotPoint] = []
+    monthly_ledger: list[MonthlyLedgerEntry] = []
+    loan_visualization: list[LoanVisualizationPoint] = []
+    provident_visualization: list[ProvidentVisualizationPoint] = []
+    account_concepts: list[AccountConceptSummary] = []
+    strategy_explanations: list[StrategyExplanationPoint] = []
+    plan_events: list[PlanEventPoint] = []
     stress_tests: list[StressResult]
     assumptions: list[str]
