@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from contextlib import asynccontextmanager
+from functools import lru_cache
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -8,9 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .calculator import calculate_affordability
 from .database import (
+    delete_record,
+    get_calculation_cache,
     initialize_database,
     insert_record,
     list_records,
+    upsert_calculation_cache,
     update_record,
 )
 from .schemas import (
@@ -32,6 +39,32 @@ from .schemas import (
     SourceFetchRequest,
 )
 from .source_monitor import fetch_preview
+
+
+CALCULATION_ENGINE_FILES = ("calculator.py", "schemas.py", "policies.py")
+
+
+@lru_cache(maxsize=1)
+def calculation_engine_fingerprint() -> str:
+    digest = hashlib.sha256()
+    app_dir = Path(__file__).resolve().parent
+    for file_name in CALCULATION_ENGINE_FILES:
+        path = app_dir / file_name
+        digest.update(file_name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def affordability_cache_key(payload: AffordabilityRequest) -> tuple[str, str]:
+    engine_fingerprint = calculation_engine_fingerprint()
+    request_payload = {
+        "engine_fingerprint": engine_fingerprint,
+        "household": payload.household.model_dump(mode="json"),
+        "scenario": payload.scenario.model_dump(mode="json"),
+        "rule_pack": payload.rule_pack.model_dump(mode="json"),
+    }
+    canonical = json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), engine_fingerprint
 
 
 @asynccontextmanager
@@ -108,6 +141,14 @@ def save_scenario(record_id: str, payload: ScenarioCreate) -> dict:
     return record
 
 
+@app.delete("/api/scenarios/{record_id}")
+def delete_scenario(record_id: str) -> dict[str, bool]:
+    deleted = delete_record("scenarios", record_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return {"deleted": True}
+
+
 @app.get("/api/rule-packs", response_model=list[RulePackRecord])
 def get_rule_packs() -> list[dict]:
     return list_records("rule_packs")
@@ -138,7 +179,14 @@ def create_market_snapshot(payload: MarketSnapshotCreate) -> dict:
 
 @app.post("/api/calculations/affordability", response_model=AffordabilityResult)
 def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
-    return calculate_affordability(payload.household, payload.scenario, payload.rule_pack)
+    cache_key, engine_fingerprint = affordability_cache_key(payload)
+    cached = get_calculation_cache(cache_key)
+    if cached is not None:
+        return AffordabilityResult.model_validate(cached)
+
+    result = calculate_affordability(payload.household, payload.scenario, payload.rule_pack)
+    upsert_calculation_cache(cache_key, engine_fingerprint, result.model_dump(mode="json"))
+    return result
 
 
 @app.post("/api/sources/fetch-preview", response_model=SourceDocumentRecord)

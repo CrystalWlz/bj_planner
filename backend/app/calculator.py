@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
+from functools import lru_cache
 from math import ceil
 from typing import Callable, Literal
 
@@ -24,6 +25,7 @@ from .schemas import (
     MonthlyCashflowPoint,
     MonthlyLedgerEntry,
     PlanEventPoint,
+    ProvidentMemberAccountPoint,
     ProvidentVisualizationPoint,
     PurchasePlanAnalysis,
     RulePackData,
@@ -86,6 +88,11 @@ class PurchaseCandidate:
     pf_upfront_extractable: float
     family_pf_upfront_extractable: float
     pf_post_transaction_extractable: float
+    cash_account_before_purchase: float
+    investment_balance_before_purchase: float
+    investment_sell_gross_at_purchase: float
+    investment_sell_proceeds_at_purchase: float
+    investment_balance_after_purchase: float
     cash_after_transaction: float
     cash_after_purchase: float
     pf_after_extract: float
@@ -93,6 +100,35 @@ class PurchaseCandidate:
     minimum_cash_balance_month: int | None
     cash_stress_ok: bool
     cash_stress_shortfall: float
+
+
+@dataclass(frozen=True)
+class InvestmentWithdrawalResult:
+    mode: str
+    mode_label: str
+    cash_before_transaction: float
+    investment_before_transaction: float
+    gross_sell: float
+    sell_fee: float
+    sell_proceeds: float
+    investment_after_transaction: float
+    cash_after_transaction: float
+
+
+VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
+
+
+@dataclass(frozen=True)
+class VehicleMonthProjection:
+    total_cash_cost: float
+    first_down_payment: float
+    extra_down_payment: float
+    total_down_payment: float
+    no_car_commute_cost: float
+    components_by_index: dict[int, dict[str, float]]
+    first_asset_value: float
+    extra_asset_value: float
+    total_asset_value: float
 
 
 def _parallel_worker_count(rules: RulePackData, task_count: int) -> int:
@@ -221,18 +257,6 @@ def _bonus_tax(annual_bonus: float, brackets: list[dict]) -> float:
     return max(0.0, annual_bonus * rate - quick_deduction)
 
 
-def _active_months_in_year(start_date: str, projection_year: int) -> int:
-    try:
-        start = date.fromisoformat(start_date)
-    except ValueError:
-        return 12
-    if start.year > projection_year:
-        return 0
-    if start.year < projection_year:
-        return 12
-    return max(0, 13 - start.month)
-
-
 def _active_months_in_period(start_date: str, end_date: str | None, projection_year: int) -> int:
     try:
         start = date.fromisoformat(start_date)
@@ -311,6 +335,7 @@ def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePa
     return personal_social, personal_housing_fund, employer_social, employer_housing_fund
 
 
+@lru_cache(maxsize=512)
 def _parse_iso_date(value: str | None, fallback: date) -> date:
     if not value:
         return fallback
@@ -358,7 +383,11 @@ def _retirement_tail_months(household: HouseholdData, *, as_of: date | None = No
     current_month = date(current.year, current.month, 1)
     shock = household.career_shock
     targets: list[int] = []
-    if household.members:
+    settings = _career_shock_settings_by_member(household)
+    for index, member in enumerate(household.members):
+        setting = settings.get(member.name)
+        effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
+        effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
         targets.append(
             max(
                 0,
@@ -366,24 +395,9 @@ def _retirement_tail_months(household: HouseholdData, *, as_of: date | None = No
                     current_month,
                     _month_start_for_birth_month_or_age(
                         current_month,
-                        shock.self_birth_month,
-                        shock.self_current_age,
-                        shock.self_retirement_age,
-                    ),
-                ),
-            )
-        )
-    if len(household.members) >= 2:
-        targets.append(
-            max(
-                0,
-                _months_between_months(
-                    current_month,
-                    _month_start_for_birth_month_or_age(
-                        current_month,
-                        shock.spouse_birth_month,
-                        shock.spouse_current_age,
-                        shock.spouse_retirement_age,
+                        effective_birth_month,
+                        effective_current_age,
+                        setting.retirement_age if setting else _default_retirement_age_for_member(index),
                     ),
                 ),
             )
@@ -397,6 +411,7 @@ def _visualization_horizon_months(
     car_loan: CarLoanSummary,
     *,
     second_loan: CarLoanSummary | None = None,
+    vehicle_states: list[VehicleLoanState] | None = None,
 ) -> int:
     plan_horizons = [
         (plan.months_to_buy or 0)
@@ -407,18 +422,17 @@ def _visualization_horizon_months(
         + 12
         for plan in purchase_plans
     ]
-    first_vehicle_start = (
-        car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else car_loan.purchase_delay_months
-    )
-    second_vehicle_start = (
-        second_loan.months_to_down_payment
-        if second_loan and second_loan.months_to_down_payment is not None
-        else second_loan.purchase_delay_months if second_loan else 0
-    )
     vehicle_horizons = [
-        first_vehicle_start + car_loan.total_months + 24 if car_loan.enabled else 0,
-        second_vehicle_start + second_loan.total_months + 24 if second_loan and second_loan.enabled else 0,
+        (purchase_month or 0) + loan.total_months + 24
+        for _, _, loan, purchase_month in (vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan))
+        if loan.enabled
     ]
+    if not vehicle_horizons and car_loan.enabled:
+        first_vehicle_start = car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else car_loan.purchase_delay_months
+        vehicle_horizons.append(first_vehicle_start + car_loan.total_months + 24)
+    if second_loan and second_loan.enabled:
+        second_vehicle_start = second_loan.months_to_down_payment if second_loan.months_to_down_payment is not None else second_loan.purchase_delay_months
+        vehicle_horizons.append(second_vehicle_start + second_loan.total_months + 24)
     return min(840, max(180, _retirement_tail_months(household), *plan_horizons, *vehicle_horizons))
 
 
@@ -443,6 +457,43 @@ def _zero_cash_stage(template: IncomeStageData, name: str, start: date, end: dat
             "payroll_contributions_enabled": False,
         }
     )
+
+
+def _default_retirement_age_for_member(index: int) -> int:
+    return 63 if index == 0 else 58
+
+
+def _career_shock_settings_by_member(household: HouseholdData):
+    shock = household.career_shock
+    settings_by_name = {item.member_name: item for item in shock.member_settings}
+    return {
+        member.name: settings_by_name.get(member.name)
+        for member in household.members
+    }
+
+
+def _member_retirement_months_by_index(
+    household: HouseholdData,
+    *,
+    as_of: date | None = None,
+) -> dict[int, int]:
+    current = as_of or date.today()
+    current_month = date(current.year, current.month, 1)
+    settings_by_member = _career_shock_settings_by_member(household)
+    retirement_months: dict[int, int] = {}
+    for index, member in enumerate(household.members):
+        setting = settings_by_member.get(member.name)
+        effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
+        effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
+        retirement_age = setting.retirement_age if setting else _default_retirement_age_for_member(index)
+        retirement_start = _month_start_for_birth_month_or_age(
+            current_month,
+            effective_birth_month,
+            effective_current_age,
+            retirement_age,
+        )
+        retirement_months[index] = max(0, _months_between_months(current_month, retirement_start))
+    return retirement_months
 
 
 def _unemployment_benefit_months_from_service(service_months: int) -> int:
@@ -504,6 +555,7 @@ def _household_with_career_income_stages(
     current = as_of or date.today()
     synthetic_prefix = "自动情景："
     updated_members: list[IncomeMember] = []
+    settings_by_member = _career_shock_settings_by_member(household)
     for index, member in enumerate(household.members):
         stages = [
             stage
@@ -529,23 +581,24 @@ def _household_with_career_income_stages(
                 )
             ]
         template = max(stages, key=lambda stage: _parse_iso_date(stage.start_date, date(1900, 1, 1)))
-        member_current_age = shock.self_current_age if index == 0 else shock.spouse_current_age
-        member_birth_month = shock.self_birth_month if index == 0 else shock.spouse_birth_month
-        retirement_age = shock.self_retirement_age if index == 0 else shock.spouse_retirement_age
-        pension_monthly = shock.self_pension_monthly if index == 0 else shock.spouse_pension_monthly
+        setting = settings_by_member.get(member.name)
+        effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
+        effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
+        retirement_age = setting.retirement_age if setting else _default_retirement_age_for_member(index)
+        pension_monthly = setting.pension_monthly if setting else 0
         retirement_start = _month_start_for_birth_month_or_age(
             current,
-            member_birth_month,
-            member_current_age,
+            effective_birth_month,
+            effective_current_age,
             retirement_age,
         )
 
-        if member.name == shock.layoff_member_name:
+        if setting and setting.enabled:
             layoff_start = _month_start_for_birth_month_or_age(
                 current,
-                shock.self_birth_month,
-                shock.self_current_age,
-                shock.layoff_age,
+                effective_birth_month,
+                effective_current_age,
+                setting.layoff_age,
             )
             unemployment_months = _career_shock_unemployment_months(household, shock)
             if unemployment_months > 0 and layoff_start < retirement_start:
@@ -557,7 +610,7 @@ def _household_with_career_income_stages(
                     )
                     first_stage = _zero_cash_stage(
                         template,
-                        f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金期",
+                        f"{synthetic_prefix}{setting.layoff_age}岁被裁员-失业金期",
                         layoff_start,
                         first_end,
                     )
@@ -580,7 +633,7 @@ def _household_with_career_income_stages(
                             )
                             later_stage = _zero_cash_stage(
                                 template,
-                                f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金后续期",
+                                f"{synthetic_prefix}{setting.layoff_age}岁被裁员-失业金后续期",
                                 later_start,
                                 later_end,
                             )
@@ -596,7 +649,7 @@ def _household_with_career_income_stages(
                 else:
                     unemployment_end = _add_months(layoff_start, unemployment_months - 1)
                     end = min(unemployment_end, _end_of_previous_month(retirement_start))
-                    unemployment_stage = _zero_cash_stage(template, f"{synthetic_prefix}{shock.layoff_age}岁被裁员-失业金期", layoff_start, end)
+                    unemployment_stage = _zero_cash_stage(template, f"{synthetic_prefix}{setting.layoff_age}岁被裁员-失业金期", layoff_start, end)
                     stages.append(
                         unemployment_stage.model_copy(
                             update={"monthly_non_taxable_income": shock.unemployment_benefit_monthly}
@@ -607,7 +660,7 @@ def _household_with_career_income_stages(
                 stages.append(
                     _zero_cash_stage(
                         template,
-                        f"{synthetic_prefix}{shock.layoff_age}岁被裁员-灵活就业自缴社保期",
+                        f"{synthetic_prefix}{setting.layoff_age}岁被裁员-灵活就业自缴社保期",
                         self_social_start,
                         _end_of_previous_month(retirement_start),
                     ).model_copy(update={"monthly_extra_cash_expense": _career_shock_self_social_monthly(shock, active_rules)})
@@ -623,7 +676,6 @@ def _household_with_career_income_stages(
         updated_members.append(member.model_copy(update={"income_stages": stages}))
 
     return household.model_copy(update={"members": updated_members, "career_shock_applied": True})
-
 
 def _parse_year_month(value: str | None) -> tuple[int, int] | None:
     if not value:
@@ -729,8 +781,18 @@ def _member_cumulative_salary_tax(
     through_month: int,
     household: HouseholdData | None = None,
 ) -> float:
+    return _member_cumulative_salary_tax_pair(member, rules, year, through_month, household)[1]
+
+
+def _member_cumulative_salary_tax_pair(
+    member: IncomeMember,
+    rules: RulePackData,
+    year: int,
+    through_month: int,
+    household: HouseholdData | None = None,
+) -> tuple[float, float]:
     if through_month <= 0:
-        return 0.0
+        return 0.0, 0.0
 
     params = rules.params
     annual_brackets = list(params.get("comprehensive_tax_brackets") or DEFAULT_COMPREHENSIVE_BRACKETS)
@@ -740,37 +802,49 @@ def _member_cumulative_salary_tax(
     cumulative_social_and_fund = 0.0
     cumulative_special_deduction = 0.0
     cumulative_other_deduction = 0.0
+    previous_tax = 0.0
+    current_tax = 0.0
+    selected_method_cache: dict[int, BonusTaxMethod] = {}
+
+    def cumulative_tax_value() -> float:
+        taxable = max(
+            0.0,
+            cumulative_income
+            - monthly_standard_deduction * active_months
+            - cumulative_social_and_fund
+            - cumulative_special_deduction
+            - cumulative_other_deduction,
+        )
+        return _progressive_tax(taxable, annual_brackets)
 
     for month in range(1, through_month + 1):
         target_date = date(year, month, 1)
         stage = _income_stage_for_month(member, year, month)
-        if stage is None:
-            continue
-        personal_social, personal_housing_fund, _, _ = _beijing_contributions(stage, rules)
-        selected_bonus_method = _stage_selected_bonus_method(stage, rules)
-        active_months += 1
-        cumulative_income += stage.monthly_salary_gross
-        cumulative_income += stage.other_annual_taxable_income / 12
-        if selected_bonus_method == "merged":
-            cumulative_income += _stage_bonus_payout_amount(stage, year, month)
-        cumulative_social_and_fund += personal_social + personal_housing_fund
-        cumulative_special_deduction += stage.monthly_special_additional_deduction
-        cumulative_special_deduction += _elderly_care_deduction_for_member_at(
-            household,
-            member.name,
-            target_date,
-        )
-        cumulative_other_deduction += stage.other_annual_deductions / 12
+        if stage is not None:
+            personal_social, personal_housing_fund, _, _ = _beijing_contributions(stage, rules)
+            stage_key = id(stage)
+            selected_bonus_method = selected_method_cache.get(stage_key)
+            if selected_bonus_method is None:
+                selected_bonus_method = _stage_selected_bonus_method(stage, rules)
+                selected_method_cache[stage_key] = selected_bonus_method
+            active_months += 1
+            cumulative_income += stage.monthly_salary_gross
+            cumulative_income += stage.other_annual_taxable_income / 12
+            if selected_bonus_method == "merged":
+                cumulative_income += _stage_bonus_payout_amount(stage, year, month)
+            cumulative_social_and_fund += personal_social + personal_housing_fund
+            cumulative_special_deduction += stage.monthly_special_additional_deduction
+            cumulative_special_deduction += _elderly_care_deduction_for_member_at(
+                household,
+                member.name,
+                target_date,
+            )
+            cumulative_other_deduction += stage.other_annual_deductions / 12
+        current_tax = cumulative_tax_value()
+        if month == through_month - 1:
+            previous_tax = current_tax
 
-    taxable = max(
-        0.0,
-        cumulative_income
-        - monthly_standard_deduction * active_months
-        - cumulative_social_and_fund
-        - cumulative_special_deduction
-        - cumulative_other_deduction,
-    )
-    return _progressive_tax(taxable, annual_brackets)
+    return previous_tax, current_tax
 
 
 def _member_monthly_income_profile(
@@ -785,18 +859,11 @@ def _member_monthly_income_profile(
 
     personal_social, personal_housing_fund, employer_social, employer_housing_fund = _beijing_contributions(stage, rules)
     selected_bonus_method = _stage_selected_bonus_method(stage, rules)
-    cumulative_tax = _member_cumulative_salary_tax(
+    previous_cumulative_tax, cumulative_tax = _member_cumulative_salary_tax_pair(
         member,
         rules,
         target_month.year,
         target_month.month,
-        household,
-    )
-    previous_cumulative_tax = _member_cumulative_salary_tax(
-        member,
-        rules,
-        target_month.year,
-        target_month.month - 1,
         household,
     )
     salary_tax = max(0.0, cumulative_tax - previous_cumulative_tax)
@@ -1308,6 +1375,185 @@ def _no_car_commute_cost(plan: CarPlanData) -> float:
     return max(0.0, plan.no_car_monthly_commute_cost)
 
 
+def _scenario_purchase_sequence(scenario: ScenarioData | None) -> int:
+    return max(1, scenario.purchase_sequence if scenario else 1)
+
+
+def _vehicle_is_before_or_parallel_home(vehicle: CarPlanData, scenario: ScenarioData | None) -> bool:
+    if scenario is None or vehicle.purchase_timing_mode in {"parallel", "manual_month"}:
+        return True
+    return max(1, vehicle.planning_sequence) <= _scenario_purchase_sequence(scenario)
+
+
+def _vehicle_base_purchase_month(
+    vehicle: CarPlanData,
+    *,
+    scenario: ScenarioData | None = None,
+    home_purchase_month: int | None = None,
+) -> int:
+    if vehicle.purchase_timing_mode == "manual_month":
+        return max(0, vehicle.manual_purchase_delay_months)
+    if (
+        scenario is not None
+        and home_purchase_month is not None
+        and vehicle.purchase_timing_mode == "auto_sequence"
+        and vehicle.planning_sequence > _scenario_purchase_sequence(scenario)
+    ):
+        return max(0, home_purchase_month + vehicle.after_previous_event_delay_months)
+    return max(0, vehicle.purchase_delay_months)
+
+
+def _vehicle_plans(
+    plan: CarPlanData,
+    *,
+    scenario: ScenarioData | None = None,
+    home_purchase_month: int | None = None,
+    include_after_home: bool = True,
+) -> list[CarPlanData]:
+    plans: list[CarPlanData] = []
+    raw_vehicle_plans = sorted(
+        enumerate(plan.vehicle_plans),
+        key=lambda item: (max(1, item[1].planning_sequence), item[0]),
+    )
+    previous_sequence_month: int | None = None
+    for index, vehicle in raw_vehicle_plans:
+        if not vehicle.enabled or vehicle.total_price <= 0:
+            continue
+        if not include_after_home and not _vehicle_is_before_or_parallel_home(vehicle, scenario):
+            continue
+        base_purchase_month = _vehicle_base_purchase_month(
+            vehicle,
+            scenario=scenario,
+            home_purchase_month=home_purchase_month,
+        )
+        effective_purchase_month = base_purchase_month
+        if vehicle.purchase_timing_mode == "auto_sequence" and previous_sequence_month is not None:
+            effective_purchase_month = max(
+                effective_purchase_month,
+                previous_sequence_month + vehicle.after_previous_event_delay_months,
+            )
+        plans.append(
+            plan.model_copy(
+                update={
+                    **vehicle.model_dump(),
+                    "enabled": True,
+                    "name": vehicle.name or f"车辆 {index + 1}",
+                    "purchase_delay_months": effective_purchase_month,
+                    "vehicle_plans": [],
+                    "second_car_enabled": False,
+                }
+            )
+        )
+        previous_sequence_month = effective_purchase_month
+    if plans:
+        return plans
+    if plan.enabled and plan.total_price > 0 and (include_after_home or _vehicle_is_before_or_parallel_home(plan, scenario)):
+        plans.append(plan.model_copy(update={"vehicle_plans": [], "second_car_enabled": False}))
+    second_plan = _second_car_plan(plan)
+    if second_plan.enabled and include_after_home:
+        plans.append(second_plan)
+    return plans
+
+
+def _vehicle_loan_states(
+    plan: CarPlanData,
+    *,
+    scenario: ScenarioData | None = None,
+    home_purchase_month: int | None = None,
+    include_after_home: bool = True,
+) -> list[VehicleLoanState]:
+    states: list[VehicleLoanState] = []
+    for index, vehicle_plan in enumerate(
+        _vehicle_plans(
+            plan,
+            scenario=scenario,
+            home_purchase_month=home_purchase_month,
+            include_after_home=include_after_home,
+        )
+    ):
+        loan = calculate_car_loan(vehicle_plan)
+        purchase_month = (
+            loan.months_to_down_payment
+            if loan.months_to_down_payment is not None
+            else vehicle_plan.purchase_delay_months
+        ) if loan.enabled else None
+        states.append((index, vehicle_plan, loan, purchase_month))
+    return states
+
+
+def _vehicle_candidate_plans(plan: CarPlanData) -> list[tuple[int | None, CarPlanData]]:
+    raw_candidates = [
+        candidate if isinstance(candidate, CarPlanData) else CarPlanData.model_validate(candidate)
+        for candidate in plan.candidate_vehicles
+        if isinstance(candidate, (CarPlanData, dict))
+    ]
+    candidates = [
+        candidate
+        for candidate in raw_candidates
+        if candidate.enabled and candidate.total_price > 0
+    ]
+    if not candidates:
+        return [(None, plan.model_copy(update={"candidate_vehicles": []}))]
+
+    options: list[tuple[int | None, CarPlanData]] = []
+    for index, candidate in enumerate(candidates):
+        candidate_data = candidate.model_dump()
+        candidate_data["candidate_vehicles"] = []
+        candidate_data["planning_sequence"] = plan.planning_sequence
+        candidate_data["purchase_timing_mode"] = plan.purchase_timing_mode
+        candidate_data["after_previous_event_delay_months"] = plan.after_previous_event_delay_months
+        candidate_data["manual_purchase_delay_months"] = plan.manual_purchase_delay_months
+        candidate_data["enabled"] = True
+        candidate_data["selected_strategy_variant"] = plan.selected_strategy_variant
+        options.append((index, plan.model_copy(update=candidate_data)))
+    return options
+
+
+def _aggregate_car_loan(
+    plan: CarPlanData,
+    *,
+    initial_cash: float = 0,
+    monthly_cash_savings_before_car: float = 0,
+    scenario: ScenarioData | None = None,
+    home_purchase_month: int | None = None,
+    include_after_home: bool = True,
+) -> CarLoanSummary:
+    vehicle_plans = _vehicle_plans(
+        plan,
+        scenario=scenario,
+        home_purchase_month=home_purchase_month,
+        include_after_home=include_after_home,
+    )
+    if not vehicle_plans:
+        return calculate_car_loan(plan.model_copy(update={"enabled": False, "total_price": 0}), initial_cash=initial_cash, monthly_cash_savings_before_car=monthly_cash_savings_before_car)
+    loans = [
+        calculate_car_loan(vehicle_plan, initial_cash=initial_cash, monthly_cash_savings_before_car=monthly_cash_savings_before_car)
+        for vehicle_plan in vehicle_plans
+    ]
+    first = loans[0]
+    return first.model_copy(
+        update={
+            "enabled": any(loan.enabled for loan in loans),
+            "total_price": round(sum(loan.total_price for loan in loans), 2),
+            "down_payment": round(sum(loan.down_payment for loan in loans), 2),
+            "loan_principal": round(sum(loan.loan_principal for loan in loans), 2),
+            "current_monthly_payment": round(sum(loan.current_monthly_payment for loan in loans), 2),
+            "total_interest": round(sum(loan.total_interest for loan in loans), 2),
+            "monthly_energy_cost": round(sum(loan.monthly_energy_cost for loan in loans), 2),
+            "monthly_insurance_cost": round(sum(loan.monthly_insurance_cost for loan in loans), 2),
+            "monthly_maintenance_cost": round(sum(loan.monthly_maintenance_cost for loan in loans), 2),
+            "monthly_parking_cost": round(sum(loan.monthly_parking_cost for loan in loans), 2),
+            "monthly_cash_operating_cost": round(sum(loan.monthly_cash_operating_cost for loan in loans), 2),
+            "monthly_depreciation_cost": round(sum(loan.monthly_depreciation_cost for loan in loans), 2),
+            "monthly_total_ownership_cost": round(sum(loan.monthly_total_ownership_cost for loan in loans), 2),
+            "months_to_down_payment": min(
+                (loan.months_to_down_payment for loan in loans if loan.months_to_down_payment is not None),
+                default=None,
+            ),
+        }
+    )
+
+
 def _second_car_plan(plan: CarPlanData) -> CarPlanData:
     return plan.model_copy(
         update={
@@ -1353,73 +1599,51 @@ def _is_car_annual_cost_month(month: int, purchase_month: int | None) -> bool:
     return (month - purchase_month) % 12 == 0
 
 
-def _car_monthly_cash_cost_at(plan: CarPlanData, car_loan: CarLoanSummary, month: int) -> float:
+def _car_monthly_cash_cost_at(
+    plan: CarPlanData,
+    car_loan: CarLoanSummary,
+    month: int,
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
+) -> float:
     no_car_commute = _no_car_commute_cost(plan)
-    first_purchase_month = (
-        (car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else plan.purchase_delay_months)
-        if plan.enabled and car_loan.enabled
-        else None
-    )
-    if first_purchase_month is None:
-        base_cost = no_car_commute
-    elif month < first_purchase_month:
-        base_cost = no_car_commute
-    else:
-        month_after_car = month - first_purchase_month
+    vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(plan)
+    if not vehicle_states:
+        return no_car_commute
+    first_purchase_month = min((purchase_month for _, _, _, purchase_month in vehicle_states if purchase_month is not None), default=None)
+    total = no_car_commute if first_purchase_month is None or month < first_purchase_month else 0.0
+    for _, vehicle_plan, loan, purchase_month in vehicle_states:
+        if purchase_month is None or month < purchase_month:
+            continue
+        month_after_car = month - purchase_month
         payment = 0.0
-        if 0 < month_after_car <= car_loan.total_months:
+        if 0 < month_after_car <= loan.total_months:
             payment = (
-                car_loan.first_phase_monthly_payment
-                if month_after_car <= car_loan.interest_free_months
-                else car_loan.later_phase_monthly_payment
+                loan.first_phase_monthly_payment
+                if month_after_car <= loan.interest_free_months
+                else loan.later_phase_monthly_payment
             )
         annual_cost = (
-            _car_annual_cash_cost_at(car_loan, plan, month, first_purchase_month)
-            if _is_car_annual_cost_month(month, first_purchase_month)
+            _car_annual_cash_cost_at(loan, vehicle_plan, month, purchase_month)
+            if _is_car_annual_cost_month(month, purchase_month)
             else 0.0
         )
-        base_cost = payment + _car_monthly_cash_cost_without_annual(car_loan) + annual_cost
-
-    second_plan = _second_car_plan(plan)
-    if not second_plan.enabled:
-        return base_cost
-    second_loan = calculate_car_loan(second_plan)
-    second_purchase_month = (
-        second_loan.months_to_down_payment if second_loan.months_to_down_payment is not None else second_plan.purchase_delay_months
-    ) if second_loan.enabled else None
-    if second_purchase_month is None or month < second_purchase_month:
-        return base_cost
-    month_after_second = month - second_purchase_month
-    second_payment = 0.0
-    if 0 < month_after_second <= second_loan.total_months:
-        second_payment = (
-            second_loan.first_phase_monthly_payment
-            if month_after_second <= second_loan.interest_free_months
-            else second_loan.later_phase_monthly_payment
-        )
-    second_annual_cost = (
-        _car_annual_cash_cost_at(second_loan, second_plan, month, second_purchase_month)
-        if _is_car_annual_cost_month(month, second_purchase_month)
-        else 0.0
-    )
-    return base_cost + second_payment + _car_monthly_cash_cost_without_annual(second_loan) + second_annual_cost
+        total += payment + _car_monthly_cash_cost_without_annual(loan) + annual_cost
+    return total
 
 
-def _car_down_payment_at(plan: CarPlanData, car_loan: CarLoanSummary, month: int) -> float:
+def _car_down_payment_at(
+    plan: CarPlanData,
+    car_loan: CarLoanSummary,
+    month: int,
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
+) -> float:
     total = 0.0
-    first_purchase_month = car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else plan.purchase_delay_months
-    if plan.enabled and car_loan.enabled and first_purchase_month == month:
-        total += car_loan.down_payment
-    second_plan = _second_car_plan(plan)
-    if second_plan.enabled:
-        second_loan = calculate_car_loan(second_plan)
-        second_purchase_month = (
-            second_loan.months_to_down_payment
-            if second_loan.months_to_down_payment is not None
-            else second_plan.purchase_delay_months
-        )
-        if second_loan.enabled and second_purchase_month == month:
-            total += second_loan.down_payment
+    vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(plan)
+    for _, _, loan, purchase_month in vehicle_states:
+        if loan.enabled and purchase_month == month:
+            total += loan.down_payment
     return total
 
 
@@ -1473,23 +1697,24 @@ def _vehicle_cash_components_at(
     }
 
 
-def _car_down_payment_components_at(plan: CarPlanData, car_loan: CarLoanSummary, month: int) -> tuple[float, float]:
+def _car_down_payment_components_at(
+    plan: CarPlanData,
+    car_loan: CarLoanSummary,
+    month: int,
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
+) -> tuple[float, float]:
     first = 0.0
-    second = 0.0
-    first_purchase_month = car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else plan.purchase_delay_months
-    if plan.enabled and car_loan.enabled and first_purchase_month == month:
-        first = car_loan.down_payment
-    second_plan = _second_car_plan(plan)
-    if second_plan.enabled:
-        second_loan = calculate_car_loan(second_plan)
-        second_purchase_month = (
-            second_loan.months_to_down_payment
-            if second_loan.months_to_down_payment is not None
-            else second_plan.purchase_delay_months
-        )
-        if second_loan.enabled and second_purchase_month == month:
-            second = second_loan.down_payment
-    return first, second
+    extra = 0.0
+    vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(plan)
+    for index, _, loan, purchase_month in vehicle_states:
+        if not loan.enabled or purchase_month != month:
+            continue
+        if index == 0:
+            first += loan.down_payment
+        else:
+            extra += loan.down_payment
+    return first, extra
 
 
 def _months_until_cash_target(initial_cash: float, monthly_savings: float, target_cash: float, max_months: int = 120) -> int | None:
@@ -1538,112 +1763,122 @@ def build_car_plan_analyses(
     *,
     net_monthly_income: float,
 ) -> list[CarPlanAnalysis]:
-    plan = household.car_plan
-    if not plan.enabled or plan.total_price <= 0:
+    vehicle_plans = _vehicle_plans(household.car_plan)
+    if not vehicle_plans:
         return []
 
-    initial_cash = household.liquid_assets + household.investments
+    initial_cash = household.cash_account_balance + household.investments
     current_monthly_expense = monthly_household_expense_at(household)
     monthly_savings_before_transport = max(
         0,
         net_monthly_income - current_monthly_expense - household.monthly_debt_payment,
     )
-    no_car_commute = _no_car_commute_cost(plan)
+    no_car_commute = _no_car_commute_cost(household.car_plan)
     monthly_savings_before_car = max(0, monthly_savings_before_transport - no_car_commute)
     required_reserve = current_monthly_expense * household.required_liquidity_months
-    high_down_ratio = min(1.0, max(plan.down_payment_ratio, 0.50))
-    low_down_ratio = min(1.0, min(plan.down_payment_ratio, 0.15))
-    delayed_down_ratio = min(1.0, max(plan.down_payment_ratio, 0.20))
-    delay_months = max(plan.purchase_delay_months, 12)
-    specs = [
-        ("按目标设置", "完全按上方买车目标测算，用来直接观察手动修改后的效果。", plan.down_payment_ratio, plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
-        ("全款", "不背车贷，现金压力最大，但买后月现金流最干净。", 1.0, plan.purchase_delay_months, 1, 0, 0.0),
-        ("高首付低贷", "按主流电车 50% 左右首付、短周期低息方案测算，降低车贷月供。", high_down_ratio, plan.purchase_delay_months, 36, 24, min(plan.later_annual_rate, 0.0199)),
-        ("低首付保现金", "按 15%-20% 低首付、60 期方案测算，把现金优先留给购房安全垫。", low_down_ratio, plan.purchase_delay_months, 60, 24, plan.later_annual_rate),
-        ("延后买车", "先把现金留给购房，至少延后一年再执行低首付长贷方案。", delayed_down_ratio, delay_months, 60, 24, plan.later_annual_rate),
-    ]
 
     analyses: list[CarPlanAnalysis] = []
-    for variant, description, down_ratio, purchase_delay, total_months, interest_free_months, later_rate in specs:
-        strategy_plan = plan.model_copy(
-            update={
-                "enabled": True,
-                "down_payment_ratio": down_ratio,
-                "down_payment": plan.total_price * down_ratio,
-                "purchase_delay_months": purchase_delay,
-                "total_months": total_months,
-                "interest_free_months": min(interest_free_months, total_months),
-                "later_annual_rate": later_rate,
-            }
-        )
-        loan = calculate_car_loan(
-            strategy_plan,
-            initial_cash=initial_cash,
-            monthly_cash_savings_before_car=monthly_savings_before_car,
-        )
-        required_cash = loan.down_payment + required_reserve
-        cash_ready_month = _months_until_cash_target(initial_cash, monthly_savings_before_car, required_cash)
-        if cash_ready_month is None:
-            months_to_buy = None
-            cash_after_purchase = initial_cash - loan.down_payment
-        else:
-            months_to_buy = max(purchase_delay, cash_ready_month)
-            cash_after_purchase = initial_cash + monthly_savings_before_car * months_to_buy - loan.down_payment
-        expected_payment = loan.first_phase_monthly_payment if loan.interest_free_months > 0 else loan.later_phase_monthly_payment
-        monthly_after_car = monthly_savings_before_transport - expected_payment - loan.monthly_cash_operating_cost
-        debt_burden_score = _clamp_score(10 - expected_payment / max(net_monthly_income, 1) / 0.18 * 10)
-        total_cost_score = _clamp_score(10 - loan.monthly_total_ownership_cost / max(net_monthly_income, 1) / 0.16 * 10)
-        happiness_score = (
-            plan.happiness_score * 0.28
-            + _ratio_score(cash_after_purchase, required_reserve) * 0.22
-            + _cash_flow_score(monthly_after_car, current_monthly_expense) * 0.20
-            + debt_burden_score * 0.12
-            + total_cost_score * 0.08
-            + _wait_score(months_to_buy, 24) * 0.10
-        )
-        notes = [
-            f"首付比例 {down_ratio:.0%}",
-            f"现金养车约 {round(loan.monthly_cash_operating_cost)} 元/月",
-            f"含折旧总成本约 {round(loan.monthly_total_ownership_cost)} 元/月",
-            "全款无贷款" if loan.loan_principal == 0 else f"{loan.interest_free_months} 期 0 息 / 共 {loan.total_months} 期",
-            "买车后无车贷月供" if loan.loan_principal == 0 else f"贷款本金 {round(loan.loan_principal)}",
-            "手动目标反馈" if variant == "按目标设置" else "保留购房现金优先" if variant in {"低首付保现金", "延后买车"} else "降低长期车贷压力",
-        ]
-        analyses.append(
-            CarPlanAnalysis(
-                variant=variant,
-                description=description,
-                purchase_delay_months=purchase_delay,
-                months_to_buy=months_to_buy,
-                years_to_buy=round(months_to_buy / 12, 1) if months_to_buy is not None else None,
-                total_price=round(plan.total_price, 2),
-                down_payment_ratio=down_ratio,
-                down_payment=loan.down_payment,
-                loan_principal=loan.loan_principal,
-                total_months=loan.total_months,
-                interest_free_months=loan.interest_free_months,
-                later_annual_rate=loan.later_annual_rate,
-                first_phase_monthly_payment=loan.first_phase_monthly_payment,
-                later_phase_monthly_payment=loan.later_phase_monthly_payment,
-                expected_monthly_payment_after_purchase=round(expected_payment, 2),
-                total_interest=loan.total_interest,
-                required_cash_at_purchase=round(required_cash, 2),
-                cash_after_purchase=round(cash_after_purchase, 2),
-                monthly_cash_flow_after_car=round(monthly_after_car, 2),
-                operating_cost=loan.monthly_cash_operating_cost,
-                monthly_energy_cost=loan.monthly_energy_cost,
-                monthly_insurance_cost=loan.monthly_insurance_cost,
-                monthly_maintenance_cost=loan.monthly_maintenance_cost,
-                monthly_parking_cost=loan.monthly_parking_cost,
-                monthly_cash_operating_cost=loan.monthly_cash_operating_cost,
-                monthly_depreciation_cost=loan.monthly_depreciation_cost,
-                monthly_total_ownership_cost=loan.monthly_total_ownership_cost,
-                happiness_score=round(_clamp_score(happiness_score), 2),
-                notes=notes,
-            )
-        )
+    for vehicle_index, vehicle_plan in enumerate(vehicle_plans):
+        candidate_options = _vehicle_candidate_plans(vehicle_plan)
+        for candidate_index, plan in candidate_options:
+            candidate_name = plan.name or vehicle_plan.name
+            variant_prefix = candidate_name if len(vehicle_plans) > 1 or len(candidate_options) > 1 else ""
+            high_down_ratio = min(1.0, max(plan.down_payment_ratio, 0.50))
+            low_down_ratio = min(1.0, min(plan.down_payment_ratio, 0.15))
+            delayed_down_ratio = min(1.0, max(plan.down_payment_ratio, 0.20))
+            delay_months = max(plan.purchase_delay_months, 12)
+            specs = [
+                ("target", "Calculate from this vehicle source and the current manual loan settings.", plan.down_payment_ratio, plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
+                ("cash", "Pay in full to avoid auto debt, with the highest purchase-month cash pressure.", 1.0, plan.purchase_delay_months, 1, 0, 0.0),
+                ("high_down_low_loan", "Use a mainstream EV-style high-down-payment, short-term low-rate loan.", high_down_ratio, plan.purchase_delay_months, 36, 24, min(plan.later_annual_rate, 0.0199)),
+                ("low_down_keep_cash", "Use a low down payment and longer term to preserve liquidity.", low_down_ratio, plan.purchase_delay_months, 60, 24, plan.later_annual_rate),
+                ("delay_purchase", "Delay the purchase and keep cash for home purchase and emergency reserve first.", delayed_down_ratio, delay_months, 60, 24, plan.later_annual_rate),
+            ]
+            for strategy_key, description, down_ratio, purchase_delay, total_months, interest_free_months, later_rate in specs:
+                strategy_plan = plan.model_copy(
+                    update={
+                        "enabled": True,
+                        "down_payment_ratio": down_ratio,
+                        "down_payment": plan.total_price * down_ratio,
+                        "purchase_delay_months": purchase_delay,
+                        "total_months": total_months,
+                        "interest_free_months": min(interest_free_months, total_months),
+                        "later_annual_rate": later_rate,
+                    }
+                )
+                loan = calculate_car_loan(
+                    strategy_plan,
+                    initial_cash=initial_cash,
+                    monthly_cash_savings_before_car=monthly_savings_before_car,
+                )
+                required_cash = loan.down_payment + required_reserve
+                cash_ready_month = _months_until_cash_target(initial_cash, monthly_savings_before_car, required_cash)
+                if cash_ready_month is None:
+                    months_to_buy = None
+                    cash_after_purchase = initial_cash - loan.down_payment
+                else:
+                    months_to_buy = max(purchase_delay, cash_ready_month)
+                    cash_after_purchase = initial_cash + monthly_savings_before_car * months_to_buy - loan.down_payment
+                expected_payment = loan.first_phase_monthly_payment if loan.interest_free_months > 0 else loan.later_phase_monthly_payment
+                monthly_after_car = monthly_savings_before_transport - expected_payment - loan.monthly_cash_operating_cost
+                debt_burden_score = _clamp_score(10 - expected_payment / max(net_monthly_income, 1) / 0.18 * 10)
+                total_cost_score = _clamp_score(10 - loan.monthly_total_ownership_cost / max(net_monthly_income, 1) / 0.16 * 10)
+                happiness_score = (
+                    plan.happiness_score * 0.28
+                    + _ratio_score(cash_after_purchase, required_reserve) * 0.22
+                    + _cash_flow_score(monthly_after_car, current_monthly_expense) * 0.20
+                    + debt_burden_score * 0.12
+                    + total_cost_score * 0.08
+                    + _wait_score(months_to_buy, 24) * 0.10
+                )
+                notes = [
+                    f"vehicle_goal:{vehicle_plan.name}",
+                    f"vehicle_source:{candidate_name}",
+                    f"down_payment_ratio:{down_ratio:.0%}",
+                    f"cash_operating_cost_monthly:{round(loan.monthly_cash_operating_cost)}",
+                    f"total_ownership_cost_monthly:{round(loan.monthly_total_ownership_cost)}",
+                    "no_auto_loan" if loan.loan_principal == 0 else f"loan_principal:{round(loan.loan_principal)}",
+                    "manual_target" if strategy_key == "target" else "preserve_home_purchase_cash" if strategy_key in {"low_down_keep_cash", "delay_purchase"} else "reduce_long_term_auto_debt_pressure",
+                ]
+                analyses.append(
+                    CarPlanAnalysis(
+                        variant=f"{variant_prefix} | {strategy_key}" if variant_prefix else strategy_key,
+                        description=description,
+                        vehicle_index=vehicle_index,
+                        vehicle_name=vehicle_plan.name,
+                        vehicle_candidate_index=candidate_index,
+                        vehicle_candidate_name=candidate_name,
+                        strategy_key=strategy_key,
+                        purchase_delay_months=purchase_delay,
+                        months_to_buy=months_to_buy,
+                        years_to_buy=round(months_to_buy / 12, 1) if months_to_buy is not None else None,
+                        total_price=round(plan.total_price, 2),
+                        down_payment_ratio=down_ratio,
+                        down_payment=loan.down_payment,
+                        loan_principal=loan.loan_principal,
+                        total_months=loan.total_months,
+                        interest_free_months=loan.interest_free_months,
+                        later_annual_rate=loan.later_annual_rate,
+                        first_phase_monthly_payment=loan.first_phase_monthly_payment,
+                        later_phase_monthly_payment=loan.later_phase_monthly_payment,
+                        expected_monthly_payment_after_purchase=round(expected_payment, 2),
+                        total_interest=loan.total_interest,
+                        required_cash_at_purchase=round(required_cash, 2),
+                        cash_after_purchase=round(cash_after_purchase, 2),
+                        monthly_cash_flow_after_car=round(monthly_after_car, 2),
+                        operating_cost=loan.monthly_cash_operating_cost,
+                        monthly_energy_cost=loan.monthly_energy_cost,
+                        monthly_insurance_cost=loan.monthly_insurance_cost,
+                        monthly_maintenance_cost=loan.monthly_maintenance_cost,
+                        monthly_parking_cost=loan.monthly_parking_cost,
+                        monthly_cash_operating_cost=loan.monthly_cash_operating_cost,
+                        monthly_depreciation_cost=loan.monthly_depreciation_cost,
+                        monthly_total_ownership_cost=loan.monthly_total_ownership_cost,
+                        happiness_score=round(_clamp_score(happiness_score), 2),
+                        notes=notes,
+                    )
+                )
     return analyses
-
 
 def _future_cash_value(initial_cash: float, monthly_savings: float, annual_return: float, months: int) -> float:
     monthly_return = annual_return / 12
@@ -1748,37 +1983,78 @@ def _provident_loan_years(household: HouseholdData, scenario: ScenarioData, rule
     return get_policy(rules).provident_loan_years(household, scenario)
 
 
-def _months_until_purchase(
+def _investment_withdrawal_mode_label(mode: str) -> str:
+    labels = {
+        "auto": "自动优化提取",
+        "full_liquidation": "清空投资账户",
+        "manual_reserve": "手动保留投资余额",
+    }
+    return labels.get(mode, "自动优化提取")
+
+
+def _investment_withdrawal_mode(scenario: ScenarioData) -> str:
+    mode = str(getattr(scenario, "investment_withdrawal_mode", "auto") or "auto")
+    return mode if mode in {"auto", "full_liquidation", "manual_reserve"} else "auto"
+
+
+def _investment_withdrawal_at_purchase(
     *,
-    upfront_cash_required: float,
-    planned_down_payment: float,
-    household: HouseholdData,
-    initial_cash: float,
-    monthly_cash_savings: float,
-    monthly_pf_net_growth: float,
-    annual_return: float,
+    scenario: ScenarioData,
+    cash_before_transaction: float,
+    investment_before_transaction: float,
+    required_cash_after_pf: float,
     required_liquidity_reserve: float,
-    max_months: int = 360,
-) -> tuple[int | None, float, float, float]:
-    for months in range(max_months + 1):
-        cash_value = _future_cash_value(initial_cash, monthly_cash_savings, annual_return, months)
-        pf_available = max(
-            0,
-            household.provident_fund_balance + monthly_pf_net_growth * months,
+    sell_fee_rate: float,
+    investment_enabled: bool,
+) -> InvestmentWithdrawalResult:
+    mode = _investment_withdrawal_mode(scenario)
+    cash_before = max(0.0, cash_before_transaction)
+    investment_before = max(0.0, investment_before_transaction if investment_enabled else 0.0)
+    fee_rate = _clamp(sell_fee_rate, 0.0, 0.05)
+    if investment_before <= 0:
+        return InvestmentWithdrawalResult(
+            mode=mode,
+            mode_label=_investment_withdrawal_mode_label(mode),
+            cash_before_transaction=round(cash_before, 2),
+            investment_before_transaction=0.0,
+            gross_sell=0.0,
+            sell_fee=0.0,
+            sell_proceeds=0.0,
+            investment_after_transaction=0.0,
+            cash_after_transaction=round(cash_before - required_cash_after_pf, 2),
         )
-        pf_extractable = min(pf_available, planned_down_payment)
-        required_cash_after_pf = max(0, upfront_cash_required - pf_extractable)
-        if cash_value >= required_cash_after_pf + required_liquidity_reserve:
-            return (
-                months,
-                round(pf_extractable, 2),
-                round(cash_value - required_cash_after_pf, 2),
-                round(pf_available - pf_extractable, 2),
-            )
-    final_cash = _future_cash_value(initial_cash, monthly_cash_savings, annual_return, max_months)
-    final_pf = max(0, household.provident_fund_balance + monthly_pf_net_growth * max_months)
-    final_extract = min(final_pf, planned_down_payment)
-    return None, round(final_extract, 2), round(final_cash - max(0, upfront_cash_required - final_extract), 2), round(final_pf - final_extract, 2)
+
+    if mode == "full_liquidation":
+        target_gross_sell = investment_before
+    else:
+        minimum_investment_balance = (
+            max(0.0, scenario.investment_min_balance_after_purchase)
+            if mode == "manual_reserve"
+            else 0.0
+        )
+        required_net_from_investment = max(
+            0.0,
+            required_cash_after_pf + max(0.0, required_liquidity_reserve) - cash_before,
+        )
+        target_gross_sell = min(
+            max(0.0, investment_before - minimum_investment_balance),
+            required_net_from_investment / max(0.01, 1 - fee_rate),
+        )
+
+    gross_sell = max(0.0, min(investment_before, target_gross_sell))
+    sell_fee = gross_sell * fee_rate
+    sell_proceeds = max(0.0, gross_sell - sell_fee)
+    return InvestmentWithdrawalResult(
+        mode=mode,
+        mode_label=_investment_withdrawal_mode_label(mode),
+        cash_before_transaction=round(cash_before, 2),
+        investment_before_transaction=round(investment_before, 2),
+        gross_sell=round(gross_sell, 2),
+        sell_fee=round(sell_fee, 2),
+        sell_proceeds=round(sell_proceeds, 2),
+        investment_after_transaction=round(max(0.0, investment_before - gross_sell), 2),
+        cash_after_transaction=round(cash_before + sell_proceeds - required_cash_after_pf, 2),
+    )
 
 
 def _purchase_cash_state_at_month(
@@ -1797,8 +2073,9 @@ def _purchase_cash_state_at_month(
     property_price: float,
     scenario: ScenarioData,
     cash_value_by_month: list[float] | None = None,
+    investment_value_by_month: list[float] | None = None,
     pf_value_by_month: list[float] | None = None,
-) -> tuple[float, float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
     sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
     cash_value = (
@@ -1810,28 +2087,31 @@ def _purchase_cash_state_at_month(
             else _future_cash_value(initial_cash, monthly_cash_savings, annual_return, month)
         )
     )
-    if cash_value > 0 and household.investment_plan_name != "cash_only":
-        cash_value *= 1 - sell_fee_rate
-    pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
-    pf_available = (
-        pf_value_by_month[month]
-        if pf_value_by_month is not None and month < len(pf_value_by_month)
-        else (
+    investment_value = (
+        investment_value_by_month[month]
+        if investment_value_by_month is not None and month < len(investment_value_by_month)
+        else 0.0
+    )
+    if pf_value_by_month is not None and month < len(pf_value_by_month):
+        pf_available = pf_value_by_month[month]
+    else:
+        pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
+        initial_pf_balance = _household_initial_provident_balance(household, rules)
+        pf_available = (
             _future_pf_value_with_schedule(
-                household.provident_fund_balance,
+                initial_pf_balance,
                 pf_interest_rate,
                 month,
                 monthly_pf_net_growth_at,
             )
             if monthly_pf_net_growth_at is not None
             else _future_pf_value(
-                household.provident_fund_balance,
+                initial_pf_balance,
                 monthly_pf_net_growth,
                 pf_interest_rate,
                 month,
             )
         )
-    )
     default_upfront_ratio = float(rules.params.get("provident_upfront_purchase_extract_ratio", 0.0))
     if _is_second_hand_property(scenario):
         upfront_ratio_key = "provident_upfront_purchase_extract_ratio_second_hand"
@@ -1858,13 +2138,27 @@ def _purchase_cash_state_at_month(
         max(0.0, upfront_cash_required - pf_upfront_extractable),
     )
     required_cash_after_pf = max(0, upfront_cash_required - pf_upfront_extractable - family_pf_upfront_extractable)
-    cash_after_transaction = cash_value - required_cash_after_pf
+    withdrawal = _investment_withdrawal_at_purchase(
+        scenario=scenario,
+        cash_before_transaction=cash_value,
+        investment_before_transaction=investment_value,
+        required_cash_after_pf=required_cash_after_pf,
+        required_liquidity_reserve=monthly_household_expense_at(household, month) * household.required_liquidity_months,
+        sell_fee_rate=sell_fee_rate,
+        investment_enabled=household.investment_plan_name != "cash_only",
+    )
+    cash_after_transaction = withdrawal.cash_after_transaction
     pf_after_upfront_extract = max(0, pf_available - pf_upfront_extractable)
     pf_post_transaction_extractable = min(pf_after_upfront_extract, property_price * post_transaction_extract_ratio)
     return (
         round(pf_upfront_extractable, 2),
         round(family_pf_upfront_extractable, 2),
         round(pf_post_transaction_extractable, 2),
+        round(withdrawal.cash_before_transaction, 2),
+        round(withdrawal.investment_before_transaction, 2),
+        round(withdrawal.gross_sell, 2),
+        round(withdrawal.sell_proceeds, 2),
+        round(withdrawal.investment_after_transaction, 2),
         round(cash_after_transaction, 2),
         round(cash_after_transaction + pf_post_transaction_extractable, 2),
         round(pf_after_upfront_extract - pf_post_transaction_extractable, 2),
@@ -1939,6 +2233,23 @@ def _is_beijing_pf_offset_month(months_from_now: int, *, as_of: date | None = No
     return target.month in {1, 7}
 
 
+def _beijing_pf_loan_offset_target(
+    *,
+    available_balance: float,
+    agreed_payment: float,
+    remaining_loan_balance: float,
+) -> float:
+    available = max(0.0, available_balance)
+    remaining = max(0.0, remaining_loan_balance)
+    if available <= 0 or remaining <= 0:
+        return 0.0
+
+    minimum_offset = min(max(0.0, agreed_payment), remaining)
+    if minimum_offset > 0 and available < minimum_offset:
+        return 0.0
+    return min(available, remaining)
+
+
 def _semiannual_loan_offset_monthly_equivalent(
     *,
     purchase_month: int,
@@ -1949,25 +2260,56 @@ def _semiannual_loan_offset_monthly_equivalent(
     horizon_months: int = 12,
     as_of: date | None = None,
 ) -> float:
+    cash_relief, _ = _semiannual_loan_offset_projection(
+        purchase_month=purchase_month,
+        starting_pf_balance=starting_pf_balance,
+        monthly_pf_deposit=monthly_pf_deposit,
+        provident_monthly_payment=provident_monthly_payment,
+        rules=rules,
+        horizon_months=horizon_months,
+        as_of=as_of,
+    )
+    return cash_relief
+
+
+def _semiannual_loan_offset_projection(
+    *,
+    purchase_month: int,
+    starting_pf_balance: float,
+    monthly_pf_deposit: float,
+    provident_monthly_payment: float,
+    rules: RulePackData,
+    horizon_months: int = 12,
+    as_of: date | None = None,
+) -> tuple[float, float]:
     if monthly_pf_deposit <= 0 or provident_monthly_payment <= 0:
-        return 0.0
+        return 0.0, 0.0
     pf_balance = max(0.0, starting_pf_balance)
     retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
     pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
     pf_monthly_rate = max(0.0, pf_interest_rate) / 12
     total_cash_relief = 0.0
+    total_offset_payment = 0.0
     for offset in range(1, horizon_months + 1):
         absolute_month = purchase_month + offset
         pf_balance += pf_balance * pf_monthly_rate + monthly_pf_deposit
         if not _is_beijing_pf_offset_month(absolute_month, as_of=as_of):
             continue
         available = max(0.0, pf_balance - retained_balance)
-        if available < provident_monthly_payment:
+        if available <= 0:
             continue
-        cash_relief = min(available, provident_monthly_payment)
-        pf_balance -= cash_relief
-        total_cash_relief += cash_relief
-    return total_cash_relief / max(1, horizon_months)
+        offset_payment = _beijing_pf_loan_offset_target(
+            available_balance=available,
+            agreed_payment=provident_monthly_payment,
+            remaining_loan_balance=max(available, provident_monthly_payment),
+        )
+        if offset_payment <= 0:
+            continue
+        pf_balance -= offset_payment
+        total_cash_relief += min(offset_payment, provident_monthly_payment)
+        total_offset_payment += offset_payment
+    months = max(1, horizon_months)
+    return total_cash_relief / months, total_offset_payment / months
 
 
 def _post_purchase_pf_strategy(
@@ -2013,7 +2355,7 @@ def _post_purchase_pf_strategy(
     # post-purchase options. Prefer loan offset only when it materially improves the
     # household cash-pressure picture; keep deposits in the account when cash flow is
     # already comfortable or there is no provident loan to offset.
-    loan_offset_improvement = _semiannual_loan_offset_monthly_equivalent(
+    loan_offset_improvement, loan_offset_principal_effect = _semiannual_loan_offset_projection(
         purchase_month=purchase_month,
         starting_pf_balance=starting_pf_balance,
         monthly_pf_deposit=monthly_pf_deposit,
@@ -2024,7 +2366,8 @@ def _post_purchase_pf_strategy(
         pressure_ratio = total_monthly_payment / max(1.0, total_monthly_payment + post_purchase_monthly_expense)
         near_cash_tension = free_cash_flow < post_purchase_monthly_expense * 0.25
         material_payment_share = loan_offset_improvement >= max(500.0, total_monthly_payment * 0.08)
-        if free_cash_flow < 0 or (near_cash_tension and material_payment_share) or pressure_ratio > 0.55:
+        material_principal_effect = loan_offset_principal_effect >= max(500.0, provident_monthly_payment * 0.5)
+        if free_cash_flow < 0 or (near_cash_tension and material_payment_share) or pressure_ratio > 0.55 or material_principal_effect:
             return loan_offset_improvement, "loan_offset_semiannual_auto"
 
     if manual_enabled:
@@ -2060,6 +2403,7 @@ def _post_purchase_cash_stress(
     expense_at_month: Callable[[int], float],
     income_at_month: Callable[[int], MonthlyIncomeProfile],
     car_monthly_cash_cost_at: Callable[[int], float],
+    car_down_payment_at: Callable[[int], float] | None = None,
     horizon_months: int = 120,
 ) -> tuple[float, int | None, bool]:
     cash_balance = starting_cash
@@ -2093,15 +2437,19 @@ def _post_purchase_cash_stress(
             retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
             available = max(0.0, pf_balance - retained_balance)
             pf_withdrawal = (
-                min(available, provident_monthly_payment)
-                if _is_beijing_pf_offset_month(absolute_month) and available >= provident_monthly_payment
+                available
+                if _is_beijing_pf_offset_month(absolute_month) and available > 0
                 else 0.0
             )
         else:
             pf_withdrawal = min(pf_balance, monthly_pf_withdrawal)
         pf_balance -= pf_withdrawal
-        monthly_cash_delta = free_cash_flow + pf_withdrawal
-        monthly_cash_delta -= _car_down_payment_at(household.car_plan, car_loan, absolute_month)
+        monthly_cash_delta = free_cash_flow + min(pf_withdrawal, provident_monthly_payment)
+        monthly_cash_delta -= (
+            car_down_payment_at(absolute_month)
+            if car_down_payment_at is not None
+            else _car_down_payment_at(household.car_plan, car_loan, absolute_month)
+        )
         cash_balance += monthly_cash_delta
         if cash_balance < minimum_cash:
             minimum_cash = cash_balance
@@ -2167,15 +2515,40 @@ def build_purchase_plan_analyses(
         for item in tax_summaries
     )
     monthly_pf_net_growth = monthly_pf_deposit - _rent_withdrawal_before_purchase(household)
-    car_purchase_month = car_loan.months_to_down_payment if household.car_plan.enabled and car_loan.enabled else None
-    initial_car_down_payment = _car_down_payment_at(household.car_plan, car_loan, 0)
-    initial_cash = max(0, household.liquid_assets + household.investments - initial_car_down_payment)
+    vehicle_states = _vehicle_loan_states(
+        household.car_plan,
+        scenario=scenario,
+        include_after_home=False,
+    )
+    car_cost_cache: dict[int, float] = {}
+    car_down_payment_cache: dict[int, float] = {}
+
+    def car_monthly_cash_cost_at(month: int) -> float:
+        if month not in car_cost_cache:
+            car_cost_cache[month] = _car_monthly_cash_cost_at(
+                household.car_plan,
+                car_loan,
+                month,
+                vehicle_states=vehicle_states,
+            )
+        return car_cost_cache[month]
+
+    def car_down_payment_at(month: int) -> float:
+        if month not in car_down_payment_cache:
+            car_down_payment_cache[month] = _car_down_payment_at(
+                household.car_plan,
+                car_loan,
+                month,
+                vehicle_states=vehicle_states,
+            )
+        return car_down_payment_cache[month]
+
+    initial_car_down_payment = car_down_payment_at(0)
+    initial_cash = max(0, household.cash_account_balance - initial_car_down_payment)
+    initial_investment = max(0.0, household.investments)
 
     def monthly_pf_net_growth_at(month: int) -> float:
         return income_at_month(month).monthly_pf_deposit - _quarterly_rent_withdrawal_before_purchase_at(household, month)
-
-    def car_monthly_cash_cost_at(month: int) -> float:
-        return _car_monthly_cash_cost_at(household.car_plan, car_loan, month)
 
     def monthly_cash_savings_at(month: int) -> float:
         savings = (
@@ -2186,20 +2559,51 @@ def build_purchase_plan_analyses(
             - car_monthly_cash_cost_at(month)
         )
         if month > 0:
-            savings -= _car_down_payment_at(household.car_plan, car_loan, month)
+            savings -= car_down_payment_at(month)
         return savings
 
     monthly_cash_savings = monthly_cash_savings_at(0)
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
+    sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
     monthly_return = scenario.annual_investment_return / 12
     pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
     pf_monthly_return = max(0.0, pf_interest_rate) / 12
     cash_value_by_month = [initial_cash]
-    pf_value_by_month = [max(0.0, household.provident_fund_balance)]
+    investment_value_by_month = [initial_investment]
+    pf_value_by_month = [max(0.0, _household_initial_provident_balance(household, rules))]
+    investment_enabled = household.investment_plan_name != "cash_only"
     for month_index in range(1, 361):
         monthly_savings = monthly_cash_savings_at(month_index)
-        net_savings = monthly_savings * (1 - buy_fee_rate) if monthly_savings > 0 else monthly_savings
-        cash_value_by_month.append(cash_value_by_month[-1] * (1 + monthly_return) + net_savings)
+        cash_value = cash_value_by_month[-1]
+        investment_value = investment_value_by_month[-1]
+        if investment_enabled:
+            investment_value = max(0.0, investment_value * (1 + monthly_return))
+        reserve_target = max(0.0, expense_at_month(month_index) * household.investment_cash_reserve_months)
+        projected_cash_before_investment = cash_value + monthly_savings
+        if (
+            investment_enabled
+            and household.investment_auto_rebalance
+            and projected_cash_before_investment < reserve_target
+            and investment_value > 0
+        ):
+            liquidity_need = max(0.0, reserve_target - projected_cash_before_investment)
+            gross_sell = min(investment_value, liquidity_need / max(0.01, 1 - sell_fee_rate))
+            cash_value += max(0.0, gross_sell * (1 - sell_fee_rate))
+            investment_value = max(0.0, investment_value - gross_sell)
+        investment_contribution = 0.0
+        if investment_enabled:
+            base_contribution, sweep_contribution = _investment_allocation_for_month(
+                monthly_surplus=monthly_savings,
+                cash_balance=cash_value,
+                reserve_target=reserve_target,
+                household=household,
+            )
+            investment_contribution = base_contribution + sweep_contribution
+        buy_fee = investment_contribution * buy_fee_rate
+        cash_value = max(0.0, cash_value + monthly_savings - investment_contribution)
+        investment_value = max(0.0, investment_value + max(0.0, investment_contribution - buy_fee))
+        cash_value_by_month.append(cash_value)
+        investment_value_by_month.append(investment_value)
         pf_value_by_month.append(
             max(0.0, pf_value_by_month[-1] * (1 + pf_monthly_return) + monthly_pf_net_growth_at(month_index))
         )
@@ -2236,6 +2640,11 @@ def build_purchase_plan_analyses(
         family_pf_upfront_extractable = 0.0
         pf_post_transaction_extractable = 0.0
         pf_extractable = 0.0
+        cash_account_before_purchase = 0.0
+        investment_balance_before_purchase = 0.0
+        investment_sell_gross_at_purchase = 0.0
+        investment_sell_proceeds_at_purchase = 0.0
+        investment_balance_after_purchase = 0.0
         cash_after_transaction = 0.0
         cash_after_purchase = 0.0
         pf_after_extract = 0.0
@@ -2283,7 +2692,7 @@ def build_purchase_plan_analyses(
         def purchase_state_for_mix(
             candidate_month: int,
             mix: tuple[float, float, float, float, float, float, float],
-        ) -> tuple[float, float, float, float, float, float]:
+        ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
             return _purchase_cash_state_at_month(
                 month=candidate_month,
                 upfront_cash_required=mix[6],
@@ -2299,6 +2708,7 @@ def build_purchase_plan_analyses(
                 property_price=price,
                 scenario=scenario,
                 cash_value_by_month=cash_value_by_month,
+                investment_value_by_month=investment_value_by_month,
                 pf_value_by_month=pf_value_by_month,
             )
 
@@ -2333,6 +2743,7 @@ def build_purchase_plan_analyses(
                 expense_at_month=expense_at_month,
                 income_at_month=income_at_month,
                 car_monthly_cash_cost_at=car_monthly_cash_cost_at,
+                car_down_payment_at=car_down_payment_at,
             )
 
         best_failed_result: PurchaseCandidate | None = None
@@ -2353,6 +2764,11 @@ def build_purchase_plan_analyses(
                     candidate_pf_upfront,
                     candidate_family_pf_upfront,
                     candidate_pf_post,
+                    candidate_cash_before_purchase,
+                    candidate_investment_before_purchase,
+                    candidate_investment_sell_gross,
+                    candidate_investment_sell_proceeds,
+                    candidate_investment_after_purchase,
                     candidate_cash_after_transaction,
                     candidate_cash_after_purchase,
                     candidate_pf_after_extract,
@@ -2379,6 +2795,11 @@ def build_purchase_plan_analyses(
                     pf_upfront_extractable=candidate_pf_upfront,
                     family_pf_upfront_extractable=candidate_family_pf_upfront,
                     pf_post_transaction_extractable=candidate_pf_post,
+                    cash_account_before_purchase=candidate_cash_before_purchase,
+                    investment_balance_before_purchase=candidate_investment_before_purchase,
+                    investment_sell_gross_at_purchase=candidate_investment_sell_gross,
+                    investment_sell_proceeds_at_purchase=candidate_investment_sell_proceeds,
+                    investment_balance_after_purchase=candidate_investment_after_purchase,
                     cash_after_transaction=candidate_cash_after_transaction,
                     cash_after_purchase=candidate_cash_after_purchase,
                     pf_after_extract=candidate_pf_after_extract,
@@ -2412,6 +2833,11 @@ def build_purchase_plan_analyses(
             pf_upfront_extractable = candidate_result.pf_upfront_extractable
             family_pf_upfront_extractable = candidate_result.family_pf_upfront_extractable
             pf_post_transaction_extractable = candidate_result.pf_post_transaction_extractable
+            cash_account_before_purchase = candidate_result.cash_account_before_purchase
+            investment_balance_before_purchase = candidate_result.investment_balance_before_purchase
+            investment_sell_gross_at_purchase = candidate_result.investment_sell_gross_at_purchase
+            investment_sell_proceeds_at_purchase = candidate_result.investment_sell_proceeds_at_purchase
+            investment_balance_after_purchase = candidate_result.investment_balance_after_purchase
             cash_after_transaction = candidate_result.cash_after_transaction
             cash_after_purchase = candidate_result.cash_after_purchase
             pf_after_extract = candidate_result.pf_after_extract
@@ -2437,6 +2863,11 @@ def build_purchase_plan_analyses(
                 pf_upfront_extractable = best_failed_result.pf_upfront_extractable
                 family_pf_upfront_extractable = best_failed_result.family_pf_upfront_extractable
                 pf_post_transaction_extractable = best_failed_result.pf_post_transaction_extractable
+                cash_account_before_purchase = best_failed_result.cash_account_before_purchase
+                investment_balance_before_purchase = best_failed_result.investment_balance_before_purchase
+                investment_sell_gross_at_purchase = best_failed_result.investment_sell_gross_at_purchase
+                investment_sell_proceeds_at_purchase = best_failed_result.investment_sell_proceeds_at_purchase
+                investment_balance_after_purchase = best_failed_result.investment_balance_after_purchase
                 cash_after_transaction = best_failed_result.cash_after_transaction
                 cash_after_purchase = best_failed_result.cash_after_purchase
                 pf_after_extract = best_failed_result.pf_after_extract
@@ -2464,6 +2895,11 @@ def build_purchase_plan_analyses(
                     pf_upfront_extractable,
                     family_pf_upfront_extractable,
                     pf_post_transaction_extractable,
+                    cash_account_before_purchase,
+                    investment_balance_before_purchase,
+                    investment_sell_gross_at_purchase,
+                    investment_sell_proceeds_at_purchase,
+                    investment_balance_after_purchase,
                     cash_after_transaction,
                     cash_after_purchase,
                     pf_after_extract,
@@ -2761,6 +3197,13 @@ def build_purchase_plan_analyses(
                 if renovation_saving_months is not None
                 else None,
                 post_purchase_renovation_monthly_saving=round(post_purchase_renovation_monthly_saving, 2),
+                investment_withdrawal_mode=_investment_withdrawal_mode(scenario),  # type: ignore[arg-type]
+                investment_withdrawal_mode_label=_investment_withdrawal_mode_label(_investment_withdrawal_mode(scenario)),
+                cash_account_before_purchase=round(cash_account_before_purchase, 2),
+                investment_balance_before_purchase=round(investment_balance_before_purchase, 2),
+                investment_sell_gross_at_purchase=round(investment_sell_gross_at_purchase, 2),
+                investment_sell_proceeds_at_purchase=round(investment_sell_proceeds_at_purchase, 2),
+                investment_balance_after_purchase=round(investment_balance_after_purchase, 2),
                 cash_after_transaction=round(cash_after_transaction, 2),
                 cash_after_purchase=round(cash_after_purchase, 2),
                 provident_balance_after_extract=round(pf_after_extract, 2),
@@ -2840,26 +3283,55 @@ def build_loan_visualization(
     *,
     base_monthly_debt_payment: float | None = None,
     provident_visualization: list[ProvidentVisualizationPoint] | None = None,
+    vehicle_states: list[VehicleLoanState] | None = None,
 ) -> list[LoanVisualizationPoint]:
-    second_plan = _second_car_plan(household.car_plan)
-    second_loan = calculate_car_loan(second_plan) if second_plan.enabled else None
-    first_car_purchase_month = (
-        car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else household.car_plan.purchase_delay_months
-    ) if household.car_plan.enabled and car_loan.enabled else None
-    second_car_purchase_month = (
-        second_loan.months_to_down_payment if second_loan and second_loan.months_to_down_payment is not None else second_plan.purchase_delay_months
-    ) if second_loan and second_loan.enabled else None
+    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario)
     base_existing_payment = max(0.0, base_monthly_debt_payment if base_monthly_debt_payment is not None else household.monthly_debt_payment)
     provident_offset_by_plan_month = {
         (row.plan_variant, row.month): row.loan_offset_payment
         for row in (provident_visualization or [])
     }
-    visualization_horizon = _visualization_horizon_months(household, purchase_plans, car_loan, second_loan=second_loan)
+    visualization_horizon = _visualization_horizon_months(
+        household,
+        purchase_plans,
+        car_loan,
+        vehicle_states=base_vehicle_states,
+    )
+    existing_loan_by_month: dict[int, tuple[float, float]] = {}
+    for month in range(visualization_horizon + 1):
+        phased_loan_states = [_phased_loan_state_at(loan, month) for loan in household.phased_loans]
+        existing_loan_by_month[month] = (
+            sum(balance for balance, _ in phased_loan_states),
+            base_existing_payment + sum(payment for _, payment in phased_loan_states),
+        )
     rows: list[LoanVisualizationPoint] = []
     for plan in purchase_plans:
         purchase_month = plan.months_to_buy if plan.months_to_buy is not None else 360
         horizon_months = visualization_horizon
+        plan_vehicle_states = (
+            vehicle_states
+            if vehicle_states is not None
+            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy)
+        )
+        cumulative_extra_provident_offset = 0.0
         for month in range(horizon_months + 1):
+            vehicle_balance = 0.0
+            vehicle_payment = 0.0
+            for _, _, vehicle_loan, vehicle_purchase_month in plan_vehicle_states:
+                if vehicle_purchase_month is None or month < vehicle_purchase_month:
+                    continue
+                vehicle_elapsed = max(0, month - vehicle_purchase_month)
+                vehicle_balance += _installment_balance_after_payments(
+                    vehicle_loan.loan_principal,
+                    vehicle_loan.total_months,
+                    vehicle_elapsed,
+                )
+                if 0 < vehicle_elapsed <= vehicle_loan.total_months:
+                    vehicle_payment += (
+                        vehicle_loan.first_phase_monthly_payment
+                        if vehicle_elapsed <= vehicle_loan.interest_free_months
+                        else vehicle_loan.later_phase_monthly_payment
+                    )
             home_elapsed = max(0, month - purchase_month) if plan.months_to_buy is not None and month >= purchase_month else 0
             commercial_balance = (
                 _loan_balance_after_payments(
@@ -2883,49 +3355,17 @@ def build_loan_visualization(
                 if plan.months_to_buy is not None and month >= purchase_month
                 else 0.0
             )
-            first_vehicle_balance = 0.0
-            first_vehicle_payment = 0.0
-            if car_loan.enabled and first_car_purchase_month is not None and month >= first_car_purchase_month:
-                vehicle_elapsed = max(0, month - first_car_purchase_month)
-                first_vehicle_balance = _installment_balance_after_payments(
-                    car_loan.loan_principal,
-                    car_loan.total_months,
-                    vehicle_elapsed,
-                )
-                if 0 < vehicle_elapsed <= car_loan.total_months:
-                    first_vehicle_payment = (
-                        car_loan.first_phase_monthly_payment
-                        if vehicle_elapsed <= car_loan.interest_free_months
-                        else car_loan.later_phase_monthly_payment
-                    )
-            second_vehicle_balance = 0.0
-            second_vehicle_payment = 0.0
-            if second_loan and second_car_purchase_month is not None and month >= second_car_purchase_month:
-                second_elapsed = max(0, month - second_car_purchase_month)
-                second_vehicle_balance = _installment_balance_after_payments(
-                    second_loan.loan_principal,
-                    second_loan.total_months,
-                    second_elapsed,
-                )
-                if 0 < second_elapsed <= second_loan.total_months:
-                    second_vehicle_payment = (
-                        second_loan.first_phase_monthly_payment
-                        if second_elapsed <= second_loan.interest_free_months
-                        else second_loan.later_phase_monthly_payment
-                    )
+            provident_offset_payment = max(0.0, provident_offset_by_plan_month.get((plan.variant, month), 0.0))
+            provident_cash_relief = min(provident_balance, plan.provident_monthly_payment, provident_offset_payment)
+            extra_provident_offset = max(0.0, provident_offset_payment - provident_cash_relief)
+            cumulative_extra_provident_offset += extra_provident_offset
+            provident_balance = max(0.0, provident_balance - cumulative_extra_provident_offset)
             commercial_payment = plan.commercial_monthly_payment if commercial_balance > 0 else 0.0
             provident_payment = plan.provident_monthly_payment if provident_balance > 0 else 0.0
             home_payment = commercial_payment + provident_payment
-            vehicle_payment = first_vehicle_payment + second_vehicle_payment
-            phased_loan_states = [_phased_loan_state_at(loan, month) for loan in household.phased_loans]
-            existing_loan_balance = sum(balance for balance, _ in phased_loan_states)
-            existing_payment = base_existing_payment + sum(payment for _, payment in phased_loan_states)
+            existing_loan_balance, existing_payment = existing_loan_by_month[month]
             total_payment = home_payment + vehicle_payment + existing_payment
-            provident_offset_payment = min(
-                provident_payment,
-                max(0.0, provident_offset_by_plan_month.get((plan.variant, month), 0.0)),
-            )
-            cash_payment = max(0.0, total_payment - provident_offset_payment)
+            cash_payment = max(0.0, total_payment - provident_cash_relief)
             rows.append(
                 LoanVisualizationPoint(
                     plan_variant=plan.variant,
@@ -2933,10 +3373,10 @@ def build_loan_visualization(
                     commercial_loan_balance=round(commercial_balance, 2),
                     provident_loan_balance=round(provident_balance, 2),
                     home_loan_balance=round(commercial_balance + provident_balance, 2),
-                    vehicle_loan_balance=round(first_vehicle_balance + second_vehicle_balance, 2),
+                    vehicle_loan_balance=round(vehicle_balance, 2),
                     existing_loan_balance=round(existing_loan_balance, 2),
                     total_loan_balance=round(
-                        commercial_balance + provident_balance + first_vehicle_balance + second_vehicle_balance + existing_loan_balance,
+                        commercial_balance + provident_balance + vehicle_balance + existing_loan_balance,
                         2,
                     ),
                     commercial_monthly_payment=round(commercial_payment, 2),
@@ -2947,9 +3387,167 @@ def build_loan_visualization(
                     total_monthly_payment=round(total_payment, 2),
                     cash_monthly_payment=round(cash_payment, 2),
                     provident_offset_payment=round(provident_offset_payment, 2),
+                    provident_monthly_payment_relief=round(provident_cash_relief, 2),
                 )
             )
     return rows
+
+
+def _member_income_profiles_at(
+    household: HouseholdData,
+    rules: RulePackData,
+    months_from_now: int,
+    *,
+    as_of: date | None = None,
+) -> list[tuple[int, str, MonthlyIncomeProfile]]:
+    household = _household_with_career_income_stages(household, rules, as_of=as_of)
+    current = as_of or date.today()
+    year, month = _month_after(current, max(0, months_from_now))
+    target_month = date(year, month, 1)
+    return [
+        (index, member.name, _member_monthly_income_profile(member, rules, target_month, household))
+        for index, member in enumerate(household.members)
+    ]
+
+
+def _initial_provident_member_accounts(household: HouseholdData, rules: RulePackData) -> list[dict[str, float | int | str]]:
+    members = household.members
+    if not members:
+        return [
+            {
+                "member_index": 0,
+                "member_name": "家庭公积金账户",
+                "balance": max(0.0, household.provident_fund_balance),
+            }
+        ]
+
+    explicit_balances = [max(0.0, getattr(member, "provident_fund_balance", 0.0)) for member in members]
+    explicit_total = sum(explicit_balances)
+    if explicit_total > 0:
+        balances = explicit_balances
+    else:
+        profiles = _member_income_profiles_at(household, rules, 1)
+        deposit_weights = [max(0.0, profile.monthly_pf_deposit) for _, _, profile in profiles]
+        total_weight = sum(deposit_weights)
+        if total_weight <= 0:
+            deposit_weights = [1.0 for _ in members]
+            total_weight = float(len(members))
+        balances = [
+            max(0.0, household.provident_fund_balance) * weight / total_weight
+            for weight in deposit_weights
+        ]
+
+    return [
+        {
+            "member_index": index,
+            "member_name": member.name,
+            "balance": balances[index] if index < len(balances) else 0.0,
+        }
+        for index, member in enumerate(members)
+    ]
+
+
+def _household_initial_provident_balance(household: HouseholdData, rules: RulePackData) -> float:
+    return sum(float(account["balance"]) for account in _initial_provident_member_accounts(household, rules))
+
+
+def _apply_provident_member_outflow(
+    account_rows: list[dict[str, float | int | str | bool]],
+    amount: float,
+    field: str,
+    *,
+    retained_balance: float = 0.0,
+    priority_member_index: int | None = None,
+) -> float:
+    target = max(0.0, amount)
+    if target <= 0:
+        return 0.0
+    available_by_index = [max(0.0, float(row["balance_end"]) - retained_balance) for row in account_rows]
+    total_available = sum(available_by_index)
+    actual = min(target, total_available)
+    if actual <= 0:
+        return 0.0
+
+    if priority_member_index is not None:
+        remaining = actual
+        ordered_indexes = sorted(
+            range(len(account_rows)),
+            key=lambda index: 0 if int(account_rows[index]["member_index"]) == priority_member_index else 1,
+        )
+        for index in ordered_indexes:
+            account_available = max(0.0, float(account_rows[index]["balance_end"]) - retained_balance)
+            if account_available <= 0:
+                continue
+            outflow = min(account_available, remaining)
+            account_rows[index][field] = float(account_rows[index].get(field, 0.0)) + outflow
+            account_rows[index]["balance_end"] = max(0.0, float(account_rows[index]["balance_end"]) - outflow)
+            remaining -= outflow
+            if remaining <= 0:
+                break
+        return actual - max(0.0, remaining)
+
+    remaining = actual
+    remaining_available = total_available
+    for index, row in enumerate(account_rows):
+        account_available = available_by_index[index]
+        if account_available <= 0:
+            continue
+        share = remaining if index == len(account_rows) - 1 else actual * account_available / total_available
+        outflow = min(account_available, share, remaining)
+        row[field] = float(row.get(field, 0.0)) + outflow
+        row["balance_end"] = max(0.0, float(row["balance_end"]) - outflow)
+        remaining -= outflow
+        remaining_available -= account_available
+        if remaining <= 0:
+            break
+
+    if remaining > 0 and remaining_available > 0:
+        for row in account_rows:
+            account_available = max(0.0, float(row["balance_end"]) - retained_balance)
+            outflow = min(account_available, remaining)
+            row[field] = float(row.get(field, 0.0)) + outflow
+            row["balance_end"] = max(0.0, float(row["balance_end"]) - outflow)
+            remaining -= outflow
+            if remaining <= 0:
+                break
+    return actual - max(0.0, remaining)
+
+
+def _provident_member_points(account_rows: list[dict[str, float | int | str | bool]]) -> list[ProvidentMemberAccountPoint]:
+    points: list[ProvidentMemberAccountPoint] = []
+    for row in account_rows:
+        total_deposit = float(row["personal_deposit"]) + float(row["employer_deposit"])
+        total_inflow = total_deposit + float(row["interest"])
+        total_outflow = (
+            float(row["rent_withdrawal"])
+            + float(row["upfront_withdrawal"])
+            + float(row["post_transaction_withdrawal"])
+            + float(row["agreed_withdrawal"])
+            + float(row["loan_offset_payment"])
+            + float(row["retirement_withdrawal"])
+        )
+        points.append(
+            ProvidentMemberAccountPoint(
+                member_index=int(row["member_index"]),
+                member_name=str(row["member_name"]),
+                balance_start=round(float(row["balance_start"]), 2),
+                personal_deposit=round(float(row["personal_deposit"]), 2),
+                employer_deposit=round(float(row["employer_deposit"]), 2),
+                total_deposit=round(total_deposit, 2),
+                interest=round(float(row["interest"]), 2),
+                rent_withdrawal=round(float(row["rent_withdrawal"]), 2),
+                upfront_withdrawal=round(float(row["upfront_withdrawal"]), 2),
+                post_transaction_withdrawal=round(float(row["post_transaction_withdrawal"]), 2),
+                agreed_withdrawal=round(float(row["agreed_withdrawal"]), 2),
+                loan_offset_payment=round(float(row["loan_offset_payment"]), 2),
+                retirement_withdrawal=round(float(row["retirement_withdrawal"]), 2),
+                account_closed_by_retirement=bool(row["account_closed_by_retirement"]),
+                total_inflow=round(total_inflow, 2),
+                total_outflow=round(total_outflow, 2),
+                balance_end=round(float(row["balance_end"]), 2),
+            )
+        )
+    return points
 
 
 def build_provident_visualization(
@@ -2958,64 +3556,131 @@ def build_provident_visualization(
     rules: RulePackData,
     purchase_plans: list[PurchasePlanAnalysis],
     car_loan: CarLoanSummary,
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
 ) -> list[ProvidentVisualizationPoint]:
-    second_plan = _second_car_plan(household.car_plan)
-    second_loan = calculate_car_loan(second_plan) if second_plan.enabled else None
-    first_car_purchase_month = (
-        car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else household.car_plan.purchase_delay_months
-    ) if household.car_plan.enabled and car_loan.enabled else None
-    second_car_purchase_month = (
-        second_loan.months_to_down_payment if second_loan and second_loan.months_to_down_payment is not None else second_plan.purchase_delay_months
-    ) if second_loan and second_loan.enabled else None
     pf_interest_rate = max(0.0, float(rules.params.get("provident_balance_annual_interest_rate", 0.015))) / 12
     retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
-    visualization_horizon = _visualization_horizon_months(household, purchase_plans, car_loan, second_loan=second_loan)
+    visualization_horizon = _visualization_horizon_months(
+        household,
+        purchase_plans,
+        car_loan,
+        vehicle_states=vehicle_states,
+    )
     rows: list[ProvidentVisualizationPoint] = []
+    monthly_member_income_cache: dict[int, list[tuple[int, str, MonthlyIncomeProfile]]] = {}
+    retirement_months_by_member = _member_retirement_months_by_index(household)
+
+    def member_income_at_month(month: int) -> list[tuple[int, str, MonthlyIncomeProfile]]:
+        if month not in monthly_member_income_cache:
+            monthly_member_income_cache[month] = _member_income_profiles_at(household, rules, month)
+        return monthly_member_income_cache[month]
 
     for plan in purchase_plans:
         purchase_month = plan.months_to_buy if plan.months_to_buy is not None else 360
         horizon_months = visualization_horizon
-        balance = max(0.0, household.provident_fund_balance)
+        account_states = _initial_provident_member_accounts(household, rules)
+        remaining_offsetable_loan = max(0.0, plan.provident_loan_amount)
         for month in range(horizon_months + 1):
-            balance_start = balance
-            income = household_monthly_income_profile_at(household, rules, month)
-            personal_deposit = income.personal_housing_fund if month > 0 else 0.0
-            employer_deposit = income.employer_housing_fund if month > 0 else 0.0
-            total_deposit = personal_deposit + employer_deposit
-            interest = balance * pf_interest_rate if month > 0 else 0.0
-            balance += total_deposit + interest
+            member_profiles = {index: profile for index, _, profile in member_income_at_month(month)}
+            account_rows: list[dict[str, float | int | str | bool]] = []
+            for account in account_states:
+                member_index = int(account["member_index"])
+                profile = member_profiles.get(member_index)
+                retirement_month = retirement_months_by_member.get(member_index, 999999)
+                is_retired_account_month = month >= retirement_month
+                closes_this_month = month == retirement_month
+                balance_start = float(account["balance"])
+                personal_deposit = profile.personal_housing_fund if profile and month > 0 and not is_retired_account_month else 0.0
+                employer_deposit = profile.employer_housing_fund if profile and month > 0 and not is_retired_account_month else 0.0
+                interest = balance_start * pf_interest_rate if month > 0 and not is_retired_account_month else 0.0
+                balance_end = balance_start + personal_deposit + employer_deposit + interest
+                retirement_withdrawal = balance_end if closes_this_month and balance_end > 0 else 0.0
+                if retirement_withdrawal:
+                    balance_end = 0.0
+                account_rows.append(
+                    {
+                        "member_index": member_index,
+                        "member_name": account["member_name"],
+                        "balance_start": balance_start,
+                        "personal_deposit": personal_deposit,
+                        "employer_deposit": employer_deposit,
+                        "interest": interest,
+                        "rent_withdrawal": 0.0,
+                        "upfront_withdrawal": 0.0,
+                        "post_transaction_withdrawal": 0.0,
+                        "agreed_withdrawal": 0.0,
+                        "loan_offset_payment": 0.0,
+                        "retirement_withdrawal": retirement_withdrawal,
+                        "account_closed_by_retirement": is_retired_account_month,
+                        "balance_end": balance_end,
+                    }
+                )
 
             rent_withdrawal = 0.0
             upfront_withdrawal = 0.0
             post_transaction_withdrawal = 0.0
             agreed_withdrawal = 0.0
             loan_offset_payment = 0.0
+            retirement_withdrawal = sum(float(row["retirement_withdrawal"]) for row in account_rows)
 
             is_purchase_month = plan.months_to_buy is not None and month == purchase_month
             is_after_purchase = plan.months_to_buy is not None and month > purchase_month
             if month > 0 and not is_purchase_month and not is_after_purchase:
-                rent_withdrawal = min(balance, _quarterly_rent_withdrawal_before_purchase_at(household, month))
-                balance -= rent_withdrawal
+                rent_withdrawal = _apply_provident_member_outflow(
+                    account_rows,
+                    _quarterly_rent_withdrawal_before_purchase_at(household, month),
+                    "rent_withdrawal",
+                )
 
             if is_purchase_month:
-                upfront_withdrawal = min(balance, plan.provident_upfront_extractable)
-                balance -= upfront_withdrawal
-                post_transaction_withdrawal = min(balance, plan.provident_post_transaction_extractable)
-                balance -= post_transaction_withdrawal
+                upfront_withdrawal = _apply_provident_member_outflow(
+                    account_rows,
+                    plan.provident_upfront_extractable,
+                    "upfront_withdrawal",
+                )
+                post_transaction_withdrawal = _apply_provident_member_outflow(
+                    account_rows,
+                    plan.provident_post_transaction_extractable,
+                    "post_transaction_withdrawal",
+                )
             elif is_after_purchase:
                 strategy = plan.post_purchase_pf_strategy or ""
                 if "loan_offset" in strategy:
-                    available = max(0.0, balance - retained_balance)
+                    available = sum(max(0.0, float(row["balance_end"]) - retained_balance) for row in account_rows)
                     loan_offset_payment = (
-                        min(available, plan.provident_monthly_payment)
-                        if _is_beijing_pf_offset_month(month) and available >= plan.provident_monthly_payment
+                        _beijing_pf_loan_offset_target(
+                            available_balance=available,
+                            agreed_payment=plan.provident_monthly_payment,
+                            remaining_loan_balance=remaining_offsetable_loan,
+                        )
+                        if _is_beijing_pf_offset_month(month) and available > 0
                         else 0.0
                     )
-                    balance -= loan_offset_payment
+                    loan_offset_payment = _apply_provident_member_outflow(
+                        account_rows,
+                        loan_offset_payment,
+                        "loan_offset_payment",
+                        retained_balance=retained_balance,
+                        priority_member_index=household.borrower_member_index,
+                    )
+                    remaining_offsetable_loan = max(0.0, remaining_offsetable_loan - loan_offset_payment)
                 elif "purchase_agreed" in strategy:
-                    agreed_withdrawal = min(balance, plan.monthly_post_purchase_pf_withdrawal)
-                    balance -= agreed_withdrawal
+                    agreed_withdrawal = _apply_provident_member_outflow(
+                        account_rows,
+                        plan.monthly_post_purchase_pf_withdrawal,
+                        "agreed_withdrawal",
+                    )
 
+            for index, account in enumerate(account_states):
+                account["balance"] = float(account_rows[index]["balance_end"])
+
+            member_accounts = _provident_member_points(account_rows)
+            balance_start = sum(item.balance_start for item in member_accounts)
+            personal_deposit = sum(item.personal_deposit for item in member_accounts)
+            employer_deposit = sum(item.employer_deposit for item in member_accounts)
+            total_deposit = sum(item.total_deposit for item in member_accounts)
+            interest = sum(item.interest for item in member_accounts)
             total_inflow = total_deposit + interest
             total_outflow = (
                 rent_withdrawal
@@ -3023,7 +3688,9 @@ def build_provident_visualization(
                 + post_transaction_withdrawal
                 + agreed_withdrawal
                 + loan_offset_payment
+                + retirement_withdrawal
             )
+            balance_end = sum(item.balance_end for item in member_accounts)
             rows.append(
                 ProvidentVisualizationPoint(
                     plan_variant=plan.variant,
@@ -3038,10 +3705,12 @@ def build_provident_visualization(
                     post_transaction_withdrawal=round(post_transaction_withdrawal, 2),
                     agreed_withdrawal=round(agreed_withdrawal, 2),
                     loan_offset_payment=round(loan_offset_payment, 2),
+                    retirement_withdrawal=round(retirement_withdrawal, 2),
                     total_inflow=round(total_inflow, 2),
                     total_outflow=round(total_outflow, 2),
-                    balance_end=round(max(0.0, balance), 2),
+                    balance_end=round(max(0.0, balance_end), 2),
                     strategy_label=plan.post_purchase_pf_strategy_label,
+                    member_accounts=member_accounts,
                 )
             )
     return rows
@@ -3100,16 +3769,16 @@ def build_monthly_cashflow_visualization(
     car_loan: CarLoanSummary,
     loan_visualization: list[LoanVisualizationPoint],
     provident_visualization: list[ProvidentVisualizationPoint],
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
 ) -> tuple[list[MonthlyCashflowPoint], list[AccountSnapshotPoint], list[MonthlyLedgerEntry]]:
-    second_plan = _second_car_plan(household.car_plan)
-    second_loan = calculate_car_loan(second_plan) if second_plan.enabled else None
-    first_car_purchase_month = (
-        car_loan.months_to_down_payment if car_loan.months_to_down_payment is not None else household.car_plan.purchase_delay_months
-    ) if household.car_plan.enabled and car_loan.enabled else None
-    second_car_purchase_month = (
-        second_loan.months_to_down_payment if second_loan and second_loan.months_to_down_payment is not None else second_plan.purchase_delay_months
-    ) if second_loan and second_loan.enabled else None
-    horizon = _visualization_horizon_months(household, purchase_plans, car_loan, second_loan=second_loan)
+    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario)
+    horizon = _visualization_horizon_months(
+        household,
+        purchase_plans,
+        car_loan,
+        vehicle_states=base_vehicle_states,
+    )
     loan_by_plan_month = {(row.plan_variant, row.month): row for row in loan_visualization}
     provident_by_plan_month = {(row.plan_variant, row.month): row for row in provident_visualization}
     monthly_return = scenario.annual_investment_return / 12
@@ -3121,9 +3790,82 @@ def build_monthly_cashflow_visualization(
     rows: list[MonthlyCashflowPoint] = []
     snapshots: list[AccountSnapshotPoint] = []
     ledger: list[MonthlyLedgerEntry] = []
+    initial_provident_balance = _household_initial_provident_balance(household, rules)
+    monthly_income_cache: dict[int, MonthlyIncomeProfile] = {}
+    monthly_expense_cache: dict[int, float] = {}
+
+    def income_at_month(month: int) -> MonthlyIncomeProfile:
+        if month not in monthly_income_cache:
+            monthly_income_cache[month] = household_monthly_income_profile_at(household, rules, month)
+        return monthly_income_cache[month]
+
+    def expense_at_month(month: int) -> float:
+        if month not in monthly_expense_cache:
+            monthly_expense_cache[month] = monthly_household_expense_at(household, month)
+        return monthly_expense_cache[month]
 
     for plan in purchase_plans:
-        cash_balance = max(0.0, household.liquid_assets)
+        plan_vehicle_states = (
+            vehicle_states
+            if vehicle_states is not None
+            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy)
+        )
+        first_car_purchase_month = min(
+            (purchase_month for _, _, _, purchase_month in plan_vehicle_states if purchase_month is not None),
+            default=None,
+        )
+        vehicle_monthly_cache: dict[int, VehicleMonthProjection] = {}
+
+        def vehicle_projection_at(month: int) -> VehicleMonthProjection:
+            if month not in vehicle_monthly_cache:
+                vehicle_total = _car_monthly_cash_cost_at(
+                    household.car_plan,
+                    car_loan,
+                    month,
+                    vehicle_states=plan_vehicle_states,
+                )
+                components_by_index = {
+                    vehicle_index: _vehicle_cash_components_at(vehicle_loan, vehicle_plan, month, vehicle_purchase_month)
+                    for vehicle_index, vehicle_plan, vehicle_loan, vehicle_purchase_month in plan_vehicle_states
+                }
+                first_down, second_down = _car_down_payment_components_at(
+                    household.car_plan,
+                    car_loan,
+                    month,
+                    vehicle_states=plan_vehicle_states,
+                )
+                first_asset = 0.0
+                second_asset = 0.0
+                for vehicle_index, vehicle_plan, vehicle_loan, vehicle_purchase_month in plan_vehicle_states:
+                    asset_value = _vehicle_asset_value_at(
+                        vehicle_loan.total_price if vehicle_loan.enabled else 0.0,
+                        vehicle_plan.depreciation_years,
+                        vehicle_purchase_month,
+                        month,
+                    )
+                    if vehicle_index == 0:
+                        first_asset += asset_value
+                    else:
+                        second_asset += asset_value
+                no_car_commute = (
+                    _no_car_commute_cost(household.car_plan)
+                    if vehicle_total > 0 and first_car_purchase_month is not None and month < first_car_purchase_month
+                    else 0.0
+                )
+                vehicle_monthly_cache[month] = VehicleMonthProjection(
+                    total_cash_cost=vehicle_total,
+                    first_down_payment=first_down,
+                    extra_down_payment=second_down,
+                    total_down_payment=first_down + second_down,
+                    no_car_commute_cost=no_car_commute,
+                    components_by_index=components_by_index,
+                    first_asset_value=first_asset,
+                    extra_asset_value=second_asset,
+                    total_asset_value=first_asset + second_asset,
+                )
+            return vehicle_monthly_cache[month]
+
+        cash_balance = max(0.0, household.cash_account_balance)
         investment_balance = max(0.0, household.investments)
         purchase_month = plan.months_to_buy if plan.months_to_buy is not None else 999999
         for month in range(0, horizon + 1):
@@ -3167,55 +3909,54 @@ def build_monthly_cashflow_visualization(
 
             provident_point = provident_by_plan_month.get((plan.variant, month))
             loan_point = loan_by_plan_month.get((plan.variant, month))
-            provident_balance = provident_point.balance_end if provident_point else max(0.0, household.provident_fund_balance)
+            provident_balance = provident_point.balance_end if provident_point else max(0.0, initial_provident_balance)
             provident_deposit = provident_point.total_deposit if provident_point else 0.0
             provident_cash_receipt = (
                 provident_point.rent_withdrawal
                 + provident_point.post_transaction_withdrawal
                 + provident_point.agreed_withdrawal
+                + provident_point.retirement_withdrawal
                 if provident_point
                 else 0.0
             )
             provident_house_offset_payment = provident_point.loan_offset_payment if provident_point else 0.0
+            provident_house_payment_relief = 0.0
+
+            if month == 0 and provident_cash_receipt:
+                cash_balance = max(0.0, cash_balance + provident_cash_receipt)
 
             if month > 0:
-                profile = household_monthly_income_profile_at(household, rules, month)
+                profile = income_at_month(month)
                 cash_income = profile.net_income
-                total_expense = monthly_household_expense_at(household, month)
+                total_expense = expense_at_month(month)
                 investment_reserve_target = max(0.0, total_expense * household.investment_cash_reserve_months)
                 living_expense = household.monthly_expense
                 scheduled_expense = max(0.0, total_expense - household.monthly_expense)
                 regular_debt_payment = base_regular_debt_payment
                 debt_payment = loan_point.existing_monthly_payment if loan_point else regular_debt_payment
                 phased_loan_payment = max(0.0, debt_payment - regular_debt_payment)
-                vehicle_total = _car_monthly_cash_cost_at(household.car_plan, car_loan, month)
+                vehicle_projection = vehicle_projection_at(month)
+                vehicle_total = vehicle_projection.total_cash_cost
                 loan_vehicle_payment = loan_point.vehicle_monthly_payment if loan_point else 0.0
                 vehicle_payment = min(vehicle_total, loan_vehicle_payment)
                 vehicle_operating_cost = max(0.0, vehicle_total - vehicle_payment)
-                first_components = _vehicle_cash_components_at(car_loan, household.car_plan, month, first_car_purchase_month)
-                second_components = (
-                    _vehicle_cash_components_at(second_loan, second_plan, month, second_car_purchase_month)
-                    if second_loan
-                    else {"payment": 0.0, "energy": 0.0, "insurance": 0.0, "maintenance": 0.0, "parking": 0.0}
-                )
-                first_vehicle_payment = first_components["payment"]
-                second_vehicle_payment = second_components["payment"]
-                first_vehicle_energy_cost = first_components["energy"]
-                first_vehicle_insurance_cost = first_components["insurance"]
-                first_vehicle_maintenance_cost = first_components["maintenance"]
-                first_vehicle_parking_cost = first_components["parking"]
-                second_vehicle_energy_cost = second_components["energy"]
-                second_vehicle_insurance_cost = second_components["insurance"]
-                second_vehicle_maintenance_cost = second_components["maintenance"]
-                second_vehicle_parking_cost = second_components["parking"]
-                if vehicle_total > 0 and first_car_purchase_month is not None and month < first_car_purchase_month:
-                    no_car_commute_cost = _no_car_commute_cost(household.car_plan)
-                first_vehicle_down_payment, second_vehicle_down_payment = _car_down_payment_components_at(
-                    household.car_plan,
-                    car_loan,
-                    month,
-                )
-                vehicle_down_payment = first_vehicle_down_payment + second_vehicle_down_payment
+                for vehicle_index, components in vehicle_projection.components_by_index.items():
+                    if vehicle_index == 0:
+                        first_vehicle_payment += components["payment"]
+                        first_vehicle_energy_cost += components["energy"]
+                        first_vehicle_insurance_cost += components["insurance"]
+                        first_vehicle_maintenance_cost += components["maintenance"]
+                        first_vehicle_parking_cost += components["parking"]
+                    else:
+                        second_vehicle_payment += components["payment"]
+                        second_vehicle_energy_cost += components["energy"]
+                        second_vehicle_insurance_cost += components["insurance"]
+                        second_vehicle_maintenance_cost += components["maintenance"]
+                        second_vehicle_parking_cost += components["parking"]
+                no_car_commute_cost = vehicle_projection.no_car_commute_cost
+                first_vehicle_down_payment = vehicle_projection.first_down_payment
+                second_vehicle_down_payment = vehicle_projection.extra_down_payment
+                vehicle_down_payment = vehicle_projection.total_down_payment
                 if vehicle_down_payment:
                     transaction_cash_out += vehicle_down_payment
                     entries.append(
@@ -3232,20 +3973,36 @@ def build_monthly_cashflow_visualization(
 
                 if month == purchase_month:
                     phase = "交易月"
-                    investment_sell_fee = investment_balance * sell_fee_rate if investment_enabled else 0.0
-                    investment_sell_proceeds = max(0.0, investment_balance - investment_sell_fee)
+                    monthly_surplus = (
+                        cash_income
+                        - total_expense
+                        - debt_payment
+                        - vehicle_total
+                        + provident_cash_receipt
+                    )
+                    investment_return = investment_balance * monthly_return if investment_enabled else 0.0
+                    if investment_return:
+                        investment_balance = max(0.0, investment_balance + investment_return)
+                    withdrawal = _investment_withdrawal_at_purchase(
+                        scenario=scenario,
+                        cash_before_transaction=cash_balance + monthly_surplus,
+                        investment_before_transaction=investment_balance,
+                        required_cash_after_pf=plan.required_cash_after_pf_extract,
+                        required_liquidity_reserve=plan.required_liquidity_reserve,
+                        sell_fee_rate=sell_fee_rate,
+                        investment_enabled=investment_enabled,
+                    )
+                    investment_sell_fee = withdrawal.sell_fee
+                    investment_sell_proceeds = withdrawal.sell_proceeds
                     investment_fee += investment_sell_fee
-                    transaction_cash_in += investment_sell_proceeds + plan.provident_post_transaction_extractable
+                    transaction_cash_in += investment_sell_proceeds
                     transaction_cash_out += plan.required_cash_after_pf_extract
                     cash_balance = max(
                         0.0,
-                        cash_balance
-                        + investment_sell_proceeds
-                        - plan.required_cash_after_pf_extract
-                        + plan.provident_post_transaction_extractable
+                        withdrawal.cash_after_transaction
                         - vehicle_down_payment,
                     )
-                    investment_balance = 0.0
+                    investment_balance = max(0.0, withdrawal.investment_after_transaction)
                     entries.extend(
                         [
                             _ledger_entry(
@@ -3272,7 +4029,17 @@ def build_monthly_cashflow_visualization(
                     if month > purchase_month:
                         phase = "购房后"
                         house_contract_payment = loan_point.home_monthly_payment if loan_point else plan.total_monthly_payment
-                        house_payment = max(0.0, house_contract_payment - provident_house_offset_payment)
+                        commercial_house_payment = loan_point.commercial_monthly_payment if loan_point else plan.commercial_monthly_payment
+                        provident_house_contract_payment = loan_point.provident_monthly_payment if loan_point else plan.provident_monthly_payment
+                        provident_current_payment_relief = min(
+                            provident_house_contract_payment,
+                            provident_house_offset_payment,
+                        )
+                        provident_house_payment_relief = provident_current_payment_relief
+                        house_payment = commercial_house_payment + max(
+                            0.0,
+                            provident_house_contract_payment - provident_current_payment_relief,
+                        )
                     monthly_surplus = (
                         cash_income
                         - total_expense
@@ -3283,6 +4050,27 @@ def build_monthly_cashflow_visualization(
                     )
                     investable_surplus = monthly_surplus - vehicle_down_payment
                     investment_return = investment_balance * monthly_return if investment_enabled else 0.0
+                    if investment_return:
+                        investment_balance = max(0.0, investment_balance + investment_return)
+                    projected_cash_before_investment = cash_balance + investable_surplus
+                    liquidity_sell_proceeds = 0.0
+                    if (
+                        investment_enabled
+                        and household.investment_auto_rebalance
+                        and projected_cash_before_investment < investment_reserve_target
+                        and investment_balance > 0
+                    ):
+                        liquidity_need = max(0.0, investment_reserve_target - projected_cash_before_investment)
+                        gross_sell = min(
+                            investment_balance,
+                            liquidity_need / max(0.01, 1 - sell_fee_rate),
+                        )
+                        investment_sell_fee = gross_sell * sell_fee_rate
+                        liquidity_sell_proceeds = max(0.0, gross_sell - investment_sell_fee)
+                        investment_sell_proceeds += liquidity_sell_proceeds
+                        investment_fee += investment_sell_fee
+                        investment_balance = max(0.0, investment_balance - gross_sell)
+                        cash_balance += liquidity_sell_proceeds
                     if investment_enabled:
                         investment_contribution_base, investment_contribution_cash_sweep = _investment_allocation_for_month(
                             monthly_surplus=investable_surplus,
@@ -3294,10 +4082,10 @@ def build_monthly_cashflow_visualization(
                         investment_contribution_base + investment_contribution_cash_sweep
                     )
                     investment_buy_fee = investment_contribution * buy_fee_rate
-                    investment_fee = investment_buy_fee
-                    net_investment = max(0.0, investment_contribution - investment_fee)
+                    investment_fee += investment_buy_fee
+                    net_investment = max(0.0, investment_contribution - investment_buy_fee)
                     cash_balance = max(0.0, cash_balance + monthly_surplus - investment_contribution - vehicle_down_payment)
-                    investment_balance = max(0.0, investment_balance + net_investment + investment_return)
+                    investment_balance = max(0.0, investment_balance + net_investment)
                     if cash_income:
                         entries.append(
                             _ledger_entry(
@@ -3334,28 +4122,46 @@ def build_monthly_cashflow_visualization(
                                 direction="transfer",
                             )
                         )
+                    if liquidity_sell_proceeds:
+                        entries.append(
+                            _ledger_entry(
+                                plan_variant=plan.variant,
+                                month=month,
+                                account="investment",
+                                category="liquidity_redemption",
+                                label="现金安全垫赎回",
+                                amount=liquidity_sell_proceeds,
+                                direction="transfer",
+                            )
+                        )
+
+            if provident_cash_receipt:
+                entries.append(
+                    _ledger_entry(
+                        plan_variant=plan.variant,
+                        month=month,
+                        account="cash",
+                        category="provident_withdrawal",
+                        label="公积金提取现金到账",
+                        amount=provident_cash_receipt,
+                        direction="inflow",
+                    )
+                )
 
             property_asset_value = scenario.total_price if month >= purchase_month else 0.0
-            first_vehicle_asset_value = _vehicle_asset_value_at(
-                car_loan.total_price if car_loan.enabled else 0.0,
-                household.car_plan.depreciation_years,
-                first_car_purchase_month,
-                month,
-            )
-            second_vehicle_asset_value = _vehicle_asset_value_at(
-                second_loan.total_price if second_loan and second_loan.enabled else 0.0,
-                second_plan.depreciation_years,
-                second_car_purchase_month,
-                month,
-            )
-            vehicle_asset_value = first_vehicle_asset_value + second_vehicle_asset_value
+            vehicle_projection = vehicle_projection_at(month)
+            first_vehicle_asset_value = vehicle_projection.first_asset_value
+            second_vehicle_asset_value = vehicle_projection.extra_asset_value
+            vehicle_asset_value = vehicle_projection.total_asset_value
             fixed_asset_value = property_asset_value + vehicle_asset_value
             total_loan_balance = loan_point.total_loan_balance if loan_point else 0.0
+            liquid_asset_value = cash_balance + investment_balance
             total_asset_value = cash_balance + investment_balance + provident_balance + fixed_asset_value
             net_worth = total_asset_value - total_loan_balance
             monthly_cash_delta = (
                 cash_income
                 + provident_cash_receipt
+                + (investment_sell_proceeds if month != purchase_month else 0.0)
                 + transaction_cash_in
                 - living_expense
                 - scheduled_expense
@@ -3373,6 +4179,7 @@ def build_monthly_cashflow_visualization(
                     month=month,
                     cash_balance=round(cash_balance, 2),
                     investment_balance=round(investment_balance, 2),
+                    liquid_asset_value=round(liquid_asset_value, 2),
                     provident_balance=round(provident_balance, 2),
                     fixed_asset_value=round(fixed_asset_value, 2),
                     total_asset_value=round(total_asset_value, 2),
@@ -3388,6 +4195,7 @@ def build_monthly_cashflow_visualization(
                     house_payment=round(house_payment, 2),
                     house_contract_payment=round(house_contract_payment, 2),
                     provident_house_offset_payment=round(provident_house_offset_payment, 2),
+                    provident_house_payment_relief=round(provident_house_payment_relief, 2),
                     vehicle_payment=round(vehicle_payment, 2),
                     first_vehicle_payment=round(first_vehicle_payment, 2),
                     second_vehicle_payment=round(second_vehicle_payment, 2),
@@ -3430,6 +4238,7 @@ def build_monthly_cashflow_visualization(
                     month=month,
                     cash_balance=round(cash_balance, 2),
                     investment_balance=round(investment_balance, 2),
+                    liquid_asset_value=round(liquid_asset_value, 2),
                     provident_balance=round(provident_balance, 2),
                     property_asset_value=round(property_asset_value, 2),
                     vehicle_asset_value=round(vehicle_asset_value, 2),
@@ -3474,6 +4283,13 @@ def build_account_concepts() -> list[AccountConceptSummary]:
             managed_by="backend",
         ),
         AccountConceptSummary(
+            code="liquid_asset_account",
+            name="流动资产",
+            category="account",
+            description="现金账户和投资账户的合计，用于观察可较快动用的资产规模；不包含公积金账户、固定资产和贷款。",
+            managed_by="backend",
+        ),
+        AccountConceptSummary(
             code="provident_account",
             name="公积金账户",
             category="provident",
@@ -3492,6 +4308,13 @@ def build_account_concepts() -> list[AccountConceptSummary]:
             name="贷款账户",
             category="loan",
             description="统一管理商业房贷、公积金贷款、车贷和阶段性既有贷款余额及月供；前端只展示后端返回的逐月余额和还款现金流。",
+            managed_by="backend",
+        ),
+        AccountConceptSummary(
+            code="net_worth",
+            name="净资产",
+            category="account",
+            description="总资产扣除贷款余额后的家庭净值。账户余额、固定资产估值和贷款余额本身不会为负，但净资产可能因为负债高于资产而为负。",
             managed_by="backend",
         ),
         AccountConceptSummary(
@@ -3687,16 +4510,20 @@ def _vehicle_events_for_plan(
 def build_plan_events(
     household: HouseholdData,
     scenario: ScenarioData,
+    rules: RulePackData,
     purchase_plans: list[PurchasePlanAnalysis],
     car_loan: CarLoanSummary,
     monthly_cashflow: list[MonthlyCashflowPoint],
 ) -> list[PlanEventPoint]:
     current_month = date(date.today().year, date.today().month, 1)
     monthly_by_plan_month = {(row.plan_variant, row.month): row for row in monthly_cashflow}
-    second_plan = _second_car_plan(household.car_plan)
-    second_loan = calculate_car_loan(second_plan) if second_plan.enabled else None
     events: list[PlanEventPoint] = []
     for plan in purchase_plans:
+        vehicle_states = _vehicle_loan_states(
+            household.car_plan,
+            scenario=scenario,
+            home_purchase_month=plan.months_to_buy,
+        )
         _append_event(
             events,
             plan_variant=plan.variant,
@@ -3704,8 +4531,8 @@ def build_plan_events(
             category="account",
             title="当前账户快照",
             detail=(
-                f"现金账户 {_money_text(household.liquid_assets)}，投资账户 {_money_text(household.investments)}，"
-                f"公积金账户 {_money_text(household.provident_fund_balance)}。这些余额后续由后端账户引擎逐月推演。"
+                f"现金账户 {_money_text(household.cash_account_balance)}，投资账户 {_money_text(household.investments)}，"
+                f"公积金账户 {_money_text(_household_initial_provident_balance(household, rules))}。这些余额后续由后端账户引擎逐月推演。"
             ),
         )
         _append_event(
@@ -3719,7 +4546,7 @@ def build_plan_events(
                 "现金不足时减少或暂停定投，现金超额时按滚动节奏转入投资账户，投资收益留在投资账户复利。"
             ),
         )
-        if not household.car_plan.enabled:
+        if not vehicle_states:
             _append_event(
                 events,
                 plan_variant=plan.variant,
@@ -3729,21 +4556,14 @@ def build_plan_events(
                 detail=f"当前不规划购车，通勤按无车成本 {_money_text(household.car_plan.no_car_monthly_commute_cost)}/月计入现金流。",
             )
         else:
-            _vehicle_events_for_plan(
-                events,
-                plan_variant=plan.variant,
-                title_prefix="车辆",
-                car_plan=household.car_plan,
-                car_loan=car_loan,
-            )
-        if second_plan.enabled and second_loan:
-            _vehicle_events_for_plan(
-                events,
-                plan_variant=plan.variant,
-                title_prefix="第二辆车",
-                car_plan=second_plan,
-                car_loan=second_loan,
-            )
+            for vehicle_index, vehicle_plan, vehicle_loan, _ in vehicle_states:
+                _vehicle_events_for_plan(
+                    events,
+                    plan_variant=plan.variant,
+                    title_prefix="车辆" if len(vehicle_states) == 1 else vehicle_plan.name or f"车辆 {vehicle_index + 1}",
+                    car_plan=vehicle_plan,
+                    car_loan=vehicle_loan,
+                )
 
         for member in household.members:
             for stage in member.income_stages:
@@ -3918,6 +4738,49 @@ def evaluate_eligibility(household: HouseholdData, rules: RulePackData) -> tuple
     return has_local_qualification and within_home_count, notes
 
 
+def _property_goal_for_scenario(household: HouseholdData, scenario: ScenarioData) -> tuple[int, str]:
+    enabled_goals = [goal for goal in household.property_goals if goal.enabled]
+    if not enabled_goals:
+        return max(1, scenario.purchase_sequence), scenario.name
+    matched = [
+        goal for goal in enabled_goals
+        if goal.scenario_id and goal.scenario_id == scenario.name
+    ] or [
+        goal for goal in enabled_goals
+        if not goal.scenario_id and (goal.name == scenario.name or len(enabled_goals) == 1)
+    ]
+    if not matched:
+        return 1, ""
+    goal = sorted(matched, key=lambda item: item.priority)[0]
+    return max(1, goal.priority), goal.name
+
+
+def _household_with_property_goal(household: HouseholdData, scenario: ScenarioData) -> tuple[HouseholdData, str]:
+    priority, goal_name = _property_goal_for_scenario(household, scenario)
+    if scenario.purchase_planning_mode == "parallel":
+        label = goal_name or f"第 {priority} 套购房需求"
+        note = (
+            f"已按「{label}」作为可并行考虑的第 {priority} 套购房目标处理：策略生成不默认等待前一套成交，"
+            "但仍会使用当前既有住房、既有房贷和规则包资格条件测算。"
+        )
+        return household, note
+    prior_purchase_count = max(0, priority - 1)
+    if prior_purchase_count <= 0:
+        return household, ""
+    adjusted = household.model_copy(
+        update={
+            "existing_home_count": min(10, household.existing_home_count + prior_purchase_count),
+            "existing_mortgage_count": min(10, household.existing_mortgage_count + prior_purchase_count),
+        }
+    )
+    label = goal_name or f"第 {priority} 套购房需求"
+    note = (
+        f"已按「{label}」作为第 {priority} 套购房目标处理：策略生成时把前置 {prior_purchase_count} 套购房需求"
+        "计入既有住房和既有房贷口径，首付比例、公积金资格和贷款压力按更保守口径测算。"
+    )
+    return adjusted, note
+
+
 def calculate_affordability(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -3944,97 +4807,171 @@ def calculate_affordability(
     )
     current_monthly_expense = monthly_household_expense_at(cashflow_household)
     current_income_profile = household_monthly_income_profile_at(cashflow_household, rules, 0)
-    car_loan = calculate_car_loan(
+    has_purchase_target = bool(scenario.enabled and scenario.total_price > 0)
+    strategy_household, property_goal_assumption = _household_with_property_goal(cashflow_household, scenario)
+    car_loan = _aggregate_car_loan(
         cashflow_household.car_plan,
-        initial_cash=cashflow_household.liquid_assets + cashflow_household.investments,
+        initial_cash=cashflow_household.cash_account_balance + cashflow_household.investments,
         monthly_cash_savings_before_car=max(
             0,
             current_income_profile.net_income - current_monthly_expense - cashflow_household.monthly_debt_payment,
         ),
     )
+    purchase_strategy_car_loan = _aggregate_car_loan(
+        cashflow_household.car_plan,
+        initial_cash=cashflow_household.cash_account_balance + cashflow_household.investments,
+        monthly_cash_savings_before_car=max(
+            0,
+            current_income_profile.net_income - current_monthly_expense - cashflow_household.monthly_debt_payment,
+        ),
+        scenario=scenario,
+        include_after_home=False,
+    )
+    pre_home_vehicle_states = _vehicle_loan_states(
+        cashflow_household.car_plan,
+        scenario=scenario,
+        include_after_home=False,
+    )
+    vehicle_states = _vehicle_loan_states(cashflow_household.car_plan, scenario=scenario)
     car_plan_analyses = build_car_plan_analyses(
         cashflow_household,
         net_monthly_income=net_monthly_income,
     )
 
-    eligible, eligibility_notes = evaluate_eligibility(cashflow_household, rules)
-    minimum_down_payment = scenario.total_price * min_down_payment_ratio
-    stated_down_payment = max(scenario.down_payment_amount, minimum_down_payment)
-    deed_tax = scenario.total_price * scenario.deed_tax_rate
-    broker_fee = scenario.total_price * scenario.broker_fee_rate
+    eligible, eligibility_notes = (
+        evaluate_eligibility(strategy_household, rules)
+        if has_purchase_target
+        else (True, ["当前未启用购房目标，购房资格和贷款策略暂不进入基线测算。"])
+    )
+    minimum_down_payment = scenario.total_price * min_down_payment_ratio if has_purchase_target else 0.0
+    stated_down_payment = max(scenario.down_payment_amount, minimum_down_payment) if has_purchase_target else 0.0
+    deed_tax = scenario.total_price * scenario.deed_tax_rate if has_purchase_target else 0.0
+    broker_fee = scenario.total_price * scenario.broker_fee_rate if has_purchase_target else 0.0
     upfront_renovation_cost = (
-        scenario.renovation_cost if scenario.renovation_funding_mode == "upfront_cash" else 0
+        scenario.renovation_cost if has_purchase_target and scenario.renovation_funding_mode == "upfront_cash" else 0
     )
-    taxes_and_fees = deed_tax + broker_fee + scenario.moving_and_misc_cost + upfront_renovation_cost
-    purchase_plan_analyses = build_purchase_plan_analyses(
-        cashflow_household,
-        scenario,
-        rules,
-        tax_summaries=tax_summaries,
-        net_monthly_income=net_monthly_income,
-        car_loan=car_loan,
-        taxes_and_fees=taxes_and_fees,
+    taxes_and_fees = deed_tax + broker_fee + (scenario.moving_and_misc_cost if has_purchase_target else 0) + upfront_renovation_cost
+    if stress_name is None and has_purchase_target:
+        purchase_plan_analyses = build_purchase_plan_analyses(
+            strategy_household,
+            scenario,
+            rules,
+            tax_summaries=tax_summaries,
+            net_monthly_income=net_monthly_income,
+            car_loan=purchase_strategy_car_loan,
+            taxes_and_fees=taxes_and_fees,
+        )
+        if parallel_workers > 1:
+            with ThreadPoolExecutor(max_workers=min(2, parallel_workers)) as executor:
+                yield_future = executor.submit(
+                    build_yield_sensitivity,
+                    strategy_household,
+                    scenario,
+                    rules,
+                    tax_summaries=tax_summaries,
+                    net_monthly_income=net_monthly_income,
+                    car_loan=purchase_strategy_car_loan,
+                    taxes_and_fees=taxes_and_fees,
+                    parallel_workers=max(1, parallel_workers - 1),
+                )
+                provident_future = executor.submit(
+                    build_provident_visualization,
+                    strategy_household,
+                    scenario,
+                    rules,
+                    purchase_plan_analyses,
+                    car_loan,
+                    vehicle_states=vehicle_states,
+                )
+                yield_sensitivity = yield_future.result()
+                provident_visualization = provident_future.result()
+        else:
+            yield_sensitivity = build_yield_sensitivity(
+                strategy_household,
+                scenario,
+                rules,
+                tax_summaries=tax_summaries,
+                net_monthly_income=net_monthly_income,
+                car_loan=purchase_strategy_car_loan,
+                taxes_and_fees=taxes_and_fees,
+                parallel_workers=1,
+            )
+            provident_visualization = build_provident_visualization(
+                strategy_household,
+                scenario,
+                rules,
+                purchase_plan_analyses,
+                car_loan,
+                vehicle_states=vehicle_states,
+            )
+        loan_visualization = build_loan_visualization(
+            strategy_household,
+            scenario,
+            purchase_plan_analyses,
+            car_loan,
+            base_monthly_debt_payment=household.monthly_debt_payment,
+            provident_visualization=provident_visualization,
+        )
+        monthly_cashflow_visualization, account_snapshots, monthly_ledger = build_monthly_cashflow_visualization(
+            strategy_household,
+            scenario,
+            rules,
+            purchase_plan_analyses,
+            car_loan,
+            loan_visualization,
+            provident_visualization,
+        )
+        account_concepts = build_account_concepts()
+        strategy_explanations = build_strategy_explanations(purchase_plan_analyses)
+        plan_events = build_plan_events(
+            strategy_household,
+            scenario,
+            rules,
+            purchase_plan_analyses,
+            car_loan,
+            monthly_cashflow_visualization,
+        )
+    else:
+        purchase_plan_analyses = []
+        yield_sensitivity = []
+        provident_visualization = []
+        loan_visualization = []
+        monthly_cashflow_visualization = []
+        account_snapshots = []
+        monthly_ledger = []
+        account_concepts = []
+        strategy_explanations = []
+        plan_events = []
+    total_required_cash = stated_down_payment + taxes_and_fees + _car_down_payment_at(
+        cashflow_household.car_plan,
+        purchase_strategy_car_loan,
+        0,
+        vehicle_states=pre_home_vehicle_states,
     )
-    yield_sensitivity = build_yield_sensitivity(
-        cashflow_household,
-        scenario,
-        rules,
-        tax_summaries=tax_summaries,
-        net_monthly_income=net_monthly_income,
-        car_loan=car_loan,
-        taxes_and_fees=taxes_and_fees,
-        parallel_workers=min(parallel_workers, 3),
-    )
-    provident_visualization = build_provident_visualization(
-        cashflow_household,
-        scenario,
-        rules,
-        purchase_plan_analyses,
-        car_loan,
-    )
-    loan_visualization = build_loan_visualization(
-        cashflow_household,
-        scenario,
-        purchase_plan_analyses,
-        car_loan,
-        base_monthly_debt_payment=household.monthly_debt_payment,
-        provident_visualization=provident_visualization,
-    )
-    monthly_cashflow_visualization, account_snapshots, monthly_ledger = build_monthly_cashflow_visualization(
-        cashflow_household,
-        scenario,
-        rules,
-        purchase_plan_analyses,
-        car_loan,
-        loan_visualization,
-        provident_visualization,
-    )
-    account_concepts = build_account_concepts()
-    strategy_explanations = build_strategy_explanations(purchase_plan_analyses)
-    plan_events = build_plan_events(
-        cashflow_household,
-        scenario,
-        purchase_plan_analyses,
-        car_loan,
-        monthly_cashflow_visualization,
-    )
-    total_required_cash = stated_down_payment + taxes_and_fees + _car_down_payment_at(cashflow_household.car_plan, car_loan, 0)
-    remaining_cash = cashflow_household.liquid_assets - total_required_cash
+    remaining_cash = cashflow_household.cash_account_balance - total_required_cash
     funding_gap = max(0, -remaining_cash)
 
-    commercial = _loan_summary(
-        scenario.commercial_loan_amount,
-        scenario.commercial_rate,
-        scenario.loan_years,
-        _commercial_repayment_method(scenario),
+    commercial = (
+        _loan_summary(
+            scenario.commercial_loan_amount,
+            scenario.commercial_rate,
+            scenario.loan_years,
+            _commercial_repayment_method(scenario),
+        )
+        if has_purchase_target
+        else None
     )
-    provident_loan_years, provident_year_reasons = _provident_loan_years(cashflow_household, scenario, rules)
-    provident = _loan_summary(
-        scenario.provident_loan_amount,
-        scenario.provident_rate,
-        provident_loan_years,
-        _provident_repayment_method(scenario),
-    )
+    if has_purchase_target:
+        provident_loan_years, provident_year_reasons = _provident_loan_years(strategy_household, scenario, rules)
+        provident = _loan_summary(
+            scenario.provident_loan_amount,
+            scenario.provident_rate,
+            provident_loan_years,
+            _provident_repayment_method(scenario),
+        )
+    else:
+        provident_year_reasons = ["当前未启用购房目标，暂不计算公积金贷款期限。"]
+        provident = None
 
     monthly_payment = 0.0
     if commercial:
@@ -4042,19 +4979,16 @@ def calculate_affordability(
     if provident:
         monthly_payment += provident.first_month_payment
 
-    car_purchased_now = cashflow_household.car_plan.enabled and car_loan.enabled and car_loan.purchase_delay_months <= 0
-    second_plan = _second_car_plan(cashflow_household.car_plan)
-    second_loan = calculate_car_loan(second_plan) if second_plan.enabled else None
-    second_car_purchased_now = bool(second_loan and second_loan.enabled and second_loan.purchase_delay_months <= 0)
-    current_transport_cost = (
-        car_loan.current_monthly_payment + car_loan.monthly_cash_operating_cost
-        if car_purchased_now
-        else _no_car_commute_cost(cashflow_household.car_plan)
+    current_transport_cost = _car_monthly_cash_cost_at(
+        cashflow_household.car_plan,
+        purchase_strategy_car_loan,
+        0,
+        vehicle_states=pre_home_vehicle_states,
     )
-    if second_car_purchased_now and second_loan:
-        current_transport_cost += second_loan.current_monthly_payment + second_loan.monthly_cash_operating_cost
-    current_car_payment = (car_loan.current_monthly_payment if car_purchased_now else 0.0) + (
-        second_loan.current_monthly_payment if second_car_purchased_now and second_loan else 0.0
+    current_car_payment = sum(
+        loan.current_monthly_payment
+        for _, _, loan, purchase_month in pre_home_vehicle_states
+        if loan.enabled and purchase_month is not None and purchase_month <= 0
     )
     monthly_income = max(net_monthly_income, 1)
     post_purchase_cash_flow = (
@@ -4076,7 +5010,10 @@ def calculate_affordability(
     )
     emergency_months = max(0, remaining_cash) / monthly_burn
 
-    if not eligible:
+    if not has_purchase_target:
+        status = "不买房基线"
+        status_reason = "当前没有启用目标房源，系统只测算家庭现状、理财、车辆和既有贷款现金流。"
+    elif not eligible:
         status = "不可行"
         status_reason = "购房资格条件未通过当前规则包。"
     elif funding_gap > 0:
@@ -4132,6 +5069,7 @@ def calculate_affordability(
         assumptions=[
             "测算结果仅用于家庭规划，不构成购房、税务、法律或银行审批意见。",
             "政策、税费、贷款额度和利率以规则包和用户手动录入为准。",
+            *([property_goal_assumption] if property_goal_assumption else []),
             "北京公积金贷款额度按当前规则包的每缴存年额度估算；夫妻分别缴存时，现阶段用家庭录入的社保/个税月数近似代表较长缴存年限。",
             f"北京公积金贷款期限按设定年限、30 年上限、借款人年龄和二手房房龄/土地剩余年限取短；当前测算：{'；'.join(provident_year_reasons)}。",
             "公积金提取区分交易前现金、交易后购房提取和购后账户留存：默认不把买房后的月缴存公积金计入自由现金流。",
@@ -4142,7 +5080,7 @@ def calculate_affordability(
         ],
     )
 
-    if stress_name is None:
+    if stress_name is None and has_purchase_target:
         result.stress_tests = build_stress_tests(household, scenario, rules, parallel_workers=min(parallel_workers, 3))
     return result
 

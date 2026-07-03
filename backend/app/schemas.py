@@ -13,10 +13,14 @@ GreenBuildingLevel = Literal["none", "two_star", "three_star"]
 PrefabBuildingLevel = Literal["none", "A", "AA", "AAA"]
 BuildingStructure = Literal["unknown", "brick_mixed", "steel_concrete"]
 RenovationFundingMode = Literal["after_purchase_saving", "upfront_cash"]
+InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
 
 
 class IncomeMember(BaseModel):
     name: str = "成员 1"
+    birth_month: str = ""
+    current_age: int = Field(30, ge=0, le=120)
+    provident_fund_balance: float = Field(0, ge=0)
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
     monthly_non_taxable_income: float = Field(0, ge=0)
@@ -77,29 +81,66 @@ class IncomeStageData(BaseModel):
     payroll_contributions_enabled: bool = True
 
 
+class CareerShockMemberSetting(BaseModel):
+    member_name: str = "成员 1"
+    enabled: bool = False
+    layoff_age: int = Field(35, ge=18, le=80)
+    retirement_age: int = Field(63, ge=50, le=70)
+    pension_monthly: float = Field(0, ge=0)
+    birth_month: str = ""
+    current_age: int = Field(30, ge=0, le=120)
+
+
 class CareerShockData(BaseModel):
     enabled: bool = False
-    layoff_member_name: str = "成员 1"
-    layoff_age: int = Field(35, ge=18, le=80)
-    self_birth_month: str = ""
-    spouse_birth_month: str = ""
-    self_current_age: int = Field(30, ge=18, le=80)
-    spouse_current_age: int = Field(30, ge=18, le=80)
+    member_settings: list[CareerShockMemberSetting] = Field(default_factory=list)
     auto_unemployment_benefit: bool = True
     auto_self_social_insurance: bool = True
     unemployment_benefit_months: int = Field(24, ge=0, le=24)
     unemployment_benefit_monthly: float = Field(0, ge=0)
     self_social_insurance_monthly: float = Field(0, ge=0)
-    self_retirement_age: int = Field(63, ge=50, le=70)
-    spouse_retirement_age: int = Field(58, ge=50, le=70)
-    self_pension_monthly: float = Field(0, ge=0)
-    spouse_pension_monthly: float = Field(0, ge=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_member_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("member_settings"):
+            return data
+        legacy_name = str(data.get("layoff_member_name") or "成员 1")
+        data = dict(data)
+        data["member_settings"] = [
+            {
+                "member_name": legacy_name,
+                "enabled": bool(data.get("enabled")),
+                "layoff_age": data.get("layoff_age", 35),
+                "retirement_age": data.get("self_retirement_age", 63),
+                "pension_monthly": data.get("self_pension_monthly", 0),
+                "birth_month": data.get("self_birth_month", ""),
+                "current_age": data.get("self_current_age", 30),
+            }
+        ]
+        if data.get("spouse_retirement_age") is not None or data.get("spouse_pension_monthly"):
+            data["member_settings"].append(
+                {
+                    "member_name": "成员 2",
+                    "enabled": False,
+                    "layoff_age": data.get("layoff_age", 35),
+                    "retirement_age": data.get("spouse_retirement_age", 58),
+                    "pension_monthly": data.get("spouse_pension_monthly", 0),
+                    "birth_month": data.get("spouse_birth_month", ""),
+                    "current_age": data.get("spouse_current_age", 30),
+                }
+            )
+        return data
 
-class CarPlanData(BaseModel):
+class VehiclePlanData(BaseModel):
     enabled: bool = False
     name: str = "车辆计划"
     selected_strategy_variant: str = "手动设置"
+    candidate_vehicles: list["VehiclePlanData"] = Field(default_factory=list)
+    planning_sequence: int = Field(1, ge=1, le=50)
+    purchase_timing_mode: Literal["auto_sequence", "parallel", "manual_month"] = "auto_sequence"
+    after_previous_event_delay_months: int = Field(0, ge=0, le=240)
+    manual_purchase_delay_months: int = Field(0, ge=0, le=600)
     total_price: float = Field(0, ge=0)
     down_payment_ratio: float = Field(0.50, ge=0, le=1)
     down_payment: float = Field(0, ge=0)
@@ -123,6 +164,12 @@ class CarPlanData(BaseModel):
     depreciation_years: int = Field(8, ge=1, le=20)
     vehicle_service_years: int = Field(15, ge=1, le=30)
     vehicle_retirement_mileage_km: float = Field(600000, ge=0, le=1000000)
+    happiness_score: float = Field(6.5, ge=0, le=10)
+    notes: str = ""
+
+
+class CarPlanData(VehiclePlanData):
+    vehicle_plans: list[VehiclePlanData] = Field(default_factory=list)
     second_car_enabled: bool = False
     second_car_total_price: float = Field(0, ge=0)
     second_car_down_payment_ratio: float = Field(0.40, ge=0, le=1)
@@ -132,7 +179,17 @@ class CarPlanData(BaseModel):
     second_car_later_annual_rate: float = Field(0.0199, ge=0, le=0.5)
     second_car_annual_mileage_km: float = Field(0, ge=0, le=100000)
     second_car_monthly_parking_cost: float = Field(0, ge=0)
-    happiness_score: float = Field(6.5, ge=0, le=10)
+
+
+class PropertyPurchaseGoalData(BaseModel):
+    name: str = "购房需求"
+    scenario_id: str = ""
+    priority: int = Field(1, ge=1, le=20)
+    enabled: bool = True
+    intended_use: Literal["self_use", "improvement", "investment", "other"] = "self_use"
+    planning_mode: Literal["after_previous_purchase", "parallel"] = "after_previous_purchase"
+    after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
+    earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
     notes: str = ""
 
 
@@ -179,12 +236,12 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(3, ge=1)
+    schema_version: int = Field(11, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
     monthly_debt_payment: float = Field(0, ge=0)
-    liquid_assets: float = Field(0, ge=0)
+    cash_account_balance: float = Field(0, ge=0)
     investments: float = Field(0, ge=0)
     income_projection_year: int = Field(2027, ge=2024, le=2050)
     monthly_rent_from_housing_fund: float = Field(0, ge=0)
@@ -211,6 +268,7 @@ class HouseholdData(BaseModel):
     career_shock: CareerShockData = Field(default_factory=CareerShockData)
     career_shock_applied: bool = False
     car_plan: CarPlanData = Field(default_factory=CarPlanData)
+    property_goals: list[PropertyPurchaseGoalData] = Field(default_factory=list)
     phased_loans: list[PhasedLoanData] = Field(default_factory=list)
     scheduled_expenses: list[ScheduledExpenseData] = Field(default_factory=list)
     elderly_dependents: list[ElderlyDependentData] = Field(default_factory=list)
@@ -241,8 +299,12 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(3, ge=1)
+    schema_version: int = Field(12, ge=1)
     name: str = "示例房源（请修改）"
+    enabled: bool = True
+    purchase_sequence: int = Field(1, ge=1, le=20)
+    purchase_planning_mode: Literal["after_previous_purchase", "parallel"] = "after_previous_purchase"
+    after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
     district: str = "未设置"
     ring_area: str = "未设置"
     property_type: str = "二手房"
@@ -261,7 +323,7 @@ class ScenarioData(BaseModel):
     manual_purchase_delay_months: int = Field(0, ge=0, le=360)
     micro_commercial_loan_ratio: float = Field(0, ge=0, le=1)
     commercial_rate: float = Field(0.035, ge=0, le=0.2)
-    provident_rate: float = Field(0.0285, ge=0, le=0.2)
+    provident_rate: float = Field(0.026, ge=0, le=0.2)
     loan_years: int = Field(25, ge=1, le=30)
     repayment_method: RepaymentMethod = "equal_installment"
     commercial_repayment_method: RepaymentMethod = "equal_installment"
@@ -272,6 +334,8 @@ class ScenarioData(BaseModel):
     renovation_funding_mode: RenovationFundingMode = "after_purchase_saving"
     moving_and_misc_cost: float = Field(50000, ge=0)
     annual_investment_return: float = Field(0.025, ge=-0.5, le=0.5)
+    investment_withdrawal_mode: InvestmentWithdrawalMode = "auto"
+    investment_min_balance_after_purchase: float = Field(0, ge=0)
     happiness_score: float = Field(7.0, ge=0, le=10)
     commute_score: float = Field(7.0, ge=0, le=10)
     school_score: float = Field(6.0, ge=0, le=10)
@@ -294,7 +358,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(3, ge=1)
+    schema_version: int = Field(11, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -310,7 +374,7 @@ class RulePackData(BaseModel):
             "first_home_commercial_min_down_payment_ratio": 0.15,
             "second_home_commercial_min_down_payment_ratio": 0.20,
             "first_home_provident_min_down_payment_ratio": 0.20,
-            "second_home_provident_min_down_payment_ratio": 0.25,
+            "second_home_provident_min_down_payment_ratio": 0.30,
             "provident_first_home_loan_cap": 1200000,
             "provident_second_home_loan_cap": 1000000,
             "provident_loan_amount_per_deposit_year": 150000,
@@ -324,6 +388,10 @@ class RulePackData(BaseModel):
             "provident_repayment_capacity_enabled": True,
             "provident_repayment_income_ratio": 0.60,
             "provident_basic_living_cost_per_person": 1778,
+            "provident_first_home_rate_1_to_5_years": 0.021,
+            "provident_first_home_rate_6_to_30_years": 0.026,
+            "provident_second_home_rate_1_to_5_years": 0.02325,
+            "provident_second_home_rate_6_to_30_years": 0.03075,
             "provident_max_loan_years": 30,
             "provident_max_borrower_age": 68,
             "provident_brick_mixed_total_life_years": 50,
@@ -410,7 +478,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(3, ge=1)
+    schema_version: int = Field(5, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -486,6 +554,11 @@ class CarLoanSummary(BaseModel):
 class CarPlanAnalysis(BaseModel):
     variant: str
     description: str
+    vehicle_index: int = 0
+    vehicle_name: str = "车辆计划"
+    vehicle_candidate_index: int | None = None
+    vehicle_candidate_name: str = ""
+    strategy_key: str = ""
     purchase_delay_months: int
     months_to_buy: int | None
     years_to_buy: float | None
@@ -555,6 +628,13 @@ class PurchasePlanAnalysis(BaseModel):
     months_to_renovation: int | None
     years_to_renovation: float | None
     post_purchase_renovation_monthly_saving: float
+    investment_withdrawal_mode: InvestmentWithdrawalMode = "auto"
+    investment_withdrawal_mode_label: str = "自动优化提取"
+    cash_account_before_purchase: float = 0.0
+    investment_balance_before_purchase: float = 0.0
+    investment_sell_gross_at_purchase: float = 0.0
+    investment_sell_proceeds_at_purchase: float = 0.0
+    investment_balance_after_purchase: float = 0.0
     cash_after_transaction: float
     cash_after_purchase: float
     provident_balance_after_extract: float
@@ -599,6 +679,27 @@ class LoanVisualizationPoint(BaseModel):
     total_monthly_payment: float
     cash_monthly_payment: float
     provident_offset_payment: float = 0.0
+    provident_monthly_payment_relief: float = 0.0
+
+
+class ProvidentMemberAccountPoint(BaseModel):
+    member_index: int
+    member_name: str
+    balance_start: float
+    personal_deposit: float
+    employer_deposit: float
+    total_deposit: float
+    interest: float
+    rent_withdrawal: float
+    upfront_withdrawal: float
+    post_transaction_withdrawal: float
+    agreed_withdrawal: float
+    loan_offset_payment: float
+    retirement_withdrawal: float = 0.0
+    account_closed_by_retirement: bool = False
+    total_inflow: float
+    total_outflow: float
+    balance_end: float
 
 
 class ProvidentVisualizationPoint(BaseModel):
@@ -614,10 +715,12 @@ class ProvidentVisualizationPoint(BaseModel):
     post_transaction_withdrawal: float
     agreed_withdrawal: float
     loan_offset_payment: float
+    retirement_withdrawal: float = 0.0
     total_inflow: float
     total_outflow: float
     balance_end: float
     strategy_label: str
+    member_accounts: list[ProvidentMemberAccountPoint] = Field(default_factory=list)
 
 
 class MonthlyLedgerEntry(BaseModel):
@@ -636,6 +739,7 @@ class AccountSnapshotPoint(BaseModel):
     month: int
     cash_balance: float
     investment_balance: float
+    liquid_asset_value: float = 0.0
     provident_balance: float
     property_asset_value: float = 0.0
     vehicle_asset_value: float = 0.0
@@ -652,6 +756,7 @@ class MonthlyCashflowPoint(BaseModel):
     month: int
     cash_balance: float
     investment_balance: float
+    liquid_asset_value: float = 0.0
     provident_balance: float
     fixed_asset_value: float
     total_asset_value: float
@@ -667,6 +772,7 @@ class MonthlyCashflowPoint(BaseModel):
     house_payment: float
     house_contract_payment: float = 0.0
     provident_house_offset_payment: float = 0.0
+    provident_house_payment_relief: float = 0.0
     vehicle_payment: float
     first_vehicle_payment: float = 0.0
     second_vehicle_payment: float = 0.0
@@ -706,7 +812,7 @@ class MonthlyCashflowPoint(BaseModel):
 class AccountConceptSummary(BaseModel):
     code: str
     name: str
-    category: Literal["cash", "investment", "provident", "fixed_asset", "loan", "policy"]
+    category: Literal["account", "cash", "investment", "provident", "fixed_asset", "loan", "policy"]
     description: str
     managed_by: Literal["backend", "user_input", "policy"]
 

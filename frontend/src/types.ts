@@ -8,6 +8,9 @@ export type RenovationFundingMode = "after_purchase_saving" | "upfront_cash";
 
 export interface IncomeMember {
   name: string;
+  birth_month: string;
+  current_age: number;
+  provident_fund_balance: number;
   monthly_salary_gross: number;
   annual_bonus: number;
   monthly_social_insurance: number;
@@ -42,29 +45,33 @@ export interface IncomeStageData {
   payroll_contributions_enabled: boolean;
 }
 
+export interface CareerShockMemberSetting {
+  member_name: string;
+  enabled: boolean;
+  layoff_age: number;
+  retirement_age: number;
+  pension_monthly: number;
+}
+
 export interface CareerShockData {
   enabled: boolean;
-  layoff_member_name: string;
-  layoff_age: number;
-  self_birth_month: string;
-  spouse_birth_month: string;
-  self_current_age: number;
-  spouse_current_age: number;
+  member_settings: CareerShockMemberSetting[];
   auto_unemployment_benefit: boolean;
   auto_self_social_insurance: boolean;
   unemployment_benefit_months: number;
   unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
-  self_retirement_age: number;
-  spouse_retirement_age: number;
-  self_pension_monthly: number;
-  spouse_pension_monthly: number;
 }
 
-export interface CarPlanData {
+export interface VehiclePlanData {
   enabled: boolean;
   name: string;
   selected_strategy_variant: string;
+  candidate_vehicles: VehiclePlanData[];
+  planning_sequence: number;
+  purchase_timing_mode: "auto_sequence" | "parallel" | "manual_month";
+  after_previous_event_delay_months: number;
+  manual_purchase_delay_months: number;
   total_price: number;
   down_payment_ratio: number;
   down_payment: number;
@@ -88,6 +95,12 @@ export interface CarPlanData {
   depreciation_years: number;
   vehicle_service_years: number;
   vehicle_retirement_mileage_km: number;
+  happiness_score: number;
+  notes: string;
+}
+
+export interface CarPlanData extends VehiclePlanData {
+  vehicle_plans: VehiclePlanData[];
   second_car_enabled: boolean;
   second_car_total_price: number;
   second_car_down_payment_ratio: number;
@@ -97,7 +110,17 @@ export interface CarPlanData {
   second_car_later_annual_rate: number;
   second_car_annual_mileage_km: number;
   second_car_monthly_parking_cost: number;
-  happiness_score: number;
+}
+
+export interface PropertyPurchaseGoalData {
+  name: string;
+  scenario_id: string;
+  priority: number;
+  enabled: boolean;
+  intended_use: "self_use" | "improvement" | "investment" | "other";
+  planning_mode: "after_previous_purchase" | "parallel";
+  after_previous_purchase_delay_months: number;
+  earliest_purchase_delay_months: number;
   notes: string;
 }
 
@@ -135,7 +158,7 @@ export interface HouseholdData {
   monthly_income: number;
   monthly_expense: number;
   monthly_debt_payment: number;
-  liquid_assets: number;
+  cash_account_balance: number;
   investments: number;
   income_projection_year: number;
   monthly_rent_from_housing_fund: number;
@@ -162,6 +185,7 @@ export interface HouseholdData {
   career_shock: CareerShockData;
   career_shock_applied?: boolean;
   car_plan: CarPlanData;
+  property_goals: PropertyPurchaseGoalData[];
   phased_loans: PhasedLoanData[];
   scheduled_expenses: ScheduledExpenseData[];
   elderly_dependents: ElderlyDependentData[];
@@ -178,6 +202,10 @@ export interface HouseholdData {
 
 export interface ScenarioData {
   name: string;
+  enabled: boolean;
+  purchase_sequence: number;
+  purchase_planning_mode: "after_previous_purchase" | "parallel";
+  after_previous_purchase_delay_months: number;
   district: string;
   ring_area: string;
   property_type: string;
@@ -207,6 +235,8 @@ export interface ScenarioData {
   renovation_funding_mode: RenovationFundingMode;
   moving_and_misc_cost: number;
   annual_investment_return: number;
+  investment_withdrawal_mode: "auto" | "full_liquidation" | "manual_reserve";
+  investment_min_balance_after_purchase: number;
   happiness_score: number;
   commute_score: number;
   school_score: number;
@@ -272,6 +302,11 @@ export interface CarLoanSummary {
 export interface CarPlanAnalysis {
   variant: string;
   description: string;
+  vehicle_index: number;
+  vehicle_name: string;
+  vehicle_candidate_index: number | null;
+  vehicle_candidate_name: string;
+  strategy_key: string;
   purchase_delay_months: number;
   months_to_buy: number | null;
   years_to_buy: number | null;
@@ -380,6 +415,13 @@ export interface PurchasePlanAnalysis {
   months_to_renovation: number | null;
   years_to_renovation: number | null;
   post_purchase_renovation_monthly_saving: number;
+  investment_withdrawal_mode?: "auto" | "full_liquidation" | "manual_reserve";
+  investment_withdrawal_mode_label?: string;
+  cash_account_before_purchase?: number;
+  investment_balance_before_purchase?: number;
+  investment_sell_gross_at_purchase?: number;
+  investment_sell_proceeds_at_purchase?: number;
+  investment_balance_after_purchase?: number;
   cash_after_transaction: number;
   cash_after_purchase: number;
   provident_balance_after_extract: number;
@@ -429,6 +471,27 @@ export interface LoanVisualizationPoint {
   total_monthly_payment: number;
   cash_monthly_payment: number;
   provident_offset_payment: number;
+  provident_monthly_payment_relief: number;
+}
+
+export interface ProvidentMemberAccountPoint {
+  member_index: number;
+  member_name: string;
+  balance_start: number;
+  personal_deposit: number;
+  employer_deposit: number;
+  total_deposit: number;
+  interest: number;
+  rent_withdrawal: number;
+  upfront_withdrawal: number;
+  post_transaction_withdrawal: number;
+  agreed_withdrawal: number;
+  loan_offset_payment: number;
+  retirement_withdrawal: number;
+  account_closed_by_retirement: boolean;
+  total_inflow: number;
+  total_outflow: number;
+  balance_end: number;
 }
 
 export interface ProvidentVisualizationPoint {
@@ -444,10 +507,12 @@ export interface ProvidentVisualizationPoint {
   post_transaction_withdrawal: number;
   agreed_withdrawal: number;
   loan_offset_payment: number;
+  retirement_withdrawal: number;
   total_inflow: number;
   total_outflow: number;
   balance_end: number;
   strategy_label: string;
+  member_accounts: ProvidentMemberAccountPoint[];
 }
 
 export interface MonthlyLedgerEntry {
@@ -466,6 +531,7 @@ export interface AccountSnapshotPoint {
   month: number;
   cash_balance: number;
   investment_balance: number;
+  liquid_asset_value: number;
   provident_balance: number;
   property_asset_value: number;
   vehicle_asset_value: number;
@@ -482,6 +548,7 @@ export interface MonthlyCashflowPoint {
   month: number;
   cash_balance: number;
   investment_balance: number;
+  liquid_asset_value: number;
   provident_balance: number;
   fixed_asset_value: number;
   total_asset_value: number;
@@ -497,6 +564,7 @@ export interface MonthlyCashflowPoint {
   house_payment: number;
   house_contract_payment: number;
   provident_house_offset_payment: number;
+  provident_house_payment_relief: number;
   vehicle_payment: number;
   first_vehicle_payment: number;
   second_vehicle_payment: number;
@@ -536,7 +604,7 @@ export interface MonthlyCashflowPoint {
 export interface AccountConceptSummary {
   code: string;
   name: string;
-  category: "cash" | "investment" | "provident" | "fixed_asset" | "loan" | "policy";
+  category: "account" | "cash" | "investment" | "provident" | "fixed_asset" | "loan" | "policy";
   description: string;
   managed_by: "backend" | "user_input" | "policy";
 }

@@ -70,6 +70,12 @@ export function createScenario(scenario: ScenarioData) {
   });
 }
 
+export function deleteScenario(id: string) {
+  return request<{ deleted: boolean }>(`/api/scenarios/${id}`, {
+    method: "DELETE"
+  });
+}
+
 export function saveRulePack(id: string, rulePack: RulePackData) {
   return request<RecordEnvelope<RulePackData>>(`/api/rule-packs/${id}`, {
     method: "PUT",
