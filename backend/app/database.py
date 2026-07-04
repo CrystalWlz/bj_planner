@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData
 
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 
 
 def default_db_path() -> Path:

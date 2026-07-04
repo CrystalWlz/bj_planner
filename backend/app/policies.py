@@ -39,6 +39,9 @@ class BeijingPolicy:
         return max(commercial_ratio, provident_ratio if uses_provident_loan else 0.0)
 
     def provident_policy_bonus(self, scenario: ScenarioData) -> float:
+        if not _is_new_home_property(scenario):
+            return 0.0
+
         params = self.params
         bonuses: list[float] = []
         if scenario.green_building_level == "two_star":
@@ -106,6 +109,10 @@ class BeijingPolicy:
 def _is_second_hand_property(scenario: ScenarioData) -> bool:
     text = scenario.property_type.strip()
     return "二手" in text or "存量" in text
+
+
+def _is_new_home_property(scenario: ScenarioData) -> bool:
+    return "新房" in scenario.property_type.strip()
 
 
 def get_policy(rules: RulePackData) -> RegionalPolicy:

@@ -1101,280 +1101,9 @@ function incomeStageAt(member: IncomeMember, baseDate: Date, monthsFromNow = 0) 
   );
 }
 
-type TaxBracket = { threshold: number; rate: number; quick_deduction: number };
-
-const defaultComprehensiveTaxBrackets: TaxBracket[] = [
-  { threshold: 36000, rate: 0.03, quick_deduction: 0 },
-  { threshold: 144000, rate: 0.1, quick_deduction: 2520 },
-  { threshold: 300000, rate: 0.2, quick_deduction: 16920 },
-  { threshold: 420000, rate: 0.25, quick_deduction: 31920 },
-  { threshold: 660000, rate: 0.3, quick_deduction: 52920 },
-  { threshold: 960000, rate: 0.35, quick_deduction: 85920 },
-  { threshold: 999999999, rate: 0.45, quick_deduction: 181920 }
-];
-
-const defaultBonusTaxBrackets: TaxBracket[] = [
-  { threshold: 3000, rate: 0.03, quick_deduction: 0 },
-  { threshold: 12000, rate: 0.1, quick_deduction: 210 },
-  { threshold: 25000, rate: 0.2, quick_deduction: 1410 },
-  { threshold: 35000, rate: 0.25, quick_deduction: 2660 },
-  { threshold: 55000, rate: 0.3, quick_deduction: 4410 },
-  { threshold: 80000, rate: 0.35, quick_deduction: 7160 },
-  { threshold: 999999999, rate: 0.45, quick_deduction: 15160 }
-];
-
 function ruleParamNumber(rulePack: RulePackData, key: string, fallback: number) {
   const value = Number(rulePack.params[key]);
   return Number.isFinite(value) ? value : fallback;
-}
-
-function ruleBrackets(rulePack: RulePackData, key: string, fallback: TaxBracket[]) {
-  const value = rulePack.params[key];
-  if (!Array.isArray(value)) return fallback;
-  const parsed = value
-    .map((item) => {
-      const bracket = item as Partial<TaxBracket>;
-      return {
-        threshold: Number(bracket.threshold),
-        rate: Number(bracket.rate),
-        quick_deduction: Number(bracket.quick_deduction)
-      };
-    })
-    .filter((item) => Number.isFinite(item.threshold) && Number.isFinite(item.rate) && Number.isFinite(item.quick_deduction));
-  return parsed.length ? parsed : fallback;
-}
-
-function progressiveTax(taxableIncome: number, brackets: TaxBracket[]) {
-  if (taxableIncome <= 0) return 0;
-  const bracket = brackets.find((item) => taxableIncome <= item.threshold) ?? brackets[brackets.length - 1];
-  return Math.max(0, taxableIncome * bracket.rate - bracket.quick_deduction);
-}
-
-function bonusTax(annualBonus: number, brackets: TaxBracket[]) {
-  if (annualBonus <= 0) return 0;
-  const convertedMonthly = annualBonus / 12;
-  const bracket = brackets.find((item) => convertedMonthly <= item.threshold) ?? brackets[brackets.length - 1];
-  return Math.max(0, annualBonus * bracket.rate - bracket.quick_deduction);
-}
-
-function estimateStageContributionsByRules(stage: IncomeStageData, rulePack: RulePackData) {
-  if (stage.payroll_contributions_enabled === false || stage.monthly_salary_gross <= 0) {
-    return {
-      personalSocial: Math.max(0, stage.monthly_social_insurance ?? 0),
-      personalHousingFund: Math.max(0, stage.monthly_housing_fund ?? 0),
-      employerHousingFund: 0
-    };
-  }
-  const socialBase = Math.max(
-    ruleParamNumber(rulePack, "beijing_social_base_floor", 7162),
-    Math.min(stage.monthly_salary_gross, ruleParamNumber(rulePack, "beijing_social_base_ceiling", 35811))
-  );
-  const fundBase = Math.max(
-    ruleParamNumber(rulePack, "beijing_housing_fund_base_floor", 2540),
-    Math.min(stage.monthly_salary_gross, ruleParamNumber(rulePack, "beijing_housing_fund_base_ceiling", 35811))
-  );
-  const fundRateFloor = ruleParamNumber(rulePack, "housing_fund_min_rate", 0.05);
-  const fundRateCeiling = ruleParamNumber(rulePack, "housing_fund_max_rate", 0.12);
-  const personalFundRate = Math.max(fundRateFloor, Math.min(stage.housing_fund_personal_rate ?? 0.12, fundRateCeiling));
-  const employerFundRate = Math.max(fundRateFloor, Math.min(stage.housing_fund_employer_rate ?? 0.12, fundRateCeiling));
-  const personalSocial =
-    socialBase * ruleParamNumber(rulePack, "employee_pension_rate", 0.08) +
-    socialBase * ruleParamNumber(rulePack, "employee_medical_rate", 0.02) +
-    ruleParamNumber(rulePack, "employee_medical_fixed", 3) +
-    socialBase * ruleParamNumber(rulePack, "employee_unemployment_rate", 0.005);
-  const personalHousingFund = fundBase * personalFundRate;
-  const employerHousingFund = fundBase * employerFundRate;
-  return { personalSocial, personalHousingFund, employerHousingFund };
-}
-
-function stageIsActiveInMonth(stage: IncomeStageData, targetDate: Date) {
-  const targetMonth = { year: targetDate.getFullYear(), month: targetDate.getMonth() + 1 };
-  const start = parseMonthValue(stage.start_date.slice(0, 7));
-  const end = parseMonthValue(stage.end_date?.slice(0, 7));
-  if (!start || compareMonth(targetMonth, start) < 0) return false;
-  if (end && compareMonth(targetMonth, end) > 0) return false;
-  return true;
-}
-
-function activeMonthsInStageYear(stage: IncomeStageData, year: number) {
-  const start = parseMonthValue(stage.start_date.slice(0, 7)) ?? { year, month: 1 };
-  const end = parseMonthValue(stage.end_date?.slice(0, 7)) ?? { year, month: 12 };
-  const startMonth = Math.max(1, start.year < year ? 1 : start.year > year ? 13 : start.month);
-  const endMonth = Math.min(12, end.year > year ? 12 : end.year < year ? 0 : end.month);
-  return Math.max(0, endMonth - startMonth + 1);
-}
-
-function stageBonusPayoutMonth(stage: IncomeStageData, year: number) {
-  if (stage.annual_bonus <= 0 || activeMonthsInStageYear(stage, year) <= 0) return null;
-  const payoutMonth = Math.max(1, Math.min(12, stage.annual_bonus_payout_month ?? 4));
-  return stageIsActiveInMonth(stage, new Date(year, payoutMonth - 1, 1)) ? payoutMonth : null;
-}
-
-function stageBonusPayoutAmount(stage: IncomeStageData, year: number, month: number) {
-  if (stageBonusPayoutMonth(stage, year) !== month) return 0;
-  return stage.annual_bonus * activeMonthsInStageYear(stage, year) / 12;
-}
-
-function selectedStageBonusMethod(stage: IncomeStageData, rulePack: RulePackData): BonusTaxMethod {
-  if (stage.bonus_tax_method === "merged" || stage.bonus_tax_method === "separate") return stage.bonus_tax_method;
-  const annualBrackets = ruleBrackets(rulePack, "comprehensive_tax_brackets", defaultComprehensiveTaxBrackets);
-  const bonusBrackets = ruleBrackets(rulePack, "monthly_converted_bonus_tax_brackets", defaultBonusTaxBrackets);
-  const estimated = estimateStageContributionsByRules(stage, rulePack);
-  const commonDeductions =
-    ruleParamNumber(rulePack, "personal_standard_deduction_annual", 60000) +
-    (estimated.personalSocial + estimated.personalHousingFund) * 12 +
-    stage.monthly_special_additional_deduction * 12 +
-    stage.other_annual_deductions;
-  const salaryTaxable = Math.max(
-    0,
-    stage.monthly_salary_gross * 12 +
-      (stage.monthly_freelance_income ?? 0) * 12 +
-      stage.other_annual_taxable_income -
-      commonDeductions
-  );
-  const separate = progressiveTax(salaryTaxable, annualBrackets) + bonusTax(stage.annual_bonus, bonusBrackets);
-  const merged = progressiveTax(Math.max(0, salaryTaxable + stage.annual_bonus), annualBrackets);
-  return merged < separate ? "merged" : "separate";
-}
-
-function cumulativeSalaryTax(
-  member: IncomeMember,
-  rulePack: RulePackData,
-  year: number,
-  throughMonth: number,
-  household: HouseholdData
-) {
-  if (throughMonth <= 0) return 0;
-  const annualBrackets = ruleBrackets(rulePack, "comprehensive_tax_brackets", defaultComprehensiveTaxBrackets);
-  const monthlyStandardDeduction = ruleParamNumber(rulePack, "personal_standard_deduction_annual", 60000) / 12;
-  let activeMonths = 0;
-  let cumulativeIncome = 0;
-  let cumulativeSocialAndFund = 0;
-  let cumulativeSpecialDeduction = 0;
-  let cumulativeOtherDeduction = 0;
-
-  for (let month = 1; month <= throughMonth; month += 1) {
-    const targetDate = new Date(year, month - 1, 1);
-    const stage = incomeStagesForMember(member).find((item) => stageIsActiveInMonth(item, targetDate));
-    if (!stage) continue;
-    const estimated = estimateStageContributionsByRules(stage, rulePack);
-    activeMonths += 1;
-    cumulativeIncome += stage.monthly_salary_gross + (stage.monthly_freelance_income ?? 0) + stage.other_annual_taxable_income / 12;
-    if (selectedStageBonusMethod(stage, rulePack) === "merged") {
-      cumulativeIncome += stageBonusPayoutAmount(stage, year, month);
-    }
-    cumulativeSocialAndFund += estimated.personalSocial + estimated.personalHousingFund;
-    cumulativeSpecialDeduction += stage.monthly_special_additional_deduction;
-    cumulativeSpecialDeduction += elderlyCareDeductionForMemberAt(household, member.name, targetDate);
-    cumulativeOtherDeduction += stage.other_annual_deductions / 12;
-  }
-
-  return progressiveTax(
-    Math.max(
-      0,
-      cumulativeIncome -
-        monthlyStandardDeduction * activeMonths -
-        cumulativeSocialAndFund -
-        cumulativeSpecialDeduction -
-        cumulativeOtherDeduction
-    ),
-    annualBrackets
-  );
-}
-
-function memberMonthlyIncomeRow(
-  member: IncomeMember,
-  rulePack: RulePackData,
-  household: HouseholdData,
-  baseDate: Date,
-  absoluteMonth: number
-) {
-  const targetDate = addMonths(baseDate, absoluteMonth);
-  const stages = incomeStagesForMember(member);
-  const stage =
-    stages
-      .filter((item) => stageIsActiveInMonth(item, targetDate))
-      .sort((left, right) => right.start_date.localeCompare(left.start_date))[0] ?? null;
-  if (!stage) {
-    return {
-      name: member.name,
-      stageName: "未生效",
-      grossMonthly: 0,
-      bonusMonthly: 0,
-      otherMonthly: 0,
-      nonTaxableMonthly: 0,
-      salaryNetMonthly: 0,
-      bonusNetMonthly: 0,
-      otherNetMonthly: 0,
-      nonTaxableNetMonthly: 0,
-      extraCashExpense: 0,
-      netMonthly: 0,
-      personalSocial: 0,
-      personalHousingFund: 0,
-      employerHousingFund: 0,
-      incomeTax: 0
-    };
-  }
-  const estimated = estimateStageContributionsByRules(stage, rulePack);
-  const selectedMethod = selectedStageBonusMethod(stage, rulePack);
-  const elderlyCareDeduction = elderlyCareDeductionForMemberAt(household, member.name, targetDate);
-  const currentCumulativeTax = cumulativeSalaryTax(
-    member,
-    rulePack,
-    targetDate.getFullYear(),
-    targetDate.getMonth() + 1,
-    household
-  );
-  const previousCumulativeTax = cumulativeSalaryTax(
-    member,
-    rulePack,
-    targetDate.getFullYear(),
-    targetDate.getMonth(),
-    household
-  );
-  const salaryTax = Math.max(0, currentCumulativeTax - previousCumulativeTax);
-  const bonusPayout = stageBonusPayoutAmount(stage, targetDate.getFullYear(), targetDate.getMonth() + 1);
-  const bonusTaxDue =
-    selectedMethod === "separate"
-      ? bonusTax(bonusPayout, ruleBrackets(rulePack, "monthly_converted_bonus_tax_brackets", defaultBonusTaxBrackets))
-      : 0;
-  const otherMonthly = stage.other_annual_taxable_income / 12;
-  const nonTaxableMonthly = stage.monthly_non_taxable_income ?? 0;
-  const extraCashExpense = stage.monthly_extra_cash_expense ?? 0;
-  const incomeTax = salaryTax + bonusTaxDue;
-  const freelanceMonthly = stage.monthly_freelance_income ?? 0;
-  const taxableCashBeforeTax = stage.monthly_salary_gross + freelanceMonthly + bonusPayout + otherMonthly;
-  const salaryTaxShare = taxableCashBeforeTax > 0 ? stage.monthly_salary_gross / taxableCashBeforeTax : 0;
-  const bonusTaxShare = taxableCashBeforeTax > 0 ? bonusPayout / taxableCashBeforeTax : 0;
-  const otherTaxShare = taxableCashBeforeTax > 0 ? (freelanceMonthly + otherMonthly) / taxableCashBeforeTax : 0;
-  const salaryNetMonthly = Math.max(
-    0,
-    stage.monthly_salary_gross - estimated.personalSocial - estimated.personalHousingFund - incomeTax * salaryTaxShare
-  );
-  const bonusNetMonthly = Math.max(0, bonusPayout - incomeTax * bonusTaxShare);
-  const otherNetMonthly = Math.max(0, freelanceMonthly + otherMonthly - incomeTax * otherTaxShare);
-  return {
-    name: member.name,
-    stageName: stage.name,
-    grossMonthly: stage.monthly_salary_gross,
-    bonusMonthly: bonusPayout,
-    otherMonthly: freelanceMonthly + otherMonthly,
-    nonTaxableMonthly,
-    salaryNetMonthly,
-    bonusNetMonthly,
-    otherNetMonthly,
-    nonTaxableNetMonthly: nonTaxableMonthly,
-    extraCashExpense,
-    netMonthly: Math.max(
-      -999999,
-      stage.monthly_salary_gross + freelanceMonthly + bonusPayout + otherMonthly + nonTaxableMonthly - estimated.personalSocial - estimated.personalHousingFund - incomeTax - extraCashExpense
-    ),
-    personalSocial: estimated.personalSocial,
-    personalHousingFund: estimated.personalHousingFund,
-    employerHousingFund: estimated.employerHousingFund,
-    incomeTax,
-    elderlyCareDeduction
-  };
 }
 
 const investmentPlanOptions = [
@@ -4787,6 +4516,11 @@ function SelectedPlanVisualization({
     () => (result.monthly_cashflow_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
     [result.monthly_cashflow_visualization, plan.variant]
   );
+  const taxMonthlySeries = result.tax_monthly_points ?? [];
+  const taxMonthlyByMonth = useMemo(
+    () => new Map(taxMonthlySeries.map((item) => [item.month, item])),
+    [taxMonthlySeries]
+  );
   const requiredCashAfterPf = plan.required_cash_after_pf_extract;
   const purchaseYearText = formatPurchaseTiming(timelineBaseDate, plan.months_to_buy, plan.years_to_buy);
   const annualReturn = scenario.annual_investment_return ?? 0;
@@ -4804,11 +4538,50 @@ function SelectedPlanVisualization({
           : plan.months_to_renovation === 0
             ? "买后可启动"
             : `买后 ${plan.months_to_renovation} 个月`;
-  const effectiveMembers = useMemo(() => effectiveIncomeMembers(household, rulePack, timelineBaseDate), [household, rulePack, timelineBaseDate]);
-  const effectiveHousehold = useMemo(() => ({ ...household, members: effectiveMembers }), [household, effectiveMembers]);
+  const taxMemberPointToIncomeRow = (member: NonNullable<(typeof taxMonthlySeries)[number]["member_points"]>[number]) => {
+    const taxableCash = member.gross_salary + member.bonus_income + member.other_taxable_income;
+    const extraCashExpense = Math.max(
+      0,
+      member.gross_salary +
+        member.bonus_income +
+        member.other_taxable_income +
+        member.non_taxable_income -
+        member.personal_social -
+        member.personal_housing_fund -
+        member.total_income_tax -
+        member.net_income
+    );
+    const allocTax = (amount: number) => (taxableCash > 0 ? member.total_income_tax * (amount / taxableCash) : 0);
+    return {
+      name: member.member_name,
+      stageName: member.stage_name,
+      grossMonthly: member.gross_salary,
+      bonusMonthly: member.bonus_income,
+      otherMonthly: member.other_taxable_income,
+      nonTaxableMonthly: member.non_taxable_income,
+      salaryNetMonthly: Math.max(
+        0,
+        member.gross_salary - member.personal_social - member.personal_housing_fund - allocTax(member.gross_salary)
+      ),
+      bonusNetMonthly: Math.max(0, member.bonus_income - allocTax(member.bonus_income)),
+      otherNetMonthly: Math.max(0, member.other_taxable_income - allocTax(member.other_taxable_income)),
+      nonTaxableNetMonthly: member.non_taxable_income,
+      extraCashExpense,
+      netMonthly: member.net_income,
+      personalSocial: member.personal_social,
+      personalHousingFund: member.personal_housing_fund,
+      employerHousingFund: member.employer_housing_fund,
+      incomeTax: member.total_income_tax,
+      salaryTax: member.salary_tax,
+      bonusTax: member.bonus_tax,
+      elderlyCareDeduction: member.elderly_care_deduction,
+      specialDeduction: member.special_additional_deduction + member.elderly_care_deduction + member.other_deduction
+    };
+  };
   const getMemberIncomeRows = (absoluteMonth: number) =>
-    effectiveMembers.length > 0
-      ? effectiveMembers.map((member) => memberMonthlyIncomeRow(member, rulePack, effectiveHousehold, timelineBaseDate, absoluteMonth))
+    taxMonthlyByMonth.get(absoluteMonth)?.member_points.map(taxMemberPointToIncomeRow) ??
+    (household.members.length > 0
+      ? []
       : [
           {
             name: "家庭",
@@ -4827,16 +4600,18 @@ function SelectedPlanVisualization({
             personalHousingFund: 0,
             employerHousingFund: 0,
             incomeTax: 0,
-            elderlyCareDeduction: 0
+            elderlyCareDeduction: 0,
+            specialDeduction: 0
           }
-        ];
+        ]);
   const horizonMonths = Math.min(
     840,
     Math.max(
       180,
       backendCashflowSeries[backendCashflowSeries.length - 1]?.month ?? 0,
       loanVisualizationSeries[loanVisualizationSeries.length - 1]?.month ?? 0,
-      providentVisualizationSeries[providentVisualizationSeries.length - 1]?.month ?? 0
+      providentVisualizationSeries[providentVisualizationSeries.length - 1]?.month ?? 0,
+      taxMonthlySeries[taxMonthlySeries.length - 1]?.month ?? 0
     )
   );
   const chartMaxTicks = isCompactChart ? 4 : 8;
@@ -4960,7 +4735,8 @@ function SelectedPlanVisualization({
     0,
     monthlySeries[monthlySeries.length - 1]?.month ?? monthlySeries.length - 1,
     loanVisualizationSeries[loanVisualizationSeries.length - 1]?.month ?? 0,
-    providentVisualizationSeries[providentVisualizationSeries.length - 1]?.month ?? 0
+    providentVisualizationSeries[providentVisualizationSeries.length - 1]?.month ?? 0,
+    taxMonthlySeries[taxMonthlySeries.length - 1]?.month ?? 0
   );
   const clampTimelineMonth = (month: number) => Math.max(0, Math.min(timelineEndMonth, Math.round(month)));
   const safeSelectedMonthIndex = clampTimelineMonth(selectedMonthIndex);
@@ -5363,12 +5139,14 @@ function SelectedPlanVisualization({
     (sum, member) => sum + member.employerHousingFund,
     0
   );
-  const taxSummaryRows = result.tax_summaries ?? [];
+  const selectedTaxYear = addMonths(timelineBaseDate, safeSelectedMonthIndex).getFullYear();
+  const selectedYearTaxSummary = result.tax_year_summaries?.find((item) => item.year === selectedTaxYear);
+  const taxSummaryRows = selectedYearTaxSummary?.summaries ?? result.tax_summaries ?? [];
   const annualTaxTotal =
-    result.annual_income_tax || taxSummaryRows.reduce((sum, item) => sum + item.total_tax, 0);
-  const annualTaxableIncome = taxSummaryRows.reduce((sum, item) => sum + item.taxable_income, 0);
-  const annualGrossIncome = taxSummaryRows.reduce((sum, item) => sum + item.gross_annual_income, 0);
-  const annualNetIncome = taxSummaryRows.reduce((sum, item) => sum + item.net_annual_income, 0);
+    selectedYearTaxSummary?.total_tax ?? result.annual_income_tax ?? taxSummaryRows.reduce((sum, item) => sum + item.total_tax, 0);
+  const annualTaxableIncome = selectedYearTaxSummary?.taxable_income ?? taxSummaryRows.reduce((sum, item) => sum + item.taxable_income, 0);
+  const annualGrossIncome = selectedYearTaxSummary?.gross_annual_income ?? taxSummaryRows.reduce((sum, item) => sum + item.gross_annual_income, 0);
+  const annualNetIncome = selectedYearTaxSummary?.net_annual_income ?? taxSummaryRows.reduce((sum, item) => sum + item.net_annual_income, 0);
   const selectedMonthTax = selectedMemberIncomeRows.reduce((sum, member) => sum + member.incomeTax, 0);
   const selectedMonthGrossIncome = selectedMemberIncomeRows.reduce(
     (sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly,
@@ -5380,13 +5158,13 @@ function SelectedPlanVisualization({
     0
   );
   const selectedMonthSpecialDeduction = selectedMemberIncomeRows.reduce(
-    (sum, member) => sum + (member.elderlyCareDeduction ?? 0),
+    (sum, member) => sum + (member.specialDeduction ?? member.elderlyCareDeduction ?? 0),
     0
   );
   const taxChartData = useMemo(
     () =>
-      monthlySeries.map((item) => {
-        const memberRows = getMemberIncomeRows(item.month);
+      taxMonthlySeries.map((item) => {
+        const memberRows = item.member_points.map(taxMemberPointToIncomeRow);
         const monthPoint: Record<string, number | string> = {
           month: item.month,
           税前收入: Math.round(
@@ -5401,7 +5179,7 @@ function SelectedPlanVisualization({
         });
         return monthPoint;
       }),
-    [effectiveHousehold, effectiveMembers, monthlySeries, rulePack, timelineBaseDate]
+    [taxMonthlySeries]
   );
   const visibleTaxChartData = useMemo(
     () => taxChartData.filter((item) => Number(item.month) >= viewStartMonth && Number(item.month) <= viewEndMonth),
@@ -6139,7 +5917,6 @@ function SelectedPlanVisualization({
             <ResponsiveContainer width="100%" height={260}>
               <LineChart
                 data={visibleTaxChartData}
-                onMouseMove={selectChartMonth}
                 onClick={selectChartMonth}
                 margin={{ top: 8, right: 12, left: 0, bottom: 8 }}
               >
@@ -6270,7 +6047,6 @@ function SelectedPlanVisualization({
             <ResponsiveContainer width="100%" height={240}>
               <LineChart
                 data={visibleMonthlySeries}
-                onMouseMove={selectChartMonth}
                 onClick={selectChartMonth}
               >
                 <CartesianGrid strokeDasharray="3 3" vertical={false} />
@@ -6326,7 +6102,6 @@ function SelectedPlanVisualization({
           <ResponsiveContainer width="100%" height={240}>
             <LineChart
               data={visibleMonthlySeries}
-              onMouseMove={selectChartMonth}
               onClick={selectChartMonth}
               margin={{ top: 8, right: 12, left: 0, bottom: 8 }}
             >
@@ -6387,7 +6162,6 @@ function SelectedPlanVisualization({
             <ResponsiveContainer width="100%" height={260}>
               <LineChart
                 data={visibleLoanChartData}
-                onMouseMove={selectChartMonth}
                 onClick={selectChartMonth}
                 margin={{ top: 8, right: 12, left: 0, bottom: 8 }}
               >
@@ -6497,7 +6271,6 @@ function SelectedPlanVisualization({
           <ResponsiveContainer width="100%" height={240}>
             <LineChart
               data={visibleProvidentChartData}
-              onMouseMove={selectChartMonth}
               onClick={selectChartMonth}
             >
               <CartesianGrid strokeDasharray="3 3" vertical={false} />

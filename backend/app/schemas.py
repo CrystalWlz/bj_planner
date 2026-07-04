@@ -219,7 +219,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(17, ge=1)
+    schema_version: int = Field(18, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -282,7 +282,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(17, ge=1)
+    schema_version: int = Field(18, ge=1)
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
@@ -330,6 +330,22 @@ class ScenarioData(BaseModel):
     notes: str = ""
     selected_purchase_plan_variant: str = ""
 
+    @model_validator(mode="after")
+    def normalize_property_specific_fields(self) -> "ScenarioData":
+        property_type = self.property_type.strip()
+        is_second_hand = "二手" in property_type or "存量" in property_type
+        is_new_home = "新房" in property_type
+        if not is_second_hand:
+            self.building_age_years = 0
+            self.building_structure = "unknown"
+            self.is_old_community_renovated = False
+            self.remaining_land_use_years = None
+        if not is_new_home:
+            self.green_building_level = "none"
+            self.prefab_building_level = "none"
+            self.is_ultra_low_energy_building = False
+        return self
+
 
 class ScenarioRecord(BaseModel):
     id: str
@@ -345,7 +361,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(17, ge=1)
+    schema_version: int = Field(18, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -474,7 +490,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(17, ge=1)
+    schema_version: int = Field(18, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -879,6 +895,82 @@ class TaxMemberSummary(BaseModel):
     selected_bonus_method: BonusTaxMethod
 
 
+class TaxYearSummary(BaseModel):
+    year: int
+    summaries: list[TaxMemberSummary]
+    gross_annual_income: float
+    taxable_income: float
+    salary_tax: float
+    bonus_tax: float
+    total_tax: float
+    net_annual_income: float
+
+
+class TaxMemberMonthlyPoint(BaseModel):
+    month: int
+    year: int
+    month_of_year: int
+    member_index: int
+    member_name: str
+    stage_name: str
+    stage_kind: str
+    gross_salary: float
+    bonus_income: float
+    other_taxable_income: float
+    non_taxable_income: float
+    personal_social: float
+    personal_housing_fund: float
+    employer_social: float
+    employer_housing_fund: float
+    special_additional_deduction: float
+    elderly_care_deduction: float
+    other_deduction: float
+    cumulative_taxable_income: float
+    salary_tax: float
+    bonus_tax: float
+    total_income_tax: float
+    net_income: float
+    selected_bonus_method: BonusTaxMethod
+
+
+class TaxMonthlyPoint(BaseModel):
+    month: int
+    year: int
+    month_of_year: int
+    gross_income: float
+    net_income: float
+    income_tax: float
+    salary_tax: float
+    bonus_tax: float
+    personal_social: float
+    personal_housing_fund: float
+    employer_social: float
+    employer_housing_fund: float
+    monthly_pf_deposit: float
+    non_taxable_income: float
+    extra_cash_expense: float
+    member_points: list[TaxMemberMonthlyPoint] = Field(default_factory=list)
+
+
+class TaxEventPoint(BaseModel):
+    month: int
+    year: int
+    month_of_year: int
+    member_name: str
+    event_type: Literal[
+        "income_stage_start",
+        "income_stage_end",
+        "bonus_payout",
+        "tax_payment",
+        "deduction_start",
+        "non_taxable_income",
+    ]
+    title: str
+    detail: str
+    amount: float | None = None
+    source: str = "backend"
+
+
 class StressResult(BaseModel):
     name: str
     status: str
@@ -920,6 +1012,9 @@ class AffordabilityResult(BaseModel):
     commercial_loan: LoanSummary | None
     provident_loan: LoanSummary | None
     tax_summaries: list[TaxMemberSummary]
+    tax_year_summaries: list[TaxYearSummary] = []
+    tax_monthly_points: list[TaxMonthlyPoint] = []
+    tax_events: list[TaxEventPoint] = []
     purchase_plan_analyses: list[PurchasePlanAnalysis]
     yield_sensitivity: list[YieldSensitivityPoint]
     monthly_cashflow_visualization: list[MonthlyCashflowPoint] = []

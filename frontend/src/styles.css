@@ -594,6 +594,43 @@ option {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 }
 
+.career-member-card .career-member-settings {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  align-items: start;
+}
+
+.career-member-card .career-member-settings > .switch-field {
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: var(--control-height);
+  box-sizing: border-box;
+  padding-block: 10px;
+  align-items: flex-start;
+  overflow: hidden;
+}
+
+.career-member-card .career-member-settings .switch-copy,
+.career-member-card .career-member-settings .switch-copy strong,
+.career-member-card .career-member-settings .switch-copy small {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.career-member-card .career-member-settings .switch-copy {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.career-member-card .career-member-settings .switch-control {
+  overflow: hidden;
+}
+
+.career-member-card .career-member-settings > .field {
+  margin-top: 0;
+}
+
 .career-member-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1593,6 +1630,11 @@ option {
   background: var(--chart-cash);
 }
 
+.loan-structure .loan-stack .down-payment,
+.loan-structure .loan-legend .down-payment {
+  background: var(--chart-safe);
+}
+
 .loan-stack .provident-loan,
 .loan-legend .provident-loan {
   background: var(--chart-provident);
@@ -2425,7 +2467,7 @@ option {
 }
 
 .attribution-pies {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .attribution-bars > div {
@@ -2470,6 +2512,19 @@ option {
 
 .attribution-pie {
   margin-top: 0;
+}
+
+.attribution-pie .compact-pie-layout {
+  grid-template-columns: minmax(210px, 0.8fr) minmax(240px, 1fr);
+}
+
+.attribution-details .attribution-grid {
+  margin: 0;
+  padding: 0 12px 12px;
+}
+
+.attribution-details .attribution-grid article {
+  background: var(--surface);
 }
 
 .compact-pie-layout {
@@ -3313,6 +3368,26 @@ option {
 
 .vehicle-source-card {
   padding: 15px;
+}
+
+.vehicle-prepayment-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.vehicle-prepayment-panel > .switch-field {
+  margin: 0;
+}
+
+.vehicle-prepayment-panel > .field-hint {
+  margin: 0;
+}
+
+.vehicle-prepayment-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .vehicle-source-head {

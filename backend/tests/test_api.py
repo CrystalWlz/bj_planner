@@ -1,7 +1,18 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+def _set_nested_value(payload: dict, path: tuple[str | int, ...], value) -> dict:
+    next_payload = deepcopy(payload)
+    cursor = next_payload
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return next_payload
 
 
 def test_fetch_preview_does_not_change_rule_pack(tmp_path: Path, monkeypatch) -> None:
@@ -168,6 +179,81 @@ def test_invalid_household_payload_is_rejected(tmp_path: Path, monkeypatch) -> N
         record = client.get("/api/households").json()[0]
         payload = record["data"] | {"child_count": -1}
         response = client.put(f"/api/households/{record['id']}", json={"data": payload})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("members", 0, "income_stages", 0, "annual_bonus_payout_month"), 13),
+        (("members", 0, "housing_fund_personal_rate"), 0.20),
+        (("car_plan", "total_months"), 0),
+        (("investment_buy_fee_rate",), 0.20),
+        (("phased_loans",), [{"name": "非法贷款", "principal": 10_000, "remaining_months": 0}]),
+        (("scheduled_expenses",), [{"name": "非法支出", "monthly_amount": -1, "start_month": "2027-01"}]),
+    ],
+)
+def test_invalid_nested_household_payload_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+    path: tuple[str | int, ...],
+    value,
+) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        record = client.get("/api/households").json()[0]
+        payload = _set_nested_value(record["data"], path, value)
+        response = client.put(f"/api/households/{record['id']}", json={"data": payload})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "scenario_patch",
+    [
+        {"total_price": -1},
+        {"loan_years": 31},
+        {"annual_investment_return": -0.51},
+        {"commercial_prepayment_start_month": 0},
+    ],
+)
+def test_invalid_scenario_payload_is_rejected(tmp_path: Path, monkeypatch, scenario_patch: dict) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        response = client.post("/api/scenarios", json={"data": scenario_patch})
+
+    assert response.status_code == 422
+
+
+def test_invalid_calculation_payload_is_rejected_before_cache_write(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]["data"]
+        scenario = {"total_price": 3_000_000, "commercial_rate": 0.30}
+        rule_pack = client.get("/api/rule-packs").json()[0]["data"]
+        response = client.post(
+            "/api/calculations/affordability",
+            json={"household": household, "scenario": scenario, "rule_pack": rule_pack},
+        )
 
     assert response.status_code == 422
 

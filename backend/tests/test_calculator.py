@@ -9,8 +9,11 @@ from app.calculator import (
     _quarterly_rent_withdrawal_before_purchase_at,
     _semiannual_loan_offset_monthly_equivalent,
     calculate_affordability,
+    build_tax_events,
+    build_tax_monthly_points,
     calculate_car_loan,
     calculate_household_tax,
+    calculate_household_tax_for_year,
     calculate_loan,
     household_monthly_income_profile_at,
     monthly_household_expense_at,
@@ -255,6 +258,131 @@ def test_annual_bonus_payout_month_can_differ_by_income_stage() -> None:
 
     assert april.gross_income == 30_000
     assert may.gross_income == 150_000
+
+
+def test_annual_tax_summary_only_counts_bonus_when_payout_month_is_active() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        income_projection_year=2027,
+        members=[
+            IncomeMember(
+                name="下半年入职成员",
+                monthly_salary_gross=12_000,
+                annual_bonus=12_000,
+                employment_start_date="2027-07-01",
+                bonus_tax_method="separate",
+                income_stages=[
+                    IncomeStageData(
+                        name="下半年收入",
+                        start_date="2027-07-01",
+                        monthly_salary_gross=12_000,
+                        annual_bonus=12_000,
+                        annual_bonus_payout_month=4,
+                        bonus_tax_method="separate",
+                    )
+                ],
+            )
+        ],
+    )
+
+    summary = calculate_household_tax(household, rule)[0][0]
+
+    assert summary.active_months == 6
+    assert summary.gross_annual_income == 72_000
+    assert summary.bonus_tax == 0
+
+
+def test_tax_monthly_points_exclude_inactive_member_and_pay_bonus_in_payout_month() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        income_projection_year=2027,
+        members=[
+            IncomeMember(
+                name="member_b",
+                monthly_salary_gross=12_000,
+                annual_bonus=12_000,
+                employment_start_date="2027-07-01",
+                bonus_tax_method="separate",
+                income_stages=[
+                    IncomeStageData(
+                        name="job_after_july",
+                        start_date="2027-07-01",
+                        monthly_salary_gross=12_000,
+                        annual_bonus=12_000,
+                        annual_bonus_payout_month=4,
+                        bonus_tax_method="separate",
+                    )
+                ],
+            )
+        ],
+    )
+
+    points = build_tax_monthly_points(household, rule, base_date=date(2027, 1, 1), horizon_months=16)
+    april_2027 = points[3]
+    july_2027 = points[6]
+    april_2028 = points[15]
+
+    assert april_2027.member_points == []
+    assert april_2027.gross_income == 0
+    assert july_2027.member_points[0].gross_salary == 12_000
+    assert july_2027.member_points[0].bonus_income == 0
+    assert april_2028.member_points[0].bonus_income == 12_000
+
+
+def test_tax_year_summary_is_backend_source_for_future_year_bonus() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        income_projection_year=2027,
+        members=[
+            IncomeMember(
+                name="member_b",
+                monthly_salary_gross=12_000,
+                annual_bonus=12_000,
+                employment_start_date="2027-07-01",
+                bonus_tax_method="separate",
+                income_stages=[
+                    IncomeStageData(
+                        name="job_after_july",
+                        start_date="2027-07-01",
+                        monthly_salary_gross=12_000,
+                        annual_bonus=12_000,
+                        annual_bonus_payout_month=4,
+                        bonus_tax_method="separate",
+                    )
+                ],
+            )
+        ],
+    )
+
+    summary_2027 = calculate_household_tax_for_year(household, rule, 2027)
+    summary_2028 = calculate_household_tax_for_year(household, rule, 2028)
+
+    assert summary_2027.gross_annual_income == 72_000
+    assert summary_2027.bonus_tax == 0
+    assert summary_2028.gross_annual_income == 156_000
+    assert summary_2028.summaries[0].gross_annual_income == 156_000
+
+
+def test_affordability_result_contains_backend_tax_timeline() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            members=[
+                IncomeMember(
+                    name="member_a",
+                    monthly_salary_gross=30_000,
+                    annual_bonus=60_000,
+                    employment_start_date="2026-07-01",
+                )
+            ]
+        ),
+        ScenarioData(total_price=0),
+        _zero_contribution_rule(),
+    )
+
+    assert result.tax_year_summaries
+    assert result.tax_monthly_points
+    assert result.tax_events
+    assert result.tax_monthly_points[0].member_points[0].member_name == "member_a"
 
 
 def test_income_member_defaults_to_one_income_stage() -> None:
@@ -1330,6 +1458,7 @@ def test_affordability_returns_backend_strategy_events_and_concepts() -> None:
 def test_affordability_generates_multiple_car_purchase_strategies() -> None:
     result = calculate_affordability(
         HouseholdData(
+            members=[IncomeMember(name="member", monthly_salary_gross=45_000)],
             cash_account_balance=200_000,
             monthly_expense=18_000,
             car_plan=CarPlanData(enabled=True, total_price=300_000, down_payment_ratio=0.5),
@@ -1353,6 +1482,54 @@ def test_affordability_generates_multiple_car_purchase_strategies() -> None:
     assert plans["low_down_keep_cash"].total_months == 60
     assert all(0 <= item.happiness_score <= 10 for item in plans.values())
     assert len({item.happiness_score for item in plans.values()}) > 1
+
+
+def test_car_prepayment_strategy_is_chosen_from_cashflow_pressure() -> None:
+    roomy_result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="member", monthly_salary_gross=50_000)],
+            cash_account_balance=300_000,
+            monthly_expense=12_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=220_000,
+                down_payment_ratio=0.3,
+                later_annual_rate=0.05,
+                loan_prepayment_enabled=True,
+                loan_prepayment_monthly_amount=0,
+            ),
+        ),
+        ScenarioData(),
+        RulePackData(),
+    )
+    tight_result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="member", monthly_salary_gross=18_000)],
+            cash_account_balance=80_000,
+            monthly_expense=17_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=220_000,
+                down_payment_ratio=0.3,
+                later_annual_rate=0.05,
+                loan_prepayment_enabled=True,
+                loan_prepayment_monthly_amount=0,
+            ),
+        ),
+        ScenarioData(),
+        RulePackData(),
+    )
+
+    roomy_plan = {item.strategy_key: item for item in roomy_result.car_plan_analyses}["accelerated_principal"]
+    tight_plan = {item.strategy_key: item for item in tight_result.car_plan_analyses}["accelerated_principal"]
+
+    assert roomy_plan.prepayment_enabled
+    assert roomy_plan.prepayment_monthly_amount > 0
+    assert roomy_plan.interest_saved_by_prepayment > 0
+    assert any("auto_extra_principal" in note for note in roomy_plan.notes)
+    assert not tight_plan.prepayment_enabled
+    assert tight_plan.prepayment_monthly_amount == 0
+    assert tight_plan.monthly_cash_flow_after_car < 0
 
 
 def test_car_plan_generates_strategies_for_each_vehicle_source_candidate() -> None:
@@ -1610,6 +1787,47 @@ def test_eligible_green_or_ultra_low_energy_home_increases_provident_cap() -> No
     assert efficient_plan.provident_policy_bonus == 400_000
     assert efficient_plan.provident_policy_cap == 1_600_000
     assert efficient_plan.provident_loan_amount > regular_plan.provident_loan_amount
+
+
+def test_new_home_clears_second_hand_policy_fields() -> None:
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        property_type="新房",
+        loan_years=30,
+        building_age_years=45,
+        building_structure="brick_mixed",
+        is_old_community_renovated=True,
+        remaining_land_use_years=20,
+    )
+
+    assert scenario.building_age_years == 0
+    assert scenario.building_structure == "unknown"
+    assert scenario.is_old_community_renovated is False
+    assert scenario.remaining_land_use_years is None
+
+    result = calculate_affordability(HouseholdData(borrower_age=30, social_security_months=96), scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    assert plan.provident_loan_years == 30
+    assert "房龄" not in "；".join(plan.provident_loan_year_limit_reasons)
+    assert "土地" not in "；".join(plan.provident_loan_year_limit_reasons)
+
+
+def test_second_hand_clears_new_home_bonus_fields() -> None:
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        property_type="二手房",
+        green_building_level="three_star",
+        prefab_building_level="AAA",
+        is_ultra_low_energy_building=True,
+    )
+
+    assert scenario.green_building_level == "none"
+    assert scenario.prefab_building_level == "none"
+    assert scenario.is_ultra_low_energy_building is False
+
+    result = calculate_affordability(HouseholdData(social_security_months=96), scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    assert plan.provident_policy_bonus == 0
 
 
 def test_new_home_provident_loan_years_can_use_requested_term() -> None:
@@ -3051,3 +3269,96 @@ def test_purchase_plan_happiness_scores_have_explainable_breakdown() -> None:
 def test_household_numeric_fields_reject_invalid_values(field: str, value: float) -> None:
     with pytest.raises(ValidationError):
         HouseholdData(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "kwargs"),
+    [
+        (IncomeStageData, {"annual_bonus_payout_month": 13}),
+        (IncomeStageData, {"monthly_salary_gross": -1}),
+        (IncomeMember, {"housing_fund_personal_rate": 0.13}),
+        (IncomeMember, {"current_age": 121}),
+        (CareerShockMemberSetting, {"layoff_age": 17}),
+        (CarPlanData, {"total_months": 0}),
+        (CarPlanData, {"later_annual_rate": 0.51}),
+        (PhasedLoanData, {"remaining_months": 0}),
+        (PhasedLoanData, {"annual_rate": 0.21}),
+        (ScheduledExpenseData, {"monthly_amount": -1}),
+        (ScenarioData, {"loan_years": 31}),
+        (ScenarioData, {"annual_investment_return": -0.51}),
+        (ScenarioData, {"commercial_prepayment_allowed_after_month": 0}),
+    ],
+)
+def test_nested_numeric_fields_reject_unreasonable_values(model_cls, kwargs: dict) -> None:
+    with pytest.raises(ValidationError):
+        model_cls(**kwargs)
+
+
+def test_invalid_phased_loan_month_strings_are_marked_for_review_without_payment() -> None:
+    loan = PhasedLoanData(
+        borrower="样例成员",
+        name="月份配置错误贷款",
+        principal=10_000,
+        interest_start_month="not-a-month",
+        interest_only_until="2028-13",
+    )
+
+    summary = summarize_phased_loans([loan], as_of=date(2027, 1, 1))[0]
+
+    assert summary.phase == "配置待校验"
+    assert summary.current_monthly_payment == 0
+
+
+def test_extreme_car_prepayment_is_capped_without_negative_interest_or_balance() -> None:
+    loan = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=200_000,
+            down_payment_ratio=0.10,
+            total_months=60,
+            interest_free_months=0,
+            later_annual_rate=0.08,
+            loan_prepayment_enabled=True,
+            loan_prepayment_start_month=1,
+            loan_prepayment_allowed_after_month=1,
+            loan_prepayment_monthly_amount=1_000_000,
+        )
+    )
+
+    assert loan.loan_principal == pytest.approx(180_000)
+    assert loan.actual_payoff_months == 1
+    assert loan.total_interest >= 0
+    assert loan.interest_saved_by_prepayment >= 0
+
+
+def test_extreme_negative_monthly_cashflow_keeps_account_balances_non_negative() -> None:
+    household = HouseholdData(
+        cash_account_balance=0,
+        investments=0,
+        monthly_expense=20_000,
+        monthly_debt_payment=5_000,
+        members=[
+            IncomeMember(
+                name="无收入成员",
+                monthly_salary_gross=0,
+                annual_bonus=0,
+                monthly_special_additional_deduction=0,
+            )
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=100_000,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        annual_investment_return=-0.50,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+
+    assert result.purchase_plan_analyses
+    assert result.monthly_cashflow_visualization
+    assert any(item.monthly_cash_delta < 0 for item in result.monthly_cashflow_visualization)
+    assert all(item.cash_balance >= 0 for item in result.monthly_cashflow_visualization)
+    assert all(item.investment_balance >= 0 for item in result.monthly_cashflow_visualization)
+    assert all(item.provident_balance >= 0 for item in result.monthly_cashflow_visualization)
+    assert all(item.total_loan_balance >= 0 for item in result.monthly_cashflow_visualization)

@@ -404,6 +404,75 @@ export interface TaxMemberSummary {
   selected_bonus_method: BonusTaxMethod;
 }
 
+export interface TaxYearSummary {
+  year: number;
+  summaries: TaxMemberSummary[];
+  gross_annual_income: number;
+  taxable_income: number;
+  salary_tax: number;
+  bonus_tax: number;
+  total_tax: number;
+  net_annual_income: number;
+}
+
+export interface TaxMemberMonthlyPoint {
+  month: number;
+  year: number;
+  month_of_year: number;
+  member_index: number;
+  member_name: string;
+  stage_name: string;
+  stage_kind: string;
+  gross_salary: number;
+  bonus_income: number;
+  other_taxable_income: number;
+  non_taxable_income: number;
+  personal_social: number;
+  personal_housing_fund: number;
+  employer_social: number;
+  employer_housing_fund: number;
+  special_additional_deduction: number;
+  elderly_care_deduction: number;
+  other_deduction: number;
+  cumulative_taxable_income: number;
+  salary_tax: number;
+  bonus_tax: number;
+  total_income_tax: number;
+  net_income: number;
+  selected_bonus_method: BonusTaxMethod;
+}
+
+export interface TaxMonthlyPoint {
+  month: number;
+  year: number;
+  month_of_year: number;
+  gross_income: number;
+  net_income: number;
+  income_tax: number;
+  salary_tax: number;
+  bonus_tax: number;
+  personal_social: number;
+  personal_housing_fund: number;
+  employer_social: number;
+  employer_housing_fund: number;
+  monthly_pf_deposit: number;
+  non_taxable_income: number;
+  extra_cash_expense: number;
+  member_points: TaxMemberMonthlyPoint[];
+}
+
+export interface TaxEventPoint {
+  month: number;
+  year: number;
+  month_of_year: number;
+  member_name: string;
+  event_type: "income_stage_start" | "income_stage_end" | "bonus_payout" | "tax_payment" | "deduction_start" | "non_taxable_income";
+  title: string;
+  detail: string;
+  amount: number | null;
+  source: string;
+}
+
 export interface PurchasePlanAnalysis {
   variant: string;
   description: string;
@@ -700,6 +769,9 @@ export interface AffordabilityResult {
   commercial_loan: LoanSummary | null;
   provident_loan: LoanSummary | null;
   tax_summaries: TaxMemberSummary[];
+  tax_year_summaries: TaxYearSummary[];
+  tax_monthly_points: TaxMonthlyPoint[];
+  tax_events: TaxEventPoint[];
   purchase_plan_analyses: PurchasePlanAnalysis[];
   yield_sensitivity: YieldSensitivityPoint[];
   monthly_cashflow_visualization: MonthlyCashflowPoint[];
