@@ -57,6 +57,7 @@ import type {
   BonusTaxMethod,
   CarPlanAnalysis,
   CarPlanData,
+  CareerShockMemberSetting,
   CareerShockData,
   ElderlyDependentData,
   HouseholdData,
@@ -104,6 +105,12 @@ const piePalette = [
   "var(--chart-extra-3)",
   "var(--chart-extra-4)"
 ];
+
+const bonusTaxMethodLabels: Record<BonusTaxMethod, string> = {
+  best: "自动择优",
+  separate: "单独计税",
+  merged: "并入综合所得"
+};
 
 const sourceDefaults = [
   "https://gjj.beijing.gov.cn/web/zwgk61/2024zcwj/436433464/436433465/743726695/index.html",
@@ -158,14 +165,31 @@ const defaultCarPlan: CarPlanData = {
   notes: ""
 };
 
+const carStrategyKeys = new Set(["target", "cash", "high_down_low_loan", "low_down_keep_cash", "delay_purchase"]);
+
+function normalizeCarStrategySelection(value?: string) {
+  const selected = (value || "").trim();
+  if (!selected || selected === "手动设置") return "target";
+  if (selected.includes("|")) return selected;
+  return carStrategyKeys.has(selected) ? selected : "target";
+}
+
+function carStrategyKeyFromSelection(value?: string) {
+  const normalized = normalizeCarStrategySelection(value);
+  return normalized.includes("|") ? normalized.split("|").pop()?.trim() || normalized : normalized;
+}
+
 const defaultCareerShock = {
   enabled: false,
   member_settings: [],
   auto_unemployment_benefit: true,
   auto_self_social_insurance: true,
+  auto_flexible_housing_fund: true,
+  auto_pension_income: true,
   unemployment_benefit_months: 24,
   unemployment_benefit_monthly: 0,
-  self_social_insurance_monthly: 0
+  self_social_insurance_monthly: 0,
+  self_housing_fund_monthly: 0
 };
 
 const defaultScheduledExpenses: ScheduledExpenseData[] = [
@@ -187,28 +211,21 @@ function normalizeCareerShockForMembers(
   rawShock: Partial<CareerShockData> | Record<string, unknown> | undefined,
   members: IncomeMember[]
 ): CareerShockData {
-  const shock = { ...defaultCareerShock, ...(rawShock ?? {}) } as CareerShockData & Record<string, unknown>;
+  const shock = { ...defaultCareerShock, ...(rawShock ?? {}) } as CareerShockData;
   const existingSettings = Array.isArray(shock.member_settings) ? shock.member_settings : [];
   const existingByName = new Map(existingSettings.map((item) => [item.member_name, item]));
-  const legacyLayoffMemberName = typeof shock.layoff_member_name === "string" ? shock.layoff_member_name : "";
-  const legacyLayoffAge = Number.isFinite(Number(shock.layoff_age)) ? Number(shock.layoff_age) : 35;
-  const legacyRetirementAges = [
-    Number.isFinite(Number(shock.self_retirement_age)) ? Number(shock.self_retirement_age) : 63,
-    Number.isFinite(Number(shock.spouse_retirement_age)) ? Number(shock.spouse_retirement_age) : 58
-  ];
-  const legacyPensions = [
-    Number.isFinite(Number(shock.self_pension_monthly)) ? Number(shock.self_pension_monthly) : 0,
-    Number.isFinite(Number(shock.spouse_pension_monthly)) ? Number(shock.spouse_pension_monthly) : 0
-  ];
   const member_settings = members.map((member, index) => {
     const memberName = member.name || `成员 ${index + 1}`;
     const existing = existingByName.get(memberName) ?? existingSettings[index];
     return {
       member_name: memberName,
-      enabled: existing?.enabled ?? (Boolean(shock.enabled) && memberName === legacyLayoffMemberName),
-      layoff_age: existing?.layoff_age ?? legacyLayoffAge,
-      retirement_age: existing?.retirement_age ?? legacyRetirementAges[index] ?? defaultRetirementAgeForMember(index),
-      pension_monthly: existing?.pension_monthly ?? legacyPensions[index] ?? 0
+      enabled: existing?.enabled ?? false,
+      layoff_age: existing?.layoff_age ?? 35,
+      retirement_age: existing?.retirement_age ?? defaultRetirementAgeForMember(index),
+      pension_monthly: existing?.pension_monthly ?? 0,
+      auto_pension_monthly: existing?.auto_pension_monthly ?? true,
+      unemployment_freelance_income_monthly: existing?.unemployment_freelance_income_monthly ?? 0,
+      flexible_freelance_income_monthly: existing?.flexible_freelance_income_monthly ?? 0
     };
   });
   return {
@@ -216,28 +233,22 @@ function normalizeCareerShockForMembers(
     member_settings,
     auto_unemployment_benefit: shock.auto_unemployment_benefit ?? true,
     auto_self_social_insurance: shock.auto_self_social_insurance ?? true,
+    auto_flexible_housing_fund: shock.auto_flexible_housing_fund ?? true,
+    auto_pension_income: shock.auto_pension_income ?? true,
     unemployment_benefit_months: shock.unemployment_benefit_months ?? 24,
     unemployment_benefit_monthly: shock.unemployment_benefit_monthly ?? 0,
-    self_social_insurance_monthly: shock.self_social_insurance_monthly ?? 0
+    self_social_insurance_monthly: shock.self_social_insurance_monthly ?? 0,
+    self_housing_fund_monthly: shock.self_housing_fund_monthly ?? 0
   };
 }
 
 function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): RecordEnvelope<HouseholdData> {
-  const rawShock = record.data.career_shock as CareerShockData & Record<string, unknown>;
-  const legacyBirthMonths = [
-    typeof rawShock?.self_birth_month === "string" ? rawShock.self_birth_month : "",
-    typeof rawShock?.spouse_birth_month === "string" ? rawShock.spouse_birth_month : ""
-  ];
-  const legacyCurrentAges = [
-    Number.isFinite(Number(rawShock?.self_current_age)) ? Number(rawShock.self_current_age) : 30,
-    Number.isFinite(Number(rawShock?.spouse_current_age)) ? Number(rawShock.spouse_current_age) : 30
-  ];
   const members = record.data.members.map((member, index) => {
-    const birthMonth = member.birth_month ?? legacyBirthMonths[index] ?? "";
+    const birthMonth = member.birth_month ?? "";
     return {
       ...member,
       birth_month: birthMonth,
-      current_age: ageYearsFromBirthMonth(birthMonth) ?? member.current_age ?? legacyCurrentAges[index] ?? 30,
+      current_age: ageYearsFromBirthMonth(birthMonth) ?? member.current_age ?? 30,
       provident_fund_balance: member.provident_fund_balance ?? 0
     };
   });
@@ -253,7 +264,11 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         candidate_vehicles: record.data.car_plan.candidate_vehicles ?? [],
         vehicle_plans: (record.data.car_plan.vehicle_plans ?? []).map((vehicle) => ({
           ...vehicle,
-          candidate_vehicles: vehicle.candidate_vehicles ?? []
+          selected_strategy_variant: normalizeCarStrategySelection(vehicle.selected_strategy_variant),
+          candidate_vehicles: (vehicle.candidate_vehicles ?? []).map((candidate) => ({
+            ...candidate,
+            selected_strategy_variant: normalizeCarStrategySelection(candidate.selected_strategy_variant)
+          }))
         })),
         no_car_monthly_commute_cost: record.data.car_plan.no_car_monthly_commute_cost ?? 0
       },
@@ -439,37 +454,38 @@ const parameterExplanations: Record<string, string> = {
   本人分摊扣除: "非独生子女时本人每月可申报的分摊额，个人上限通常为 1500 元/月。",
   成员名称: "收入成员名称。老人专项扣除、工资阶段和可视化明细会按这个名称关联。",
   阶段名称: "工资阶段的名称，例如当前收入、换工作后。用于识别不同收入时期。",
+  阶段类型: "选择这一段收入的性质。工资就业会按工资薪金自动扣社保、公积金和个税；失业期、自由职业和养老金阶段会按你填写或系统生成的收入项测算。",
   开始日期: "该工资阶段从哪天开始生效；税费和公积金会按月份匹配阶段。",
   结束日期: "该工资阶段结束日期；留空表示一直持续。",
   月工资税前: "每月税前工资，是社保、公积金、个税预扣和现金流收入的基础。",
+  "自由职业收入/月": "失业或灵活就业阶段可以填写预计自由职业收入。系统会把它作为综合所得现金收入纳入税务和现金流测算。",
   年终奖年额: "预计全年年终奖金额。现金流按该收入阶段设置的发放月份一次性入账，不均摊到每个月；系统会按单独计税或并入综合所得择优测算。",
   发放月份: "该收入阶段年终奖实际入账月份。不同成员、不同工作阶段可以不同；税率和单独计税有效期仍由政策规则控制。",
   "非税收入/月": "每月进入现金流但不并入工资薪金计税的收入，例如失业金、基础养老金等估算项。",
-  "额外现金支出/月": "该收入阶段每月额外发生的现金支出，例如灵活就业自缴社保。",
+  "额外现金支出/月": "该收入阶段每月额外发生、但不属于社保公积金扣缴的现金支出。灵活就业自缴社保和自缴公积金请使用专门字段，避免重复计算。",
   工资社保扣缴: "开启时按工资薪金自动估算北京社保、公积金和个税；失业金、养老金等阶段应关闭。",
   个人公积金比例: "个人缴纳住房公积金比例，会减少税后现金但增加公积金账户余额。",
   单位公积金比例: "单位缴纳住房公积金比例，会进入公积金账户，但不是当月现金工资。",
   "专项附加/月": "除赡养老人外的每月专项附加扣除，例如子女教育、住房租金等。",
   其他年收入: "工资薪金以外但需要并入综合所得测算的年度收入。",
   年终奖计税: "选择年终奖按单独计税、并入工资或由系统自动择优。",
-  被裁员成员: "选择职业冲击压力情景作用到哪个收入成员。关闭该情景时不会生成失业金或自缴社保阶段。",
-  第一成员出生年月: "优先用于把裁员年龄和退休年龄换算成真实月份；留空时使用当前年龄兜底。",
-  第二成员出生年月: "优先用于把第二位成员的退休年龄换算成真实月份；留空时使用当前年龄兜底。",
-  第一成员当前年龄: "仅在出生年月缺失或格式错误时兜底使用。",
-  第二成员当前年龄: "仅在出生年月缺失或格式错误时兜底使用。",
   裁员年龄: "压力情景触发年龄。达到该年龄当月起，系统自动切换到失业金和自缴社保收入阶段。",
   自动估算失业保险待遇: "开启后按家庭画像里的累计社保/个税月数估算待遇期限，并按规则包里的北京失业保险金标准分档生成现金流；关闭后使用手动月数和月额。",
   自动估算灵活就业自缴: "开启后按规则包里的灵活就业缴费基数、养老比例、失业比例和医保月额合计生成裁员后的自缴社保支出。",
+  自动估算灵活就业公积金: "开启后按规则包里的灵活就业公积金基数和比例生成自缴公积金。它会进入成员公积金账户，不作为可随意动用的现金。",
+  自动估算退休养老金: "开启后系统按基础养老金加个人账户养老金的简化公式估算退休后月收入；关闭后可逐个成员手动填写养老金。",
   估算失业金月数: "根据累计社保/个税月数估算：不足 12 个月为 0，1-5 年为 12 个月，5-10 年为 18 个月，10 年以上为 24 个月。",
   估算失业金月额: "按规则包里的北京失业保险金分档金额展示；如果超过 12 个月，斜杠后是第 13 个月起的后续期金额。",
   "估算自缴社保/月": "按规则包自动估算的灵活就业养老、失业和医保合计月支出。",
+  "估算自缴公积金/月": "按规则包自动估算的灵活就业住房公积金月缴存额，会增加对应成员的公积金账户余额。",
   失业金月数: "手动覆盖失业保险待遇期限；自动估算关闭时才参与计算，最长按 24 个月建模。",
   失业金月额: "手动覆盖失业保险金月额；自动估算关闭时才参与计算，作为非税现金收入进入家庭现金流。",
   "自缴社保/月": "手动覆盖裁员后以灵活就业身份自行缴纳养老、医保等的月现金支出；自动估算关闭时才参与计算。",
-  第一成员退休年龄: "第一位成员退休年龄假设，用于养老金阶段测算。请按自己的职业和政策口径填写。",
-  第二成员退休年龄: "第二位成员退休年龄假设，用于养老金阶段测算。请按自己的职业和政策口径填写。",
-  "第一成员养老金/月": "第一位成员退休后每月养老金估算，按非税现金收入进入收入阶段。实际养老金取决于缴费年限、基数和个人账户。",
-  "第二成员养老金/月": "第二位成员退休后每月养老金估算，按非税现金收入进入收入阶段。",
+  "自缴公积金/月": "手动覆盖灵活就业住房公积金月缴存额；自动估算关闭时才参与计算。",
+  "失业期自由职业收入/月": "裁员后领取失业金阶段可能发生的自由职业收入。它会作为应税现金收入进入测算；若实际申领失业金政策要求更严格，应按真实情况调低或设为 0。",
+  "灵活就业期自由职业收入/月": "失业金结束后、退休前的自由职业月收入。系统会同时计入该阶段的自缴社保、公积金和个税。",
+  自动估算养老金: "开启后按成员年龄、退休年龄、缴费基数和规则包里的养老金参数估算；关闭后使用手动养老金。",
+  "预计养老金/月": "按当前规则估算的退休后非税现金收入，用于长期现金流，不代表社保机构最终核定金额。",
   借款人: "贷款归属人，只用于展示和汇总，不改变还款计算公式。",
   贷款名称: "用于区分多笔贷款，例如低息贷款 A、教育贷款 A 或亲友借款 A。",
   本金: "当前仍需偿还或进入测算的贷款本金。",
@@ -785,11 +801,13 @@ function elderlyDeductionPolicyStatus(
 function incomeStageFromMember(member: IncomeMember): IncomeStageData {
   return {
     name: "当前收入",
+    stage_kind: "salary",
     start_date: member.employment_start_date || "2026-07-01",
     end_date: null,
     monthly_salary_gross: member.monthly_salary_gross,
     annual_bonus: member.annual_bonus,
     annual_bonus_payout_month: 4,
+    monthly_freelance_income: 0,
     monthly_non_taxable_income: 0,
     monthly_extra_cash_expense: 0,
     monthly_social_insurance: member.monthly_social_insurance,
@@ -808,7 +826,9 @@ function incomeStagesForMember(member: IncomeMember) {
   const stages = member.income_stages?.length ? member.income_stages : [incomeStageFromMember(member)];
   return stages.map((stage) => ({
     ...stage,
+    stage_kind: stage.stage_kind ?? "salary",
     annual_bonus_payout_month: stage.annual_bonus_payout_month ?? 4,
+    monthly_freelance_income: stage.monthly_freelance_income ?? 0,
     monthly_non_taxable_income: stage.monthly_non_taxable_income ?? 0,
     monthly_extra_cash_expense: stage.monthly_extra_cash_expense ?? 0,
     payroll_contributions_enabled: stage.payroll_contributions_enabled ?? true
@@ -858,6 +878,18 @@ function autoSelfSocialInsuranceMonthly(rulePack: RulePackData) {
   return Math.max(0, pension + unemployment + medical);
 }
 
+function autoFlexibleHousingFundMonthly(rulePack: RulePackData, shock?: CareerShockData) {
+  const params = rulePack.params ?? {};
+  if (shock && !shock.auto_flexible_housing_fund) return Math.max(0, shock.self_housing_fund_monthly ?? 0);
+  if (params.flexible_employment_housing_fund_enabled === false) return 0;
+  const floor = Number(params.beijing_housing_fund_base_floor ?? 2540);
+  const ceiling = Number(params.beijing_housing_fund_base_ceiling ?? 35811);
+  const rawBase = Number(params.flexible_employment_housing_fund_base ?? floor);
+  const base = Math.max(floor, Math.min(rawBase, ceiling));
+  const rate = Math.max(0, Math.min(Number(params.flexible_employment_housing_fund_rate ?? 0.12), 0.24));
+  return Math.max(0, base * rate);
+}
+
 function monthsBetween(baseDate: Date, targetDate: Date) {
   return Math.max(
     0,
@@ -873,15 +905,62 @@ function endOfPreviousMonth(monthStart: Date) {
   return new Date(monthStart.getFullYear(), monthStart.getMonth(), 0);
 }
 
+function estimateAutoPensionMonthly(
+  member: IncomeMember,
+  setting: CareerShockMemberSetting,
+  rulePack: RulePackData,
+  retirementStart: Date,
+  baseDate: Date
+) {
+  if (!setting.auto_pension_monthly) return Math.max(0, setting.pension_monthly ?? 0);
+  const params = rulePack.params ?? {};
+  const monthsToRetirement = monthsBetween(baseDate, retirementStart);
+  const stages = incomeStagesForMember(member).sort((left, right) => left.start_date.localeCompare(right.start_date));
+  const currentStage = stages[stages.length - 1] ?? incomeStageFromMember(member);
+  const socialFloor = ruleParamNumber(rulePack, "beijing_social_base_floor", 7162);
+  const socialCeiling = ruleParamNumber(rulePack, "beijing_social_base_ceiling", 35811);
+  const currentSalary = Math.max(member.monthly_salary_gross ?? 0, currentStage.monthly_salary_gross ?? 0);
+  const contributionBase = Math.max(socialFloor, Math.min(currentSalary > 0 ? currentSalary : socialFloor, socialCeiling));
+  const flexibleBase = Math.max(
+    socialFloor,
+    Math.min(ruleParamNumber(rulePack, "flexible_employment_social_base", socialFloor), socialCeiling)
+  );
+  const averageSalaryNow = Math.max(
+    socialFloor,
+    Math.min(ruleParamNumber(rulePack, "pension_reference_average_salary", socialCeiling), socialCeiling)
+  );
+  const salaryGrowth = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_average_salary_growth_rate", 0.03), 0.1));
+  const projectedAverageSalary = averageSalaryNow * ((1 + salaryGrowth) ** (monthsToRetirement / 12));
+  const existingPaidYears = Math.max(ruleParamNumber(rulePack, "pension_default_paid_years", 15), Math.max(0, (member.current_age ?? 30) - 22));
+  const totalPaidYears = Math.max(15, existingPaidYears + monthsToRetirement / 12);
+  const indexedBase = (contributionBase + flexibleBase) / 2;
+  const basicPension = projectedAverageSalary * (1 + indexedBase / projectedAverageSalary) / 2 * totalPaidYears * 0.01;
+  const employeeRate = ruleParamNumber(rulePack, "employee_pension_rate", 0.08);
+  const flexibleRate = ruleParamNumber(rulePack, "flexible_employment_pension_rate", 0.2);
+  const accountReturn = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_personal_account_annual_return", 0.025), 0.08));
+  const existingAccount = contributionBase * employeeRate * 12 * existingPaidYears;
+  let futureAccount = 0;
+  for (let month = 0; month < monthsToRetirement; month += 1) {
+    futureAccount = (futureAccount + flexibleBase * flexibleRate * 0.4) * ((1 + accountReturn) ** (1 / 12));
+  }
+  const accountMonths = Math.max(1, ruleParamNumber(rulePack, "pension_personal_account_months", 139));
+  const rawPension = basicPension + (existingAccount + futureAccount) / accountMonths;
+  const floorRate = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_replacement_rate_floor", 0.2), 1));
+  const ceilingRate = Math.max(floorRate, Math.min(ruleParamNumber(rulePack, "pension_replacement_rate_ceiling", 0.65), 1.2));
+  return Math.max(projectedAverageSalary * floorRate, Math.min(rawPension, projectedAverageSalary * ceilingRate));
+}
+
 function zeroCashStage(template: IncomeStageData, name: string, start: Date, end: Date | null = null): IncomeStageData {
   return {
     ...template,
     name,
+    stage_kind: "manual",
     start_date: formatDateInputValue(start),
     end_date: end ? formatDateInputValue(end) : null,
     monthly_salary_gross: 0,
     annual_bonus: 0,
     annual_bonus_payout_month: template.annual_bonus_payout_month ?? 4,
+    monthly_freelance_income: 0,
     monthly_non_taxable_income: 0,
     monthly_extra_cash_expense: 0,
     monthly_social_insurance: 0,
@@ -909,14 +988,17 @@ function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData
   const selfSocialMonthly = shock.auto_self_social_insurance
     ? autoSelfSocialInsuranceMonthly(rulePack)
     : shock.self_social_insurance_monthly;
+  const flexibleHousingFundMonthly = autoFlexibleHousingFundMonthly(rulePack, shock);
   const settingsByName = new Map(shock.member_settings.map((item) => [item.member_name, item]));
   return household.members.map((member, memberIndex) => {
     const originalStages = incomeStagesForMember(member).filter((stage) => !stage.name.startsWith(syntheticPrefix));
     const template = originalStages[originalStages.length - 1] ?? incomeStageFromMember(member);
     const setting = settingsByName.get(member.name);
     const retirementAge = setting?.retirement_age ?? defaultRetirementAgeForMember(memberIndex);
-    const pensionMonthly = setting?.pension_monthly ?? 0;
     const retirementStart = monthStartForBirthMonthOrAge(baseDate, member.birth_month, member.current_age, retirementAge);
+    const pensionMonthly = setting
+      ? estimateAutoPensionMonthly(member, setting, rulePack, retirementStart, baseDate)
+      : 0;
     const stages = [...originalStages];
 
     if (setting?.enabled) {
@@ -927,6 +1009,8 @@ function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData
         const boundedFirstEnd = firstEnd < retirementStart ? firstEnd : endOfPreviousMonth(retirementStart);
         stages.push({
           ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-失业金期`, layoffStart, boundedFirstEnd),
+          stage_kind: "unemployment",
+          monthly_freelance_income: setting.unemployment_freelance_income_monthly ?? 0,
           monthly_non_taxable_income: firstUnemploymentMonthly
         });
         if (shock.auto_unemployment_benefit && unemploymentMonths > 12) {
@@ -936,6 +1020,8 @@ function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData
           if (laterStart < retirementStart) {
             stages.push({
               ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-失业金后续期`, laterStart, boundedLaterEnd),
+              stage_kind: "unemployment",
+              monthly_freelance_income: setting.unemployment_freelance_income_monthly ?? 0,
               monthly_non_taxable_income: laterUnemploymentMonthly
             });
           }
@@ -945,7 +1031,10 @@ function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData
       if (selfSocialStart < retirementStart) {
         stages.push({
           ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-灵活就业自缴社保期`, selfSocialStart, endOfPreviousMonth(retirementStart)),
-          monthly_extra_cash_expense: selfSocialMonthly
+          stage_kind: "freelance",
+          monthly_freelance_income: setting.flexible_freelance_income_monthly ?? 0,
+          monthly_social_insurance: selfSocialMonthly,
+          monthly_housing_fund: flexibleHousingFundMonthly
         });
       }
     }
@@ -953,6 +1042,7 @@ function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData
     if (pensionMonthly > 0) {
       stages.push({
         ...zeroCashStage(template, `${syntheticPrefix}${retirementAge}岁退休-养老金`, retirementStart),
+        stage_kind: "pension",
         monthly_non_taxable_income: pensionMonthly
       });
     }
@@ -1034,7 +1124,11 @@ function bonusTax(annualBonus: number, brackets: TaxBracket[]) {
 
 function estimateStageContributionsByRules(stage: IncomeStageData, rulePack: RulePackData) {
   if (stage.payroll_contributions_enabled === false || stage.monthly_salary_gross <= 0) {
-    return { personalSocial: 0, personalHousingFund: 0, employerHousingFund: 0 };
+    return {
+      personalSocial: Math.max(0, stage.monthly_social_insurance ?? 0),
+      personalHousingFund: Math.max(0, stage.monthly_housing_fund ?? 0),
+      employerHousingFund: 0
+    };
   }
   const socialBase = Math.max(
     ruleParamNumber(rulePack, "beijing_social_base_floor", 7162),
@@ -1096,7 +1190,13 @@ function selectedStageBonusMethod(stage: IncomeStageData, rulePack: RulePackData
     (estimated.personalSocial + estimated.personalHousingFund) * 12 +
     stage.monthly_special_additional_deduction * 12 +
     stage.other_annual_deductions;
-  const salaryTaxable = Math.max(0, stage.monthly_salary_gross * 12 + stage.other_annual_taxable_income - commonDeductions);
+  const salaryTaxable = Math.max(
+    0,
+    stage.monthly_salary_gross * 12 +
+      (stage.monthly_freelance_income ?? 0) * 12 +
+      stage.other_annual_taxable_income -
+      commonDeductions
+  );
   const separate = progressiveTax(salaryTaxable, annualBrackets) + bonusTax(stage.annual_bonus, bonusBrackets);
   const merged = progressiveTax(Math.max(0, salaryTaxable + stage.annual_bonus), annualBrackets);
   return merged < separate ? "merged" : "separate";
@@ -1124,7 +1224,7 @@ function cumulativeSalaryTax(
     if (!stage) continue;
     const estimated = estimateStageContributionsByRules(stage, rulePack);
     activeMonths += 1;
-    cumulativeIncome += stage.monthly_salary_gross + stage.other_annual_taxable_income / 12;
+    cumulativeIncome += stage.monthly_salary_gross + (stage.monthly_freelance_income ?? 0) + stage.other_annual_taxable_income / 12;
     if (selectedStageBonusMethod(stage, rulePack) === "merged") {
       cumulativeIncome += stageBonusPayoutAmount(stage, year, month);
     }
@@ -1207,22 +1307,23 @@ function memberMonthlyIncomeRow(
   const nonTaxableMonthly = stage.monthly_non_taxable_income ?? 0;
   const extraCashExpense = stage.monthly_extra_cash_expense ?? 0;
   const incomeTax = salaryTax + bonusTaxDue;
-  const taxableCashBeforeTax = stage.monthly_salary_gross + bonusPayout + otherMonthly;
+  const freelanceMonthly = stage.monthly_freelance_income ?? 0;
+  const taxableCashBeforeTax = stage.monthly_salary_gross + freelanceMonthly + bonusPayout + otherMonthly;
   const salaryTaxShare = taxableCashBeforeTax > 0 ? stage.monthly_salary_gross / taxableCashBeforeTax : 0;
   const bonusTaxShare = taxableCashBeforeTax > 0 ? bonusPayout / taxableCashBeforeTax : 0;
-  const otherTaxShare = taxableCashBeforeTax > 0 ? otherMonthly / taxableCashBeforeTax : 0;
+  const otherTaxShare = taxableCashBeforeTax > 0 ? (freelanceMonthly + otherMonthly) / taxableCashBeforeTax : 0;
   const salaryNetMonthly = Math.max(
     0,
     stage.monthly_salary_gross - estimated.personalSocial - estimated.personalHousingFund - incomeTax * salaryTaxShare
   );
   const bonusNetMonthly = Math.max(0, bonusPayout - incomeTax * bonusTaxShare);
-  const otherNetMonthly = Math.max(0, otherMonthly - incomeTax * otherTaxShare);
+  const otherNetMonthly = Math.max(0, freelanceMonthly + otherMonthly - incomeTax * otherTaxShare);
   return {
     name: member.name,
     stageName: stage.name,
     grossMonthly: stage.monthly_salary_gross,
     bonusMonthly: bonusPayout,
-    otherMonthly,
+    otherMonthly: freelanceMonthly + otherMonthly,
     nonTaxableMonthly,
     salaryNetMonthly,
     bonusNetMonthly,
@@ -1231,7 +1332,7 @@ function memberMonthlyIncomeRow(
     extraCashExpense,
     netMonthly: Math.max(
       -999999,
-      stage.monthly_salary_gross + bonusPayout + otherMonthly + nonTaxableMonthly - estimated.personalSocial - estimated.personalHousingFund - incomeTax - extraCashExpense
+      stage.monthly_salary_gross + freelanceMonthly + bonusPayout + otherMonthly + nonTaxableMonthly - estimated.personalSocial - estimated.personalHousingFund - incomeTax - extraCashExpense
     ),
     personalSocial: estimated.personalSocial,
     personalHousingFund: estimated.personalHousingFund,
@@ -1860,6 +1961,7 @@ function IncomePage({
   const estimatedUnemploymentBenefitMonthly = unemploymentBenefitMonthlyFromService(household.social_security_months ?? 0, activeRulePack);
   const estimatedLaterUnemploymentBenefitMonthly = Number(activeRulePack.params.beijing_unemployment_benefit_after_12_months ?? 2129);
   const estimatedSelfSocialInsuranceMonthly = autoSelfSocialInsuranceMonthly(activeRulePack);
+  const estimatedFlexibleHousingFundMonthly = autoFlexibleHousingFundMonthly(activeRulePack, careerShock);
   const elderlyPolicyStatus = elderlyDeductionPolicyStatus(elderlyDependents, new Date());
   const phasedLoanPhaseSummary = (result?.phased_loan_summaries ?? []).reduce<Record<string, number>>((summary, loan) => {
     summary[loan.phase] = (summary[loan.phase] ?? 0) + 1;
@@ -1972,6 +2074,24 @@ function IncomePage({
                         onChange={(event) => updateIncomeStage(index, stageIndex, "name", event.target.value)}
                       />
                     </Field>
+                    <Field label="阶段类型">
+                      <select
+                        value={stage.stage_kind ?? "salary"}
+                        onChange={(event) => {
+                          const nextKind = event.target.value as IncomeStageData["stage_kind"];
+                          updateIncomeStage(index, stageIndex, "stage_kind", nextKind);
+                          if (nextKind !== "salary") {
+                            updateIncomeStage(index, stageIndex, "payroll_contributions_enabled", false);
+                          }
+                        }}
+                      >
+                        <option value="salary">工资就业</option>
+                        <option value="unemployment">失业期</option>
+                        <option value="freelance">自由职业</option>
+                        <option value="pension">退休养老金</option>
+                        <option value="manual">手动阶段</option>
+                      </select>
+                    </Field>
                     <button
                       className="icon-button"
                       onClick={() => removeIncomeStage(index, stageIndex)}
@@ -2003,6 +2123,13 @@ function IncomePage({
                       min={0}
                       step={100}
                       onChange={(value) => updateIncomeStage(index, stageIndex, "monthly_salary_gross", value)}
+                    />
+                    <NumberField
+                      label="自由职业收入/月"
+                      value={stage.monthly_freelance_income ?? 0}
+                      min={0}
+                      step={100}
+                      onChange={(value) => updateIncomeStage(index, stageIndex, "monthly_freelance_income", value)}
                     />
                     <NumberField
                       label="年终奖年额"
@@ -2256,6 +2383,11 @@ function IncomePage({
                 step={1}
                 onChange={(value) => updateHousehold("child_count", value)}
               />
+              <SwitchField
+                label="北京户籍家庭"
+                checked={household.has_beijing_hukou}
+                onChange={(checked) => updateHousehold("has_beijing_hukou", checked)}
+              />
               <NumberField
                 label="社保/个税月数"
                 value={household.social_security_months}
@@ -2278,11 +2410,6 @@ function IncomePage({
                 max={10}
                 step={1}
                 onChange={(value) => updateHousehold("existing_mortgage_count", value)}
-              />
-              <SwitchField
-                label="北京户籍家庭"
-                checked={household.has_beijing_hukou}
-                onChange={(checked) => updateHousehold("has_beijing_hukou", checked)}
               />
             </div>
           </div>
@@ -2308,7 +2435,7 @@ function IncomePage({
                       <Trash2 size={15} />
                     </button>
                   </div>
-                  <div className="form-grid structured-settings">
+                  <div className="profile-member-fields">
                     <Field label="成员名称">
                       <input
                         value={member.name}
@@ -2445,6 +2572,7 @@ function IncomePage({
           <Metric label="当前启用成员" value={careerShockSummaryText} tone={activeCareerShockSettings.length > 0 ? "warn" : undefined} />
           <Metric label="估算失业金月数" value={`${estimatedUnemploymentBenefitMonths} 个月`} />
           <Metric label="估算自缴社保/月" value={money(estimatedSelfSocialInsuranceMonthly)} />
+          <Metric label="估算自缴公积金/月" value={money(estimatedFlexibleHousingFundMonthly)} />
         </div>
         <div className="setting-group">
           <strong className="setting-group-title">全局估算规则</strong>
@@ -2459,8 +2587,21 @@ function IncomePage({
               checked={careerShock.auto_self_social_insurance}
               onChange={(checked) => updateCareerShock({ auto_self_social_insurance: checked })}
             />
+            <SwitchField
+              label="自动估算灵活就业公积金"
+              checked={careerShock.auto_flexible_housing_fund}
+              onChange={(checked) => updateCareerShock({ auto_flexible_housing_fund: checked })}
+            />
+            <SwitchField
+              label="自动估算退休养老金"
+              checked={careerShock.auto_pension_income}
+              onChange={(checked) => {
+                const member_settings = careerShock.member_settings.map((setting) => ({ ...setting, auto_pension_monthly: checked }));
+                updateCareerShock({ auto_pension_income: checked, member_settings });
+              }}
+            />
           </div>
-          {!careerShock.auto_unemployment_benefit || !careerShock.auto_self_social_insurance ? (
+          {!careerShock.auto_unemployment_benefit || !careerShock.auto_self_social_insurance || !careerShock.auto_flexible_housing_fund ? (
             <div className="form-grid structured-settings">
               {!careerShock.auto_unemployment_benefit ? (
                 <>
@@ -2470,6 +2611,9 @@ function IncomePage({
               ) : null}
               {!careerShock.auto_self_social_insurance ? (
                 <NumberField label="自缴社保/月" value={careerShock.self_social_insurance_monthly} min={0} step={100} onChange={(value) => updateCareerShock({ self_social_insurance_monthly: value })} />
+              ) : null}
+              {!careerShock.auto_flexible_housing_fund ? (
+                <NumberField label="自缴公积金/月" value={careerShock.self_housing_fund_monthly} min={0} step={100} onChange={(value) => updateCareerShock({ self_housing_fund_monthly: value })} />
               ) : null}
             </div>
           ) : null}
@@ -2487,6 +2631,9 @@ function IncomePage({
             {careerShock.auto_self_social_insurance ? (
               <Metric label="自动估算自缴社保/月" value={money(estimatedSelfSocialInsuranceMonthly)} />
             ) : null}
+            {careerShock.auto_flexible_housing_fund ? (
+              <Metric label="自动估算自缴公积金/月" value={money(estimatedFlexibleHousingFundMonthly)} />
+            ) : null}
           </div>
         </div>
         <div className="member-list compact-list career-member-list">
@@ -2496,15 +2643,20 @@ function IncomePage({
               enabled: false,
               layoff_age: 35,
               retirement_age: defaultRetirementAgeForMember(index),
-              pension_monthly: 0
+              pension_monthly: 0,
+              auto_pension_monthly: careerShock.auto_pension_income ?? true,
+              unemployment_freelance_income_monthly: 0,
+              flexible_freelance_income_monthly: 0
             };
+            const retirementStartDate = monthStartForBirthMonthOrAge(today, member.birth_month, memberAges[index] ?? member.current_age ?? 30, setting.retirement_age);
+            const estimatedPensionMonthly = estimateAutoPensionMonthly(member, setting, activeRulePack, retirementStartDate, today);
             const layoffDate = formatMonthDate(
               today,
               monthsBetween(today, monthStartForBirthMonthOrAge(today, member.birth_month, memberAges[index] ?? member.current_age ?? 30, setting.layoff_age))
             );
             const retirementDate = formatMonthDate(
               today,
-              monthsBetween(today, monthStartForBirthMonthOrAge(today, member.birth_month, memberAges[index] ?? member.current_age ?? 30, setting.retirement_age))
+              monthsBetween(today, retirementStartDate)
             );
             return (
               <section className="member-card loan-card career-member-card" key={`career-shock-${index}`}>
@@ -2519,12 +2671,22 @@ function IncomePage({
                 <div className="form-grid structured-settings">
                   <NumberField label="裁员年龄" value={setting.layoff_age} min={18} max={80} step={1} onChange={(value) => updateMemberCareerShockSetting(index, { layoff_age: value })} />
                   <NumberField label="退休年龄" value={setting.retirement_age} min={50} max={70} step={1} onChange={(value) => updateMemberCareerShockSetting(index, { retirement_age: value })} />
-                  <NumberField label="养老金/月" value={setting.pension_monthly} min={0} step={500} onChange={(value) => updateMemberCareerShockSetting(index, { pension_monthly: value })} />
+                  <NumberField label="失业期自由职业收入/月" value={setting.unemployment_freelance_income_monthly ?? 0} min={0} step={100} onChange={(value) => updateMemberCareerShockSetting(index, { unemployment_freelance_income_monthly: value })} />
+                  <NumberField label="灵活就业期自由职业收入/月" value={setting.flexible_freelance_income_monthly ?? 0} min={0} step={100} onChange={(value) => updateMemberCareerShockSetting(index, { flexible_freelance_income_monthly: value })} />
+                  <SwitchField
+                    label="自动估算养老金"
+                    checked={setting.auto_pension_monthly ?? true}
+                    onChange={(checked) => updateMemberCareerShockSetting(index, { auto_pension_monthly: checked })}
+                  />
+                  {!setting.auto_pension_monthly ? (
+                    <NumberField label="手动养老金/月" value={setting.pension_monthly} min={0} step={500} onChange={(value) => updateMemberCareerShockSetting(index, { pension_monthly: value })} />
+                  ) : null}
                 </div>
                 <div className="read-only-grid">
                   <Metric label="当前年龄" value={member.birth_month ? `${memberAges[index]} 岁` : "待填写出生年月"} />
                   <Metric label="预计裁员月份" value={setting.enabled ? layoffDate : "未启用"} tone={setting.enabled ? "warn" : undefined} />
                   <Metric label="预计退休月份" value={retirementDate} />
+                  <Metric label="预计养老金/月" value={money(estimatedPensionMonthly)} />
                 </div>
               </section>
             );
@@ -3746,11 +3908,29 @@ function CarPlanPage({
     const sourceName = strategy.vehicle_candidate_name || strategy.vehicle_name;
     return `${sourceName} · ${strategyLabel(strategy.strategy_key)}`;
   };
+  const strategiesByVehicle = vehiclePlans.map((_, vehicleIndex) => carStrategies.filter((strategy) => strategy.vehicle_index === vehicleIndex));
+  const resolveActiveCarStrategy = (vehicle: VehiclePlanData, vehicleIndex: number) => {
+    const strategies = strategiesByVehicle[vehicleIndex] ?? [];
+    if (!strategies.length) return null;
+    const selectedVariant = normalizeCarStrategySelection(vehicle.selected_strategy_variant);
+    const exact = strategies.find((strategy) => strategy.variant === selectedVariant);
+    if (exact) return exact;
+    const selectedKey = carStrategyKeyFromSelection(selectedVariant);
+    return strategies.find((strategy) => strategy.strategy_key === selectedKey) ?? null;
+  };
   const activeVehicleStrategies = new Set(
-    vehiclePlans.map((vehicle) => vehicle.selected_strategy_variant).filter(Boolean)
+    vehiclePlans
+      .map((vehicle, index) => resolveActiveCarStrategy(vehicle, index)?.variant)
+      .filter(Boolean)
   );
   const selectedCarStrategy = vehiclePlans.length
-    ? vehiclePlans.map((vehicle, index) => `${vehicle.name || `车辆 ${index + 1}`}：${strategyLabel(vehicle.selected_strategy_variant || "target")}`).join("；")
+    ? vehiclePlans.map((vehicle, index) => {
+      const activeStrategy = resolveActiveCarStrategy(vehicle, index);
+      if (activeStrategy) {
+        return `${vehicle.name || `车辆 ${index + 1}`}：${displayStrategyName(activeStrategy)}`;
+      }
+      return `${vehicle.name || `车辆 ${index + 1}`}：尚未采用具体方案`;
+    }).join("；")
     : "不买车模式";
 
   const buildVehicleSource = (vehicleIndex: number, candidateIndex: number, base?: Partial<VehiclePlanData>): VehiclePlanData => ({
@@ -3909,7 +4089,6 @@ function CarPlanPage({
     updateVehiclePlans(nextVehicles, strategy.variant);
   };
 
-  const strategiesByVehicle = vehiclePlans.map((_, vehicleIndex) => carStrategies.filter((strategy) => strategy.vehicle_index === vehicleIndex));
   const carLoan = result?.car_loan;
 
   return (
@@ -4186,6 +4365,11 @@ function RulePage({
           <NumberField label="灵活养老比例" value={ruleNumber("flexible_employment_pension_rate", 0.2)} min={0} max={1} step={0.01} onChange={(value) => updateRuleParam("flexible_employment_pension_rate", value)} />
           <NumberField label="灵活失业比例" value={ruleNumber("flexible_employment_unemployment_rate", 0.01)} min={0} max={1} step={0.001} onChange={(value) => updateRuleParam("flexible_employment_unemployment_rate", value)} />
           <NumberField label="灵活医保月额" value={ruleNumber("flexible_employment_medical_monthly", 584.92)} min={0} step={10} onChange={(value) => updateRuleParam("flexible_employment_medical_monthly", value)} />
+          <NumberField label="灵活公积金基数" value={ruleNumber("flexible_employment_housing_fund_base", 7162)} min={0} step={100} onChange={(value) => updateRuleParam("flexible_employment_housing_fund_base", value)} />
+          <NumberField label="灵活公积金比例" value={ruleNumber("flexible_employment_housing_fund_rate", 0.12)} min={0} max={0.24} step={0.01} onChange={(value) => updateRuleParam("flexible_employment_housing_fund_rate", value)} />
+          <NumberField label="养老金工资增长" value={ruleNumber("pension_average_salary_growth_rate", 0.03)} min={0} max={0.1} step={0.005} onChange={(value) => updateRuleParam("pension_average_salary_growth_rate", value)} />
+          <NumberField label="养老金账户收益" value={ruleNumber("pension_personal_account_annual_return", 0.025)} min={0} max={0.08} step={0.005} onChange={(value) => updateRuleParam("pension_personal_account_annual_return", value)} />
+          <NumberField label="养老金计发月数" value={ruleNumber("pension_personal_account_months", 139)} min={1} max={300} step={1} onChange={(value) => updateRuleParam("pension_personal_account_months", value)} />
           <NumberField label="首套商贷首付" value={ruleNumber("first_home_commercial_min_down_payment_ratio", 0.15)} min={0} max={1} step={0.01} onChange={(value) => updateRuleParam("first_home_commercial_min_down_payment_ratio", value)} />
           <NumberField label="首套公积金首付" value={ruleNumber("first_home_provident_min_down_payment_ratio", 0.2)} min={0} max={1} step={0.01} onChange={(value) => updateRuleParam("first_home_provident_min_down_payment_ratio", value)} />
           <NumberField label="二套商贷首付" value={ruleNumber("second_home_commercial_min_down_payment_ratio", 0.2)} min={0} max={1} step={0.01} onChange={(value) => updateRuleParam("second_home_commercial_min_down_payment_ratio", value)} />
@@ -4295,7 +4479,7 @@ function VisualizationPage({
   };
 
   return (
-    <div className="page-stack">
+    <div className="page-stack visualization-page">
       <SectionHeader icon={<TrendingUp size={20} />} title="可视化" />
       <section className="result-panel decision-board">
         <div className="strategy-panel-head">
@@ -4352,7 +4536,7 @@ function VisualizationPage({
           <div className="empty-state">{calculationPending ? "正在计算房源对比" : "等待计算房源对比"}</div>
         )}
       </section>
-      <section className="result-panel">
+      <section className="result-panel visualization-story-panel">
         {result && selectedPlan ? (
           <>
             <div className="visual-header">
@@ -5047,6 +5231,62 @@ function SelectedPlanVisualization({
     (sum, member) => sum + member.employerHousingFund,
     0
   );
+  const taxSummaryRows = result.tax_summaries ?? [];
+  const annualTaxTotal =
+    result.annual_income_tax || taxSummaryRows.reduce((sum, item) => sum + item.total_tax, 0);
+  const annualTaxableIncome = taxSummaryRows.reduce((sum, item) => sum + item.taxable_income, 0);
+  const annualGrossIncome = taxSummaryRows.reduce((sum, item) => sum + item.gross_annual_income, 0);
+  const annualNetIncome = taxSummaryRows.reduce((sum, item) => sum + item.net_annual_income, 0);
+  const selectedMonthTax = selectedMemberIncomeRows.reduce((sum, member) => sum + member.incomeTax, 0);
+  const selectedMonthGrossIncome = selectedMemberIncomeRows.reduce(
+    (sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly,
+    0
+  );
+  const selectedMonthNetIncome = selectedMemberIncomeRows.reduce((sum, member) => sum + member.netMonthly, 0);
+  const selectedMonthPreTaxDeductions = selectedMemberIncomeRows.reduce(
+    (sum, member) => sum + member.personalSocial + member.personalHousingFund,
+    0
+  );
+  const selectedMonthSpecialDeduction = selectedMemberIncomeRows.reduce(
+    (sum, member) => sum + (member.elderlyCareDeduction ?? 0),
+    0
+  );
+  const taxChartData = useMemo(
+    () =>
+      monthlySeries.map((item) => {
+        const memberRows = getMemberIncomeRows(item.month);
+        const monthPoint: Record<string, number | string> = {
+          month: item.month,
+          税前收入: Math.round(
+            memberRows.reduce((sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly, 0)
+          ),
+          税后现金入账: Math.round(memberRows.reduce((sum, member) => sum + member.netMonthly, 0)),
+          当月个税: Math.round(memberRows.reduce((sum, member) => sum + member.incomeTax, 0)),
+          年终奖入账: Math.round(memberRows.reduce((sum, member) => sum + member.bonusMonthly, 0))
+        };
+        memberRows.forEach((member) => {
+          monthPoint[`${member.name}个税`] = Math.round(member.incomeTax);
+        });
+        return monthPoint;
+      }),
+    [effectiveHousehold, effectiveMembers, monthlySeries, rulePack, timelineBaseDate]
+  );
+  const visibleTaxChartData = useMemo(
+    () => taxChartData.filter((item) => Number(item.month) >= viewStartMonth && Number(item.month) <= viewEndMonth),
+    [taxChartData, viewEndMonth, viewStartMonth]
+  );
+  const taxMemberLineKeys = useMemo(() => {
+    const availableKeys = new Set(
+      taxChartData.flatMap((item) =>
+        Object.keys(item).filter((key) => key.endsWith("个税") && key !== "当月个税" && Number(item[key]) > 0)
+      )
+    );
+    const orderedKeys = household.members
+      .map((member) => `${member.name}个税`)
+      .filter((key) => availableKeys.has(key));
+    const extraKeys = Array.from(availableKeys).filter((key) => !orderedKeys.includes(key));
+    return [...orderedKeys, ...extraKeys];
+  }, [household.members, taxChartData]);
   const investmentSummaryEndMonth = plan.months_to_buy ?? monthlySeries[monthlySeries.length - 1]?.month ?? 0;
   const investmentSummaryRows = monthlySeries.filter((item) => item.month <= investmentSummaryEndMonth);
   const investmentSummaryPoint =
@@ -5329,6 +5569,53 @@ function SelectedPlanVisualization({
   ].filter((item) => item.value > 0);
   const sumPieValues = (items: Array<{ value: number }>) =>
     items.reduce((sum, item) => sum + Math.max(0, Number(item.value) || 0), 0);
+  const annualTaxMemberPieData = taxSummaryRows
+    .map((item) => ({ name: `${item.member_name}年度个税`, value: item.total_tax }))
+    .filter((item) => item.value > 0);
+  const annualTaxTypePieData = [
+    { name: "工资薪金个税", value: taxSummaryRows.reduce((sum, item) => sum + item.salary_tax, 0) },
+    { name: "年终奖个税", value: taxSummaryRows.reduce((sum, item) => sum + item.bonus_tax, 0) }
+  ].filter((item) => item.value > 0);
+  const currentMonthTaxPieData = selectedMemberIncomeRows
+    .map((member) => ({ name: `${member.name}当月个税`, value: member.incomeTax }))
+    .filter((item) => item.value > 0);
+  const currentMonthDeductionPieData = selectedMemberIncomeRows
+    .flatMap((member) => [
+      { name: `${member.name}个人社保`, value: member.personalSocial },
+      { name: `${member.name}个人公积金`, value: member.personalHousingFund },
+      { name: `${member.name}专项附加扣除`, value: member.elderlyCareDeduction ?? 0 }
+    ])
+    .filter((item) => item.value > 0);
+  const taxPieBlocks = [
+    {
+      title: "年度个税成员构成",
+      period: "年度",
+      data: annualTaxMemberPieData,
+      total: sumPieValues(annualTaxMemberPieData),
+      emptyText: "当前年度没有可展示的成员个税。"
+    },
+    {
+      title: "年度个税税种构成",
+      period: "年度",
+      data: annualTaxTypePieData,
+      total: sumPieValues(annualTaxTypePieData),
+      emptyText: "当前年度没有可拆分的工资薪金或年终奖个税。"
+    },
+    {
+      title: "当月个税成员构成",
+      period: selectedMonth.name,
+      data: currentMonthTaxPieData,
+      total: sumPieValues(currentMonthTaxPieData),
+      emptyText: "当前月份没有个税扣缴。"
+    },
+    {
+      title: "当月税前扣除构成",
+      period: selectedMonth.name,
+      data: currentMonthDeductionPieData,
+      total: sumPieValues(currentMonthDeductionPieData),
+      emptyText: "当前月份没有社保、公积金或专项附加扣除。"
+    }
+  ];
   const pieTooltipFormatter = (value: unknown) => money(Number(value));
   const cashFlowTooltipFormatter = (value: unknown, _name: unknown, item: { payload?: { name?: string } }) => [
     money(Number(value)),
@@ -5496,7 +5783,7 @@ function SelectedPlanVisualization({
         </div>
       </section>
 
-      <div className="metric-grid">
+      <div className="metric-grid visual-strategy-metrics">
         <Metric label="计划买入月份" value={purchaseYearText} tone={plan.months_to_buy === null ? "bad" : "good"} />
         <Metric label="买房当天自备资金" value={money(requiredCashAfterPf)} />
         <Metric label="买房当天剩余现金" value={money(plan.cash_after_transaction)} tone={plan.liquidity_ok ? "good" : "warn"} />
@@ -5506,10 +5793,9 @@ function SelectedPlanVisualization({
         <Metric label="装修资金" value={renovationTimingText} tone={plan.months_to_renovation === null ? "warn" : "good"} />
         <Metric label="负债收入比" value={percent(plan.debt_to_income_ratio)} tone={plan.debt_to_income_ratio > 0.5 ? "bad" : "warn"} />
         <Metric label="幸福指数" value={`${plan.happiness_score.toFixed(1)} / 10`} tone={plan.happiness_score >= 7 ? "good" : plan.happiness_score >= 5 ? "warn" : "bad"} />
-        <Metric label="选中月实际定投" value={money(selectedMonth.monthlyInvestment)} />
         <Metric label="截至买房月投入本金" value={money(displayedInvestmentContribution)} />
         <Metric label="截至买房月投资收益" value={money(displayedInvestmentReturn)} tone={displayedInvestmentReturn >= 0 ? "good" : "warn"} />
-        <Metric label="截至买房月交易手续费" value={money(displayedInvestmentFees)} tone={displayedInvestmentFees > 0 ? "warn" : undefined} />
+        <Metric label="交易手续费" value={money(displayedInvestmentFees)} tone={displayedInvestmentFees > 0 ? "warn" : undefined} />
       </div>
       <p className={cashStressOk ? "field-hint" : "field-hint danger-text"}>
         {stressCashSummary}
@@ -5595,7 +5881,7 @@ function SelectedPlanVisualization({
       </section>
 
       <section className="linked-month-panel">
-        <div>
+        <div className="visual-control-header">
           <PanelTitle icon={<CalendarClock size={18} />} title="联动月份查看" compact />
           <p>{monthAdvisorText}</p>
         </div>
@@ -5681,14 +5967,162 @@ function SelectedPlanVisualization({
             </div>
           </div>
         </div>
-        <div className="month-driver-list">
-          {selectedMonthDrivers.map((item) => (
-            <span className={item.amount >= 0 ? "positive" : "negative"} key={item.name}>
-              <em>{item.name}</em>
-              <strong>{money(item.amount)}</strong>
-            </span>
+        <div className="month-driver-panel">
+          <div className="month-driver-head">
+            <strong>当月关键变化</strong>
+            <span>{selectedMonth.name}</span>
+          </div>
+          <div className="month-driver-list">
+            {selectedMonthDrivers.map((item) => (
+              <span className={item.amount >= 0 ? "positive" : "negative"} key={item.name}>
+                <em>{item.name}</em>
+                <strong>{money(item.amount)}</strong>
+              </span>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="chart-block tax-visual-chart">
+        <div className="strategy-panel-head">
+          <PanelTitle icon={<CircleDollarSign size={18} />} title="税务与工资扣缴" compact />
+          <span>把工资从税前到税后拆开看；个人社保、公积金和专项扣除只影响计税口径，不再混进家庭支出饼图。</span>
+        </div>
+        <div className="tax-kpi-grid">
+          <Metric label="年度个税合计" value={money(annualTaxTotal)} />
+          <Metric label={`${selectedMonth.name} 个税`} value={money(selectedMonthTax)} />
+          <Metric label={`${selectedMonth.name} 税前收入`} value={money(selectedMonthGrossIncome)} />
+          <Metric label={`${selectedMonth.name} 税后现金入账`} value={money(selectedMonthNetIncome)} />
+          <Metric label={`${selectedMonth.name} 社保公积金个人扣缴`} value={money(selectedMonthPreTaxDeductions)} />
+          <Metric label={`${selectedMonth.name} 专项附加扣除`} value={money(selectedMonthSpecialDeduction)} />
+        </div>
+        <div className="tax-chart-grid">
+          <div className="tax-trend-panel">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart
+                data={visibleTaxChartData}
+                onMouseMove={selectChartMonth}
+                onClick={selectChartMonth}
+                margin={{ top: 8, right: 12, left: 0, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis {...chartXAxisProps} />
+                <YAxis tickLine={false} axisLine={false} width={58} tickFormatter={(value) => `${Math.round(Number(value) / 10000)}万`} />
+                <Tooltip formatter={(value) => money(Number(value))} labelFormatter={(value) => formatMonthDate(timelineBaseDate, Number(value))} />
+                <Legend verticalAlign="top" height={30} iconType="line" />
+                <Line type="monotone" dataKey="税前收入" stroke={visualColors.baseline} strokeWidth={2.2} dot={false} />
+                <Line type="monotone" dataKey="税后现金入账" stroke={visualColors.cash} strokeWidth={2.5} dot={false} />
+                <Line type="monotone" dataKey="当月个税" stroke={visualColors.deduction} strokeWidth={2.2} dot={false} />
+                <Line type="monotone" dataKey="年终奖入账" stroke={visualColors.warning} strokeWidth={2} strokeDasharray="5 4" dot={false} />
+                {taxMemberLineKeys.map((key, index) => (
+                  <Line
+                    key={key}
+                    type="monotone"
+                    dataKey={key}
+                    stroke={piePalette[(index + 5) % piePalette.length]}
+                    strokeWidth={1.7}
+                    strokeDasharray="3 5"
+                    dot={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+            <p className="field-hint">
+              税务曲线跟随上方月份窗口。年终奖只在发放月入账和计税，所以奖金发放月会看到税前收入、税后现金和个税同时跳升；这比把年终奖均摊到每个月更贴近真实现金流。
+            </p>
+          </div>
+          <div className="tax-summary-panel">
+            <div>
+              <span>年度税前收入</span>
+              <strong>{money(annualGrossIncome)}</strong>
+            </div>
+            <div>
+              <span>年度应税所得</span>
+              <strong>{money(annualTaxableIncome)}</strong>
+            </div>
+            <div>
+              <span>年度税后到手</span>
+              <strong>{money(annualNetIncome)}</strong>
+            </div>
+            <div>
+              <span>当前月扣缴后留存率</span>
+              <strong>{selectedMonthGrossIncome > 0 ? percent(selectedMonthNetIncome / selectedMonthGrossIncome) : "-"}</strong>
+            </div>
+          </div>
+        </div>
+        <div className="cash-flow-pies tax-pies">
+          {taxPieBlocks.map((pie, pieIndex) => (
+            <div className="cash-flow-pie" key={pie.title}>
+              <div className="pie-heading">
+                <strong>{pie.title}</strong>
+                <span>
+                  <small>{pie.period}</small>
+                  <b>{money(pie.total)}</b>
+                </span>
+              </div>
+              {pie.data.length > 0 ? (
+                <div className="pie-layout">
+                  <ResponsiveContainer width="100%" height={190}>
+                    <PieChart>
+                      <Tooltip formatter={pieTooltipFormatter} />
+                      <Pie data={pie.data} dataKey="value" nameKey="name" innerRadius={42} outerRadius={68} paddingAngle={2}>
+                        {pie.data.map((item, index) => (
+                          <Cell key={`${pie.title}-${item.name}`} fill={piePalette[(index + pieIndex) % piePalette.length]} />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="pie-legend">
+                    {pie.data.map((item, index) => (
+                      <span key={`${pie.title}-legend-${item.name}`}>
+                        <i style={{ background: piePalette[(index + pieIndex) % piePalette.length] }} />
+                        <em>{item.name}</em>
+                        <strong>{money(item.value)}</strong>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="field-hint">{pie.emptyText}</p>
+              )}
+            </div>
           ))}
         </div>
+        <details className="details-panel tax-detail-panel">
+          <summary>
+            <span>查看年度税务明细</span>
+            <small>按成员展示工资薪金税、年终奖税和计税方式，方便解释税负从哪里来</small>
+          </summary>
+          <div className="tax-detail-table">
+            <div className="tax-detail-row tax-detail-head">
+              <span>成员</span>
+              <span>税前收入</span>
+              <span>应税所得</span>
+              <span>工资个税</span>
+              <span>年终奖个税</span>
+              <span>年度到手</span>
+              <span>年终奖口径</span>
+            </div>
+            {taxSummaryRows.length > 0 ? (
+              taxSummaryRows.map((item) => (
+                <div className="tax-detail-row" key={item.member_name}>
+                  <span>{item.member_name}</span>
+                  <span>{money(item.gross_annual_income)}</span>
+                  <span>{money(item.taxable_income)}</span>
+                  <span>{money(item.salary_tax)}</span>
+                  <span>{money(item.bonus_tax)}</span>
+                  <span>{money(item.net_annual_income)}</span>
+                  <span>{bonusTaxMethodLabels[item.selected_bonus_method] ?? item.selected_bonus_method}</span>
+                </div>
+              ))
+            ) : (
+              <div className="tax-detail-empty">当前没有年度税务汇总。</div>
+            )}
+          </div>
+          <p className="field-hint">
+            这里的“税前扣除”是为了计算个税而展示的过程项，不等同于家庭消费支出；家庭支出仍只看生活、贷款、用车、交易、理财手续费等真实现金流出。
+          </p>
+        </details>
       </section>
 
       <div className="visual-grid">

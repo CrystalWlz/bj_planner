@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData
 
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 def default_db_path() -> Path:
@@ -155,6 +155,9 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     if not _migration_applied(conn, 13):
         _migrate_json_records_to_v13(conn)
         _mark_migration(conn, 13, "move member age and career shock settings to household members")
+    if not _migration_applied(conn, 14):
+        _migrate_json_records_to_v14(conn)
+        _mark_migration(conn, 14, "add unemployment, freelance and pension income controls")
 
 
 def _load_json(value: str) -> dict[str, Any]:
@@ -452,7 +455,7 @@ def _migrate_household_v9(data: dict[str, Any]) -> dict[str, Any]:
             candidate_vehicles = [_strip_nested_vehicle_candidates(vehicle)]
         for candidate in candidate_vehicles:
             candidate.setdefault("enabled", True)
-            candidate.setdefault("selected_strategy_variant", "鎵嬪姩璁剧疆")
+            candidate.setdefault("selected_strategy_variant", "手动设置")
             candidate.setdefault("candidate_vehicles", [])
         vehicle["candidate_vehicles"] = candidate_vehicles
     car_plan["enabled"] = any(
@@ -649,6 +652,69 @@ def _migrate_json_records_to_v13(conn: sqlite3.Connection) -> None:
     _update_table_json(conn, "households", _migrate_household_v13)
     _update_table_json(conn, "scenarios", _set_schema_version_current)
     _update_table_json(conn, "rule_packs", _set_schema_version_current)
+    _update_table_json(conn, "market_snapshots", _set_schema_version_current)
+
+
+def _migrate_household_v14(data: dict[str, Any]) -> dict[str, Any]:
+    data["schema_version"] = CURRENT_SCHEMA_VERSION
+    members = data.get("members")
+    if isinstance(members, list):
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            stages = member.get("income_stages")
+            if not isinstance(stages, list):
+                continue
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                stage.setdefault("stage_kind", "salary")
+                stage.setdefault("monthly_freelance_income", 0)
+
+    career_shock = data.setdefault("career_shock", {})
+    if not isinstance(career_shock, dict):
+        career_shock = {}
+        data["career_shock"] = career_shock
+    career_shock.setdefault("auto_flexible_housing_fund", True)
+    career_shock.setdefault("auto_pension_income", True)
+    career_shock.setdefault("self_housing_fund_monthly", 0)
+    settings = career_shock.get("member_settings")
+    if isinstance(settings, list):
+        for setting in settings:
+            if not isinstance(setting, dict):
+                continue
+            setting.setdefault("auto_pension_monthly", float(setting.get("pension_monthly") or 0) <= 0)
+            setting.setdefault("unemployment_freelance_income_monthly", 0)
+            setting.setdefault("flexible_freelance_income_monthly", 0)
+    return data
+
+
+def _migrate_rule_pack_v14(data: dict[str, Any]) -> dict[str, Any]:
+    data["schema_version"] = CURRENT_SCHEMA_VERSION
+    params = data.setdefault("params", {})
+    if not isinstance(params, dict):
+        params = {}
+        data["params"] = params
+    defaults = RulePackData().params
+    for key in (
+        "flexible_employment_housing_fund_enabled",
+        "flexible_employment_housing_fund_base",
+        "flexible_employment_housing_fund_rate",
+        "pension_average_salary_growth_rate",
+        "pension_personal_account_annual_return",
+        "pension_personal_account_months",
+        "pension_default_paid_years",
+        "pension_replacement_rate_floor",
+        "pension_replacement_rate_ceiling",
+    ):
+        params.setdefault(key, defaults[key])
+    return data
+
+
+def _migrate_json_records_to_v14(conn: sqlite3.Connection) -> None:
+    _update_table_json(conn, "households", _migrate_household_v14)
+    _update_table_json(conn, "scenarios", _set_schema_version_current)
+    _update_table_json(conn, "rule_packs", _migrate_rule_pack_v14)
     _update_table_json(conn, "market_snapshots", _set_schema_version_current)
 
 

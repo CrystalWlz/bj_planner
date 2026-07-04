@@ -299,7 +299,12 @@ def _clamp(value: float, floor: float, ceiling: float) -> float:
 
 def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePackData) -> tuple[float, float, float, float]:
     if isinstance(member, IncomeStageData) and not member.payroll_contributions_enabled:
-        return 0.0, 0.0, 0.0, 0.0
+        return (
+            max(0.0, member.monthly_social_insurance),
+            max(0.0, member.monthly_housing_fund),
+            0.0,
+            0.0,
+        )
     if member.monthly_salary_gross <= 0:
         return 0.0, 0.0, 0.0, 0.0
     params = rules.params
@@ -440,11 +445,13 @@ def _zero_cash_stage(template: IncomeStageData, name: str, start: date, end: dat
     return template.model_copy(
         update={
             "name": name,
+            "stage_kind": "manual",
             "start_date": start.isoformat(),
             "end_date": end.isoformat() if end else None,
             "monthly_salary_gross": 0,
             "annual_bonus": 0,
             "annual_bonus_payout_month": template.annual_bonus_payout_month,
+            "monthly_freelance_income": 0,
             "monthly_non_taxable_income": 0,
             "monthly_extra_cash_expense": 0,
             "monthly_social_insurance": 0,
@@ -541,6 +548,85 @@ def _career_shock_self_social_monthly(shock: "CareerShockData", rules: RulePackD
     return round(max(0.0, pension + unemployment + medical), 2)
 
 
+def _career_shock_flexible_housing_fund_monthly(shock: "CareerShockData", rules: RulePackData) -> float:
+    if not shock.auto_flexible_housing_fund:
+        return max(0.0, shock.self_housing_fund_monthly)
+    params = rules.params
+    if not bool(params.get("flexible_employment_housing_fund_enabled", True)):
+        return 0.0
+    raw_base = float(params.get("flexible_employment_housing_fund_base", params.get("beijing_housing_fund_base_floor", 2540)))
+    floor = float(params.get("beijing_housing_fund_base_floor", 2540))
+    ceiling = float(params.get("beijing_housing_fund_base_ceiling", 35811))
+    base = _clamp(raw_base, floor, ceiling)
+    rate = _clamp(float(params.get("flexible_employment_housing_fund_rate", 0.12)), 0.0, 0.24)
+    return round(base * rate, 2)
+
+
+def _estimate_auto_pension_monthly(
+    member: IncomeMember,
+    setting: "CareerShockMemberSetting",
+    rules: RulePackData,
+    retirement_start: date,
+    as_of: date,
+) -> float:
+    params = rules.params
+    manual_value = max(0.0, setting.pension_monthly)
+    if not setting.auto_pension_monthly:
+        return manual_value
+
+    current_month = date(as_of.year, as_of.month, 1)
+    months_to_retirement = max(0, _months_between_months(current_month, retirement_start))
+    stages = sorted(
+        member.income_stages or [],
+        key=lambda stage: _parse_iso_date(stage.start_date, date(1900, 1, 1)),
+    )
+    current_stage = stages[-1] if stages else IncomeStageData(
+        monthly_salary_gross=member.monthly_salary_gross,
+        annual_bonus=member.annual_bonus,
+    )
+    current_salary = max(member.monthly_salary_gross, current_stage.monthly_salary_gross)
+    social_floor = float(params.get("beijing_social_base_floor", 7162))
+    social_ceiling = float(params.get("beijing_social_base_ceiling", 35811))
+    contribution_base = _clamp(current_salary if current_salary > 0 else social_floor, social_floor, social_ceiling)
+    flexible_base = _clamp(
+        float(params.get("flexible_employment_social_base", social_floor)),
+        social_floor,
+        social_ceiling,
+    )
+    avg_salary_now = max(
+        social_floor,
+        min(
+            social_ceiling,
+            float(params.get("pension_reference_average_salary", params.get("beijing_social_base_ceiling", 35811))),
+        ),
+    )
+    salary_growth = _clamp(float(params.get("pension_average_salary_growth_rate", 0.03)), 0.0, 0.10)
+    projected_avg_salary = avg_salary_now * ((1 + salary_growth) ** (months_to_retirement / 12))
+    existing_paid_years = max(
+        float(params.get("pension_default_paid_years", 15)),
+        max(0, member.current_age - 22),
+    )
+    future_paid_years = months_to_retirement / 12
+    total_paid_years = max(15.0, existing_paid_years + future_paid_years)
+    indexed_base = (contribution_base + flexible_base) / 2
+    basic_pension = projected_avg_salary * (1 + indexed_base / projected_avg_salary) / 2 * total_paid_years * 0.01
+    employee_rate = float(params.get("employee_pension_rate", 0.08))
+    flexible_rate = float(params.get("flexible_employment_pension_rate", 0.20))
+    account_return = _clamp(float(params.get("pension_personal_account_annual_return", 0.025)), 0.0, 0.08)
+    existing_account = contribution_base * employee_rate * 12 * existing_paid_years
+    future_account = 0.0
+    for month in range(max(0, months_to_retirement)):
+        future_account = (future_account + flexible_base * flexible_rate * 0.40) * ((1 + account_return) ** (1 / 12))
+    account_months = max(1.0, float(params.get("pension_personal_account_months", 139)))
+    personal_account_pension = (existing_account + future_account) / account_months
+    raw_pension = basic_pension + personal_account_pension
+    floor_rate = _clamp(float(params.get("pension_replacement_rate_floor", 0.20)), 0.0, 1.0)
+    ceiling_rate = _clamp(float(params.get("pension_replacement_rate_ceiling", 0.65)), floor_rate, 1.2)
+    floor_value = projected_avg_salary * floor_rate
+    ceiling_value = projected_avg_salary * ceiling_rate
+    return round(_clamp(raw_pension, floor_value, ceiling_value), 2)
+
+
 def _household_with_career_income_stages(
     household: HouseholdData,
     rules: RulePackData | None = None,
@@ -548,7 +634,7 @@ def _household_with_career_income_stages(
     as_of: date | None = None,
 ) -> HouseholdData:
     shock = household.career_shock
-    if household.career_shock_applied or not shock.enabled or not household.members:
+    if household.career_shock_applied or not household.members:
         return household
     active_rules = rules or RulePackData()
 
@@ -566,6 +652,7 @@ def _household_with_career_income_stages(
             stages = [
                 IncomeStageData(
                     name="current",
+                    stage_kind="salary",
                     start_date=member.employment_start_date,
                     monthly_salary_gross=member.monthly_salary_gross,
                     annual_bonus=member.annual_bonus,
@@ -585,15 +672,19 @@ def _household_with_career_income_stages(
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
         retirement_age = setting.retirement_age if setting else _default_retirement_age_for_member(index)
-        pension_monthly = setting.pension_monthly if setting else 0
         retirement_start = _month_start_for_birth_month_or_age(
             current,
             effective_birth_month,
             effective_current_age,
             retirement_age,
         )
+        pension_monthly = (
+            _estimate_auto_pension_monthly(member, setting, active_rules, retirement_start, current)
+            if setting
+            else 0
+        )
 
-        if setting and setting.enabled:
+        if shock.enabled and setting and setting.enabled:
             layoff_start = _month_start_for_birth_month_or_age(
                 current,
                 effective_birth_month,
@@ -617,6 +708,8 @@ def _household_with_career_income_stages(
                     stages.append(
                         first_stage.model_copy(
                             update={
+                                "stage_kind": "unemployment",
+                                "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
                                 "monthly_non_taxable_income": _unemployment_benefit_monthly_from_service(
                                     household.social_security_months,
                                     active_rules,
@@ -640,6 +733,8 @@ def _household_with_career_income_stages(
                             stages.append(
                                 later_stage.model_copy(
                                     update={
+                                        "stage_kind": "unemployment",
+                                        "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
                                         "monthly_non_taxable_income": float(
                                             active_rules.params.get("beijing_unemployment_benefit_after_12_months", 2129)
                                         )
@@ -652,24 +747,39 @@ def _household_with_career_income_stages(
                     unemployment_stage = _zero_cash_stage(template, f"{synthetic_prefix}{setting.layoff_age}岁被裁员-失业金期", layoff_start, end)
                     stages.append(
                         unemployment_stage.model_copy(
-                            update={"monthly_non_taxable_income": shock.unemployment_benefit_monthly}
+                            update={
+                                "stage_kind": "unemployment",
+                                "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
+                                "monthly_non_taxable_income": shock.unemployment_benefit_monthly,
+                            }
                         )
                     )
             self_social_start = _add_months(layoff_start, unemployment_months)
             if self_social_start < retirement_start:
+                flexible_housing_fund = _career_shock_flexible_housing_fund_monthly(shock, active_rules)
                 stages.append(
                     _zero_cash_stage(
                         template,
                         f"{synthetic_prefix}{setting.layoff_age}岁被裁员-灵活就业自缴社保期",
                         self_social_start,
                         _end_of_previous_month(retirement_start),
-                    ).model_copy(update={"monthly_extra_cash_expense": _career_shock_self_social_monthly(shock, active_rules)})
+                    ).model_copy(
+                        update={
+                            "stage_kind": "freelance",
+                            "monthly_freelance_income": setting.flexible_freelance_income_monthly,
+                            "monthly_social_insurance": _career_shock_self_social_monthly(shock, active_rules),
+                            "monthly_housing_fund": flexible_housing_fund,
+                            "housing_fund_personal_rate": 0,
+                            "housing_fund_employer_rate": 0,
+                            "payroll_contributions_enabled": False,
+                        }
+                    )
                 )
 
         if pension_monthly > 0:
             stages.append(
                 _zero_cash_stage(template, f"{synthetic_prefix}{retirement_age}岁退休-养老金", retirement_start).model_copy(
-                    update={"monthly_non_taxable_income": pension_monthly}
+                    update={"stage_kind": "pension", "monthly_non_taxable_income": pension_monthly}
                 )
             )
 
@@ -767,7 +877,13 @@ def _stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData) ->
         + stage.monthly_special_additional_deduction * 12
         + stage.other_annual_deductions
     )
-    salary_taxable = max(0.0, stage.monthly_salary_gross * 12 + stage.other_annual_taxable_income - common_deductions)
+    salary_taxable = max(
+        0.0,
+        stage.monthly_salary_gross * 12
+        + stage.monthly_freelance_income * 12
+        + stage.other_annual_taxable_income
+        - common_deductions,
+    )
     merged_taxable = max(0.0, salary_taxable + stage.annual_bonus)
     separate_total = _progressive_tax(salary_taxable, annual_brackets) + _bonus_tax(stage.annual_bonus, bonus_brackets)
     merged_total = _progressive_tax(merged_taxable, annual_brackets)
@@ -829,6 +945,7 @@ def _member_cumulative_salary_tax_pair(
                 selected_method_cache[stage_key] = selected_bonus_method
             active_months += 1
             cumulative_income += stage.monthly_salary_gross
+            cumulative_income += stage.monthly_freelance_income
             cumulative_income += stage.other_annual_taxable_income / 12
             if selected_bonus_method == "merged":
                 cumulative_income += _stage_bonus_payout_amount(stage, year, month)
@@ -873,7 +990,12 @@ def _member_monthly_income_profile(
         bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
         bonus_tax_due = _bonus_tax(bonus_payout, bonus_brackets) if bonus_payout > 0 else 0.0
 
-    taxable_cash_income = stage.monthly_salary_gross + bonus_payout + stage.other_annual_taxable_income / 12
+    taxable_cash_income = (
+        stage.monthly_salary_gross
+        + stage.monthly_freelance_income
+        + bonus_payout
+        + stage.other_annual_taxable_income / 12
+    )
     gross_income = taxable_cash_income + stage.monthly_non_taxable_income
     income_tax = salary_tax + bonus_tax_due
     net_income = gross_income - personal_social - personal_housing_fund - income_tax - stage.monthly_extra_cash_expense
@@ -984,6 +1106,7 @@ def _member_tax_summary(
         stage_ratio = stage_months / 12
         active_months += stage_months
         salary_annual += stage.monthly_salary_gross * stage_months
+        salary_annual += stage.monthly_freelance_income * stage_months
         bonus_annual += stage.annual_bonus * stage_ratio
         non_taxable_income += stage.monthly_non_taxable_income * stage_months
         extra_cash_expense += stage.monthly_extra_cash_expense * stage_months
@@ -4507,6 +4630,69 @@ def _vehicle_events_for_plan(
         )
 
 
+def _income_stage_event_detail(stage: IncomeStageData) -> str:
+    parts: list[str] = []
+    if stage.stage_kind == "pension":
+        parts.append(f"退休后养老金约 {_money_text(stage.monthly_non_taxable_income)}/月，作为非税现金收入进入长期现金流。")
+    elif stage.stage_kind == "unemployment":
+        if stage.monthly_non_taxable_income > 0:
+            parts.append(f"失业保险待遇约 {_money_text(stage.monthly_non_taxable_income)}/月。")
+        if stage.monthly_freelance_income > 0:
+            parts.append(f"同期自由职业收入约 {_money_text(stage.monthly_freelance_income)}/月，会并入税务和现金流测算。")
+    elif stage.stage_kind == "freelance":
+        if stage.monthly_freelance_income > 0:
+            parts.append(f"自由职业收入约 {_money_text(stage.monthly_freelance_income)}/月。")
+        if stage.monthly_social_insurance > 0:
+            parts.append(f"灵活就业自缴社保约 {_money_text(stage.monthly_social_insurance)}/月。")
+        if stage.monthly_housing_fund > 0:
+            parts.append(f"灵活就业自缴公积金约 {_money_text(stage.monthly_housing_fund)}/月，进入成员公积金账户。")
+    else:
+        if stage.monthly_non_taxable_income > 0:
+            parts.append(f"非税现金收入约 {_money_text(stage.monthly_non_taxable_income)}/月。")
+        if stage.monthly_extra_cash_expense > 0:
+            parts.append(f"额外现金支出约 {_money_text(stage.monthly_extra_cash_expense)}/月。")
+    return "；".join(parts) if parts else "该收入阶段改变工资、社保、公积金或现金流口径。"
+
+
+def _append_retirement_account_events(
+    events: list[PlanEventPoint],
+    *,
+    plan_variant: str,
+    provident_rows: list[ProvidentVisualizationPoint],
+) -> None:
+    for row in provident_rows:
+        retired_accounts = [
+            account
+            for account in row.member_accounts
+            if account.account_closed_by_retirement and account.retirement_withdrawal > 0
+        ]
+        if not retired_accounts:
+            continue
+        if len(retired_accounts) == 1:
+            account = retired_accounts[0]
+            title = f"{account.member_name}公积金退休销户"
+            detail = (
+                f"该成员达到退休月份，后端停止继续缴存公积金，并将账户余额 "
+                f"{_money_text(account.retirement_withdrawal)} 作为退休销户提取进入现金账户。"
+            )
+        else:
+            title = "家庭公积金退休销户"
+            detail = (
+                "、".join(f"{account.member_name} {_money_text(account.retirement_withdrawal)}" for account in retired_accounts)
+                + "；后端从该月起停止对应成员公积金缴存，并把退休销户提取计入现金账户。"
+            )
+        _append_event(
+            events,
+            plan_variant=plan_variant,
+            month=row.month,
+            category="provident",
+            title=title,
+            detail=detail,
+            amount=sum(account.retirement_withdrawal for account in retired_accounts),
+            severity="success",
+        )
+
+
 def build_plan_events(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -4514,9 +4700,15 @@ def build_plan_events(
     purchase_plans: list[PurchasePlanAnalysis],
     car_loan: CarLoanSummary,
     monthly_cashflow: list[MonthlyCashflowPoint],
+    provident_visualization: list[ProvidentVisualizationPoint],
 ) -> list[PlanEventPoint]:
     current_month = date(date.today().year, date.today().month, 1)
     monthly_by_plan_month = {(row.plan_variant, row.month): row for row in monthly_cashflow}
+    provident_by_plan = {
+        plan.variant: [row for row in provident_visualization if row.plan_variant == plan.variant]
+        for plan in purchase_plans
+    }
+    retirement_window_end = _retirement_tail_months(household, as_of=current_month)
     events: list[PlanEventPoint] = []
     for plan in purchase_plans:
         vehicle_states = _vehicle_loan_states(
@@ -4571,21 +4763,29 @@ def build_plan_events(
                     continue
                 start = _parse_iso_date(stage.start_date, current_month)
                 month = max(0, _months_between_months(current_month, date(start.year, start.month, 1)))
-                if stage.monthly_non_taxable_income > 0:
-                    detail = f"非税现金收入约 {_money_text(stage.monthly_non_taxable_income)}/月。"
-                elif stage.monthly_extra_cash_expense > 0:
-                    detail = f"额外现金支出约 {_money_text(stage.monthly_extra_cash_expense)}/月。"
-                else:
-                    detail = "该收入阶段改变工资、社保、公积金或现金流口径。"
                 _append_event(
                     events,
                     plan_variant=plan.variant,
                     month=month,
                     category="income",
                     title=f"{member.name}{stage.name.replace('自动情景：', '')}",
-                    detail=detail,
-                    severity="warning",
+                    detail=_income_stage_event_detail(stage),
+                    severity="success" if stage.stage_kind == "pension" else "warning",
                 )
+        _append_retirement_account_events(
+            events,
+            plan_variant=plan.variant,
+            provident_rows=provident_by_plan.get(plan.variant, []),
+        )
+        if retirement_window_end > 0:
+            _append_event(
+                events,
+                plan_variant=plan.variant,
+                month=retirement_window_end,
+                category="income",
+                title="退休后长期观察窗口",
+                detail="后端账户曲线至少延伸到最晚退休后 10 年，用于观察养老金、公积金销户、贷款余额、现金账户和投资账户在退休后的变化。",
+            )
 
         if plan.months_to_buy is None:
             _append_event(
@@ -4930,6 +5130,7 @@ def calculate_affordability(
             purchase_plan_analyses,
             car_loan,
             monthly_cashflow_visualization,
+            provident_visualization,
         )
     else:
         purchase_plan_analyses = []
@@ -5115,6 +5316,7 @@ def build_stress_tests(
                                 stage.model_copy(
                                     update={
                                         "monthly_salary_gross": stage.monthly_salary_gross * income_factor,
+                                        "monthly_freelance_income": stage.monthly_freelance_income * income_factor,
                                         "annual_bonus": stage.annual_bonus * income_factor,
                                         "other_annual_taxable_income": stage.other_annual_taxable_income * income_factor,
                                     }

@@ -1,6 +1,7 @@
 export type RepaymentMethod = "equal_installment" | "equal_principal";
 export type RuleStatus = "draft" | "active" | "archived";
 export type BonusTaxMethod = "separate" | "merged" | "best";
+export type IncomeStageKind = "salary" | "unemployment" | "freelance" | "pension" | "manual";
 export type GreenBuildingLevel = "none" | "two_star" | "three_star";
 export type PrefabBuildingLevel = "none" | "A" | "AA" | "AAA";
 export type BuildingStructure = "unknown" | "brick_mixed" | "steel_concrete";
@@ -27,11 +28,13 @@ export interface IncomeMember {
 
 export interface IncomeStageData {
   name: string;
+  stage_kind: IncomeStageKind;
   start_date: string;
   end_date: string | null;
   monthly_salary_gross: number;
   annual_bonus: number;
   annual_bonus_payout_month: number;
+  monthly_freelance_income: number;
   monthly_non_taxable_income: number;
   monthly_extra_cash_expense: number;
   monthly_social_insurance: number;
@@ -51,6 +54,9 @@ export interface CareerShockMemberSetting {
   layoff_age: number;
   retirement_age: number;
   pension_monthly: number;
+  auto_pension_monthly: boolean;
+  unemployment_freelance_income_monthly: number;
+  flexible_freelance_income_monthly: number;
 }
 
 export interface CareerShockData {
@@ -58,9 +64,12 @@ export interface CareerShockData {
   member_settings: CareerShockMemberSetting[];
   auto_unemployment_benefit: boolean;
   auto_self_social_insurance: boolean;
+  auto_flexible_housing_fund: boolean;
+  auto_pension_income: boolean;
   unemployment_benefit_months: number;
   unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
+  self_housing_fund_monthly: number;
 }
 
 export interface VehiclePlanData {

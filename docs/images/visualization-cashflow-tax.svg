@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">月现金流与税务模块示例</title>
+  <desc id="desc">使用假数据展示月现金流、收入支出构成和税务扣缴模块。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#f6f9fc"/>
+      <stop offset="1" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#27405f" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .bg { fill: url(#bg); }
+      .card { fill: #fff; stroke: #dce6ef; stroke-width: 1; filter: url(#shadow); }
+      .soft { fill: #f7fafc; stroke: #e1e8f0; stroke-width: 1; }
+      .text { fill: #213044; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+      .muted { fill: #667386; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+      .small { font-size: 20px; }
+      .tiny { font-size: 16px; }
+      .mid { font-size: 26px; font-weight: 700; }
+      .big { font-size: 36px; font-weight: 800; }
+      .income { fill: #4f9b74; }
+      .expense { fill: #b14545; }
+      .invest { fill: #3d6fb6; }
+      .tax { fill: #b98b2f; }
+      .pf { fill: #7c5bb4; }
+      .grid { stroke: #e6edf4; stroke-width: 1; }
+      .line { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 4; }
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="720"/>
+  <text class="text big" x="56" y="72">月现金流与税务解释</text>
+  <text class="muted small" x="56" y="110">示例数据：税务模块已放在核心账户和月现金流之后，作为解释层查看</text>
+
+  <rect class="card" x="56" y="142" width="1168" height="292" rx="14"/>
+  <text class="text mid" x="86" y="194">2030年5月 月现金流</text>
+  <text class="muted tiny" x="930" y="194">默认展示图表，明细可展开</text>
+  <line class="grid" x1="96" y1="222" x2="760" y2="222"/>
+  <line class="grid" x1="96" y1="262" x2="760" y2="262"/>
+  <line class="grid" x1="96" y1="302" x2="760" y2="302"/>
+  <line class="grid" x1="96" y1="342" x2="760" y2="342"/>
+  <rect class="income" x="314" y="236" width="300" height="24" rx="6"/>
+  <rect class="income" x="314" y="276" width="180" height="24" rx="6"/>
+  <rect class="expense" x="206" y="316" width="108" height="24" rx="6"/>
+  <rect class="expense" x="134" y="356" width="180" height="24" rx="6"/>
+  <rect class="invest" x="220" y="396" width="94" height="24" rx="6"/>
+  <text class="muted tiny" x="96" y="254">成员A税后现金</text>
+  <text class="muted tiny" x="96" y="294">成员B税后现金</text>
+  <text class="muted tiny" x="96" y="334">生活支出</text>
+  <text class="muted tiny" x="96" y="374">贷款还款</text>
+  <text class="muted tiny" x="96" y="414">定投</text>
+
+  <g transform="translate(815 224)">
+    <circle cx="82" cy="82" r="70" fill="#e9eef5"/>
+    <path d="M82 82 L82 12 A70 70 0 0 1 142 118 Z" class="income"/>
+    <path d="M82 82 L142 118 A70 70 0 0 1 40 140 Z" class="invest"/>
+    <path d="M82 82 L40 140 A70 70 0 0 1 82 12 Z" class="tax"/>
+    <circle cx="82" cy="82" r="42" fill="#fff"/>
+    <text class="text tiny" x="220" y="38">收入构成</text>
+    <rect class="income" x="220" y="58" width="16" height="16" rx="3"/><text class="muted tiny" x="246" y="72">工资现金</text>
+    <rect class="invest" x="220" y="88" width="16" height="16" rx="3"/><text class="muted tiny" x="246" y="102">投资收益</text>
+    <rect class="tax" x="220" y="118" width="16" height="16" rx="3"/><text class="muted tiny" x="246" y="132">年终奖入账</text>
+  </g>
+
+  <rect class="card" x="56" y="466" width="1168" height="190" rx="14"/>
+  <text class="text mid" x="86" y="518">税务与工资扣缴</text>
+  <text class="muted tiny" x="86" y="548">个人社保、公积金和专项扣除只作为计税过程项，不混入家庭支出饼图。</text>
+
+  <g transform="translate(86 574)">
+    <rect class="soft" x="0" y="0" width="170" height="58" rx="10"/>
+    <text class="muted tiny" x="18" y="24">年度个税合计</text>
+    <text class="text small" x="18" y="48" font-weight="700">3.6 万</text>
+    <rect class="soft" x="190" y="0" width="170" height="58" rx="10"/>
+    <text class="muted tiny" x="208" y="24">当月个税</text>
+    <text class="text small" x="208" y="48" font-weight="700">820</text>
+    <rect class="soft" x="380" y="0" width="170" height="58" rx="10"/>
+    <text class="muted tiny" x="398" y="24">税前收入</text>
+    <text class="text small" x="398" y="48" font-weight="700">3.2 万</text>
+    <rect class="soft" x="570" y="0" width="170" height="58" rx="10"/>
+    <text class="muted tiny" x="588" y="24">税后现金</text>
+    <text class="text small" x="588" y="48" font-weight="700">2.5 万</text>
+  </g>
+
+  <g transform="translate(880 512)">
+    <line class="grid" x1="0" y1="56" x2="280" y2="56"/>
+    <line class="grid" x1="0" y1="92" x2="280" y2="92"/>
+    <path class="line" stroke="#3d6fb6" d="M0 112 C60 88 80 96 120 64 S220 50 280 42"/>
+    <path class="line" stroke="#b98b2f" d="M0 120 C50 118 90 110 120 104 S210 78 280 88"/>
+    <text class="muted tiny" x="0" y="150">税前/税后/个税趋势</text>
+  </g>
+</svg>

@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">账户曲线与联动月份示例</title>
+  <desc id="desc">使用假数据展示联动月份查看、流动资产、贷款余额与月供、公积金账户变化。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#f6f9fc"/>
+      <stop offset="1" stop-color="#edf4f7"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#27405f" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .bg { fill: url(#bg); }
+      .card { fill: #fff; stroke: #dce6ef; stroke-width: 1; filter: url(#shadow); }
+      .soft { fill: #f7fafc; stroke: #e1e8f0; stroke-width: 1; }
+      .text { fill: #213044; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+      .muted { fill: #667386; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+      .small { font-size: 20px; }
+      .tiny { font-size: 16px; }
+      .mid { font-size: 26px; font-weight: 700; }
+      .big { font-size: 36px; font-weight: 800; }
+      .grid { stroke: #e6edf4; stroke-width: 1; }
+      .axis { stroke: #cad5e2; stroke-width: 1; }
+      .cash { stroke: #3d6fb6; }
+      .invest { stroke: #4f9b74; }
+      .debt { stroke: #b14545; }
+      .pf { stroke: #b98b2f; }
+      .line { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 4; }
+      .dash { stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="720"/>
+  <text class="text big" x="56" y="72">账户曲线与联动月份</text>
+  <text class="muted small" x="56" y="110">示例数据：拖动月份窗口后，所有账户、现金流和事件同步定位</text>
+
+  <rect class="card" x="56" y="142" width="1168" height="116" rx="14"/>
+  <text class="text mid" x="86" y="190">联动月份查看</text>
+  <rect class="soft" x="290" y="168" width="170" height="60" rx="10"/>
+  <text class="muted tiny" x="312" y="192">查看月份</text>
+  <text class="text small" x="312" y="218" font-weight="700">2030年5月</text>
+  <line class="axis" x1="510" y1="198" x2="1156" y2="198"/>
+  <rect x="660" y="182" width="250" height="32" rx="16" fill="#dbeafe" stroke="#7aa7d8"/>
+  <circle cx="790" cy="198" r="12" fill="#315e95"/>
+  <text class="muted tiny" x="510" y="230">2026</text>
+  <text class="muted tiny" x="720" y="230">2030</text>
+  <text class="muted tiny" x="930" y="230">2034</text>
+  <text class="muted tiny" x="1120" y="230">2038</text>
+
+  <g transform="translate(56 286)">
+    <rect class="card" width="560" height="178" rx="14"/>
+    <text class="text mid" x="30" y="48">流动资产</text>
+    <line class="grid" x1="40" y1="80" x2="520" y2="80"/>
+    <line class="grid" x1="40" y1="118" x2="520" y2="118"/>
+    <line class="axis" x1="40" y1="146" x2="520" y2="146"/>
+    <path class="line cash" d="M50 132 C130 128 180 122 240 112 S360 94 510 82"/>
+    <path class="line invest" d="M50 136 C140 130 190 116 260 96 S390 78 510 54"/>
+    <text class="muted tiny" x="40" y="166">现金账户</text>
+    <text class="muted tiny" x="160" y="166">投资账户</text>
+  </g>
+
+  <g transform="translate(664 286)">
+    <rect class="card" width="560" height="178" rx="14"/>
+    <text class="text mid" x="30" y="48">贷款余额与月供</text>
+    <line class="grid" x1="40" y1="80" x2="520" y2="80"/>
+    <line class="grid" x1="40" y1="118" x2="520" y2="118"/>
+    <line class="axis" x1="40" y1="146" x2="520" y2="146"/>
+    <path class="line debt" d="M50 146 L150 146 C190 58 250 58 310 70 S430 100 510 132"/>
+    <path class="line pf dash" d="M160 120 C220 112 260 132 320 104 S430 108 500 92"/>
+    <text class="muted tiny" x="40" y="166">总贷款余额</text>
+    <text class="muted tiny" x="178" y="166">公积金冲抵</text>
+  </g>
+
+  <g transform="translate(56 494)">
+    <rect class="card" width="560" height="178" rx="14"/>
+    <text class="text mid" x="30" y="48">公积金账户变化</text>
+    <line class="grid" x1="40" y1="80" x2="520" y2="80"/>
+    <line class="grid" x1="40" y1="118" x2="520" y2="118"/>
+    <line class="axis" x1="40" y1="146" x2="520" y2="146"/>
+    <path class="line pf" d="M50 132 C120 126 180 112 240 88 S340 80 420 92 S480 76 510 70"/>
+    <path class="line cash dash" d="M50 138 C150 130 230 124 300 112 S420 104 510 98"/>
+    <text class="muted tiny" x="40" y="166">家庭公积金合计</text>
+    <text class="muted tiny" x="210" y="166">成员账户</text>
+  </g>
+
+  <g transform="translate(664 494)">
+    <rect class="card" width="560" height="178" rx="14"/>
+    <text class="text mid" x="30" y="48">当前月账户摘要</text>
+    <rect class="soft" x="30" y="72" width="150" height="76" rx="10"/>
+    <text class="muted tiny" x="48" y="98">现金账户</text>
+    <text class="text small" x="48" y="128" font-weight="700">18.6 万</text>
+    <rect class="soft" x="204" y="72" width="150" height="76" rx="10"/>
+    <text class="muted tiny" x="222" y="98">投资账户</text>
+    <text class="text small" x="222" y="128" font-weight="700">42.0 万</text>
+    <rect class="soft" x="378" y="72" width="150" height="76" rx="10"/>
+    <text class="muted tiny" x="396" y="98">公积金账户</text>
+    <text class="text small" x="396" y="128" font-weight="700">16.2 万</text>
+  </g>
+</svg>

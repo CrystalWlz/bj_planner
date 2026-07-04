@@ -16,7 +16,7 @@ from app.calculator import (
     monthly_household_expense_at,
     summarize_phased_loans,
 )
-from app.schemas import CareerShockData, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData
+from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -337,25 +337,32 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
         scheduled_expenses=[],
         career_shock=CareerShockData(
             enabled=True,
-            layoff_member_name="我",
-            layoff_age=31,
             auto_unemployment_benefit=False,
             auto_self_social_insurance=False,
-            self_birth_month="",
-            spouse_birth_month="",
-            self_current_age=30,
-            spouse_current_age=28,
             unemployment_benefit_months=2,
             unemployment_benefit_monthly=2_000,
             self_social_insurance_monthly=1_800,
-            self_retirement_age=50,
-            spouse_retirement_age=58,
-            self_pension_monthly=6_000,
-            spouse_pension_monthly=5_000,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="我",
+                    enabled=True,
+                    layoff_age=31,
+                    retirement_age=50,
+                    pension_monthly=6_000,
+                    auto_pension_monthly=False,
+                ),
+                CareerShockMemberSetting(
+                    member_name="成员B",
+                    enabled=False,
+                    retirement_age=58,
+                    pension_monthly=5_000,
+                    auto_pension_monthly=False,
+                ),
+            ],
         ),
         members=[
-            IncomeMember(name="我", monthly_salary_gross=20_000, annual_bonus=0, monthly_special_additional_deduction=0),
-            IncomeMember(name="成员B", monthly_salary_gross=12_000, annual_bonus=0, monthly_special_additional_deduction=0),
+            IncomeMember(name="我", current_age=30, monthly_salary_gross=20_000, annual_bonus=0, monthly_special_additional_deduction=0),
+            IncomeMember(name="成员B", current_age=28, monthly_salary_gross=12_000, annual_bonus=0, monthly_special_additional_deduction=0),
         ],
     )
 
@@ -366,7 +373,7 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
 
     assert unemployment.non_taxable_income == pytest.approx(2_000)
     assert unemployment.net_income < before_layoff.net_income
-    assert self_social.extra_cash_expense == pytest.approx(1_800)
+    assert self_social.personal_social == pytest.approx(1_800)
     assert pension.non_taxable_income >= 6_000
 
 
@@ -391,12 +398,16 @@ def test_career_shock_auto_estimates_unemployment_and_self_social_from_rules() -
         scheduled_expenses=[],
         career_shock=CareerShockData(
             enabled=True,
-            layoff_member_name="样例成员",
-            layoff_age=31,
-            self_current_age=30,
-            self_retirement_age=60,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="样例成员",
+                    enabled=True,
+                    layoff_age=31,
+                    retirement_age=60,
+                )
+            ],
         ),
-        members=[IncomeMember(name="样例成员", monthly_salary_gross=20_000, annual_bonus=0)],
+        members=[IncomeMember(name="样例成员", current_age=30, monthly_salary_gross=20_000, annual_bonus=0)],
     )
 
     first_month = household_monthly_income_profile_at(household, rule, months_from_now=12, as_of=date(2026, 7, 1))
@@ -405,7 +416,64 @@ def test_career_shock_auto_estimates_unemployment_and_self_social_from_rules() -
 
     assert first_month.non_taxable_income == pytest.approx(2600)
     assert thirteenth_month.non_taxable_income == pytest.approx(2100)
-    assert after_benefit.extra_cash_expense == pytest.approx(2180)
+    assert after_benefit.personal_social == pytest.approx(2180)
+
+
+def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_pension() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "beijing_unemployment_benefit_under_5y": 2200,
+                "beijing_social_base_floor": 7000,
+                "beijing_social_base_ceiling": 30000,
+                "beijing_housing_fund_base_floor": 3000,
+                "beijing_housing_fund_base_ceiling": 30000,
+                "flexible_employment_social_base": 8000,
+                "flexible_employment_pension_rate": 0.2,
+                "flexible_employment_unemployment_rate": 0.01,
+                "flexible_employment_medical_monthly": 500,
+                "flexible_employment_housing_fund_base": 6000,
+                "flexible_employment_housing_fund_rate": 0.12,
+                "pension_default_paid_years": 15,
+                "pension_average_salary_growth_rate": 0.0,
+                "pension_personal_account_annual_return": 0.0,
+                "pension_replacement_rate_floor": 0.2,
+                "pension_replacement_rate_ceiling": 0.65,
+            }
+        }
+    )
+    household = HouseholdData(
+        social_security_months=36,
+        scheduled_expenses=[],
+        career_shock=CareerShockData(
+            enabled=True,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="样例成员",
+                    enabled=True,
+                    layoff_age=31,
+                    retirement_age=50,
+                    auto_pension_monthly=True,
+                    unemployment_freelance_income_monthly=3000,
+                    flexible_freelance_income_monthly=5000,
+                )
+            ],
+        ),
+        members=[IncomeMember(name="样例成员", current_age=30, monthly_salary_gross=20_000, annual_bonus=0)],
+    )
+
+    unemployment = household_monthly_income_profile_at(household, rule, months_from_now=12, as_of=date(2026, 7, 1))
+    flexible = household_monthly_income_profile_at(household, rule, months_from_now=30, as_of=date(2026, 7, 1))
+    pension = household_monthly_income_profile_at(household, rule, months_from_now=240, as_of=date(2026, 7, 1))
+
+    assert unemployment.non_taxable_income == pytest.approx(2200)
+    assert unemployment.gross_income >= 5200
+    assert flexible.personal_social == pytest.approx(2180)
+    assert flexible.personal_housing_fund == pytest.approx(720)
+    assert flexible.monthly_pf_deposit == pytest.approx(720)
+    assert flexible.gross_income >= 5000
+    assert pension.non_taxable_income > 0
 
 
 def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
@@ -414,18 +482,21 @@ def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
         scheduled_expenses=[],
         career_shock=CareerShockData(
             enabled=True,
-            layoff_member_name="样例成员",
-            layoff_age=35,
             auto_unemployment_benefit=False,
             auto_self_social_insurance=False,
-            self_birth_month="1980-01",
-            self_current_age=30,
             unemployment_benefit_months=24,
             unemployment_benefit_monthly=2_000,
             self_social_insurance_monthly=1_800,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="样例成员",
+                    enabled=True,
+                    layoff_age=35,
+                )
+            ],
         ),
         members=[
-            IncomeMember(name="样例成员", monthly_salary_gross=20_000, annual_bonus=0, monthly_special_additional_deduction=0),
+            IncomeMember(name="样例成员", birth_month="1980-01", current_age=30, monthly_salary_gross=20_000, annual_bonus=0, monthly_special_additional_deduction=0),
         ],
     )
 
@@ -450,20 +521,25 @@ def test_purchase_plan_avoids_negative_cash_pool_after_layoff() -> None:
         car_plan=CarPlanData(enabled=False, no_car_monthly_commute_cost=0),
         career_shock=CareerShockData(
             enabled=True,
-            layoff_member_name="self",
-            layoff_age=35,
             auto_unemployment_benefit=False,
             auto_self_social_insurance=False,
-            self_birth_month="1980-01",
-            self_current_age=25,
             unemployment_benefit_months=0,
             unemployment_benefit_monthly=0,
             self_social_insurance_monthly=3_000,
-            self_retirement_age=60,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="self",
+                    enabled=True,
+                    layoff_age=35,
+                    retirement_age=60,
+                )
+            ],
         ),
         members=[
             IncomeMember(
                 name="self",
+                birth_month="1980-01",
+                current_age=25,
                 monthly_salary_gross=45_000,
                 annual_bonus=0,
                 housing_fund_personal_rate=0,
@@ -1640,7 +1716,7 @@ def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
     zero_commercial = next(
         item
         for item in result.purchase_plan_analyses
-        if item.commercial_loan_amount == 0 and item.variant != "鎵嬪姩鎸囧畾"
+        if item.commercial_loan_amount == 0 and item.variant != "手动指定"
     )
     micro_plan = positive_commercial[0]
 
@@ -1674,13 +1750,14 @@ def test_micro_commercial_strategy_avoids_negative_cash_for_400w_new_home() -> N
         members=[
             IncomeMember(
                 name="样例成员",
+                birth_month="1995-01",
                 monthly_salary_gross=20_000,
                 annual_bonus=0,
                 monthly_special_additional_deduction=0,
             )
         ],
         car_plan=CarPlanData(enabled=False),
-        career_shock=CareerShockData(enabled=True, self_birth_month="1995-01", self_layoff_age=35),
+        career_shock=CareerShockData(enabled=False),
     )
     scenario = ScenarioData(
         total_price=4_000_000,
@@ -1880,12 +1957,13 @@ def test_family_provident_support_can_make_400w_new_home_micro_plan_cash_safe() 
         members=[
             IncomeMember(
                 name="样例成员",
+                birth_month="1995-01",
                 monthly_salary_gross=20_000,
                 annual_bonus=0,
             )
         ],
         car_plan=CarPlanData(enabled=False),
-        career_shock=CareerShockData(enabled=True, self_birth_month="1995-01", self_layoff_age=35),
+        career_shock=CareerShockData(enabled=False),
     )
     scenario = ScenarioData(
         total_price=4_000_000,
@@ -2593,6 +2671,67 @@ def test_provident_account_closes_and_transfers_to_cash_at_retirement() -> None:
     assert after_retirement.total_deposit == 0
     assert after_retirement.balance_end == 0
     assert cashflow_row.provident_withdrawal == pytest.approx(retirement_row.retirement_withdrawal)
+    assert any(
+        event.plan_variant == plan.variant
+        and event.month == 2
+        and event.category == "provident"
+        and "公积金退休销户" in event.title
+        and event.amount == pytest.approx(retirement_row.retirement_withdrawal)
+        for event in result.plan_events
+    )
+
+
+def test_timeline_and_account_curves_extend_past_retirement() -> None:
+    current_month = date(date.today().year, date.today().month, 1)
+    retirement_month = calculator_module._add_months(current_month, 2)
+    birth_month = f"{retirement_month.year - 50}-{retirement_month.month:02d}"
+    household = HouseholdData(
+        cash_account_balance=800_000,
+        investments=50_000,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        social_security_months=180,
+        career_shock=CareerShockData(
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="样例成员",
+                    enabled=False,
+                    retirement_age=50,
+                    pension_monthly=4_000,
+                    auto_pension_monthly=False,
+                )
+            ],
+        ),
+        members=[
+            IncomeMember(
+                name="样例成员",
+                birth_month=birth_month,
+                provident_fund_balance=80_000,
+                monthly_salary_gross=20_000,
+                annual_bonus=0,
+            ),
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = result.purchase_plan_analyses[0]
+    cashflow_months = [
+        item.month
+        for item in result.monthly_cashflow_visualization
+        if item.plan_variant == plan.variant
+    ]
+    events = [item for item in result.plan_events if item.plan_variant == plan.variant]
+
+    assert max(cashflow_months) >= 122
+    assert any(event.month == 2 and "退休-养老金" in event.title and "养老金" in event.detail for event in events)
+    assert any(event.month >= 122 and event.title == "退休后长期观察窗口" for event in events)
 
 
 def test_provident_loan_offset_uses_borrower_account_before_other_members() -> None:

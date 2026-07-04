@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 RepaymentMethod = Literal["equal_installment", "equal_principal"]
 RuleStatus = Literal["draft", "active", "archived"]
 BonusTaxMethod = Literal["separate", "merged", "best"]
+IncomeStageKind = Literal["salary", "unemployment", "freelance", "pension", "manual"]
 GreenBuildingLevel = Literal["none", "two_star", "three_star"]
 PrefabBuildingLevel = Literal["none", "A", "AA", "AAA"]
 BuildingStructure = Literal["unknown", "brick_mixed", "steel_concrete"]
@@ -42,10 +43,12 @@ class IncomeMember(BaseModel):
             self.income_stages = [
                 IncomeStageData(
                     name="当前收入",
+                    stage_kind="salary",
                     start_date=self.employment_start_date,
                     monthly_salary_gross=self.monthly_salary_gross,
                     annual_bonus=self.annual_bonus,
                     annual_bonus_payout_month=4,
+                    monthly_freelance_income=0,
                     monthly_non_taxable_income=self.monthly_non_taxable_income,
                     monthly_extra_cash_expense=self.monthly_extra_cash_expense,
                     monthly_social_insurance=self.monthly_social_insurance,
@@ -63,11 +66,13 @@ class IncomeMember(BaseModel):
 
 class IncomeStageData(BaseModel):
     name: str = "当前收入"
+    stage_kind: IncomeStageKind = "salary"
     start_date: str = "2026-07-01"
     end_date: str | None = None
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
     annual_bonus_payout_month: int = Field(4, ge=1, le=12)
+    monthly_freelance_income: float = Field(0, ge=0)
     monthly_non_taxable_income: float = Field(0, ge=0)
     monthly_extra_cash_expense: float = Field(0, ge=0)
     monthly_social_insurance: float = Field(0, ge=0)
@@ -87,6 +92,9 @@ class CareerShockMemberSetting(BaseModel):
     layoff_age: int = Field(35, ge=18, le=80)
     retirement_age: int = Field(63, ge=50, le=70)
     pension_monthly: float = Field(0, ge=0)
+    auto_pension_monthly: bool = True
+    unemployment_freelance_income_monthly: float = Field(0, ge=0)
+    flexible_freelance_income_monthly: float = Field(0, ge=0)
     birth_month: str = ""
     current_age: int = Field(30, ge=0, le=120)
 
@@ -96,41 +104,12 @@ class CareerShockData(BaseModel):
     member_settings: list[CareerShockMemberSetting] = Field(default_factory=list)
     auto_unemployment_benefit: bool = True
     auto_self_social_insurance: bool = True
+    auto_flexible_housing_fund: bool = True
+    auto_pension_income: bool = True
     unemployment_benefit_months: int = Field(24, ge=0, le=24)
     unemployment_benefit_monthly: float = Field(0, ge=0)
     self_social_insurance_monthly: float = Field(0, ge=0)
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_legacy_member_fields(cls, data: Any) -> Any:
-        if not isinstance(data, dict) or data.get("member_settings"):
-            return data
-        legacy_name = str(data.get("layoff_member_name") or "成员 1")
-        data = dict(data)
-        data["member_settings"] = [
-            {
-                "member_name": legacy_name,
-                "enabled": bool(data.get("enabled")),
-                "layoff_age": data.get("layoff_age", 35),
-                "retirement_age": data.get("self_retirement_age", 63),
-                "pension_monthly": data.get("self_pension_monthly", 0),
-                "birth_month": data.get("self_birth_month", ""),
-                "current_age": data.get("self_current_age", 30),
-            }
-        ]
-        if data.get("spouse_retirement_age") is not None or data.get("spouse_pension_monthly"):
-            data["member_settings"].append(
-                {
-                    "member_name": "成员 2",
-                    "enabled": False,
-                    "layoff_age": data.get("layoff_age", 35),
-                    "retirement_age": data.get("spouse_retirement_age", 58),
-                    "pension_monthly": data.get("spouse_pension_monthly", 0),
-                    "birth_month": data.get("spouse_birth_month", ""),
-                    "current_age": data.get("spouse_current_age", 30),
-                }
-            )
-        return data
+    self_housing_fund_monthly: float = Field(0, ge=0)
 
 class VehiclePlanData(BaseModel):
     enabled: bool = False
@@ -236,7 +215,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(11, ge=1)
+    schema_version: int = Field(14, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -358,7 +337,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(11, ge=1)
+    schema_version: int = Field(14, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -444,6 +423,15 @@ class RulePackData(BaseModel):
             "flexible_employment_pension_rate": 0.20,
             "flexible_employment_unemployment_rate": 0.01,
             "flexible_employment_medical_monthly": 584.92,
+            "flexible_employment_housing_fund_enabled": True,
+            "flexible_employment_housing_fund_base": 7162,
+            "flexible_employment_housing_fund_rate": 0.12,
+            "pension_average_salary_growth_rate": 0.03,
+            "pension_personal_account_annual_return": 0.025,
+            "pension_personal_account_months": 139,
+            "pension_default_paid_years": 15,
+            "pension_replacement_rate_floor": 0.20,
+            "pension_replacement_rate_ceiling": 0.65,
             "comprehensive_tax_brackets": [
                 {"threshold": 36000, "rate": 0.03, "quick_deduction": 0},
                 {"threshold": 144000, "rate": 0.10, "quick_deduction": 2520},
