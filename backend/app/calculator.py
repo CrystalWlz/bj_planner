@@ -68,6 +68,24 @@ class LoanComputation:
 
 
 @dataclass(frozen=True)
+class LoanMonthProjection:
+    balance_start: float
+    interest: float
+    contract_payment: float
+    extra_principal_payment: float
+    total_payment: float
+    balance_end: float
+
+
+@dataclass(frozen=True)
+class LoanProjection:
+    points: tuple[LoanMonthProjection, ...]
+    total_interest: float
+    actual_payoff_months: int
+    interest_saved_by_prepayment: float
+
+
+@dataclass(frozen=True)
 class MonthlyIncomeProfile:
     gross_income: float
     net_income: float
@@ -166,6 +184,105 @@ def calculate_loan(principal: float, annual_rate: float, years: int, method: str
     return LoanComputation(monthly_payment, monthly_payment, total_interest)
 
 
+def _loan_projection_with_prepayment(
+    principal: float,
+    annual_rate: float,
+    total_months: int,
+    method: str,
+    *,
+    prepayment_monthly_amount: float = 0.0,
+    prepayment_start_month: int = 1,
+) -> LoanProjection:
+    if principal <= 0 or total_months <= 0:
+        return LoanProjection((), 0.0, 0, 0.0)
+
+    monthly_rate = annual_rate / 12
+    extra_monthly = max(0.0, prepayment_monthly_amount)
+    start_month = max(1, int(prepayment_start_month))
+    fixed_payment = 0.0
+    baseline_interest = 0.0
+    principal_per_month = principal / total_months
+    if method != "equal_principal":
+        if monthly_rate <= 0:
+            fixed_payment = principal / total_months
+        else:
+            factor = (1 + monthly_rate) ** total_months
+            fixed_payment = principal * monthly_rate * factor / (factor - 1)
+            baseline_interest = fixed_payment * total_months - principal
+    elif monthly_rate > 0:
+        baseline_interest = monthly_rate * principal_per_month * total_months * (total_months + 1) / 2
+
+    balance = principal
+    total_interest = 0.0
+    points: list[LoanMonthProjection] = []
+    for month_index in range(1, total_months + 1):
+        if balance <= 0:
+            break
+        balance_start = balance
+        interest = max(0.0, balance_start * monthly_rate)
+        if method == "equal_principal":
+            scheduled_principal = min(balance_start, principal_per_month)
+            contract_payment = scheduled_principal + interest
+        else:
+            contract_payment = min(balance_start + interest, fixed_payment)
+            scheduled_principal = max(0.0, min(balance_start, contract_payment - interest))
+        balance_after_contract = max(0.0, balance_start - scheduled_principal)
+        extra_principal = min(
+            balance_after_contract,
+            extra_monthly if month_index >= start_month else 0.0,
+        )
+        balance = max(0.0, balance_after_contract - extra_principal)
+        total_interest += interest
+        points.append(
+            LoanMonthProjection(
+                balance_start=balance_start,
+                interest=interest,
+                contract_payment=contract_payment,
+                extra_principal_payment=extra_principal,
+                total_payment=contract_payment + extra_principal,
+                balance_end=balance,
+            )
+        )
+
+    interest_saved = max(0.0, baseline_interest - total_interest) if extra_monthly > 0 else 0.0
+    return LoanProjection(
+        points=tuple(points),
+        total_interest=total_interest,
+        actual_payoff_months=len(points),
+        interest_saved_by_prepayment=interest_saved,
+    )
+
+
+def _loan_projection_point_after_payments(
+    principal: float,
+    annual_rate: float,
+    total_months: int,
+    method: str,
+    elapsed_payments: int,
+    *,
+    prepayment_monthly_amount: float = 0.0,
+    prepayment_start_month: int = 1,
+) -> tuple[float, float, float]:
+    if principal <= 0 or total_months <= 0:
+        return 0.0, 0.0, 0.0
+    paid_months = max(0, int(elapsed_payments))
+    projection = _loan_projection_with_prepayment(
+        principal,
+        annual_rate,
+        total_months,
+        method,
+        prepayment_monthly_amount=prepayment_monthly_amount,
+        prepayment_start_month=prepayment_start_month,
+    )
+    if paid_months <= 0:
+        first_point = projection.points[0] if projection.points else None
+        return principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
+    if paid_months > len(projection.points):
+        return 0.0, 0.0, 0.0
+    previous = projection.points[paid_months - 1]
+    return previous.balance_end, previous.contract_payment, previous.extra_principal_payment
+
+
 def _loan_principal_for_payment_cap(
     monthly_payment_cap: float,
     annual_rate: float,
@@ -229,6 +346,94 @@ def _installment_balance_after_payments(principal: float, total_months: int, ela
         return 0.0
     paid_months = max(0, min(total_months, int(elapsed_payments)))
     return max(0.0, principal - (principal / total_months) * paid_months)
+
+
+def _vehicle_loan_projection(
+    principal: float,
+    total_months: int,
+    interest_free_months: int,
+    later_annual_rate: float,
+    *,
+    prepayment_monthly_amount: float = 0.0,
+    prepayment_start_month: int = 1,
+) -> LoanProjection:
+    if principal <= 0 or total_months <= 0:
+        return LoanProjection((), 0.0, 0, 0.0)
+    interest_free_months = max(0, min(interest_free_months, total_months))
+    later_months = max(0, total_months - interest_free_months)
+    principal_per_month = principal / total_months
+    standard_remaining_principal = max(0.0, principal - principal_per_month * interest_free_months)
+    later_monthly = 0.0
+    monthly_rate = later_annual_rate / 12
+    if later_months > 0:
+        if monthly_rate <= 0:
+            later_monthly = standard_remaining_principal / later_months
+        else:
+            factor = (1 + monthly_rate) ** later_months
+            later_monthly = standard_remaining_principal * monthly_rate * factor / (factor - 1)
+    baseline_interest = max(0.0, later_monthly * later_months - standard_remaining_principal)
+
+    balance = principal
+    total_interest = 0.0
+    extra_monthly = max(0.0, prepayment_monthly_amount)
+    start_month = max(1, int(prepayment_start_month))
+    points: list[LoanMonthProjection] = []
+    for month_index in range(1, total_months + 1):
+        if balance <= 0:
+            break
+        balance_start = balance
+        if month_index <= interest_free_months:
+            interest = 0.0
+            contract_payment = min(balance_start, principal_per_month)
+        else:
+            interest = max(0.0, balance_start * monthly_rate)
+            contract_payment = min(balance_start + interest, later_monthly)
+        scheduled_principal = max(0.0, min(balance_start, contract_payment - interest))
+        balance_after_contract = max(0.0, balance_start - scheduled_principal)
+        extra_principal = min(
+            balance_after_contract,
+            extra_monthly if month_index >= start_month else 0.0,
+        )
+        balance = max(0.0, balance_after_contract - extra_principal)
+        total_interest += interest
+        points.append(
+            LoanMonthProjection(
+                balance_start=balance_start,
+                interest=interest,
+                contract_payment=contract_payment,
+                extra_principal_payment=extra_principal,
+                total_payment=contract_payment + extra_principal,
+                balance_end=balance,
+            )
+        )
+
+    return LoanProjection(
+        points=tuple(points),
+        total_interest=total_interest,
+        actual_payoff_months=len(points),
+        interest_saved_by_prepayment=max(0.0, baseline_interest - total_interest) if extra_monthly > 0 else 0.0,
+    )
+
+
+def _vehicle_loan_point_after_payments(loan: CarLoanSummary, elapsed_payments: int) -> tuple[float, float, float]:
+    if loan.loan_principal <= 0 or loan.total_months <= 0:
+        return 0.0, 0.0, 0.0
+    projection = _vehicle_loan_projection(
+        loan.loan_principal,
+        loan.total_months,
+        loan.interest_free_months,
+        loan.later_annual_rate,
+        prepayment_monthly_amount=loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0,
+        prepayment_start_month=loan.prepayment_start_month,
+    )
+    paid_months = max(0, int(elapsed_payments))
+    if paid_months <= 0:
+        first_point = projection.points[0] if projection.points else None
+        return loan.loan_principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
+    if paid_months > len(projection.points):
+        return 0.0, 0.0, 0.0
+    previous = projection.points[paid_months - 1]
+    return previous.balance_end, previous.contract_payment, previous.extra_principal_payment
 
 
 def _pick_bracket(amount: float, brackets: list[dict]) -> tuple[float, float]:
@@ -402,7 +607,7 @@ def _retirement_tail_months(household: HouseholdData, *, as_of: date | None = No
                         current_month,
                         effective_birth_month,
                         effective_current_age,
-                        setting.retirement_age if setting else _default_retirement_age_for_member(index),
+                        setting.retirement_age if setting else _policy_retirement_age_for_member(member, index),
                     ),
                 ),
             )
@@ -470,6 +675,17 @@ def _default_retirement_age_for_member(index: int) -> int:
     return 63 if index == 0 else 58
 
 
+def _policy_retirement_age_for_member(member, index: int) -> int:
+    category = getattr(member, "retirement_category", None)
+    if category == "female_50":
+        return 55
+    if category == "female_55":
+        return 58
+    if category == "male_60":
+        return 63
+    return _default_retirement_age_for_member(index)
+
+
 def _career_shock_settings_by_member(household: HouseholdData):
     shock = household.career_shock
     settings_by_name = {item.member_name: item for item in shock.member_settings}
@@ -492,7 +708,7 @@ def _member_retirement_months_by_index(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = setting.retirement_age if setting else _default_retirement_age_for_member(index)
+        retirement_age = setting.retirement_age if setting else _policy_retirement_age_for_member(member, index)
         retirement_start = _month_start_for_birth_month_or_age(
             current_month,
             effective_birth_month,
@@ -671,7 +887,7 @@ def _household_with_career_income_stages(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = setting.retirement_age if setting else _default_retirement_age_for_member(index)
+        retirement_age = setting.retirement_age if setting else _policy_retirement_age_for_member(member, index)
         retirement_start = _month_start_for_birth_month_or_age(
             current,
             effective_birth_month,
@@ -709,7 +925,7 @@ def _household_with_career_income_stages(
                         first_stage.model_copy(
                             update={
                                 "stage_kind": "unemployment",
-                                "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
+                                "monthly_freelance_income": 0,
                                 "monthly_non_taxable_income": _unemployment_benefit_monthly_from_service(
                                     household.social_security_months,
                                     active_rules,
@@ -734,7 +950,7 @@ def _household_with_career_income_stages(
                                 later_stage.model_copy(
                                     update={
                                         "stage_kind": "unemployment",
-                                        "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
+                                        "monthly_freelance_income": 0,
                                         "monthly_non_taxable_income": float(
                                             active_rules.params.get("beijing_unemployment_benefit_after_12_months", 2129)
                                         )
@@ -749,7 +965,7 @@ def _household_with_career_income_stages(
                         unemployment_stage.model_copy(
                             update={
                                 "stage_kind": "unemployment",
-                                "monthly_freelance_income": setting.unemployment_freelance_income_monthly,
+                                "monthly_freelance_income": 0,
                                 "monthly_non_taxable_income": shock.unemployment_benefit_monthly,
                             }
                         )
@@ -766,7 +982,7 @@ def _household_with_career_income_stages(
                     ).model_copy(
                         update={
                             "stage_kind": "freelance",
-                            "monthly_freelance_income": setting.flexible_freelance_income_monthly,
+                            "monthly_freelance_income": 0,
                             "monthly_social_insurance": _career_shock_self_social_monthly(shock, active_rules),
                             "monthly_housing_fund": flexible_housing_fund,
                             "housing_fund_personal_rate": 0,
@@ -1420,6 +1636,12 @@ def calculate_car_loan(
             first_phase_monthly_payment=0,
             later_phase_monthly_payment=0,
             current_monthly_payment=0,
+            prepayment_enabled=False,
+            prepayment_start_month=max(1, plan.loan_prepayment_start_month, plan.loan_prepayment_allowed_after_month),
+            prepayment_allowed_after_month=max(1, plan.loan_prepayment_allowed_after_month),
+            prepayment_monthly_amount=0,
+            actual_payoff_months=0,
+            interest_saved_by_prepayment=0,
             total_interest=0,
             total_months=plan.total_months,
             interest_free_months=plan.interest_free_months,
@@ -1448,6 +1670,25 @@ def calculate_car_loan(
         later_monthly = 0.0
         later_total_interest = 0.0
 
+    prepayment_monthly_amount = (
+        max(0.0, plan.loan_prepayment_monthly_amount)
+        if plan.loan_prepayment_enabled
+        else 0.0
+    )
+    prepayment_allowed_after_month = max(1, min(total_months, plan.loan_prepayment_allowed_after_month))
+    prepayment_start_month = max(
+        prepayment_allowed_after_month,
+        max(1, min(total_months, plan.loan_prepayment_start_month)),
+    )
+    loan_projection = _vehicle_loan_projection(
+        principal,
+        total_months,
+        interest_free_months,
+        plan.later_annual_rate,
+        prepayment_monthly_amount=prepayment_monthly_amount,
+        prepayment_start_month=prepayment_start_month,
+    )
+
     current_month = max(1, min(plan.current_month_index, total_months))
     if plan.purchase_delay_months > 0:
         current_monthly = 0.0
@@ -1467,7 +1708,13 @@ def calculate_car_loan(
         first_phase_monthly_payment=round(first_phase_monthly, 2),
         later_phase_monthly_payment=round(later_monthly, 2),
         current_monthly_payment=round(current_monthly, 2),
-        total_interest=round(later_total_interest, 2),
+        prepayment_enabled=prepayment_monthly_amount > 0,
+        prepayment_start_month=prepayment_start_month,
+        prepayment_allowed_after_month=prepayment_allowed_after_month,
+        prepayment_monthly_amount=round(prepayment_monthly_amount, 2),
+        actual_payoff_months=loan_projection.actual_payoff_months,
+        interest_saved_by_prepayment=round(loan_projection.interest_saved_by_prepayment, 2),
+        total_interest=round(loan_projection.total_interest if prepayment_monthly_amount > 0 else later_total_interest, 2),
         total_months=total_months,
         interest_free_months=interest_free_months,
         later_annual_rate=plan.later_annual_rate,
@@ -1740,12 +1987,9 @@ def _car_monthly_cash_cost_at(
             continue
         month_after_car = month - purchase_month
         payment = 0.0
-        if 0 < month_after_car <= loan.total_months:
-            payment = (
-                loan.first_phase_monthly_payment
-                if month_after_car <= loan.interest_free_months
-                else loan.later_phase_monthly_payment
-            )
+        if month_after_car > 0:
+            _, contract_payment, extra_payment = _vehicle_loan_point_after_payments(loan, month_after_car)
+            payment = contract_payment + extra_payment
         annual_cost = (
             _car_annual_cash_cost_at(loan, vehicle_plan, month, purchase_month)
             if _is_car_annual_cost_month(month, purchase_month)
@@ -1794,12 +2038,9 @@ def _vehicle_cash_components_at(
         }
     elapsed = month - purchase_month
     payment = 0.0
-    if 0 < elapsed <= loan.total_months:
-        payment = (
-            loan.first_phase_monthly_payment
-            if elapsed <= loan.interest_free_months
-            else loan.later_phase_monthly_payment
-        )
+    if elapsed > 0:
+        _, contract_payment, extra_payment = _vehicle_loan_point_after_payments(loan, elapsed)
+        payment = contract_payment + extra_payment
     annual_cost = (
         _car_annual_cash_cost_at(loan, plan, month, purchase_month)
         if _is_car_annual_cost_month(month, purchase_month)
@@ -1910,14 +2151,16 @@ def build_car_plan_analyses(
             low_down_ratio = min(1.0, min(plan.down_payment_ratio, 0.15))
             delayed_down_ratio = min(1.0, max(plan.down_payment_ratio, 0.20))
             delay_months = max(plan.purchase_delay_months, 12)
+            accelerated_extra_principal = min(6000.0, max(1000.0, monthly_savings_before_car * 0.25))
             specs = [
-                ("target", "Calculate from this vehicle source and the current manual loan settings.", plan.down_payment_ratio, plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
-                ("cash", "Pay in full to avoid auto debt, with the highest purchase-month cash pressure.", 1.0, plan.purchase_delay_months, 1, 0, 0.0),
-                ("high_down_low_loan", "Use a mainstream EV-style high-down-payment, short-term low-rate loan.", high_down_ratio, plan.purchase_delay_months, 36, 24, min(plan.later_annual_rate, 0.0199)),
-                ("low_down_keep_cash", "Use a low down payment and longer term to preserve liquidity.", low_down_ratio, plan.purchase_delay_months, 60, 24, plan.later_annual_rate),
-                ("delay_purchase", "Delay the purchase and keep cash for home purchase and emergency reserve first.", delayed_down_ratio, delay_months, 60, 24, plan.later_annual_rate),
+                ("target", "Calculate from this vehicle source and the current manual loan settings.", plan.down_payment_ratio, plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate, plan.loan_prepayment_enabled, plan.loan_prepayment_start_month, plan.loan_prepayment_allowed_after_month, plan.loan_prepayment_monthly_amount),
+                ("cash", "Pay in full to avoid auto debt, with the highest purchase-month cash pressure.", 1.0, plan.purchase_delay_months, 1, 0, 0.0, False, 1, 1, 0.0),
+                ("high_down_low_loan", "Use a mainstream EV-style high-down-payment, short-term low-rate loan.", high_down_ratio, plan.purchase_delay_months, 36, 24, min(plan.later_annual_rate, 0.0199), False, 1, 12, 0.0),
+                ("low_down_keep_cash", "Use a low down payment and longer term to preserve liquidity.", low_down_ratio, plan.purchase_delay_months, 60, 24, plan.later_annual_rate, False, 1, 12, 0.0),
+                ("accelerated_principal", "Use a regular auto loan, then add a monthly principal prepayment when cash flow allows.", max(plan.down_payment_ratio, 0.30), plan.purchase_delay_months, 60, 12, plan.later_annual_rate, accelerated_extra_principal > 0, 13, 12, accelerated_extra_principal),
+                ("delay_purchase", "Delay the purchase and keep cash for home purchase and emergency reserve first.", delayed_down_ratio, delay_months, 60, 24, plan.later_annual_rate, False, 1, 12, 0.0),
             ]
-            for strategy_key, description, down_ratio, purchase_delay, total_months, interest_free_months, later_rate in specs:
+            for strategy_key, description, down_ratio, purchase_delay, total_months, interest_free_months, later_rate, prepay_enabled, prepay_start, prepay_allowed_after, prepay_monthly in specs:
                 strategy_plan = plan.model_copy(
                     update={
                         "enabled": True,
@@ -1927,6 +2170,10 @@ def build_car_plan_analyses(
                         "total_months": total_months,
                         "interest_free_months": min(interest_free_months, total_months),
                         "later_annual_rate": later_rate,
+                        "loan_prepayment_enabled": prepay_enabled,
+                        "loan_prepayment_start_month": min(total_months, max(1, prepay_start)),
+                        "loan_prepayment_allowed_after_month": min(total_months, max(1, prepay_allowed_after)),
+                        "loan_prepayment_monthly_amount": max(0.0, prepay_monthly),
                     }
                 )
                 loan = calculate_car_loan(
@@ -1943,7 +2190,8 @@ def build_car_plan_analyses(
                     months_to_buy = max(purchase_delay, cash_ready_month)
                     cash_after_purchase = initial_cash + monthly_savings_before_car * months_to_buy - loan.down_payment
                 expected_payment = loan.first_phase_monthly_payment if loan.interest_free_months > 0 else loan.later_phase_monthly_payment
-                monthly_after_car = monthly_savings_before_transport - expected_payment - loan.monthly_cash_operating_cost
+                expected_total_payment = expected_payment + (loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0)
+                monthly_after_car = monthly_savings_before_transport - expected_total_payment - loan.monthly_cash_operating_cost
                 debt_burden_score = _clamp_score(10 - expected_payment / max(net_monthly_income, 1) / 0.18 * 10)
                 total_cost_score = _clamp_score(10 - loan.monthly_total_ownership_cost / max(net_monthly_income, 1) / 0.16 * 10)
                 happiness_score = (
@@ -1961,6 +2209,12 @@ def build_car_plan_analyses(
                     f"cash_operating_cost_monthly:{round(loan.monthly_cash_operating_cost)}",
                     f"total_ownership_cost_monthly:{round(loan.monthly_total_ownership_cost)}",
                     "no_auto_loan" if loan.loan_principal == 0 else f"loan_principal:{round(loan.loan_principal)}",
+                    (
+                        f"extra_principal:{round(loan.prepayment_monthly_amount)} from month {loan.prepayment_start_month}, "
+                        f"payoff_months:{loan.actual_payoff_months}, interest_saved:{round(loan.interest_saved_by_prepayment)}"
+                    )
+                    if loan.prepayment_enabled
+                    else "no_extra_principal",
                     "manual_target" if strategy_key == "target" else "preserve_home_purchase_cash" if strategy_key in {"low_down_keep_cash", "delay_purchase"} else "reduce_long_term_auto_debt_pressure",
                 ]
                 analyses.append(
@@ -1984,7 +2238,13 @@ def build_car_plan_analyses(
                         later_annual_rate=loan.later_annual_rate,
                         first_phase_monthly_payment=loan.first_phase_monthly_payment,
                         later_phase_monthly_payment=loan.later_phase_monthly_payment,
-                        expected_monthly_payment_after_purchase=round(expected_payment, 2),
+                        expected_monthly_payment_after_purchase=round(expected_total_payment, 2),
+                        prepayment_enabled=loan.prepayment_enabled,
+                        prepayment_start_month=loan.prepayment_start_month,
+                        prepayment_allowed_after_month=loan.prepayment_allowed_after_month,
+                        prepayment_monthly_amount=loan.prepayment_monthly_amount,
+                        actual_payoff_months=loan.actual_payoff_months,
+                        interest_saved_by_prepayment=loan.interest_saved_by_prepayment,
                         total_interest=loan.total_interest,
                         required_cash_at_purchase=round(required_cash, 2),
                         cash_after_purchase=round(cash_after_purchase, 2),
@@ -2853,6 +3113,13 @@ def build_purchase_plan_analyses(
                 provident_loan_years,
                 _provident_repayment_method(scenario),
             )
+            candidate_commercial_prepayment = (
+                max(0.0, scenario.commercial_prepayment_monthly_amount)
+                if scenario.commercial_prepayment_enabled
+                and mix[4] > 0
+                and max(scenario.commercial_prepayment_start_month, scenario.commercial_prepayment_allowed_after_month) <= 1
+                else 0.0
+            )
             return _post_purchase_cash_stress(
                 household=household,
                 rules=rules,
@@ -2860,7 +3127,8 @@ def build_purchase_plan_analyses(
                 starting_cash=candidate_cash_after_purchase,
                 starting_pf_balance=candidate_pf_after_extract,
                 total_monthly_payment=candidate_commercial_payment.first_month_payment
-                + candidate_provident_payment.first_month_payment,
+                + candidate_provident_payment.first_month_payment
+                + candidate_commercial_prepayment,
                 provident_monthly_payment=candidate_provident_payment.first_month_payment,
                 car_loan=car_loan,
                 expense_at_month=expense_at_month,
@@ -3066,6 +3334,30 @@ def build_purchase_plan_analyses(
             scenario.loan_years,
             _commercial_repayment_method(scenario),
         )
+        commercial_prepayment_monthly = (
+            max(0.0, scenario.commercial_prepayment_monthly_amount)
+            if scenario.commercial_prepayment_enabled and commercial_loan > 0
+            else 0.0
+        )
+        commercial_prepayment_allowed_after_month = max(1, min(scenario.loan_years * 12, scenario.commercial_prepayment_allowed_after_month))
+        commercial_prepayment_start_month = max(
+            commercial_prepayment_allowed_after_month,
+            max(1, min(scenario.loan_years * 12, scenario.commercial_prepayment_start_month)),
+        )
+        immediate_commercial_prepayment = commercial_prepayment_monthly if commercial_prepayment_start_month <= 1 else 0.0
+        commercial_projection = _loan_projection_with_prepayment(
+            commercial_loan,
+            scenario.commercial_rate,
+            scenario.loan_years * 12,
+            _commercial_repayment_method(scenario),
+            prepayment_monthly_amount=commercial_prepayment_monthly,
+            prepayment_start_month=commercial_prepayment_start_month,
+        )
+        commercial_interest = (
+            commercial_projection.total_interest
+            if commercial_prepayment_monthly > 0
+            else commercial_payment.total_interest
+        )
         provident_equal_installment_payment = calculate_loan(
             provident_loan,
             scenario.provident_rate,
@@ -3096,6 +3388,7 @@ def build_purchase_plan_analyses(
                 - household.monthly_debt_payment
                 - post_purchase_car_cost
                 - equal_principal_total_payment
+                - immediate_commercial_prepayment
             )
             equal_principal_pf_relief, _ = _post_purchase_pf_strategy(
                 purchase_month=post_purchase_month,
@@ -3122,6 +3415,7 @@ def build_purchase_plan_analyses(
             - household.monthly_debt_payment
             - post_purchase_car_cost
             - total_monthly_payment
+            - immediate_commercial_prepayment
         )
         monthly_pf_withdrawal, monthly_pf_withdrawal_mode = _post_purchase_pf_strategy(
             purchase_month=post_purchase_month,
@@ -3158,9 +3452,9 @@ def build_purchase_plan_analyses(
         post_extract_liquidity_score = _ratio_score(cash_after_purchase, required_liquidity_reserve)
         flow_score = _cash_flow_score(post_purchase_cash_flow_with_pf, post_purchase_monthly_expense)
         dti_score = _dti_score(dti)
-        payment_pressure_score = _clamp_score(10 - total_monthly_payment / max(post_purchase_income.net_income, 1) / 0.45 * 10)
+        payment_pressure_score = _clamp_score(10 - (total_monthly_payment + commercial_prepayment_monthly) / max(post_purchase_income.net_income, 1) / 0.45 * 10)
         commercial_pressure_score = _clamp_score(10 - commercial_loan / max(price, 1) / 0.65 * 10)
-        interest_score = _clamp_score(10 - (commercial_payment.total_interest + provident_payment.total_interest) / max(price, 1) / 0.55 * 10)
+        interest_score = _clamp_score(10 - (commercial_interest + provident_payment.total_interest) / max(price, 1) / 0.55 * 10)
         provident_interest_saving_if_equal_principal = max(
             0.0,
             provident_equal_installment_payment.total_interest - provident_equal_principal_payment.total_interest,
@@ -3176,6 +3470,7 @@ def build_purchase_plan_analyses(
             - post_purchase_car_cost
             - commercial_payment.first_month_payment
             - provident_equal_principal_payment.first_month_payment
+            - immediate_commercial_prepayment
             + monthly_pf_withdrawal
         )
         if provident_loan <= 0:
@@ -3260,7 +3555,7 @@ def build_purchase_plan_analyses(
                 "name": "商贷与利息压力",
                 "score": round((commercial_pressure_score * 0.65 + interest_score * 0.35), 2),
                 "weight": 0.08,
-                "note": f"商贷 {round(commercial_loan)}，总利息 {round(commercial_payment.total_interest + provident_payment.total_interest)}。",
+                "note": f"商贷 {round(commercial_loan)}，总利息 {round(commercial_interest + provident_payment.total_interest)}。",
             },
             {
                 "name": "等待时间",
@@ -3305,8 +3600,14 @@ def build_purchase_plan_analyses(
                 provident_repayment_method=selected_provident_repayment_method,  # type: ignore[arg-type]
                 commercial_monthly_payment=round(commercial_payment.first_month_payment, 2),
                 provident_monthly_payment=round(provident_payment.first_month_payment, 2),
+                commercial_prepayment_enabled=commercial_prepayment_monthly > 0,
+                commercial_prepayment_start_month=commercial_prepayment_start_month,
+                commercial_prepayment_allowed_after_month=commercial_prepayment_allowed_after_month,
+                commercial_prepayment_monthly_amount=round(commercial_prepayment_monthly, 2),
+                commercial_actual_payoff_months=commercial_projection.actual_payoff_months if commercial_loan > 0 else 0,
+                commercial_interest_saved_by_prepayment=round(commercial_projection.interest_saved_by_prepayment, 2),
                 total_monthly_payment=round(total_monthly_payment, 2),
-                total_interest=round(commercial_payment.total_interest + provident_payment.total_interest, 2),
+                total_interest=round(commercial_interest + provident_payment.total_interest, 2),
                 provident_contract_months=provident_loan_years * 12 if provident_loan > 0 else 0,
                 provident_interest_saving_if_equal_principal=round(provident_interest_saving_if_equal_principal, 2),
                 provident_equal_principal_first_payment=round(provident_equal_principal_payment.first_month_payment, 2),
@@ -3440,33 +3741,42 @@ def build_loan_visualization(
         for month in range(horizon_months + 1):
             vehicle_balance = 0.0
             vehicle_payment = 0.0
+            vehicle_extra_principal_payment = 0.0
             for _, _, vehicle_loan, vehicle_purchase_month in plan_vehicle_states:
                 if vehicle_purchase_month is None or month < vehicle_purchase_month:
                     continue
                 vehicle_elapsed = max(0, month - vehicle_purchase_month)
-                vehicle_balance += _installment_balance_after_payments(
-                    vehicle_loan.loan_principal,
-                    vehicle_loan.total_months,
+                if vehicle_elapsed <= 0:
+                    vehicle_balance += vehicle_loan.loan_principal
+                    continue
+                vehicle_balance_at_month, vehicle_contract_payment, vehicle_extra_payment = _vehicle_loan_point_after_payments(
+                    vehicle_loan,
                     vehicle_elapsed,
                 )
-                if 0 < vehicle_elapsed <= vehicle_loan.total_months:
-                    vehicle_payment += (
-                        vehicle_loan.first_phase_monthly_payment
-                        if vehicle_elapsed <= vehicle_loan.interest_free_months
-                        else vehicle_loan.later_phase_monthly_payment
-                    )
+                vehicle_balance += vehicle_balance_at_month
+                vehicle_payment += vehicle_contract_payment + vehicle_extra_payment
+                vehicle_extra_principal_payment += vehicle_extra_payment
             home_elapsed = max(0, month - purchase_month) if plan.months_to_buy is not None and month >= purchase_month else 0
-            commercial_balance = (
-                _loan_balance_after_payments(
+            commercial_payment = 0.0
+            commercial_extra_principal_payment = 0.0
+            if plan.months_to_buy is not None and month >= purchase_month:
+                (
+                    commercial_balance,
+                    commercial_payment,
+                    commercial_extra_principal_payment,
+                ) = _loan_projection_point_after_payments(
                     plan.commercial_loan_amount,
                     scenario.commercial_rate,
-                    plan.commercial_loan_years,
+                    plan.commercial_loan_years * 12,
                     plan.commercial_repayment_method,
                     home_elapsed,
+                    prepayment_monthly_amount=plan.commercial_prepayment_monthly_amount
+                    if plan.commercial_prepayment_enabled
+                    else 0.0,
+                    prepayment_start_month=plan.commercial_prepayment_start_month,
                 )
-                if plan.months_to_buy is not None and month >= purchase_month
-                else 0.0
-            )
+            else:
+                commercial_balance = 0.0
             provident_balance = (
                 _loan_balance_after_payments(
                     plan.provident_loan_amount,
@@ -3483,11 +3793,10 @@ def build_loan_visualization(
             extra_provident_offset = max(0.0, provident_offset_payment - provident_cash_relief)
             cumulative_extra_provident_offset += extra_provident_offset
             provident_balance = max(0.0, provident_balance - cumulative_extra_provident_offset)
-            commercial_payment = plan.commercial_monthly_payment if commercial_balance > 0 else 0.0
             provident_payment = plan.provident_monthly_payment if provident_balance > 0 else 0.0
             home_payment = commercial_payment + provident_payment
             existing_loan_balance, existing_payment = existing_loan_by_month[month]
-            total_payment = home_payment + vehicle_payment + existing_payment
+            total_payment = home_payment + commercial_extra_principal_payment + vehicle_payment + existing_payment
             cash_payment = max(0.0, total_payment - provident_cash_relief)
             rows.append(
                 LoanVisualizationPoint(
@@ -3506,6 +3815,8 @@ def build_loan_visualization(
                     provident_monthly_payment=round(provident_payment, 2),
                     home_monthly_payment=round(home_payment, 2),
                     vehicle_monthly_payment=round(vehicle_payment, 2),
+                    commercial_extra_principal_payment=round(commercial_extra_principal_payment, 2),
+                    vehicle_extra_principal_payment=round(vehicle_extra_principal_payment, 2),
                     existing_monthly_payment=round(existing_payment, 2),
                     total_monthly_payment=round(total_payment, 2),
                     cash_monthly_payment=round(cash_payment, 2),
@@ -4153,13 +4464,14 @@ def build_monthly_cashflow_visualization(
                         phase = "购房后"
                         house_contract_payment = loan_point.home_monthly_payment if loan_point else plan.total_monthly_payment
                         commercial_house_payment = loan_point.commercial_monthly_payment if loan_point else plan.commercial_monthly_payment
+                        commercial_extra_principal_payment = loan_point.commercial_extra_principal_payment if loan_point else 0.0
                         provident_house_contract_payment = loan_point.provident_monthly_payment if loan_point else plan.provident_monthly_payment
                         provident_current_payment_relief = min(
                             provident_house_contract_payment,
                             provident_house_offset_payment,
                         )
                         provident_house_payment_relief = provident_current_payment_relief
-                        house_payment = commercial_house_payment + max(
+                        house_payment = commercial_house_payment + commercial_extra_principal_payment + max(
                             0.0,
                             provident_house_contract_payment - provident_current_payment_relief,
                         )

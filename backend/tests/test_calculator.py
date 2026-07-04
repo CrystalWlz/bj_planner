@@ -455,8 +455,6 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
                     layoff_age=31,
                     retirement_age=50,
                     auto_pension_monthly=True,
-                    unemployment_freelance_income_monthly=3000,
-                    flexible_freelance_income_monthly=5000,
                 )
             ],
         ),
@@ -468,11 +466,11 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
     pension = household_monthly_income_profile_at(household, rule, months_from_now=240, as_of=date(2026, 7, 1))
 
     assert unemployment.non_taxable_income == pytest.approx(2200)
-    assert unemployment.gross_income >= 5200
+    assert unemployment.gross_income == pytest.approx(2200)
     assert flexible.personal_social == pytest.approx(2180)
     assert flexible.personal_housing_fund == pytest.approx(720)
     assert flexible.monthly_pf_deposit == pytest.approx(720)
-    assert flexible.gross_income >= 5000
+    assert flexible.gross_income == pytest.approx(0)
     assert pension.non_taxable_income > 0
 
 
@@ -1068,6 +1066,80 @@ def test_backend_loan_visualization_projects_selected_strategy_loans_by_month() 
     assert later_row.vehicle_loan_balance < car_row.vehicle_loan_balance
 
 
+def test_commercial_and_vehicle_prepayment_reduce_interest_and_balances() -> None:
+    household = HouseholdData(
+        cash_account_balance=1_200_000,
+        monthly_expense=8_000,
+        members=[IncomeMember(name="sample", monthly_salary_gross=80_000, annual_bonus=0)],
+        car_plan=CarPlanData(enabled=False, vehicle_plans=[]),
+    )
+    base_scenario = ScenarioData(
+        total_price=2_000_000,
+        down_payment_amount=800_000,
+        commercial_loan_amount=1_000_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=1,
+        commercial_rate=0.04,
+        loan_years=20,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+    prepay_scenario = base_scenario.model_copy(
+        update={
+            "commercial_prepayment_enabled": True,
+            "commercial_prepayment_start_month": 1,
+            "commercial_prepayment_monthly_amount": 5_000,
+        }
+    )
+
+    base_result = calculate_affordability(household, base_scenario, RulePackData())
+    prepay_result = calculate_affordability(household, prepay_scenario, RulePackData())
+    base_plan = {item.variant: item for item in base_result.purchase_plan_analyses}["手动指定"]
+    prepay_plan = {item.variant: item for item in prepay_result.purchase_plan_analyses}["手动指定"]
+
+    assert prepay_plan.commercial_prepayment_enabled
+    assert prepay_plan.commercial_prepayment_allowed_after_month == 12
+    assert prepay_plan.commercial_prepayment_start_month == 12
+    assert prepay_plan.commercial_actual_payoff_months < base_plan.commercial_loan_years * 12
+    assert prepay_plan.commercial_interest_saved_by_prepayment > 0
+    assert prepay_plan.total_interest < base_plan.total_interest
+
+    base_rows = [item for item in base_result.loan_visualization if item.plan_variant == base_plan.variant]
+    prepay_rows = [item for item in prepay_result.loan_visualization if item.plan_variant == prepay_plan.variant]
+    first_payment_row = next(item for item in prepay_rows if item.month == prepay_plan.months_to_buy + 1)
+    assert first_payment_row.commercial_extra_principal_payment == 0
+    compare_month = prepay_plan.months_to_buy + 24
+    base_row = next(item for item in base_rows if item.month == compare_month)
+    prepay_row = next(item for item in prepay_rows if item.month == compare_month)
+    assert prepay_row.commercial_extra_principal_payment == pytest.approx(5_000)
+    assert prepay_row.commercial_loan_balance < base_row.commercial_loan_balance
+
+    base_car = calculate_car_loan(
+        CarPlanData(enabled=True, total_price=120_000, down_payment_ratio=0.2, total_months=60, interest_free_months=0, later_annual_rate=0.05)
+    )
+    prepay_car = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=120_000,
+            down_payment_ratio=0.2,
+            total_months=60,
+            interest_free_months=0,
+            later_annual_rate=0.05,
+            loan_prepayment_enabled=True,
+            loan_prepayment_start_month=1,
+            loan_prepayment_monthly_amount=1_000,
+        )
+    )
+    assert prepay_car.prepayment_enabled
+    assert prepay_car.prepayment_allowed_after_month == 12
+    assert prepay_car.prepayment_start_month == 12
+    assert prepay_car.actual_payoff_months < base_car.total_months
+    assert prepay_car.total_interest < base_car.total_interest
+    assert prepay_car.interest_saved_by_prepayment > 0
+
+
 def test_affordability_returns_backend_account_cashflow_series() -> None:
     household = HouseholdData(
         cash_account_balance=900_000,
@@ -1267,12 +1339,14 @@ def test_affordability_generates_multiple_car_purchase_strategies() -> None:
     )
     plans = {item.strategy_key: item for item in result.car_plan_analyses}
 
-    assert list(plans) == ["target", "cash", "high_down_low_loan", "low_down_keep_cash", "delay_purchase"]
+    assert list(plans) == ["target", "cash", "high_down_low_loan", "low_down_keep_cash", "accelerated_principal", "delay_purchase"]
     assert plans["target"].total_price == 300_000
     assert plans["target"].down_payment_ratio == 0.5
     assert plans["cash"].loan_principal == 0
     assert plans["high_down_low_loan"].down_payment > plans["low_down_keep_cash"].down_payment
     assert plans["low_down_keep_cash"].loan_principal > plans["high_down_low_loan"].loan_principal
+    assert plans["accelerated_principal"].prepayment_enabled
+    assert plans["accelerated_principal"].interest_saved_by_prepayment >= 0
     assert plans["delay_purchase"].purchase_delay_months >= 12
     assert plans["high_down_low_loan"].total_months == 36
     assert plans["low_down_keep_cash"].down_payment_ratio <= 0.20
@@ -1303,7 +1377,7 @@ def test_car_plan_generates_strategies_for_each_vehicle_source_candidate() -> No
     )
 
     strategies = result.car_plan_analyses
-    assert len(strategies) == 10
+    assert len(strategies) == 12
     assert {item.vehicle_candidate_name for item in strategies} == {"compact ev", "large ev"}
     assert {item.vehicle_candidate_index for item in strategies} == {0, 1}
     compact_target = next(item for item in strategies if item.vehicle_candidate_name == "compact ev" and item.strategy_key == "target")

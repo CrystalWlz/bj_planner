@@ -11,6 +11,7 @@ export interface IncomeMember {
   name: string;
   birth_month: string;
   current_age: number;
+  retirement_category: "male_60" | "female_55" | "female_50";
   provident_fund_balance: number;
   monthly_salary_gross: number;
   annual_bonus: number;
@@ -55,8 +56,6 @@ export interface CareerShockMemberSetting {
   retirement_age: number;
   pension_monthly: number;
   auto_pension_monthly: boolean;
-  unemployment_freelance_income_monthly: number;
-  flexible_freelance_income_monthly: number;
 }
 
 export interface CareerShockData {
@@ -88,6 +87,10 @@ export interface VehiclePlanData {
   total_months: number;
   interest_free_months: number;
   later_annual_rate: number;
+  loan_prepayment_enabled: boolean;
+  loan_prepayment_start_month: number;
+  loan_prepayment_allowed_after_month: number;
+  loan_prepayment_monthly_amount: number;
   current_month_index: number;
   saving_start_date: string;
   monthly_operating_cost: number;
@@ -163,6 +166,7 @@ export interface ElderlyDependentData {
 }
 
 export interface HouseholdData {
+  schema_version: number;
   name: string;
   monthly_income: number;
   monthly_expense: number;
@@ -238,6 +242,10 @@ export interface ScenarioData {
   repayment_method: RepaymentMethod;
   commercial_repayment_method: RepaymentMethod;
   provident_repayment_method: RepaymentMethod;
+  commercial_prepayment_enabled: boolean;
+  commercial_prepayment_start_month: number;
+  commercial_prepayment_allowed_after_month: number;
+  commercial_prepayment_monthly_amount: number;
   deed_tax_rate: number;
   broker_fee_rate: number;
   renovation_cost: number;
@@ -295,6 +303,12 @@ export interface CarLoanSummary {
   first_phase_monthly_payment: number;
   later_phase_monthly_payment: number;
   current_monthly_payment: number;
+  prepayment_enabled: boolean;
+  prepayment_start_month: number;
+  prepayment_allowed_after_month: number;
+  prepayment_monthly_amount: number;
+  actual_payoff_months: number;
+  interest_saved_by_prepayment: number;
   total_interest: number;
   total_months: number;
   interest_free_months: number;
@@ -329,6 +343,12 @@ export interface CarPlanAnalysis {
   first_phase_monthly_payment: number;
   later_phase_monthly_payment: number;
   expected_monthly_payment_after_purchase: number;
+  prepayment_enabled: boolean;
+  prepayment_start_month: number;
+  prepayment_allowed_after_month: number;
+  prepayment_monthly_amount: number;
+  actual_payoff_months: number;
+  interest_saved_by_prepayment: number;
   total_interest: number;
   required_cash_at_purchase: number;
   cash_after_purchase: number;
@@ -411,6 +431,12 @@ export interface PurchasePlanAnalysis {
   provident_repayment_method: RepaymentMethod;
   commercial_monthly_payment: number;
   provident_monthly_payment: number;
+  commercial_prepayment_enabled: boolean;
+  commercial_prepayment_start_month: number;
+  commercial_prepayment_allowed_after_month: number;
+  commercial_prepayment_monthly_amount: number;
+  commercial_actual_payoff_months: number;
+  commercial_interest_saved_by_prepayment: number;
   total_monthly_payment: number;
   total_interest: number;
   provident_contract_months: number;
@@ -476,6 +502,8 @@ export interface LoanVisualizationPoint {
   provident_monthly_payment: number;
   home_monthly_payment: number;
   vehicle_monthly_payment: number;
+  commercial_extra_principal_payment: number;
+  vehicle_extra_principal_payment: number;
   existing_monthly_payment: number;
   total_monthly_payment: number;
   cash_monthly_payment: number;
