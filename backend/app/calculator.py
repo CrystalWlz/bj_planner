@@ -1897,22 +1897,10 @@ def summarize_phased_loans(
         if start_month is None or interest_only_until is None or loan.principal <= 0:
             phase = "配置待校验"
             current_payment = 0.0
-        elif _month_distance(current_month, start_month) > 0:
-            phase = "未开始计息"
-            current_payment = 0.0
-        elif _month_distance(current_month, interest_only_until) >= 0:
-            phase = "只还利息"
-            current_payment = loan.principal * loan.annual_rate / 12
+            extra_payment = 0.0
         else:
-            elapsed_months = max(0, _month_distance(start_month, current_month))
-            remaining_months = max(1, loan.remaining_months - elapsed_months)
-            phase = "等额本金" if loan.repayment_method == "equal_principal" else "等额本息"
-            current_payment = _amortized_monthly_payment(
-                loan.principal,
-                loan.annual_rate,
-                remaining_months,
-                loan.repayment_method,
-            )
+            phase = _phased_loan_phase_at(loan, 0, as_of=current)
+            _, current_payment, extra_payment = _phased_loan_state_detail_at(loan, 0, as_of=current)
 
         summaries.append(
             PhasedLoanSummary(
@@ -1926,6 +1914,11 @@ def summarize_phased_loans(
                 interest_only_until=loan.interest_only_until,
                 phase=phase,
                 current_monthly_payment=round(current_payment, 2),
+                current_extra_principal_payment=round(extra_payment, 2),
+                prepayment_mode=loan.prepayment_mode,
+                prepayment_start_month=loan.prepayment_start_month,
+                prepayment_allowed_after_month=loan.prepayment_allowed_after_month,
+                prepayment_monthly_amount=round(loan.prepayment_monthly_amount, 2),
             )
         )
     return summaries
@@ -1937,41 +1930,87 @@ def _phased_loan_state_at(
     *,
     as_of: date | None = None,
 ) -> tuple[float, float]:
+    balance, payment, _ = _phased_loan_state_detail_at(loan, months_from_now, as_of=as_of)
+    return balance, payment
+
+
+def _phased_loan_prepayment_amount(loan: PhasedLoanData, payment_month_index: int, balance_after_contract: float) -> float:
+    if balance_after_contract <= 0:
+        return 0.0
+    mode = getattr(loan, "prepayment_mode", "none") or "none"
+    if mode == "none":
+        return 0.0
+    allowed_month = max(1, int(getattr(loan, "prepayment_allowed_after_month", 1) or 1))
+    start_month = max(allowed_month, int(getattr(loan, "prepayment_start_month", 1) or 1))
+    if payment_month_index < start_month:
+        return 0.0
+    configured_amount = max(0.0, float(getattr(loan, "prepayment_monthly_amount", 0.0) or 0.0))
+    if mode == "manual":
+        return min(balance_after_contract, configured_amount)
+    auto_amount = configured_amount if configured_amount > 0 else min(5000.0, max(500.0, loan.principal * 0.01))
+    return min(balance_after_contract, auto_amount)
+
+
+def _phased_loan_state_detail_at(
+    loan: PhasedLoanData,
+    months_from_now: int,
+    *,
+    as_of: date | None = None,
+) -> tuple[float, float, float]:
     if loan.principal <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     current = as_of or date.today()
     target_month = _month_after(current, max(0, months_from_now))
     start_month = _parse_month(loan.interest_start_month)
     interest_only_until = _parse_month(loan.interest_only_until)
     if start_month is None or interest_only_until is None:
-        return loan.principal, 0.0
+        return loan.principal, 0.0, 0.0
 
     if _month_distance(target_month, start_month) > 0:
-        return loan.principal, 0.0
+        return loan.principal, 0.0, 0.0
 
     monthly_rate = loan.annual_rate / 12
-    if _month_distance(target_month, interest_only_until) >= 0:
-        return loan.principal, loan.principal * monthly_rate
-
     interest_only_months = max(0, _month_distance(start_month, interest_only_until))
     amortization_months = max(1, loan.remaining_months - interest_only_months)
-    elapsed_payments = max(0, _month_distance(interest_only_until, target_month))
-    balance = _loan_balance_after_monthly_payments(
-        loan.principal,
-        loan.annual_rate,
-        amortization_months,
-        loan.repayment_method,
-        elapsed_payments,
-    )
-    if balance <= 0:
-        return 0.0, 0.0
+    fixed_installment_payment = _equal_installment_monthly_payment(loan.principal, loan.annual_rate, amortization_months)
+    balance = loan.principal
+    payment_month_index = 0
+    total_months = max(0, months_from_now)
+    for offset in range(total_months + 1):
+        month = _month_after(current, offset)
+        if _month_distance(month, start_month) > 0:
+            contract_payment = 0.0
+            scheduled_principal = 0.0
+            extra_principal = 0.0
+        elif _month_distance(month, interest_only_until) >= 0:
+            payment_month_index += 1
+            interest = balance * monthly_rate
+            contract_payment = interest
+            scheduled_principal = 0.0
+            extra_principal = _phased_loan_prepayment_amount(loan, payment_month_index, balance)
+        else:
+            payment_month_index += 1
+            interest = balance * monthly_rate
+            if loan.repayment_method == "equal_principal":
+                scheduled_principal = min(balance, loan.principal / amortization_months)
+                contract_payment = scheduled_principal + interest
+            else:
+                contract_payment = min(balance + interest, fixed_installment_payment)
+                scheduled_principal = max(0.0, min(balance, contract_payment - interest))
+            extra_principal = _phased_loan_prepayment_amount(
+                loan,
+                payment_month_index,
+                max(0.0, balance - scheduled_principal),
+            )
 
-    if loan.repayment_method == "equal_principal":
-        payment = loan.principal / amortization_months + balance * monthly_rate
-    else:
-        payment = _equal_installment_monthly_payment(loan.principal, loan.annual_rate, amortization_months)
-    return balance, payment
+        if offset == total_months:
+            if balance <= 0:
+                return 0.0, 0.0, 0.0
+            return balance, contract_payment + extra_principal, extra_principal
+        balance = max(0.0, balance - scheduled_principal - extra_principal)
+        if balance <= 0:
+            return 0.0, 0.0, 0.0
 
 
 def _phased_loan_phase_at(
@@ -2004,7 +2043,7 @@ def _existing_loan_details_at(
 ) -> list[ExistingLoanVisualizationDetail]:
     details: list[ExistingLoanVisualizationDetail] = []
     for index, loan in enumerate(loans, start=1):
-        balance, payment = _phased_loan_state_at(loan, months_from_now, as_of=as_of)
+        balance, payment, extra_principal_payment = _phased_loan_state_detail_at(loan, months_from_now, as_of=as_of)
         if balance <= 0 and payment <= 0:
             continue
         details.append(
@@ -2015,6 +2054,7 @@ def _existing_loan_details_at(
                 phase=_phased_loan_phase_at(loan, months_from_now, as_of=as_of),
                 balance=round(balance, 2),
                 monthly_payment=round(payment, 2),
+                extra_principal_payment=round(extra_principal_payment, 2),
             )
         )
     return details
@@ -2227,7 +2267,6 @@ def _vehicle_plans(
                     "name": vehicle.name or f"车辆 {index + 1}",
                     "purchase_delay_months": effective_purchase_month,
                     "vehicle_plans": [],
-                    "second_car_enabled": False,
                 }
             )
         )
@@ -2235,10 +2274,7 @@ def _vehicle_plans(
     if plans:
         return plans
     if plan.enabled and plan.total_price > 0 and (include_after_home or _vehicle_is_before_or_parallel_home(plan, scenario)):
-        plans.append(plan.model_copy(update={"vehicle_plans": [], "second_car_enabled": False}))
-    second_plan = _second_car_plan(plan)
-    if second_plan.enabled and include_after_home:
-        plans.append(second_plan)
+        plans.append(plan.model_copy(update={"vehicle_plans": []}))
     return plans
 
 
@@ -2337,25 +2373,6 @@ def _aggregate_car_loan(
                 (loan.months_to_down_payment for loan in loans if loan.months_to_down_payment is not None),
                 default=None,
             ),
-        }
-    )
-
-
-def _second_car_plan(plan: CarPlanData) -> CarPlanData:
-    return plan.model_copy(
-        update={
-            "enabled": plan.second_car_enabled and plan.second_car_total_price > 0,
-            "name": "second_car",
-            "selected_strategy_variant": "第二辆车",
-            "total_price": plan.second_car_total_price,
-            "down_payment_ratio": plan.second_car_down_payment_ratio,
-            "down_payment": plan.second_car_total_price * plan.second_car_down_payment_ratio,
-            "purchase_delay_months": plan.second_car_purchase_delay_months,
-            "total_months": plan.second_car_total_months,
-            "interest_free_months": min(plan.second_car_interest_free_months, plan.second_car_total_months),
-            "later_annual_rate": plan.second_car_later_annual_rate,
-            "annual_mileage_km": plan.second_car_annual_mileage_km,
-            "monthly_parking_cost": plan.second_car_monthly_parking_cost,
         }
     )
 
@@ -2537,6 +2554,98 @@ def _wait_score(months: int | None, max_comfort_months: int) -> float:
     if months <= 0:
         return 10
     return _clamp_score(10 - months / max(max_comfort_months, 1) * 10)
+
+
+DEFAULT_PURCHASE_HAPPINESS_WEIGHTS = {
+    "living_quality": 0.12,
+    "commute": 0.10,
+    "education": 0.08,
+    "vehicle_convenience": 0.05,
+    "transaction_liquidity": 0.12,
+    "post_purchase_liquidity": 0.08,
+    "monthly_cashflow": 0.14,
+    "debt_to_income": 0.10,
+    "monthly_payment_pressure": 0.07,
+    "loan_interest_pressure": 0.06,
+    "waiting_time": 0.04,
+    "renovation_readiness": 0.02,
+    "stress_resilience": 0.02,
+}
+
+PURCHASE_HAPPINESS_FINANCIAL_KEYS = {
+    "transaction_liquidity",
+    "post_purchase_liquidity",
+    "monthly_cashflow",
+    "debt_to_income",
+    "monthly_payment_pressure",
+    "loan_interest_pressure",
+    "stress_resilience",
+}
+
+
+def _purchase_happiness_weights(rules: RulePackData, liquidity_priority_score: float) -> dict[str, float]:
+    raw_weights = rules.params.get("purchase_happiness_weights", {})
+    weights: dict[str, float] = {}
+    for key, default in DEFAULT_PURCHASE_HAPPINESS_WEIGHTS.items():
+        raw_value = raw_weights.get(key, default) if isinstance(raw_weights, dict) else default
+        try:
+            weights[key] = max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            weights[key] = default
+
+    priority = (_clamp_score(liquidity_priority_score) - 5.0) / 5.0
+    for key in list(weights):
+        if key in PURCHASE_HAPPINESS_FINANCIAL_KEYS:
+            weights[key] *= 1.0 + priority * 0.28
+        elif key in {"living_quality", "commute", "education", "vehicle_convenience"}:
+            weights[key] *= 1.0 - priority * 0.12
+
+    total = sum(weights.values())
+    if total <= 0:
+        return DEFAULT_PURCHASE_HAPPINESS_WEIGHTS.copy()
+    return {key: value / total for key, value in weights.items()}
+
+
+def _renovation_readiness_score(
+    renovation_cost: float,
+    renovation_included_upfront: bool,
+    renovation_saving_months: int | None,
+) -> float:
+    if renovation_cost <= 0:
+        return 10
+    if renovation_included_upfront:
+        return 8.5
+    if renovation_saving_months is None:
+        return 2.0
+    return _wait_score(renovation_saving_months, 36)
+
+
+def _stress_resilience_score(cash_stress_ok: bool, cash_stress_shortfall: float, required_liquidity_reserve: float) -> float:
+    if cash_stress_ok:
+        return 10
+    if required_liquidity_reserve <= 0:
+        return 0
+    return _clamp_score(10 - max(0.0, cash_stress_shortfall) / required_liquidity_reserve * 10)
+
+
+def _weighted_happiness_breakdown(items: list[dict[str, float | str]], weights: dict[str, float]) -> tuple[float, list[dict[str, float | str]]]:
+    enriched: list[dict[str, float | str]] = []
+    total_score = 0.0
+    for item in items:
+        key = str(item["key"])
+        score = _clamp_score(float(item["score"]))
+        weight = weights.get(key, 0.0)
+        weighted_score = score * weight
+        total_score += weighted_score
+        enriched.append(
+            {
+                **item,
+                "score": round(score, 2),
+                "weight": round(weight, 4),
+                "weighted_score": round(weighted_score, 3),
+            }
+        )
+    return total_score, enriched
 
 
 def _round_down_to_step(value: float, step: float) -> float:
@@ -4221,80 +4330,133 @@ def build_purchase_plan_analyses(
                 f"等额本金可少付公积金利息约 {round(provident_interest_saving_if_equal_principal)}，"
                 f"但首月现金压力增加约 {round(equal_principal_extra_first_payment)}，当前现金流不宜自动切换。"
             )
-        life_quality_score = (
-            scenario.happiness_score * 0.28
-            + scenario.commute_score * 0.21
-            + scenario.school_score * 0.18
-            + household.car_plan.happiness_score * 0.08
-            + wait_score * 0.11
-            + commercial_pressure_score * 0.06
-            + liquidity_score * 0.08
+        vehicle_convenience_score = (
+            _clamp_score(household.car_plan.happiness_score)
+            if post_purchase_car_cost > 0
+            else _clamp_score(7 - (household.car_plan.no_car_monthly_commute_cost or 0) / max(post_purchase_income.net_income, 1) / 0.08 * 3)
         )
-        financial_score = (
-            liquidity_score * 0.22
-            + post_extract_liquidity_score * 0.12
-            + flow_score * 0.24
-            + dti_score * 0.18
-            + wait_score * 0.08
-            + payment_pressure_score * 0.08
-            + commercial_pressure_score * 0.05
-            + interest_score * 0.03
+        loan_interest_pressure_score = _clamp_score(commercial_pressure_score * 0.55 + interest_score * 0.45)
+        renovation_score = _renovation_readiness_score(
+            scenario.renovation_cost,
+            renovation_included_upfront,
+            renovation_saving_months,
         )
-        liquidity_weight = _clamp_score(scenario.liquidity_priority_score) / 10
-        happiness_score = (
-            life_quality_score * (0.70 - liquidity_weight * 0.15)
-            + financial_score * (0.30 + liquidity_weight * 0.15)
+        stress_score = _stress_resilience_score(cash_stress_ok, cash_stress_shortfall, required_liquidity_reserve)
+        happiness_weights = _purchase_happiness_weights(rules, scenario.liquidity_priority_score)
+        happiness_score, happiness_breakdown = _weighted_happiness_breakdown(
+            [
+                {
+                    "key": "living_quality",
+                    "name": "居住体验",
+                    "category": "life",
+                    "score": scenario.happiness_score,
+                    "note": "目标房源的户型、面积、社区、楼龄和主观居住满意度。",
+                },
+                {
+                    "key": "commute",
+                    "name": "通勤便利",
+                    "category": "life",
+                    "score": scenario.commute_score,
+                    "note": "通勤时间、稳定性和日常时间成本。",
+                },
+                {
+                    "key": "education",
+                    "name": "教育匹配",
+                    "category": "life",
+                    "score": scenario.school_score,
+                    "note": "教育资源与家庭长期确定性。",
+                },
+                {
+                    "key": "vehicle_convenience",
+                    "name": "用车便利",
+                    "category": "life",
+                    "score": vehicle_convenience_score,
+                    "note": (
+                        f"已纳入买车后的便利度约 {round(household.car_plan.happiness_score, 1)} 分。"
+                        if post_purchase_car_cost > 0
+                        else f"未购车时按无车通勤成本 {round(household.car_plan.no_car_monthly_commute_cost or 0)} 估算便利度。"
+                    ),
+                },
+                {
+                    "key": "transaction_liquidity",
+                    "name": "买房当天现金安全",
+                    "category": "finance",
+                    "score": liquidity_score,
+                    "note": f"买房当天现金 {round(cash_after_transaction)}，压力期最低现金 {round(minimum_cash_balance)}，基础安全垫 {round(required_liquidity_reserve)}。",
+                },
+                {
+                    "key": "post_purchase_liquidity",
+                    "name": "买后现金安全",
+                    "category": "finance",
+                    "score": post_extract_liquidity_score,
+                    "note": f"买后现金 {round(cash_after_purchase)}，目标安全垫 {round(required_liquidity_reserve)}。",
+                },
+                {
+                    "key": "monthly_cashflow",
+                    "name": "买后月度自由现金流",
+                    "category": "finance",
+                    "score": flow_score,
+                    "note": f"买后自由现金月结余 {round(post_purchase_cash_flow)}；公积金策略为{_post_purchase_pf_withdrawal_label(monthly_pf_withdrawal_mode)}，策略后现金压力约 {round(post_purchase_cash_flow_with_pf)}。",
+                },
+                {
+                    "key": "debt_to_income",
+                    "name": "负债收入比",
+                    "category": "finance",
+                    "score": dti_score,
+                    "note": f"负债收入比 {round(dti * 100, 1)}%。",
+                },
+                {
+                    "key": "monthly_payment_pressure",
+                    "name": "月供压力",
+                    "category": "finance",
+                    "score": payment_pressure_score,
+                    "note": f"房贷合同月供 {round(total_monthly_payment)}，商贷额外还本 {round(commercial_prepayment_monthly)}。",
+                },
+                {
+                    "key": "loan_interest_pressure",
+                    "name": "贷款利息与商贷暴露",
+                    "category": "finance",
+                    "score": loan_interest_pressure_score,
+                    "note": f"商贷 {round(commercial_loan)}，全周期利息约 {round(commercial_interest + provident_payment.total_interest)}。",
+                },
+                {
+                    "key": "waiting_time",
+                    "name": "等待时间",
+                    "category": "timing",
+                    "score": wait_score,
+                    "note": "越早可执行，对家庭确定性和机会成本越友好。",
+                },
+                {
+                    "key": "renovation_readiness",
+                    "name": "装修可达性",
+                    "category": "timing",
+                    "score": renovation_score,
+                    "note": (
+                        "未设置装修预算。"
+                        if scenario.renovation_cost <= 0
+                        else "装修资金已计入交易现金。"
+                        if renovation_included_upfront
+                        else (
+                            "买后现金流暂不足以估算装修启动时间。"
+                            if renovation_saving_months is None
+                            else f"预计买后 {renovation_saving_months} 个月可启动装修。"
+                        )
+                    ),
+                },
+                {
+                    "key": "stress_resilience",
+                    "name": "压力测试韧性",
+                    "category": "resilience",
+                    "score": stress_score,
+                    "note": (
+                        "压力情景下现金账户没有跌破 0。"
+                        if cash_stress_ok
+                        else f"压力情景现金缺口约 {round(cash_stress_shortfall)}。"
+                    ),
+                },
+            ],
+            happiness_weights,
         )
-        happiness_breakdown = [
-            {
-                "name": "居住体验",
-                "score": round(scenario.happiness_score, 2),
-                "weight": 0.18,
-                "note": "目标房源的户型、社区、主观居住满意度。",
-            },
-            {
-                "name": "通勤",
-                "score": round(scenario.commute_score, 2),
-                "weight": 0.14,
-                "note": "通勤便利度和日常时间成本。",
-            },
-            {
-                "name": "教育",
-                "score": round(scenario.school_score, 2),
-                "weight": 0.12,
-                "note": "教育资源与家庭长期确定性。",
-            },
-            {
-                "name": "交易当下现金安全",
-                "score": round(liquidity_score, 2),
-                "weight": 0.16,
-                "note": f"交易当下现金 {round(cash_after_transaction)}，安全垫 {round(required_liquidity_reserve)}。",
-            },
-            {
-                "name": "买后现金流",
-                "score": round(flow_score, 2),
-                "weight": 0.16,
-                "note": f"买后自由现金月结余 {round(post_purchase_cash_flow)}；贷后公积金策略为{_post_purchase_pf_withdrawal_label(monthly_pf_withdrawal_mode)}，策略后现金压力约 {round(post_purchase_cash_flow_with_pf)}。",
-            },
-            {
-                "name": "负债压力",
-                "score": round(dti_score, 2),
-                "weight": 0.10,
-                "note": f"负债收入比 {round(dti * 100, 1)}%。",
-            },
-            {
-                "name": "商贷与利息压力",
-                "score": round((commercial_pressure_score * 0.65 + interest_score * 0.35), 2),
-                "weight": 0.08,
-                "note": f"商贷 {round(commercial_loan)}，总利息 {round(commercial_interest + provident_payment.total_interest)}。",
-            },
-            {
-                "name": "等待时间",
-                "score": round(wait_score, 2),
-                "weight": 0.06,
-                "note": "越早可执行，对家庭确定性和机会成本越友好。",
-            },
-        ]
         analyses.append(
             PurchasePlanAnalysis(
                 variant=name,
@@ -4387,7 +4549,90 @@ def build_purchase_plan_analyses(
                 happiness_breakdown=happiness_breakdown,
             )
         )
-    return analyses
+    return _with_purchase_plan_recommendations(analyses, scenario)
+
+
+def _purchase_plan_recommendation_reason(plan: PurchasePlanAnalysis) -> list[str]:
+    effective_cash_flow = plan.post_purchase_cash_flow_with_pf_withdrawal
+    return [
+        (
+            "当前现金路径暂未达成买入条件"
+            if plan.months_to_buy is None
+            else f"{plan.years_to_buy} 年左右可执行买入"
+        ),
+        (
+            f"买后仍覆盖 {_money_text(plan.required_liquidity_reserve)} 安全垫"
+            if plan.liquidity_ok
+            else "买后安全垫偏紧，需要提高现金留存"
+        ),
+        (
+            f"策略后现金压力每月结余 {_money_text(effective_cash_flow)}"
+            if effective_cash_flow >= 0
+            else f"策略后现金压力每月缺口 {_money_text(abs(effective_cash_flow))}"
+        ),
+        (
+            f"{plan.post_purchase_pf_strategy_label}，月均减少现金压力 {_money_text(plan.monthly_post_purchase_pf_withdrawal)}"
+            if plan.monthly_post_purchase_pf_withdrawal > 0
+            else "公积金继续留存在账户，不进入自由现金流"
+        ),
+        (
+            "不使用商贷，利息压力最低"
+            if plan.commercial_loan_amount == 0
+            else f"商贷控制在 {_money_text(plan.commercial_loan_amount)}"
+        ),
+    ]
+
+
+def _with_purchase_plan_recommendations(
+    plans: list[PurchasePlanAnalysis],
+    scenario: ScenarioData,
+) -> list[PurchasePlanAnalysis]:
+    if not plans:
+        return plans
+    finite_months = [plan.months_to_buy for plan in plans if plan.months_to_buy is not None]
+    max_months = max(max(finite_months or [1]), 1)
+    max_payment = max([plan.total_monthly_payment for plan in plans] or [1], default=1)
+    max_cash_after_transaction = max([max(plan.cash_after_transaction, 0.0) for plan in plans] or [1], default=1)
+    max_payment = max(max_payment, 1.0)
+    max_cash_after_transaction = max(max_cash_after_transaction, 1.0)
+    liquidity_weight = _clamp(float(scenario.liquidity_priority_score or 7), 0, 10) / 10
+
+    scored: list[tuple[PurchasePlanAnalysis, int, list[str]]] = []
+    for plan in plans:
+        speed_score = (
+            0.0
+            if plan.months_to_buy is None
+            else max(0.0, 100 - (plan.months_to_buy / max_months) * 36)
+        )
+        cash_score = _clamp((max(plan.cash_after_transaction, 0.0) / max_cash_after_transaction) * 100, 0, 100)
+        effective_cash_flow = plan.post_purchase_cash_flow_with_pf_withdrawal
+        flow_score = 100.0 if effective_cash_flow >= 0 else max(0.0, 100 + effective_cash_flow / 1000)
+        debt_score = max(0.0, 100 - plan.debt_to_income_ratio * 150)
+        liquidity_score = 100.0 if plan.liquidity_ok else 45.0
+        payment_score = max(0.0, 100 - (plan.total_monthly_payment / max_payment) * 42)
+        happiness_score = _clamp(plan.happiness_score * 10, 0, 100)
+        score = (
+            speed_score * (0.2 + (1 - liquidity_weight) * 0.12)
+            + cash_score * (0.16 + liquidity_weight * 0.14)
+            + flow_score * 0.18
+            + debt_score * 0.16
+            + liquidity_score * 0.12
+            + payment_score * 0.1
+            + happiness_score * 0.08
+        )
+        scored.append((plan, int(round(_clamp(score, 0, 100))), _purchase_plan_recommendation_reason(plan)))
+
+    best_variant = max(scored, key=lambda item: item[1])[0].variant
+    return [
+        plan.model_copy(
+            update={
+                "recommendation_score": score,
+                "recommendation_reasons": reasons,
+                "is_recommended": plan.variant == best_variant,
+            }
+        )
+        for plan, score, reasons in scored
+    ]
 
 
 def build_yield_sensitivity(
@@ -4983,8 +5228,8 @@ def build_investment_plan_recommendations(
     )
     monthly_surplus = max(0.0, net_monthly_income - current_monthly_expense - effective_monthly_debt_payment - car_cost)
     current_cash = max(0.0, household.cash_account_balance)
-    total_liquid_assets = max(1.0, household.cash_account_balance + household.investments)
-    current_investment_ratio = max(0.0, household.investments) / total_liquid_assets
+    total_liquid_account_assets = max(1.0, household.cash_account_balance + household.investments)
+    current_investment_ratio = max(0.0, household.investments) / total_liquid_account_assets
     configured_reserve_months = max(
         1.0,
         household.investment_cash_reserve_months or household.required_liquidity_months or 6,
@@ -5656,6 +5901,10 @@ def build_annual_financial_summaries(
                         else snapshot.provident_balance if snapshot else row.provident_balance
                     ),
                     "fixed_asset_value_end": snapshot.fixed_asset_value if snapshot else row.fixed_asset_value,
+                    "property_asset_value_end": row.property_asset_value,
+                    "vehicle_asset_value_end": row.vehicle_asset_value,
+                    "first_vehicle_asset_value_end": row.first_vehicle_asset_value,
+                    "second_vehicle_asset_value_end": row.second_vehicle_asset_value,
                     "total_asset_value_end": snapshot.total_asset_value if snapshot else row.total_asset_value,
                     "total_loan_balance_end": (
                         loan_snapshot.total_loan_balance
@@ -6291,6 +6540,7 @@ def calculate_affordability(
     rules: RulePackData,
     *,
     stress_name: str | None = None,
+    include_stress_tests: bool = False,
 ) -> AffordabilityResult:
     raw_household = household
     base_date = date.today()
@@ -6652,7 +6902,7 @@ def calculate_affordability(
         ],
     )
 
-    if stress_name is None and has_purchase_target:
+    if include_stress_tests and stress_name is None and has_purchase_target:
         result.stress_tests = build_stress_tests(household, scenario, rules, parallel_workers=min(parallel_workers, 3))
     return result
 

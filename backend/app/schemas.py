@@ -17,6 +17,7 @@ RenovationFundingMode = Literal["after_purchase_saving", "upfront_cash"]
 InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
 CommercialPrepaymentMode = Literal["auto", "manual", "none"]
+ExistingLoanPrepaymentMode = Literal["none", "manual", "auto"]
 
 
 class IncomeMember(BaseModel):
@@ -154,15 +155,6 @@ class VehiclePlanData(BaseModel):
 
 class CarPlanData(VehiclePlanData):
     vehicle_plans: list[VehiclePlanData] = Field(default_factory=list)
-    second_car_enabled: bool = False
-    second_car_total_price: float = Field(0, ge=0)
-    second_car_down_payment_ratio: float = Field(0.40, ge=0, le=1)
-    second_car_purchase_delay_months: int = Field(60, ge=0, le=240)
-    second_car_total_months: int = Field(60, ge=1, le=120)
-    second_car_interest_free_months: int = Field(24, ge=0, le=120)
-    second_car_later_annual_rate: float = Field(0.0199, ge=0, le=0.5)
-    second_car_annual_mileage_km: float = Field(0, ge=0, le=100000)
-    second_car_monthly_parking_cost: float = Field(0, ge=0)
 
 
 class PropertyPurchaseGoalData(BaseModel):
@@ -187,6 +179,10 @@ class PhasedLoanData(BaseModel):
     remaining_months: int = Field(120, ge=1, le=360)
     interest_start_month: str = "2026-07"
     interest_only_until: str = "2028-07"
+    prepayment_mode: ExistingLoanPrepaymentMode = "none"
+    prepayment_start_month: int = Field(1, ge=1, le=360)
+    prepayment_allowed_after_month: int = Field(1, ge=1, le=360)
+    prepayment_monthly_amount: float = Field(0, ge=0)
 
 
 class PhasedLoanSummary(BaseModel):
@@ -200,6 +196,11 @@ class PhasedLoanSummary(BaseModel):
     interest_only_until: str
     phase: str
     current_monthly_payment: float
+    current_extra_principal_payment: float = 0.0
+    prepayment_mode: ExistingLoanPrepaymentMode = "none"
+    prepayment_start_month: int = 1
+    prepayment_allowed_after_month: int = 1
+    prepayment_monthly_amount: float = 0.0
 
 
 class ExistingLoanVisualizationDetail(BaseModel):
@@ -209,6 +210,7 @@ class ExistingLoanVisualizationDetail(BaseModel):
     phase: str
     balance: float
     monthly_payment: float
+    extra_principal_payment: float = 0.0
 
 
 class ScheduledExpenseData(BaseModel):
@@ -229,7 +231,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(21, ge=1)
+    schema_version: int = Field(23, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -292,7 +294,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(21, ge=1)
+    schema_version: int = Field(23, ge=1)
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
@@ -372,7 +374,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(21, ge=1)
+    schema_version: int = Field(23, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -432,6 +434,21 @@ class RulePackData(BaseModel):
             "income_stress_factor": 0.90,
             "price_stress_factor": 1.05,
             "backend_parallel_workers": 4,
+            "purchase_happiness_weights": {
+                "living_quality": 0.12,
+                "commute": 0.10,
+                "education": 0.08,
+                "vehicle_convenience": 0.05,
+                "transaction_liquidity": 0.12,
+                "post_purchase_liquidity": 0.08,
+                "monthly_cashflow": 0.14,
+                "debt_to_income": 0.10,
+                "monthly_payment_pressure": 0.07,
+                "loan_interest_pressure": 0.06,
+                "waiting_time": 0.04,
+                "renovation_readiness": 0.02,
+                "stress_resilience": 0.02,
+            },
             "personal_standard_deduction_annual": 60000,
             "annual_bonus_separate_tax_valid_until": "2027-12-31",
             "beijing_social_base_floor": 7162,
@@ -501,7 +518,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(21, ge=1)
+    schema_version: int = Field(23, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -623,6 +640,16 @@ class CarPlanAnalysis(BaseModel):
     notes: list[str]
 
 
+class HappinessBreakdownItem(BaseModel):
+    key: str
+    name: str
+    category: Literal["life", "finance", "timing", "resilience"]
+    score: float
+    weight: float
+    weighted_score: float
+    note: str
+
+
 class PurchasePlanAnalysis(BaseModel):
     variant: str
     description: str
@@ -693,8 +720,11 @@ class PurchasePlanAnalysis(BaseModel):
     post_purchase_cash_flow_with_pf_withdrawal: float
     debt_to_income_ratio: float
     happiness_score: float
+    recommendation_score: int = Field(0, ge=0, le=100)
+    recommendation_reasons: list[str] = Field(default_factory=list)
+    is_recommended: bool = False
     provident_extraction_notes: list[str]
-    happiness_breakdown: list[dict[str, float | str]]
+    happiness_breakdown: list[HappinessBreakdownItem]
 
 
 class YieldSensitivityPoint(BaseModel):
@@ -1065,6 +1095,10 @@ class AnnualFinancialSummary(BaseModel):
     liquid_asset_value_end: float = 0.0
     provident_balance_end: float = 0.0
     fixed_asset_value_end: float = 0.0
+    property_asset_value_end: float = 0.0
+    vehicle_asset_value_end: float = 0.0
+    first_vehicle_asset_value_end: float = 0.0
+    second_vehicle_asset_value_end: float = 0.0
     total_asset_value_end: float = 0.0
     total_loan_balance_end: float = 0.0
     net_worth_end: float = 0.0
@@ -1095,6 +1129,7 @@ class AffordabilityRequest(BaseModel):
     household: HouseholdData
     scenario: ScenarioData
     rule_pack: RulePackData
+    include_stress_tests: bool = False
 
 
 class AffordabilityResult(BaseModel):

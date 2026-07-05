@@ -184,7 +184,12 @@ def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
     if cached is not None:
         return AffordabilityResult.model_validate(cached)
 
-    result = calculate_affordability(payload.household, payload.scenario, payload.rule_pack)
+    result = calculate_affordability(
+        payload.household,
+        payload.scenario,
+        payload.rule_pack,
+        include_stress_tests=payload.include_stress_tests,
+    )
     upsert_calculation_cache(cache_key, engine_fingerprint, result.model_dump(mode="json"))
     return result
 

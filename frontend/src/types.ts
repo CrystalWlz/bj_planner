@@ -170,15 +170,6 @@ export interface VehiclePlanData {
 
 export interface CarPlanData extends VehiclePlanData {
   vehicle_plans: VehiclePlanData[];
-  second_car_enabled: boolean;
-  second_car_total_price: number;
-  second_car_down_payment_ratio: number;
-  second_car_purchase_delay_months: number;
-  second_car_total_months: number;
-  second_car_interest_free_months: number;
-  second_car_later_annual_rate: number;
-  second_car_annual_mileage_km: number;
-  second_car_monthly_parking_cost: number;
 }
 
 export interface PropertyPurchaseGoalData {
@@ -203,6 +194,10 @@ export interface PhasedLoanData {
   remaining_months: number;
   interest_start_month: string;
   interest_only_until: string;
+  prepayment_mode: "none" | "manual" | "auto";
+  prepayment_start_month: number;
+  prepayment_allowed_after_month: number;
+  prepayment_monthly_amount: number;
 }
 
 export interface ExistingLoanVisualizationDetail {
@@ -212,6 +207,7 @@ export interface ExistingLoanVisualizationDetail {
   phase: string;
   balance: number;
   monthly_payment: number;
+  extra_principal_payment: number;
 }
 
 export interface ScheduledExpenseData {
@@ -443,6 +439,11 @@ export interface PhasedLoanSummary {
   interest_only_until: string;
   phase: string;
   current_monthly_payment: number;
+  current_extra_principal_payment: number;
+  prepayment_mode: "none" | "manual" | "auto";
+  prepayment_start_month: number;
+  prepayment_allowed_after_month: number;
+  prepayment_monthly_amount: number;
 }
 
 export interface StressResult {
@@ -610,11 +611,17 @@ export interface PurchasePlanAnalysis {
   post_purchase_cash_flow_with_pf_withdrawal: number;
   debt_to_income_ratio: number;
   happiness_score: number;
+  recommendation_score: number;
+  recommendation_reasons: string[];
+  is_recommended: boolean;
   provident_extraction_notes: string[];
   happiness_breakdown: Array<{
+    key: string;
     name: string;
+    category: "life" | "finance" | "timing" | "resilience";
     score: number;
     weight: number;
+    weighted_score: number;
     note: string;
   }>;
 }
@@ -837,6 +844,10 @@ export interface AnnualFinancialSummary {
   liquid_asset_value_end: number;
   provident_balance_end: number;
   fixed_asset_value_end: number;
+  property_asset_value_end: number;
+  vehicle_asset_value_end: number;
+  first_vehicle_asset_value_end: number;
+  second_vehicle_asset_value_end: number;
   total_asset_value_end: number;
   total_loan_balance_end: number;
   net_worth_end: number;

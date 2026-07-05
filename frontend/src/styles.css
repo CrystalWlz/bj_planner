@@ -581,6 +581,13 @@ option {
 .career-member-card .switch-field {
   margin: 0;
   min-width: min(220px, 100%);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.career-member-card > .member-card-head .switch-field {
+  width: min(260px, 100%);
+  min-width: 0;
 }
 
 .career-member-card .form-grid > .switch-field,
@@ -794,6 +801,23 @@ option {
   position: absolute;
   opacity: 0;
   pointer-events: none;
+}
+
+.switch-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.switch-copy strong,
+.switch-copy small {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.switch-copy small {
+  margin-top: 2px;
+  line-height: 1.35;
 }
 
 .switch-control {
@@ -1378,6 +1402,43 @@ option {
   gap: 12px;
 }
 
+.rule-meta-grid {
+  margin-bottom: 14px;
+}
+
+.rule-category-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.rule-category-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+  padding: 14px;
+}
+
+.categorized-rule-grid {
+  margin-top: 12px;
+}
+
+.rule-param-field {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  min-width: 0;
+}
+
+.rule-param-field .field-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.switch-rule-param {
+  min-height: var(--control-row-height);
+}
+
 .rule-switch-group {
   grid-column: 1 / -1;
   border: 1px solid var(--border);
@@ -1891,6 +1952,33 @@ option {
   background: var(--surface-soft);
   padding: 12px;
   box-shadow: 0 4px 14px rgba(24, 39, 75, 0.035);
+}
+
+.annual-inline-chart {
+  min-width: 0;
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+  padding: 12px;
+  box-shadow: 0 4px 14px rgba(24, 39, 75, 0.035);
+}
+
+.annual-inline-chart .strategy-panel-head {
+  margin-bottom: 8px;
+}
+
+.annual-inline-chart .strategy-panel-head > span {
+  text-align: right;
+}
+
+.annual-inline-chart .annual-summary-panel {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  margin-bottom: 12px;
+}
+
+.annual-inline-chart .annual-pies {
+  margin-top: 0;
 }
 
 .pie-heading {
@@ -2772,6 +2860,8 @@ option {
   background: color-mix(in srgb, var(--blue) 18%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 55%, transparent), 0 7px 18px color-mix(in srgb, var(--blue) 18%, transparent);
   cursor: grab;
+  transition: left 0.22s ease, width 0.22s ease, background 0.18s ease, box-shadow 0.18s ease;
+  will-change: left, width;
 }
 
 .timeline-window-band:active {
@@ -2829,6 +2919,78 @@ option {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 70%, transparent), 0 6px 14px rgba(0, 0, 0, 0.16);
   translate: -50% -50%;
   cursor: pointer;
+  transition: left 0.24s cubic-bezier(0.22, 1, 0.36, 1), transform 0.18s ease, box-shadow 0.18s ease;
+  will-change: left, transform;
+}
+
+.timeline-selected-marker::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border-radius: inherit;
+  border: 1px solid color-mix(in srgb, var(--red) 38%, transparent);
+  opacity: 0.72;
+  scale: 0.85;
+  transition: scale 0.24s ease, opacity 0.24s ease;
+}
+
+.timeline-selected-marker:hover {
+  transform: scale(1.08);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 78%, transparent), 0 8px 18px rgba(0, 0, 0, 0.2);
+}
+
+.timeline-selected-marker:hover::after {
+  opacity: 0.38;
+  scale: 1.18;
+}
+
+.timeline-focus-label {
+  position: absolute;
+  left: 0;
+  top: -42px;
+  z-index: 5;
+  transform: translateX(-50%);
+  display: grid;
+  gap: 1px;
+  min-width: 88px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  box-shadow: var(--shadow-soft);
+  color: var(--text);
+  text-align: center;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.timeline-focus-label::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  border-right: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.timeline-focus-label strong {
+  font-size: 12px;
+  line-height: 1.1;
+}
+
+.timeline-focus-label span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.1;
+}
+
+.timeline-rail.is-dragging .timeline-window-band,
+.timeline-rail.is-dragging .timeline-selected-marker {
+  transition: none;
 }
 
 .month-driver-panel {

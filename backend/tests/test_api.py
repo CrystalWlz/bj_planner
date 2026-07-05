@@ -1,4 +1,3 @@
-import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -76,95 +75,23 @@ def test_household_update_is_persisted(tmp_path: Path, monkeypatch) -> None:
     assert persisted["investment_plan_name"] == "稳健月度理财"
 
 
-def test_initialize_database_migrates_previous_json_records(tmp_path: Path, monkeypatch) -> None:
+def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
     from app import database
 
     database.DB_PATH = database.default_db_path()
-    with database.get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE households (
-                id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE scenarios (
-                id TEXT PRIMARY KEY,
-                household_id TEXT,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE rule_packs (
-                id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "INSERT INTO households (id, data, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (
-                "account-rename-household",
-                json.dumps({"liquid_assets": 100000, "car_plan": {"enabled": False}}, ensure_ascii=False),
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        conn.execute(
-            "INSERT INTO scenarios (id, household_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (
-                "old-rate-scenario",
-                None,
-                json.dumps({"provident_rate": 0.0285}, ensure_ascii=False),
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-        conn.execute(
-            "INSERT INTO rule_packs (id, data, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (
-                "old-policy-rule",
-                json.dumps(
-                    {"params": {"second_home_provident_min_down_payment_ratio": 0.25}},
-                    ensure_ascii=False,
-                ),
-                "2026-01-01T00:00:00+00:00",
-                "2026-01-01T00:00:00+00:00",
-            ),
-        )
-
     database.initialize_database()
-    migrated = database.get_record("households", "account-rename-household")
-    migrated_scenario = database.get_record("scenarios", "old-rate-scenario")
-    migrated_rule = database.get_record("rule_packs", "old-policy-rule")
+    households = database.list_records("households")
+    rule_packs = database.list_records("rule_packs")
 
-    assert migrated is not None
-    assert migrated["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
-    assert migrated["data"]["cash_account_balance"] == 100000
-    assert "liquid_assets" not in migrated["data"]
-    assert migrated["data"]["family_down_payment_support_mode"] == "provident"
-    assert migrated["data"]["investment_buy_fee_rate"] > 0
-    assert migrated["data"]["car_plan"]["second_car_enabled"] is False
-    assert migrated_scenario is not None
-    assert migrated_scenario["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
-    assert migrated_scenario["data"]["provident_rate"] == 0.026
-    assert migrated_rule is not None
-    assert migrated_rule["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
-    assert migrated_rule["data"]["params"]["second_home_provident_min_down_payment_ratio"] == 0.30
-    assert migrated_rule["data"]["params"]["provident_first_home_rate_6_to_30_years"] == 0.026
+    assert households[0]["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
+    assert households[0]["data"]["cash_account_balance"] == 0
+    assert households[0]["data"]["car_plan"]["vehicle_plans"] == []
+    assert rule_packs[0]["data"]["schema_version"] == database.CURRENT_SCHEMA_VERSION
+    with database.get_connection() as conn:
+        versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()]
+    assert versions == [database.CURRENT_SCHEMA_VERSION]
 
 
 def test_invalid_household_payload_is_rejected(tmp_path: Path, monkeypatch) -> None:
@@ -181,6 +108,65 @@ def test_invalid_household_payload_is_rejected(tmp_path: Path, monkeypatch) -> N
         response = client.put(f"/api/households/{record['id']}", json={"data": payload})
 
     assert response.status_code == 422
+
+
+def test_empty_vehicle_candidate_list_is_preserved_on_save(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        record = client.get("/api/households").json()[0]
+        payload = deepcopy(record["data"])
+        payload["car_plan"] = {
+            **payload["car_plan"],
+            "enabled": True,
+            "vehicle_plans": [
+                {
+                    "enabled": True,
+                    "name": "测试用车需求",
+                    "selected_strategy_variant": "target",
+                    "candidate_vehicles": [],
+                    "planning_sequence": 1,
+                    "purchase_timing_mode": "auto_sequence",
+                    "after_previous_event_delay_months": 0,
+                    "manual_purchase_delay_months": 0,
+                    "total_price": 200000,
+                    "down_payment_ratio": 0.3,
+                    "down_payment": 60000,
+                    "purchase_delay_months": 0,
+                    "total_months": 60,
+                    "interest_free_months": 24,
+                    "later_annual_rate": 0.0199,
+                    "current_month_index": 1,
+                    "saving_start_date": "2026-07-01",
+                    "monthly_operating_cost": 0,
+                    "no_car_monthly_commute_cost": 800,
+                    "annual_mileage_km": 12000,
+                    "electricity_kwh_per_100km": 14,
+                    "electricity_price_per_kwh": 0.8,
+                    "monthly_parking_cost": 0,
+                    "annual_maintenance_cost": 2500,
+                    "annual_maintenance_growth_rate": 0.03,
+                    "annual_insurance_rate": 0.018,
+                    "annual_insurance_min": 4500,
+                    "annual_insurance_growth_rate": 0.02,
+                    "depreciation_years": 8,
+                    "vehicle_service_years": 15,
+                    "vehicle_retirement_mileage_km": 600000,
+                    "happiness_score": 6.5,
+                    "notes": "",
+                }
+            ],
+        }
+        response = client.put(f"/api/households/{record['id']}", json={"data": payload})
+
+    assert response.status_code == 200
+    saved_vehicle = response.json()["data"]["car_plan"]["vehicle_plans"][0]
+    assert saved_vehicle["candidate_vehicles"] == []
 
 
 @pytest.mark.parametrize(

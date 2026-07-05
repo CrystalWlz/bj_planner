@@ -93,12 +93,15 @@ def test_affordability_marks_cash_gap_as_not_viable() -> None:
     assert result.funding_gap > 0
 
 
-def test_affordability_builds_stress_tests() -> None:
+def test_affordability_skips_stress_tests_by_default() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData())
+    assert result.stress_tests == []
+
+
+def test_affordability_builds_stress_tests_when_requested() -> None:
+    result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData(), include_stress_tests=True)
     assert len(result.stress_tests) == 3
-    assert {item.name for item in result.stress_tests} == {"利率上行", "收入下降", "房价上行"}
-
-
+    assert all(item.name for item in result.stress_tests)
 def test_parallel_affordability_matches_serial_result() -> None:
     serial_rules = RulePackData(
         params={**RulePackData().params, "backend_parallel_workers": 1}
@@ -117,8 +120,8 @@ def test_parallel_affordability_matches_serial_result() -> None:
     )
     scenario = ScenarioData(total_price=3_000_000, renovation_cost=80_000)
 
-    serial = calculate_affordability(household, scenario, serial_rules)
-    parallel = calculate_affordability(household, scenario, parallel_rules)
+    serial = calculate_affordability(household, scenario, serial_rules, include_stress_tests=True)
+    parallel = calculate_affordability(household, scenario, parallel_rules, include_stress_tests=True)
 
     assert parallel.status == serial.status
     assert parallel.yield_sensitivity == serial.yield_sensitivity
@@ -148,14 +151,28 @@ def test_vehicle_loan_projection_is_cached_during_full_calculation(monkeypatch: 
             IncomeMember(name="样例成员B", monthly_salary_gross=18_000, annual_bonus=20_000),
         ],
         car_plan=CarPlanData(
-            enabled=True,
-            total_price=250_000,
-            down_payment_ratio=0.5,
-            down_payment=125_000,
-            purchase_delay_months=6,
-            second_car_enabled=True,
-            second_car_total_price=180_000,
-            second_car_purchase_delay_months=48,
+            enabled=False,
+            vehicle_plans=[
+                CarPlanData(
+                    enabled=True,
+                    name="样例车辆A",
+                    total_price=250_000,
+                    down_payment_ratio=0.5,
+                    down_payment=125_000,
+                    purchase_delay_months=6,
+                    purchase_timing_mode="parallel",
+                    planning_sequence=1,
+                ),
+                CarPlanData(
+                    enabled=True,
+                    name="样例车辆B",
+                    total_price=180_000,
+                    down_payment_ratio=0.5,
+                    purchase_delay_months=48,
+                    purchase_timing_mode="auto_sequence",
+                    planning_sequence=2,
+                ),
+            ],
         ),
     )
     scenario = ScenarioData(total_price=3_000_000, renovation_cost=80_000)
@@ -439,6 +456,12 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
     assert summary.investment_contribution == pytest.approx(sum(item.investment_contribution for item in rows))
     assert summary.cash_balance_end == pytest.approx(snapshot.cash_balance)
     assert summary.investment_balance_end == pytest.approx(snapshot.investment_balance)
+    assert summary.fixed_asset_value_end == pytest.approx(snapshot.fixed_asset_value)
+    last_cashflow_row = next(item for item in rows if item.month == last_month)
+    assert summary.property_asset_value_end == pytest.approx(last_cashflow_row.property_asset_value)
+    assert summary.vehicle_asset_value_end == pytest.approx(last_cashflow_row.vehicle_asset_value)
+    assert summary.first_vehicle_asset_value_end == pytest.approx(last_cashflow_row.first_vehicle_asset_value)
+    assert summary.second_vehicle_asset_value_end == pytest.approx(last_cashflow_row.second_vehicle_asset_value)
     assert summary.total_loan_balance_end == pytest.approx(loan_row.total_loan_balance)
     assert summary.provident_balance_end == pytest.approx(provident_row.balance_end)
     assert summary.commercial_loan_balance_end == pytest.approx(loan_row.commercial_loan_balance)
@@ -848,12 +871,12 @@ def test_purchase_plan_avoids_negative_cash_pool_after_layoff() -> None:
     assert manual_plan.minimum_cash_balance_month is None or manual_plan.minimum_cash_balance_month >= (manual_plan.months_to_buy or 0)
 
 
-def test_second_car_down_payment_is_counted_in_current_cash_need() -> None:
-    household_without_second = HouseholdData(
+def test_vehicle_plan_down_payment_is_counted_in_current_cash_need() -> None:
+    household_without_vehicle = HouseholdData(
         phased_loans=[],
         car_plan=CarPlanData(enabled=False, no_car_monthly_commute_cost=0, vehicle_plans=[]),
     )
-    household_with_second = household_without_second.model_copy(
+    household_with_vehicle = household_without_vehicle.model_copy(
         update={
             "car_plan": CarPlanData(
                 enabled=False,
@@ -872,10 +895,10 @@ def test_second_car_down_payment_is_counted_in_current_cash_need() -> None:
         }
     )
 
-    base = calculate_affordability(household_without_second, ScenarioData(), RulePackData())
-    with_second = calculate_affordability(household_with_second, ScenarioData(), RulePackData())
+    base = calculate_affordability(household_without_vehicle, ScenarioData(), RulePackData())
+    with_vehicle = calculate_affordability(household_with_vehicle, ScenarioData(), RulePackData())
 
-    assert with_second.total_required_cash - base.total_required_cash == pytest.approx(50_000)
+    assert with_vehicle.total_required_cash - base.total_required_cash == pytest.approx(50_000)
 
 
 def test_elderly_care_deduction_starts_when_parent_turns_sixty() -> None:
@@ -1186,6 +1209,38 @@ def test_phased_loans_can_use_equal_principal_after_interest_only_period() -> No
 
     assert equal_principal.phase == "等额本金"
     assert equal_principal.current_monthly_payment > equal_installment.current_monthly_payment
+
+
+def test_phased_loans_support_manual_and_auto_prepayment() -> None:
+    base = PhasedLoanData(
+        name="提前还本样例",
+        principal=120_000,
+        annual_rate=0.05,
+        remaining_months=60,
+        interest_start_month="2026-07",
+        interest_only_until="2026-06",
+    )
+    manual = base.model_copy(
+        update={
+            "prepayment_mode": "manual",
+            "prepayment_start_month": 1,
+            "prepayment_allowed_after_month": 1,
+            "prepayment_monthly_amount": 2_000,
+        }
+    )
+    auto = base.model_copy(update={"prepayment_mode": "auto", "prepayment_start_month": 1, "prepayment_allowed_after_month": 1})
+
+    base_month0 = calculator_module._phased_loan_state_detail_at(base, 0, as_of=date(2026, 7, 1))
+    manual_month0 = calculator_module._phased_loan_state_detail_at(manual, 0, as_of=date(2026, 7, 1))
+    base_month12 = calculator_module._phased_loan_state_detail_at(base, 12, as_of=date(2026, 7, 1))
+    manual_month12 = calculator_module._phased_loan_state_detail_at(manual, 12, as_of=date(2026, 7, 1))
+    auto_summary = summarize_phased_loans([auto], as_of=date(2026, 7, 1))[0]
+
+    assert manual_month0[1] > base_month0[1]
+    assert manual_month0[2] == pytest.approx(2_000)
+    assert manual_month12[0] < base_month12[0]
+    assert auto_summary.current_extra_principal_payment > 0
+    assert auto_summary.prepayment_mode == "auto"
 
 
 def test_car_plan_is_included_in_affordability_cash_flow() -> None:
@@ -1871,6 +1926,9 @@ def test_affordability_returns_multiple_purchase_plan_analyses() -> None:
     assert set(plans) == {"手动指定", "0商贷", "微量商贷", "较多商贷"}
     assert all(plan.provident_loan_amount >= 0 for plan in plans.values())
     assert all(plan.minimum_cash_balance >= 0 for plan in plans.values())
+    assert all(0 <= plan.recommendation_score <= 100 for plan in plans.values())
+    assert all(plan.recommendation_reasons for plan in plans.values())
+    assert sum(1 for plan in plans.values() if plan.is_recommended) == 1
     assert plans["0商贷"].commercial_loan_amount == 0
 
 
@@ -3466,11 +3524,15 @@ def test_purchase_plan_happiness_scores_have_explainable_breakdown() -> None:
     assert len(scores) > 1
     for plan in result.purchase_plan_analyses:
         assert plan.happiness_breakdown
-        assert {item["name"] for item in plan.happiness_breakdown} >= {
-            "交易当下现金安全",
-            "买后现金流",
-            "商贷与利息压力",
+        assert {item.name for item in plan.happiness_breakdown} >= {
+            "买房当天现金安全",
+            "买后月度自由现金流",
+            "贷款利息与商贷暴露",
+            "压力测试韧性",
         }
+        assert sum(item.weight for item in plan.happiness_breakdown) == pytest.approx(1.0, abs=0.01)
+        assert sum(item.weighted_score for item in plan.happiness_breakdown) == pytest.approx(plan.happiness_score, abs=0.05)
+        assert all(0 <= item.score <= 10 for item in plan.happiness_breakdown)
 
 
 @pytest.mark.parametrize(

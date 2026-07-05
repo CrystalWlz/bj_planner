@@ -8,6 +8,8 @@ import type {
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+const MAX_CALCULATION_CACHE_ENTRIES = 50;
+const calculationRequestCache = new Map<string, Promise<AffordabilityResult>>();
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -37,16 +39,30 @@ export function loadInitialData() {
 export function calculateAffordability(
   household: HouseholdData,
   scenario: ScenarioData,
-  rulePack: RulePackData
+  rulePack: RulePackData,
+  includeStressTests = false
 ) {
-  return request<AffordabilityResult>("/api/calculations/affordability", {
-    method: "POST",
-    body: JSON.stringify({
-      household,
-      scenario,
-      rule_pack: rulePack
-    })
+  const body = JSON.stringify({
+    household,
+    scenario,
+    rule_pack: rulePack,
+    include_stress_tests: includeStressTests
   });
+  const cached = calculationRequestCache.get(body);
+  if (cached) return cached;
+  const promise = request<AffordabilityResult>("/api/calculations/affordability", {
+    method: "POST",
+    body
+  }).catch((error) => {
+    calculationRequestCache.delete(body);
+    throw error;
+  });
+  calculationRequestCache.set(body, promise);
+  if (calculationRequestCache.size > MAX_CALCULATION_CACHE_ENTRIES) {
+    const firstKey = calculationRequestCache.keys().next().value;
+    if (firstKey) calculationRequestCache.delete(firstKey);
+  }
+  return promise;
 }
 
 export function saveHousehold(id: string, household: HouseholdData) {
@@ -89,4 +105,3 @@ export function fetchSourcePreview(url: string, name?: string) {
     body: JSON.stringify({ url, name })
   });
 }
-

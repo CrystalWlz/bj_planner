@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData
 
 
-CURRENT_SCHEMA_VERSION = 21
+CURRENT_SCHEMA_VERSION = 23
 
 
 def default_db_path() -> Path:
@@ -118,9 +118,9 @@ def _mark_migration(conn: sqlite3.Connection, version: int, description: str) ->
 
 
 def migrate_database(conn: sqlite3.Connection) -> None:
-    legacy_history = _has_legacy_migration_history(conn)
+    previous_schema_history = _has_previous_schema_history(conn)
     changed = _normalize_current_records(conn)
-    if legacy_history or not _migration_applied(conn, CURRENT_SCHEMA_VERSION):
+    if previous_schema_history or not _migration_applied(conn, CURRENT_SCHEMA_VERSION):
         conn.execute("DELETE FROM schema_migrations")
         _mark_migration(conn, CURRENT_SCHEMA_VERSION, "current schema baseline")
         conn.execute("DELETE FROM calculation_cache")
@@ -155,7 +155,7 @@ def _update_table_json(
     return changed
 
 
-def _has_legacy_migration_history(conn: sqlite3.Connection) -> bool:
+def _has_previous_schema_history(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT 1 FROM schema_migrations WHERE version < ? LIMIT 1",
         (CURRENT_SCHEMA_VERSION,),
@@ -179,44 +179,6 @@ def _safe_int(value: Any, fallback: int) -> int:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
-
-
-def _vehicle_from_legacy_car_plan(car_plan: dict[str, Any], *, name: str) -> dict[str, Any]:
-    return {
-        "enabled": True,
-        "name": name,
-        "selected_strategy_variant": car_plan.get("selected_strategy_variant") or "手动设置",
-        "candidate_vehicles": [],
-        "total_price": max(0, _safe_float(car_plan.get("total_price"))),
-        "down_payment_ratio": _clamp(_safe_float(car_plan.get("down_payment_ratio"), 0.5), 0, 1),
-        "down_payment": max(0, _safe_float(car_plan.get("down_payment"))),
-        "purchase_delay_months": max(0, _safe_int(car_plan.get("purchase_delay_months"), 0)),
-        "total_months": max(1, _safe_int(car_plan.get("total_months"), 60)),
-        "interest_free_months": max(0, _safe_int(car_plan.get("interest_free_months"), 24)),
-        "later_annual_rate": max(0, _safe_float(car_plan.get("later_annual_rate"), 0.0199)),
-        "loan_prepayment_enabled": bool(car_plan.get("loan_prepayment_enabled", False)),
-        "loan_prepayment_start_month": max(1, _safe_int(car_plan.get("loan_prepayment_start_month"), 1)),
-        "loan_prepayment_allowed_after_month": max(1, _safe_int(car_plan.get("loan_prepayment_allowed_after_month"), 12)),
-        "loan_prepayment_monthly_amount": max(0, _safe_float(car_plan.get("loan_prepayment_monthly_amount"))),
-        "current_month_index": max(1, _safe_int(car_plan.get("current_month_index"), 1)),
-        "saving_start_date": car_plan.get("saving_start_date") or "2026-07-01",
-        "monthly_operating_cost": max(0, _safe_float(car_plan.get("monthly_operating_cost"))),
-        "no_car_monthly_commute_cost": max(0, _safe_float(car_plan.get("no_car_monthly_commute_cost"))),
-        "annual_mileage_km": max(0, _safe_float(car_plan.get("annual_mileage_km"))),
-        "electricity_kwh_per_100km": max(0, _safe_float(car_plan.get("electricity_kwh_per_100km"), 14)),
-        "electricity_price_per_kwh": max(0, _safe_float(car_plan.get("electricity_price_per_kwh"), 0.8)),
-        "monthly_parking_cost": max(0, _safe_float(car_plan.get("monthly_parking_cost"))),
-        "annual_maintenance_cost": max(0, _safe_float(car_plan.get("annual_maintenance_cost"))),
-        "annual_maintenance_growth_rate": max(0, _safe_float(car_plan.get("annual_maintenance_growth_rate"), 0.03)),
-        "annual_insurance_rate": max(0, _safe_float(car_plan.get("annual_insurance_rate"), 0.018)),
-        "annual_insurance_min": max(0, _safe_float(car_plan.get("annual_insurance_min"))),
-        "annual_insurance_growth_rate": max(0, _safe_float(car_plan.get("annual_insurance_growth_rate"), 0.02)),
-        "depreciation_years": max(1, _safe_int(car_plan.get("depreciation_years"), 8)),
-        "vehicle_service_years": max(1, _safe_int(car_plan.get("vehicle_service_years"), 15)),
-        "vehicle_retirement_mileage_km": max(0, _safe_float(car_plan.get("vehicle_retirement_mileage_km"), 600000)),
-        "happiness_score": _clamp(_safe_float(car_plan.get("happiness_score"), 6.5), 0, 10),
-        "notes": car_plan.get("notes") or "",
-    }
 
 
 def _strip_nested_vehicle_candidates(vehicle: dict[str, Any]) -> dict[str, Any]:
@@ -266,33 +228,18 @@ def _normalize_car_plan(data: dict[str, Any]) -> None:
 
     existing = car_plan.get("vehicle_plans")
     vehicle_plans = [item for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
-    if not vehicle_plans:
-        if bool(car_plan.get("enabled")) and _safe_float(car_plan.get("total_price")) > 0:
-            vehicle_plans.append(_vehicle_from_legacy_car_plan(car_plan, name=car_plan.get("name") or "车辆 1"))
-        if bool(car_plan.get("second_car_enabled")) and _safe_float(car_plan.get("second_car_total_price")) > 0:
-            second = _vehicle_from_legacy_car_plan(car_plan, name="车辆 2")
-            second["selected_strategy_variant"] = "手动设置"
-            second["total_price"] = max(0, _safe_float(car_plan.get("second_car_total_price")))
-            second["down_payment_ratio"] = _clamp(_safe_float(car_plan.get("second_car_down_payment_ratio"), 0.4), 0, 1)
-            second["down_payment"] = second["total_price"] * second["down_payment_ratio"]
-            second["purchase_delay_months"] = max(0, _safe_int(car_plan.get("second_car_purchase_delay_months"), 60))
-            second["total_months"] = max(1, _safe_int(car_plan.get("second_car_total_months"), 60))
-            second["interest_free_months"] = max(0, _safe_int(car_plan.get("second_car_interest_free_months"), 24))
-            second["later_annual_rate"] = max(0, _safe_float(car_plan.get("second_car_later_annual_rate"), 0.0199))
-            second["annual_mileage_km"] = max(0, _safe_float(car_plan.get("second_car_annual_mileage_km")))
-            second["monthly_parking_cost"] = max(0, _safe_float(car_plan.get("second_car_monthly_parking_cost")))
-            vehicle_plans.append(second)
 
     for index, vehicle in enumerate(vehicle_plans):
         if not isinstance(vehicle, dict):
             continue
         candidates = vehicle.get("candidate_vehicles")
-        candidate_vehicles = [item for item in candidates if isinstance(item, dict)] if isinstance(candidates, list) else []
-        if not candidate_vehicles and bool(vehicle.get("enabled")) and _safe_float(vehicle.get("total_price")) > 0:
+        has_explicit_candidate_list = isinstance(candidates, list)
+        candidate_vehicles = [item for item in candidates if isinstance(item, dict)] if has_explicit_candidate_list else []
+        if not has_explicit_candidate_list and bool(vehicle.get("enabled")) and _safe_float(vehicle.get("total_price")) > 0:
             candidate_vehicles = [_strip_nested_vehicle_candidates(vehicle)]
         for candidate in candidate_vehicles:
             candidate.setdefault("enabled", True)
-            candidate.setdefault("selected_strategy_variant", "手动设置")
+            candidate.setdefault("selected_strategy_variant", "target")
             candidate.setdefault("candidate_vehicles", [])
             _fill_vehicle_timing_defaults(candidate, index)
             _fill_vehicle_prepayment_defaults(candidate)
@@ -357,13 +304,6 @@ def _normalize_members_and_career_shock(data: dict[str, Any]) -> None:
         career_shock = {}
         data["career_shock"] = career_shock
 
-    legacy_birth_months = [str(career_shock.get("self_birth_month") or ""), str(career_shock.get("spouse_birth_month") or "")]
-    legacy_current_ages = [_safe_int(career_shock.get("self_current_age"), 30), _safe_int(career_shock.get("spouse_current_age"), 30)]
-    legacy_retirement_ages = [_safe_int(career_shock.get("self_retirement_age"), 63), _safe_int(career_shock.get("spouse_retirement_age"), 58)]
-    legacy_pensions = [_safe_float(career_shock.get("self_pension_monthly")), _safe_float(career_shock.get("spouse_pension_monthly"))]
-    legacy_layoff_member = str(career_shock.get("layoff_member_name") or "")
-    legacy_layoff_age = _safe_int(career_shock.get("layoff_age"), 35)
-    legacy_global_enabled = bool(career_shock.get("enabled"))
 
     existing_settings = career_shock.get("member_settings")
     existing_by_name: dict[str, dict[str, Any]] = {}
@@ -377,28 +317,23 @@ def _normalize_members_and_career_shock(data: dict[str, Any]) -> None:
         if not isinstance(member, dict):
             continue
         name = str(member.get("name") or f"成员 {index + 1}")
-        member.setdefault("birth_month", legacy_birth_months[index] if index < len(legacy_birth_months) else "")
-        member.setdefault("current_age", legacy_current_ages[index] if index < len(legacy_current_ages) else 30)
-        legacy_retirement_age = legacy_retirement_ages[index] if index < len(legacy_retirement_ages) else 63
-        member.setdefault("retirement_category", _retirement_category_from_age(legacy_retirement_age, index))
+        member.setdefault("birth_month", "")
+        member.setdefault("current_age", 30)
+        member.setdefault("retirement_category", _retirement_category_from_age(63 if index == 0 else 58, index))
         for stage in member.get("income_stages", []):
             if isinstance(stage, dict):
                 stage.setdefault("stage_kind", "salary")
                 stage.setdefault("annual_bonus_payout_month", 4)
                 stage.setdefault("monthly_freelance_income", 0)
         existing = existing_by_name.get(name, {})
-        member_enabled = bool(existing.get("enabled")) if existing else legacy_global_enabled and name == legacy_layoff_member
+        member_enabled = bool(existing.get("enabled")) if existing else False
         next_settings.append(
             {
                 "member_name": name,
                 "enabled": member_enabled,
-                "layoff_age": _safe_int(existing.get("layoff_age") if existing else legacy_layoff_age, legacy_layoff_age),
+                "layoff_age": _safe_int(existing.get("layoff_age") if existing else 35, 35),
                 "retirement_age": _policy_retirement_age(str(member.get("retirement_category") or "male_60")),
-                "pension_monthly": _safe_float(
-                    existing.get("pension_monthly")
-                    if existing
-                    else (legacy_pensions[index] if index < len(legacy_pensions) else 0)
-                ),
+                "pension_monthly": _safe_float(existing.get("pension_monthly") if existing else 0),
                 "auto_pension_monthly": bool(existing.get("auto_pension_monthly", True)) if existing else True,
             }
         )
@@ -408,25 +343,8 @@ def _normalize_members_and_career_shock(data: dict[str, Any]) -> None:
     career_shock.setdefault("auto_flexible_housing_fund", True)
     career_shock.setdefault("auto_pension_income", True)
     career_shock.setdefault("self_housing_fund_monthly", 0)
-    for legacy_key in (
-        "layoff_member_name",
-        "layoff_age",
-        "self_birth_month",
-        "spouse_birth_month",
-        "self_current_age",
-        "spouse_current_age",
-        "self_retirement_age",
-        "spouse_retirement_age",
-        "self_pension_monthly",
-        "spouse_pension_monthly",
-    ):
-        career_shock.pop(legacy_key, None)
-
 
 def _normalize_household(data: dict[str, Any]) -> dict[str, Any]:
-    if "cash_account_balance" not in data and "liquid_assets" in data:
-        data["cash_account_balance"] = data.get("liquid_assets") or 0
-    data.pop("liquid_assets", None)
     data.setdefault("family_down_payment_support_mode", "provident")
     data.setdefault("family_savings_support_amount", 0)
     data.setdefault("investment_buy_fee_rate", 0.0015)
@@ -434,8 +352,11 @@ def _normalize_household(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("scheduled_expenses", [])
     data.setdefault("phased_loans", [])
     for loan in data["phased_loans"]:
-        if isinstance(loan, dict) and loan.get("name") == "目前贷款":
-            loan["name"] = "已有贷款"
+        if isinstance(loan, dict):
+            loan.setdefault("prepayment_mode", "none")
+            loan.setdefault("prepayment_start_month", 1)
+            loan.setdefault("prepayment_allowed_after_month", 1)
+            loan.setdefault("prepayment_monthly_amount", 0)
     data.setdefault("elderly_dependents", [])
     data.setdefault("property_goals", [])
     _normalize_car_plan(data)
@@ -446,8 +367,6 @@ def _normalize_household(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_scenario(data: dict[str, Any]) -> dict[str, Any]:
-    if _safe_float(data.get("provident_rate")) == 0.0285:
-        data["provident_rate"] = 0.026
     data.setdefault("selected_purchase_plan_variant", "")
     data.setdefault("enabled", True)
     data.setdefault("purchase_sequence", 1)
