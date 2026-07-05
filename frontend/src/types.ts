@@ -7,12 +7,18 @@ export type PrefabBuildingLevel = "none" | "A" | "AA" | "AAA";
 export type BuildingStructure = "unknown" | "brick_mixed" | "steel_concrete";
 export type RenovationFundingMode = "after_purchase_saving" | "upfront_cash";
 export type CommercialPrepaymentMode = "auto" | "manual" | "none";
+export type ProvidentAccountRepaymentStrategy =
+  | "auto"
+  | "monthly_repayment_withdrawal"
+  | "semiannual_principal_offset"
+  | "keep_in_account";
 
 export interface IncomeMember {
   name: string;
   birth_month: string;
   current_age: number;
   retirement_category: "male_60" | "female_55" | "female_50";
+  provident_account_management_center: "beijing_municipal" | "national";
   provident_fund_balance: number;
   monthly_salary_gross: number;
   annual_bonus: number;
@@ -55,6 +61,7 @@ export interface CareerShockMemberSetting {
   enabled: boolean;
   layoff_age: number;
   retirement_age: number;
+  freelance_income_monthly: number;
   pension_monthly: number;
   auto_pension_monthly: boolean;
 }
@@ -65,7 +72,6 @@ export interface CareerShockData {
   auto_unemployment_benefit: boolean;
   auto_self_social_insurance: boolean;
   auto_flexible_housing_fund: boolean;
-  auto_pension_income: boolean;
   unemployment_benefit_months: number;
   unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
@@ -133,6 +139,14 @@ export interface VehiclePlanData {
   name: string;
   selected_strategy_variant: string;
   candidate_vehicles: VehiclePlanData[];
+  financing_options: VehicleFinancingOptionData[];
+  selected_financing_option_id: string;
+  selected_financing_option_name: string;
+  selected_financing_type: string;
+  selected_financing_min_down_payment_ratio: number;
+  selected_financing_max_down_payment_ratio: number;
+  selected_financing_prepayment_allowed: boolean;
+  selected_financing_prepayment_policy_note: string;
   planning_sequence: number;
   purchase_timing_mode: "auto_sequence" | "parallel" | "manual_month";
   after_previous_event_delay_months: number;
@@ -148,6 +162,9 @@ export interface VehiclePlanData {
   loan_prepayment_start_month: number;
   loan_prepayment_allowed_after_month: number;
   loan_prepayment_monthly_amount: number;
+  loan_prepayment_strategy_type: string;
+  loan_prepayment_lump_sum_month: number;
+  loan_prepayment_lump_sum_amount: number;
   current_month_index: number;
   saving_start_date: string;
   monthly_operating_cost: number;
@@ -165,6 +182,22 @@ export interface VehiclePlanData {
   vehicle_service_years: number;
   vehicle_retirement_mileage_km: number;
   happiness_score: number;
+  notes: string;
+}
+
+export interface VehicleFinancingOptionData {
+  id: string;
+  name: string;
+  enabled: boolean;
+  financing_type: "dealer_subsidy" | "standard" | "bank_loan" | "cash_only";
+  total_months: number;
+  interest_free_months: number;
+  later_annual_rate: number;
+  min_down_payment_ratio: number;
+  max_down_payment_ratio: number;
+  prepayment_allowed: boolean;
+  prepayment_allowed_after_month: number;
+  prepayment_policy_note: string;
   notes: string;
 }
 
@@ -309,6 +342,7 @@ export interface ScenarioData {
   commercial_prepayment_start_month: number;
   commercial_prepayment_allowed_after_month: number;
   commercial_prepayment_monthly_amount: number;
+  provident_account_repayment_strategy: ProvidentAccountRepaymentStrategy;
   deed_tax_rate: number;
   broker_fee_rate: number;
   renovation_cost: number;
@@ -365,11 +399,22 @@ export interface CarLoanSummary {
   years_to_down_payment: number | null;
   first_phase_monthly_payment: number;
   later_phase_monthly_payment: number;
+  contract_monthly_payment: number;
+  first_phase_interest_subsidy: number;
+  total_interest_subsidy: number;
+  borrower_total_interest: number;
   current_monthly_payment: number;
+  prepayment_allowed: boolean;
   prepayment_enabled: boolean;
   prepayment_start_month: number;
   prepayment_allowed_after_month: number;
   prepayment_monthly_amount: number;
+  prepayment_strategy_type: string;
+  prepayment_lump_sum_month: number;
+  prepayment_lump_sum_amount: number;
+  prepayment_total_extra_principal: number;
+  prepayment_net_benefit: number;
+  prepayment_explanation: string;
   actual_payoff_months: number;
   interest_saved_by_prepayment: number;
   total_interest: number;
@@ -392,6 +437,9 @@ export interface CarPlanAnalysis {
   vehicle_name: string;
   vehicle_candidate_index: number | null;
   vehicle_candidate_name: string;
+  financing_option_id: string;
+  financing_option_name: string;
+  financing_type: string;
   strategy_key: string;
   purchase_delay_months: number;
   months_to_buy: number | null;
@@ -405,11 +453,22 @@ export interface CarPlanAnalysis {
   later_annual_rate: number;
   first_phase_monthly_payment: number;
   later_phase_monthly_payment: number;
+  contract_monthly_payment: number;
+  first_phase_interest_subsidy: number;
+  total_interest_subsidy: number;
+  borrower_total_interest: number;
   expected_monthly_payment_after_purchase: number;
+  prepayment_allowed: boolean;
   prepayment_enabled: boolean;
   prepayment_start_month: number;
   prepayment_allowed_after_month: number;
   prepayment_monthly_amount: number;
+  prepayment_strategy_type: string;
+  prepayment_lump_sum_month: number;
+  prepayment_lump_sum_amount: number;
+  prepayment_total_extra_principal: number;
+  prepayment_net_benefit: number;
+  prepayment_explanation: string;
   actual_payoff_months: number;
   interest_saved_by_prepayment: number;
   total_interest: number;
@@ -561,6 +620,12 @@ export interface PurchasePlanAnalysis {
   provident_loan_amount: number;
   provident_policy_bonus: number;
   provident_policy_cap: number;
+  commercial_rate: number;
+  provident_rate: number;
+  deed_tax_rate: number;
+  broker_fee_rate: number;
+  deed_tax_amount: number;
+  broker_fee_amount: number;
   commercial_loan_years: number;
   provident_loan_years: number;
   provident_loan_year_limit_reasons: string[];
@@ -653,6 +718,8 @@ export interface LoanVisualizationPoint {
   total_monthly_payment: number;
   cash_monthly_payment: number;
   provident_offset_payment: number;
+  provident_monthly_withdrawal_payment: number;
+  provident_principal_offset_payment: number;
   provident_monthly_payment_relief: number;
 }
 
@@ -668,6 +735,7 @@ export interface ProvidentMemberAccountPoint {
   upfront_withdrawal: number;
   post_transaction_withdrawal: number;
   agreed_withdrawal: number;
+  monthly_repayment_withdrawal: number;
   loan_offset_payment: number;
   retirement_withdrawal: number;
   account_closed_by_retirement: boolean;
@@ -688,6 +756,7 @@ export interface ProvidentVisualizationPoint {
   upfront_withdrawal: number;
   post_transaction_withdrawal: number;
   agreed_withdrawal: number;
+  monthly_repayment_withdrawal: number;
   loan_offset_payment: number;
   retirement_withdrawal: number;
   total_inflow: number;
@@ -858,6 +927,8 @@ export interface AnnualFinancialSummary {
   commercial_extra_principal_payment: number;
   vehicle_extra_principal_payment: number;
   provident_offset_payment: number;
+  provident_monthly_withdrawal_payment: number;
+  provident_principal_offset_payment: number;
   cash_monthly_payment: number;
   commercial_loan_balance_end: number;
   provident_loan_balance_end: number;

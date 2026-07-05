@@ -684,8 +684,14 @@ option {
 
 .stage-switch-row {
   display: grid;
-  grid-template-columns: minmax(220px, 300px);
+  grid-template-columns: repeat(2, minmax(220px, 300px));
+  gap: 10px;
   margin: 2px 0 10px;
+  align-items: stretch;
+}
+
+.stage-switch-row .switch-field {
+  min-width: 0;
 }
 
 .read-only-grid {
@@ -895,6 +901,7 @@ option {
   flex-direction: column;
   gap: 12px;
   margin-bottom: 14px;
+  min-width: 0;
 }
 
 .member-list.roomy {
@@ -926,6 +933,7 @@ option {
   background: linear-gradient(180deg, var(--surface-raised), var(--surface-soft));
   border-radius: 7px;
   padding: 14px;
+  min-width: 0;
 }
 
 .member-card .field:last-child {
@@ -1358,6 +1366,119 @@ option {
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
 }
 
+.planning-goal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.vehicle-goal-grid {
+  margin-top: 4px;
+}
+
+.purchase-demand-grid {
+  margin-bottom: 12px;
+}
+
+.planning-goal-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-soft);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.planning-goal-card.active {
+  border-color: color-mix(in srgb, var(--blue) 42%, var(--border));
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface-raised));
+  box-shadow: inset 3px 0 0 var(--blue), var(--shadow-soft);
+}
+
+.planning-goal-select {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+
+.planning-goal-select strong,
+.planning-goal-select small,
+.planning-goal-select em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planning-goal-select strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.planning-goal-select.compact-select {
+  cursor: pointer;
+}
+
+.planning-goal-select small,
+.planning-goal-select em {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.goal-status {
+  width: fit-content;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.goal-status.enabled {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--green) 24%, var(--border));
+}
+
+.goal-status.paused {
+  color: var(--muted-strong);
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+}
+
+.planning-goal-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.planning-goal-actions .ghost-button.small {
+  min-height: 30px;
+}
+
+.goal-updating-note {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--blue) 20%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface-soft));
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
 .strategy-main-panel {
   min-width: 0;
 }
@@ -1398,8 +1519,9 @@ option {
 
 .rule-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 12px;
+  align-items: stretch;
 }
 
 .rule-meta-grid {
@@ -1420,23 +1542,70 @@ option {
 
 .categorized-rule-grid {
   margin-top: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
 .rule-param-field {
   display: grid;
-  gap: 6px;
-  align-content: start;
+  grid-template-rows: auto 1fr;
+  gap: 8px;
+  align-content: stretch;
   min-width: 0;
+  height: 100%;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.rule-param-field > .field,
+.rule-param-field > .switch-field {
+  min-height: calc(var(--field-label-height) + var(--field-gap) + var(--control-height));
+}
+
+.rule-param-field > .field {
+  justify-content: start;
+}
+
+.rule-param-field > .switch-field {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  align-items: end;
+}
+
+.rule-param-field > .switch-field .switch-control {
+  margin-bottom: 10px;
+}
+
+.rule-param-field > .switch-field .switch-copy {
+  min-height: var(--control-height);
+  align-content: center;
+}
+
+.rule-param-field > .switch-field .switch-copy strong {
+  min-height: var(--field-label-height);
+  display: flex;
+  align-items: center;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.rule-param-field > .switch-field .switch-copy small {
+  display: none;
 }
 
 .rule-param-field .field-hint {
   margin: 0;
   font-size: 12px;
   line-height: 1.45;
+  color: var(--muted);
 }
 
 .switch-rule-param {
-  min-height: var(--control-row-height);
+  min-height: auto;
 }
 
 .rule-switch-group {
@@ -1462,6 +1631,12 @@ option {
   grid-template-columns: 1fr 120px;
   gap: 10px;
   margin-top: 14px;
+  align-items: end;
+}
+
+.source-row button {
+  height: var(--control-height);
+  min-height: var(--control-height);
 }
 
 .source-preview {
@@ -1756,6 +1931,14 @@ option {
 
 .loan-balance-legend .cash-payment-line {
   background: var(--chart-total-asset);
+}
+
+.loan-balance-legend .provident-payment-line {
+  background: var(--chart-provident);
+}
+
+.loan-balance-legend .provident-principal-offset-line {
+  background: var(--chart-debt);
 }
 
 .loan-legend {
@@ -2640,6 +2823,98 @@ option {
   grid-template-columns: minmax(210px, 0.8fr) minmax(240px, 1fr);
 }
 
+.key-attribution-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  align-items: stretch;
+}
+
+.funding-structure-card,
+.car-home-impact-card {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 14px;
+}
+
+.card-mini-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.card-mini-head strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.card-mini-head span {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.compact-loan-legend {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  align-content: start;
+}
+
+.car-home-impact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  flex: 1;
+}
+
+.car-home-impact-grid span,
+.car-strategy-analysis-strip span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  padding: 10px;
+  min-height: 92px;
+  align-content: start;
+}
+
+.car-home-impact-grid small,
+.car-strategy-analysis-strip small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.car-home-impact-grid strong,
+.car-strategy-analysis-strip strong {
+  color: var(--text);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.car-home-impact-grid em,
+.car-strategy-analysis-strip em {
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.45;
+}
+
+.key-attribution-block .attribution-details {
+  margin-top: 12px;
+}
+
 .attribution-details .attribution-grid {
   margin: 0;
   padding: 0 12px 12px;
@@ -2888,6 +3163,7 @@ option {
   box-shadow: var(--shadow-soft);
   translate: 0 -50%;
   cursor: ew-resize;
+  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
 }
 
 .timeline-window-handle::before {
@@ -2907,6 +3183,12 @@ option {
   right: -8px;
 }
 
+.timeline-window-handle:hover {
+  transform: scale(1.04);
+  border-color: color-mix(in srgb, var(--blue) 78%, var(--border));
+  box-shadow: 0 10px 22px color-mix(in srgb, var(--blue) 18%, transparent);
+}
+
 .timeline-selected-marker {
   position: absolute;
   top: 50%;
@@ -2915,12 +3197,22 @@ option {
   height: 18px;
   border: 3px solid var(--surface-raised);
   border-radius: 999px;
-  background: var(--red);
+  padding: 0;
+  background: transparent;
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 70%, transparent), 0 6px 14px rgba(0, 0, 0, 0.16);
   translate: -50% -50%;
   cursor: pointer;
   transition: left 0.24s cubic-bezier(0.22, 1, 0.36, 1), transform 0.18s ease, box-shadow 0.18s ease;
   will-change: left, transform;
+}
+
+.timeline-selected-marker-core {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--red);
+  animation: timelineMarkerSettle 0.42s cubic-bezier(0.2, 0.9, 0.22, 1);
+  transform-origin: center;
 }
 
 .timeline-selected-marker::after {
@@ -2932,6 +3224,7 @@ option {
   opacity: 0.72;
   scale: 0.85;
   transition: scale 0.24s ease, opacity 0.24s ease;
+  animation: timelineMarkerHalo 0.42s ease-out;
 }
 
 .timeline-selected-marker:hover {
@@ -2962,6 +3255,7 @@ option {
   text-align: center;
   pointer-events: none;
   white-space: nowrap;
+  animation: timelineFocusIn 0.16s ease-out;
 }
 
 .timeline-focus-label::after {
@@ -2991,6 +3285,45 @@ option {
 .timeline-rail.is-dragging .timeline-window-band,
 .timeline-rail.is-dragging .timeline-selected-marker {
   transition: none;
+}
+
+.timeline-rail.is-dragging .timeline-selected-marker-core,
+.timeline-rail.is-dragging .timeline-selected-marker::after {
+  animation: none;
+}
+
+@keyframes timelineMarkerSettle {
+  0% {
+    transform: scale(0.72);
+  }
+  55% {
+    transform: scale(1.22);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes timelineMarkerHalo {
+  0% {
+    opacity: 0.55;
+    scale: 0.7;
+  }
+  100% {
+    opacity: 0.2;
+    scale: 1.45;
+  }
+}
+
+@keyframes timelineFocusIn {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }
 
 .month-driver-panel {
@@ -3065,11 +3398,18 @@ option {
   color: var(--text);
   text-align: left;
   min-width: 980px;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
 }
 
 .comparison-row.active {
   border-color: color-mix(in srgb, var(--blue) 46%, var(--border));
   background: linear-gradient(180deg, color-mix(in srgb, var(--blue) 7%, var(--surface-raised)), var(--surface-tint));
+}
+
+button.comparison-row:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--blue) 30%, var(--border));
+  box-shadow: 0 10px 22px rgba(24, 39, 75, 0.07);
 }
 
 .status-pill {
@@ -3084,6 +3424,7 @@ option {
   font-size: 12px;
   font-weight: 700;
   white-space: nowrap;
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
 }
 
 .car-planner-panel .status-pill {
@@ -3132,6 +3473,7 @@ option {
   border: 1px solid var(--border);
   background: var(--surface-soft);
   color: var(--muted-strong);
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease, transform 0.16s ease;
 }
 
 .decision-pill.good {
@@ -3366,6 +3708,7 @@ option {
   color: var(--muted-strong);
   font-size: 13px;
   font-weight: 700;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
 }
 
 .strategy-adoption-row.active,
@@ -3373,6 +3716,11 @@ option {
   border-color: rgba(63, 139, 104, 0.28);
   background: #edf8f2;
   color: #28724f;
+}
+
+.strategy-adoption-row:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-soft);
 }
 
 .strategy-card p,
@@ -3515,6 +3863,7 @@ option {
 }
 
 .car-planner-panel,
+.car-config-panel,
 .car-strategy-result-panel {
   display: grid;
   gap: 16px;
@@ -3541,8 +3890,197 @@ option {
   gap: 12px;
 }
 
+.compact-section-head {
+  padding-top: 4px;
+}
+
+.compact-section-head > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.car-strategy-analysis-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.selected-car-strategy-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.selected-car-narrative-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.selected-car-narrative-grid article,
+.selected-car-risk-list div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.selected-car-narrative-grid article {
+  display: grid;
+  gap: 7px;
+  min-height: 136px;
+  padding: 13px;
+}
+
+.selected-car-narrative-grid article.wide {
+  grid-column: span 2;
+}
+
+.selected-car-narrative-grid span,
+.selected-car-risk-list span {
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.selected-car-narrative-grid article > span {
+  color: var(--blue);
+  font-weight: 700;
+}
+
+.selected-car-narrative-grid strong {
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.selected-car-narrative-grid p {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.selected-car-risk-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.selected-car-risk-list div {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 58px;
+  padding: 10px 12px;
+}
+
+.selected-car-risk-list svg {
+  flex: 0 0 auto;
+  color: var(--green);
+  margin-top: 2px;
+}
+
+.selected-car-strategy-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.selected-car-strategy-grid article {
+  display: grid;
+  gap: 6px;
+  min-height: 132px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.selected-car-strategy-grid span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.selected-car-strategy-grid strong {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.selected-car-strategy-grid p {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.car-strategy-comparison-table {
+  display: grid;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.car-strategy-comparison-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(230px, 1.4fr) minmax(90px, 0.6fr) minmax(130px, 0.85fr) minmax(92px, 0.65fr) minmax(86px, 0.6fr) minmax(98px, 0.68fr) minmax(98px, 0.68fr) minmax(82px, 0.56fr) minmax(96px, 0.64fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 1120px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: linear-gradient(180deg, var(--surface-raised), var(--surface));
+  color: var(--text);
+  text-align: left;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.car-strategy-comparison-row.active {
+  border-color: color-mix(in srgb, var(--blue) 46%, var(--border));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--blue) 7%, var(--surface-raised)), var(--surface-tint));
+}
+
+button.car-strategy-comparison-row:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--blue) 30%, var(--border));
+  box-shadow: 0 10px 22px rgba(24, 39, 75, 0.07);
+}
+
+.car-strategy-comparison-head {
+  background: var(--surface-soft);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.car-strategy-comparison-row strong,
+.car-strategy-comparison-row small {
+  display: block;
+  min-width: 0;
+}
+
+.car-strategy-comparison-row strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.car-strategy-comparison-row small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  margin-top: 2px;
+}
+
 .vehicle-source-grid {
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.car-source-list {
+  grid-template-columns: 1fr;
+  margin-bottom: 0;
 }
 
 .vehicle-sequence-grid {
@@ -3564,6 +4102,149 @@ option {
 
 .vehicle-source-card {
   padding: 15px;
+}
+
+.car-source-list .vehicle-source-card {
+  padding: 12px;
+}
+
+.source-summary-pill {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted-strong);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.car-config-panel .vehicle-plan-list {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.car-config-panel .vehicle-plan-card {
+  display: grid;
+  gap: 14px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  min-width: 0;
+}
+
+.car-config-panel .member-card-head {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(190px, auto) auto;
+  align-items: end;
+  min-width: 0;
+}
+
+.car-config-panel .vehicle-source-grid {
+  grid-template-columns: 1fr;
+}
+
+.car-config-panel .vehicle-source-card {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.car-config-panel .vehicle-source-card + .vehicle-source-card {
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.car-config-panel .vehicle-source-head {
+  grid-template-columns: minmax(280px, 1fr) auto auto;
+  align-items: end;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.car-config-panel .vehicle-financing-grid {
+  grid-template-columns: 1fr;
+}
+
+.car-config-panel .vehicle-financing-card .vehicle-source-head {
+  grid-template-columns: minmax(240px, 1fr) auto auto;
+}
+
+.car-config-panel .vehicle-financing-card .compact-fields {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.vehicle-setting-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.vehicle-financing-group .vehicle-source-toolbar {
+  margin: 0 0 8px;
+}
+
+.template-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 2px;
+}
+
+.template-chip-row .ghost-button {
+  min-height: 34px;
+}
+
+.vehicle-financing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.vehicle-financing-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.vehicle-financing-card .vehicle-source-head {
+  align-items: end;
+}
+
+.vehicle-source-card.active {
+  border-color: color-mix(in srgb, var(--blue) 42%, var(--border));
+  background: color-mix(in srgb, var(--blue) 6%, var(--surface-raised));
+  box-shadow: inset 3px 0 0 var(--blue), var(--shadow-soft);
+}
+
+.property-source-toolbar {
+  margin-top: 2px;
+}
+
+.property-source-toolbar strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.property-source-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin-bottom: 12px;
+}
+
+.compact-empty-state {
+  margin: 0 0 12px;
+  min-height: 96px;
 }
 
 .vehicle-prepayment-panel {
@@ -3977,6 +4658,7 @@ option {
 :root[data-theme="dark"] .happiness-breakdown-item,
 :root[data-theme="dark"] .strategy-card,
 :root[data-theme="dark"] .car-strategy-card,
+:root[data-theme="dark"] .selected-car-strategy-panel,
 :root[data-theme="dark"] .investment-card,
 :root[data-theme="dark"] .strategy-current-panel > div,
 :root[data-theme="dark"] .profile-config-block {
@@ -4321,6 +5003,17 @@ option {
   color: var(--text) !important;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
 @media (max-width: 1180px) {
   .comparison-table {
     overflow-x: visible;
@@ -4343,6 +5036,22 @@ option {
   .tax-kpi-grid,
   .car-cost-breakdown {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .key-attribution-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .car-strategy-analysis-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .selected-car-strategy-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .selected-car-risk-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .visual-strategy-metrics {
@@ -4448,8 +5157,18 @@ option {
   .tax-chart-grid,
   .tax-pies,
   .provident-balance-summary,
+  .key-attribution-layout,
+  .car-home-impact-grid,
+  .car-strategy-analysis-strip,
+  .selected-car-narrative-grid,
+  .selected-car-risk-list,
+  .selected-car-strategy-grid,
   .pie-layout {
     grid-template-columns: 1fr;
+  }
+
+  .selected-car-narrative-grid article.wide {
+    grid-column: auto;
   }
 
   .advisor-evidence-item {
@@ -4505,6 +5224,37 @@ option {
     align-items: stretch;
   }
 
+  .car-config-panel .member-card-head,
+  .car-config-panel .vehicle-source-head,
+  .car-config-panel .vehicle-financing-card .vehicle-source-head {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .car-config-panel .vehicle-plan-list,
+  .car-config-panel .vehicle-plan-card,
+  .car-config-panel .vehicle-sequence-grid,
+  .car-config-panel .vehicle-source-grid,
+  .car-config-panel .vehicle-source-card,
+  .car-config-panel .vehicle-setting-stack,
+  .car-config-panel .vehicle-financing-grid,
+  .car-config-panel .vehicle-financing-card {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .car-config-panel .field,
+  .car-config-panel .switch-field,
+  .car-config-panel input,
+  .car-config-panel select,
+  .car-config-panel button {
+    max-width: 100%;
+    min-width: 0;
+  }
+
   .member-card-head:has(> .field) > .field {
     max-width: none;
   }
@@ -4512,6 +5262,10 @@ option {
   .source-comparison-metrics {
     width: 100%;
     min-width: 0;
+  }
+
+  .stage-switch-row {
+    grid-template-columns: 1fr;
   }
 
   .tax-detail-table {
@@ -4656,5 +5410,455 @@ option {
 
   .tax-detail-row {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  html,
+  body {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  :root {
+    --panel-padding: 16px;
+    --layout-gap: 14px;
+    --layout-gap-sm: 10px;
+    --control-height: 44px;
+    --button-height-nav: 38px;
+  }
+
+  .app-shell {
+    min-width: 0;
+  }
+
+  .topbar {
+    border-bottom-color: color-mix(in srgb, var(--border) 70%, transparent);
+  }
+
+  .brand {
+    width: 100%;
+    min-width: 0;
+    justify-content: space-between;
+  }
+
+  .brand h1 {
+    font-size: 17px;
+  }
+
+  .brand p {
+    max-width: 56vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .topbar-actions button {
+    min-width: 0;
+    justify-content: center;
+    padding-inline: 10px;
+  }
+
+  .page-nav {
+    gap: 8px;
+    scroll-padding-inline: 12px;
+  }
+
+  .page-tab {
+    flex: 0 0 auto;
+    min-width: max-content;
+    padding-inline: 13px;
+  }
+
+  .page-stack,
+  .strategy-workbench,
+  .income-page-stack {
+    width: 100%;
+    gap: 16px;
+  }
+
+  .section-header {
+    min-height: 0;
+  }
+
+  .section-header h1,
+  .recommend-title h3 {
+    font-size: 22px;
+    line-height: 1.25;
+  }
+
+  .form-panel,
+  .rule-panel,
+  .result-panel,
+  .strategy-hero-main,
+  .strategy-hero-side,
+  .strategy-side-panel,
+  .strategy-main-panel,
+  .visual-grid .chart-block,
+  .tax-visual-chart,
+  .happiness-chart,
+  .advisor-panel,
+  .linked-month-panel,
+  .visual-story-block,
+  .member-card,
+  .planning-goal-card,
+  .vehicle-source-card,
+  .vehicle-financing-card,
+  .strategy-card,
+  .car-strategy-card,
+  .selected-car-strategy-panel,
+  .investment-card,
+  .timeline-panel {
+    border-radius: var(--radius);
+  }
+
+  .form-panel,
+  .rule-panel,
+  .result-panel,
+  .strategy-main-panel,
+  .strategy-side-panel,
+  .visual-grid .chart-block,
+  .tax-visual-chart,
+  .happiness-chart,
+  .advisor-panel,
+  .linked-month-panel,
+  .visual-story-block {
+    padding: var(--panel-padding);
+  }
+
+  .panel-title,
+  .panel-title.compact {
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .panel-title h2,
+  .visual-header h3 {
+    min-width: 0;
+    font-size: 16px;
+    line-height: 1.3;
+  }
+
+  .field,
+  .switch-field {
+    min-width: 0;
+  }
+
+  input,
+  select,
+  textarea {
+    min-width: 0;
+    width: 100%;
+    font-size: 16px;
+  }
+
+  .switch-field {
+    min-height: var(--control-height);
+    align-items: center;
+    padding: 10px 12px;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .switch-copy {
+    min-width: 0;
+  }
+
+  .switch-copy strong,
+  .switch-copy small,
+  .parameter-help,
+  .field-hint,
+  .strategy-card p,
+  .visual-header p {
+    overflow-wrap: anywhere;
+  }
+
+  .stage-row .member-card-head,
+  .member-card-head,
+  .loan-card .member-card-head,
+  .vehicle-source-head,
+  .strategy-panel-head,
+  .visual-header,
+  .card-mini-head,
+  .vehicle-source-toolbar {
+    gap: 10px;
+  }
+
+  .stage-row .member-card-head {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .stage-row .member-card-head .icon-button {
+    width: 100%;
+  }
+
+  .profile-member-fields .field:last-child,
+  .member-card .field:last-child,
+  .member-card .form-grid .field:last-child,
+  .member-card .vehicle-sequence-grid .field:last-child {
+    align-self: stretch;
+  }
+
+  .planning-goal-grid,
+  .purchase-demand-grid,
+  .property-source-grid,
+  .vehicle-goal-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .strategy-hero-main {
+    min-height: 0;
+    padding: 18px;
+  }
+
+  .strategy-hero-main p {
+    max-width: none;
+  }
+
+  .strategy-panel-head select {
+    width: 100%;
+  }
+
+  .comparison-table,
+  .car-strategy-comparison-table,
+  .tax-detail-table {
+    overflow-x: visible;
+  }
+
+  .comparison-row,
+  .car-strategy-comparison-row {
+    min-width: 0;
+    width: 100%;
+    align-items: start;
+    border-radius: var(--radius);
+  }
+
+  .car-strategy-comparison-head {
+    display: none;
+  }
+
+  .car-strategy-comparison-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .car-strategy-comparison-row > :first-child {
+    grid-column: 1 / -1;
+  }
+
+  .decision-pill,
+  .status-pill,
+  .strategy-state-pill {
+    width: fit-content;
+    max-width: 100%;
+    white-space: normal;
+    text-align: left;
+  }
+
+  .linked-month-panel {
+    position: static;
+    top: auto;
+  }
+
+  .timeline-window-track {
+    min-height: 42px;
+  }
+
+  .timeline-scale {
+    font-size: 10px;
+  }
+
+  .timeline-window-label {
+    font-size: 11px;
+  }
+
+  .month-driver-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .month-driver-list span {
+    min-width: 0;
+    white-space: normal;
+  }
+
+  .visual-grid .chart-block,
+  .tax-trend-panel,
+  .happiness-chart,
+  .loan-payment-pie-panel {
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .visual-grid .chart-block > .recharts-responsive-container,
+  .tax-trend-panel > .recharts-responsive-container,
+  .happiness-chart > .recharts-responsive-container,
+  .loan-payment-pie-panel > .recharts-responsive-container {
+    min-width: 560px;
+  }
+
+  .cash-flow-pie,
+  .attribution-pie,
+  .tax-summary-panel,
+  .tax-trend-panel,
+  .funding-structure-card,
+  .car-home-impact-card {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .cash-flow-pie .recharts-responsive-container,
+  .pie-layout .recharts-responsive-container {
+    min-height: 220px;
+  }
+
+  .attribution-pie .compact-pie-layout,
+  .compact-pie-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .attribution-pie .recharts-responsive-container {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .tax-kpi-grid .metric,
+  .metric,
+  .strategy-metrics .metric,
+  .visual-strategy-metrics .metric {
+    min-width: 0;
+  }
+
+  .tax-detail-row {
+    min-width: 0;
+    padding: 11px 0;
+  }
+
+  .timeline-item {
+    gap: 8px;
+  }
+
+  .timeline-date {
+    width: fit-content;
+  }
+}
+
+@media (max-width: 640px) {
+  :root {
+    --panel-padding: 14px;
+    --layout-gap: 12px;
+    --button-height-sm: 36px;
+  }
+
+  .topbar {
+    padding: 12px 10px;
+  }
+
+  .brand {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .brand p {
+    max-width: 100%;
+  }
+
+  .topbar-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar-actions button,
+  .primary-button,
+  .ghost-button,
+  .icon-button {
+    min-height: 42px;
+  }
+
+  .page-nav {
+    padding: 8px 10px;
+  }
+
+  .page-workspace {
+    padding: 12px 10px 24px;
+  }
+
+  .section-header h1,
+  .recommend-title h3 {
+    font-size: 20px;
+  }
+
+  .form-panel,
+  .rule-panel,
+  .result-panel,
+  .strategy-main-panel,
+  .strategy-side-panel,
+  .visual-grid .chart-block,
+  .tax-visual-chart,
+  .happiness-chart,
+  .advisor-panel,
+  .linked-month-panel,
+  .visual-story-block {
+    padding: var(--panel-padding);
+  }
+
+  .metric-grid,
+  .visual-strategy-metrics,
+  .selected-car-strategy-grid,
+  .month-driver-list {
+    grid-template-columns: 1fr;
+  }
+
+  .comparison-row,
+  .car-strategy-comparison-row,
+  .tax-detail-row {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+
+  .comparison-row > :first-child,
+  .car-strategy-comparison-row > :first-child {
+    grid-column: auto;
+  }
+
+  .comparison-row small,
+  .car-strategy-comparison-row small {
+    margin-top: 1px;
+  }
+
+  .visual-grid .chart-block > .recharts-responsive-container,
+  .tax-trend-panel > .recharts-responsive-container,
+  .happiness-chart > .recharts-responsive-container,
+  .loan-payment-pie-panel > .recharts-responsive-container {
+    min-width: 500px;
+  }
+
+  .timeline-scale span:nth-child(odd) {
+    display: none;
+  }
+
+  .card-mini-head,
+  .strategy-card-head,
+  .visual-header,
+  .plan-card-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .card-mini-head span,
+  .strategy-card-head span,
+  .plan-card-head span {
+    align-self: flex-start;
+  }
+}
+
+@media (min-width: 901px) {
+  .mobile-only {
+    display: none !important;
   }
 }

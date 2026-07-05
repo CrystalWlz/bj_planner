@@ -19,7 +19,7 @@ from app.calculator import (
     monthly_household_expense_at,
     summarize_phased_loans,
 )
-from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData
+from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData, VehicleFinancingOptionData
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -88,7 +88,13 @@ def test_equal_installment_loan_has_stable_monthly_payment() -> None:
 def test_affordability_marks_cash_gap_as_not_viable() -> None:
     household = HouseholdData(cash_account_balance=300_000, monthly_income=50_000)
     scenario = ScenarioData(total_price=6_000_000, down_payment_amount=1_800_000)
-    result = calculate_affordability(household, scenario, RulePackData())
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_municipal_monthly_repayment_withdrawal_supported": False,
+        }
+    )
+    result = calculate_affordability(household, scenario, rules)
     assert result.status == "不可行"
     assert result.funding_gap > 0
 
@@ -672,6 +678,7 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
                     enabled=True,
                     layoff_age=31,
                     retirement_age=50,
+                    freelance_income_monthly=3_500,
                     auto_pension_monthly=True,
                 )
             ],
@@ -692,11 +699,12 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
     pension = household_monthly_income_profile_at(household, rule, months_from_now=300, as_of=date(2026, 7, 1))
 
     assert unemployment.non_taxable_income == pytest.approx(2200)
-    assert unemployment.gross_income == pytest.approx(2200)
+    assert unemployment.gross_income == pytest.approx(5700)
+    assert unemployment.gross_income - unemployment.non_taxable_income == pytest.approx(3500)
     assert flexible.personal_social == pytest.approx(2180)
     assert flexible.personal_housing_fund == pytest.approx(720)
     assert flexible.monthly_pf_deposit == pytest.approx(720)
-    assert flexible.gross_income == pytest.approx(0)
+    assert flexible.gross_income == pytest.approx(3500)
     assert pension.non_taxable_income > 0
 
 
@@ -1122,7 +1130,7 @@ def test_beijing_social_and_housing_fund_contributions_use_policy_caps() -> None
     assert summary.monthly_personal_social_insurance == pytest.approx(35_811 * 0.105 + 3, abs=0.02)
 
 
-def test_car_plan_uses_interest_free_then_low_rate_schedule() -> None:
+def test_car_plan_uses_contract_installment_with_manufacturer_interest_subsidy() -> None:
     loan = calculate_car_loan(
         CarPlanData(
             enabled=True,
@@ -1135,10 +1143,18 @@ def test_car_plan_uses_interest_free_then_low_rate_schedule() -> None:
             current_month_index=1,
         )
     )
+    principal = 150_000
+    monthly_rate = 0.0199 / 12
+    factor = (1 + monthly_rate) ** 60
+    contract_monthly = principal * monthly_rate * factor / (factor - 1)
     assert loan.down_payment == 150_000
-    assert loan.first_phase_monthly_payment == 2_500
-    assert loan.later_phase_monthly_payment > loan.first_phase_monthly_payment
-    assert loan.total_interest > 0
+    assert loan.contract_monthly_payment == pytest.approx(contract_monthly, abs=0.01)
+    assert loan.first_phase_interest_subsidy == pytest.approx(principal * monthly_rate, abs=0.01)
+    assert loan.first_phase_monthly_payment == pytest.approx(contract_monthly - principal * monthly_rate, abs=0.01)
+    assert loan.later_phase_monthly_payment == pytest.approx(contract_monthly, abs=0.01)
+    assert loan.total_interest_subsidy > 0
+    assert loan.total_interest == loan.borrower_total_interest
+    assert loan.total_interest < contract_monthly * 60 - principal
     assert loan.monthly_insurance_cost > 0
     assert loan.monthly_energy_cost > 0
     assert loan.monthly_total_ownership_cost > loan.monthly_cash_operating_cost
@@ -1241,6 +1257,26 @@ def test_phased_loans_support_manual_and_auto_prepayment() -> None:
     assert manual_month12[0] < base_month12[0]
     assert auto_summary.current_extra_principal_payment > 0
     assert auto_summary.prepayment_mode == "auto"
+
+
+def test_phased_loan_auto_prepayment_respects_investment_opportunity_cost() -> None:
+    loan = PhasedLoanData(
+        name="低息已有贷款样例",
+        principal=120_000,
+        annual_rate=0.028,
+        remaining_months=60,
+        interest_start_month="2026-07",
+        interest_only_until="2026-06",
+        prepayment_mode="auto",
+        prepayment_start_month=1,
+        prepayment_allowed_after_month=1,
+    )
+
+    low_return = summarize_phased_loans([loan], as_of=date(2026, 7, 1), annual_investment_return=0.0)[0]
+    high_return = summarize_phased_loans([loan], as_of=date(2026, 7, 1), annual_investment_return=0.08)[0]
+
+    assert low_return.current_extra_principal_payment > 0
+    assert high_return.current_extra_principal_payment == 0
 
 
 def test_car_plan_is_included_in_affordability_cash_flow() -> None:
@@ -1539,6 +1575,38 @@ def test_auto_commercial_prepayment_is_chosen_from_cashflow_pressure() -> None:
     assert tight_plan.commercial_prepayment_monthly_amount == 0
 
 
+def test_auto_commercial_prepayment_respects_investment_opportunity_cost() -> None:
+    household = HouseholdData(
+        cash_account_balance=1_600_000,
+        monthly_expense=8_000,
+        members=[IncomeMember(name="sample", monthly_salary_gross=90_000, annual_bonus=0)],
+        car_plan=CarPlanData(enabled=False, vehicle_plans=[]),
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        down_payment_amount=800_000,
+        commercial_loan_amount=1_000_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=1,
+        commercial_rate=0.04,
+        commercial_prepayment_mode="auto",
+        commercial_prepayment_allowed_after_month=12,
+        loan_years=20,
+        annual_investment_return=0.08,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["手动指定"]
+
+    assert plan.commercial_prepayment_mode == "auto"
+    assert not plan.commercial_prepayment_enabled
+    assert plan.commercial_prepayment_monthly_amount == 0
+
+
 def test_affordability_returns_backend_account_cashflow_series() -> None:
     household = HouseholdData(
         cash_account_balance=900_000,
@@ -1732,27 +1800,140 @@ def test_affordability_generates_multiple_car_purchase_strategies() -> None:
             members=[IncomeMember(name="member", monthly_salary_gross=45_000)],
             cash_account_balance=200_000,
             monthly_expense=18_000,
-            car_plan=CarPlanData(enabled=True, total_price=300_000, down_payment_ratio=0.5),
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=300_000,
+                down_payment_ratio=0.5,
+                financing_options=[
+                    VehicleFinancingOptionData(
+                        id="dealer_subsidy",
+                        name="经销商贴息方案",
+                        financing_type="dealer_subsidy",
+                        total_months=60,
+                        interest_free_months=24,
+                        later_annual_rate=0.0199,
+                        min_down_payment_ratio=0.10,
+                        prepayment_allowed=True,
+                        prepayment_allowed_after_month=12,
+                    )
+                ],
+            ),
         ),
         ScenarioData(),
         RulePackData(),
     )
     plans = {item.strategy_key: item for item in result.car_plan_analyses}
 
-    assert list(plans) == ["target", "cash", "high_down_low_loan", "low_down_keep_cash", "accelerated_principal", "delay_purchase"]
+    assert list(plans) == ["target", "cash", "high_down_low_loan", "low_down_keep_cash", "delay_purchase"]
     assert plans["target"].total_price == 300_000
     assert plans["target"].down_payment_ratio == 0.5
     assert plans["cash"].loan_principal == 0
+    assert plans["high_down_low_loan"].down_payment_ratio != plans["target"].down_payment_ratio
     assert plans["high_down_low_loan"].down_payment > plans["low_down_keep_cash"].down_payment
     assert plans["low_down_keep_cash"].loan_principal > plans["high_down_low_loan"].loan_principal
-    assert plans["accelerated_principal"].prepayment_enabled
-    assert plans["accelerated_principal"].interest_saved_by_prepayment >= 0
     assert plans["delay_purchase"].purchase_delay_months >= 12
-    assert plans["high_down_low_loan"].total_months == 36
+    assert plans["high_down_low_loan"].total_months == plans["target"].total_months
+    assert plans["high_down_low_loan"].financing_option_name == plans["target"].financing_option_name
     assert plans["low_down_keep_cash"].down_payment_ratio <= 0.20
     assert plans["low_down_keep_cash"].total_months == 60
     assert all(0 <= item.happiness_score <= 10 for item in plans.values())
     assert len({item.happiness_score for item in plans.values()}) > 1
+
+
+def test_car_strategy_generation_deduplicates_equivalent_cash_plans() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="sample member", monthly_salary_gross=42_000)],
+            cash_account_balance=260_000,
+            monthly_expense=16_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=180_000,
+                down_payment_ratio=0.35,
+            ),
+        ),
+        ScenarioData(),
+        RulePackData(),
+    )
+
+    immediate_cash_plans = [
+        item
+        for item in result.car_plan_analyses
+        if item.loan_principal <= 1 and item.purchase_delay_months == 0
+    ]
+
+    assert len(immediate_cash_plans) == 1
+    assert immediate_cash_plans[0].strategy_key == "cash"
+    assert immediate_cash_plans[0].financing_type == "cash_only"
+    assert all(
+        not (
+            item.loan_principal <= 1
+            and item.strategy_key in {"target", "high_down_low_loan", "low_down_keep_cash", "accelerated_principal"}
+        )
+        for item in result.car_plan_analyses
+    )
+
+
+def test_selected_car_strategy_changes_home_purchase_strategy() -> None:
+    def result_for(selection: str):
+        car_plan = CarPlanData(
+            enabled=False,
+            vehicle_plans=[
+                CarPlanData(
+                    enabled=True,
+                    name="示例车辆",
+                    selected_strategy_variant=selection,
+                    total_price=300_000,
+                    down_payment_ratio=0.5,
+                    purchase_timing_mode="parallel",
+                    planning_sequence=1,
+                    financing_options=[
+                        VehicleFinancingOptionData(
+                            id="dealer_plan",
+                            name="经销商方案",
+                            financing_type="dealer_subsidy",
+                            total_months=60,
+                            interest_free_months=24,
+                            later_annual_rate=0.0199,
+                            min_down_payment_ratio=0.10,
+                            max_down_payment_ratio=1.0,
+                            prepayment_allowed=True,
+                            prepayment_allowed_after_month=12,
+                        )
+                    ],
+                )
+            ],
+        )
+        return calculate_affordability(
+            HouseholdData(
+                members=[IncomeMember(name="样例成员A", monthly_salary_gross=55_000)],
+                cash_account_balance=950_000,
+                monthly_expense=16_000,
+                social_security_months=120,
+                car_plan=car_plan,
+            ),
+            ScenarioData(
+                total_price=3_000_000,
+                down_payment_amount=900_000,
+                renovation_cost=0,
+                moving_and_misc_cost=0,
+                broker_fee_rate=0,
+            ),
+            RulePackData(),
+        )
+
+    cash_result = result_for("经销商方案 | cash")
+    low_down_result = result_for("经销商方案 | low_down_keep_cash")
+
+    cash_plan = cash_result.purchase_plan_analyses[-1]
+    low_down_plan = low_down_result.purchase_plan_analyses[-1]
+
+    assert cash_result.car_plan_analyses
+    assert low_down_result.car_plan_analyses
+    assert low_down_plan.months_to_buy is not None
+    assert cash_plan.months_to_buy is not None
+    assert low_down_plan.months_to_buy < cash_plan.months_to_buy
+    assert low_down_plan.cash_after_transaction > cash_plan.cash_after_transaction
 
 
 def test_car_prepayment_strategy_is_chosen_from_cashflow_pressure() -> None:
@@ -1765,7 +1946,17 @@ def test_car_prepayment_strategy_is_chosen_from_cashflow_pressure() -> None:
                 enabled=True,
                 total_price=220_000,
                 down_payment_ratio=0.3,
-                later_annual_rate=0.05,
+                financing_options=[
+                    VehicleFinancingOptionData(
+                        id="standard_high_rate",
+                        name="普通高息贷款",
+                        financing_type="standard",
+                        total_months=60,
+                        interest_free_months=0,
+                        later_annual_rate=0.05,
+                        prepayment_allowed_after_month=1,
+                    )
+                ],
                 loan_prepayment_enabled=True,
                 loan_prepayment_monthly_amount=0,
             ),
@@ -1782,7 +1973,17 @@ def test_car_prepayment_strategy_is_chosen_from_cashflow_pressure() -> None:
                 enabled=True,
                 total_price=220_000,
                 down_payment_ratio=0.3,
-                later_annual_rate=0.05,
+                financing_options=[
+                    VehicleFinancingOptionData(
+                        id="standard_high_rate",
+                        name="普通高息贷款",
+                        financing_type="standard",
+                        total_months=60,
+                        interest_free_months=0,
+                        later_annual_rate=0.05,
+                        prepayment_allowed_after_month=1,
+                    )
+                ],
                 loan_prepayment_enabled=True,
                 loan_prepayment_monthly_amount=0,
             ),
@@ -1792,15 +1993,98 @@ def test_car_prepayment_strategy_is_chosen_from_cashflow_pressure() -> None:
     )
 
     roomy_plan = {item.strategy_key: item for item in roomy_result.car_plan_analyses}["accelerated_principal"]
-    tight_plan = {item.strategy_key: item for item in tight_result.car_plan_analyses}["accelerated_principal"]
+    tight_plans = {item.strategy_key: item for item in tight_result.car_plan_analyses}
 
     assert roomy_plan.prepayment_enabled
     assert roomy_plan.prepayment_monthly_amount > 0
     assert roomy_plan.interest_saved_by_prepayment > 0
     assert any("auto_extra_principal" in note for note in roomy_plan.notes)
-    assert not tight_plan.prepayment_enabled
-    assert tight_plan.prepayment_monthly_amount == 0
-    assert tight_plan.monthly_cash_flow_after_car < 0
+    assert "accelerated_principal" not in tight_plans
+
+
+def test_car_prepayment_strategy_respects_investment_opportunity_cost() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="member", monthly_salary_gross=60_000)],
+            cash_account_balance=400_000,
+            monthly_expense=10_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=220_000,
+                down_payment_ratio=0.3,
+                later_annual_rate=0.035,
+                loan_prepayment_enabled=True,
+                loan_prepayment_monthly_amount=0,
+            ),
+        ),
+        ScenarioData(annual_investment_return=0.08),
+        RulePackData(),
+    )
+    assert "accelerated_principal" not in {item.strategy_key for item in result.car_plan_analyses}
+
+
+def test_car_prepayment_strategy_respects_financing_contract_permission() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="sample member", monthly_salary_gross=80_000)],
+            cash_account_balance=900_000,
+            monthly_expense=12_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=300_000,
+                down_payment_ratio=0.2,
+                financing_options=[
+                    VehicleFinancingOptionData(
+                        id="no_prepay_offer",
+                        name="不可提前还本金融方案",
+                        financing_type="standard",
+                        total_months=60,
+                        later_annual_rate=0.08,
+                        prepayment_allowed=False,
+                        prepayment_allowed_after_month=12,
+                        prepayment_policy_note="合同约定不可提前还本。",
+                    )
+                ],
+                loan_prepayment_enabled=True,
+                loan_prepayment_monthly_amount=20_000,
+                loan_prepayment_lump_sum_month=12,
+                loan_prepayment_lump_sum_amount=100_000,
+            ),
+        ),
+        ScenarioData(annual_investment_return=0.01),
+        RulePackData(),
+    )
+
+    assert "accelerated_principal" not in {item.strategy_key for item in result.car_plan_analyses}
+
+
+def test_car_prepayment_strategy_can_choose_lump_sum_and_monthly_combo() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            members=[IncomeMember(name="sample member", monthly_salary_gross=80_000)],
+            cash_account_balance=900_000,
+            monthly_expense=12_000,
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=300_000,
+                down_payment_ratio=0.3,
+                later_annual_rate=0.08,
+                loan_prepayment_enabled=True,
+                loan_prepayment_monthly_amount=0,
+            ),
+        ),
+        ScenarioData(annual_investment_return=0.02),
+        RulePackData(),
+    )
+
+    plan = {item.strategy_key: item for item in result.car_plan_analyses}["accelerated_principal"]
+
+    assert plan.prepayment_enabled
+    assert plan.prepayment_strategy_type in {"lump_sum", "monthly", "hybrid"}
+    assert plan.prepayment_total_extra_principal > 0
+    assert plan.prepayment_net_benefit > 0
+    assert "自动策略" in plan.prepayment_explanation
+    assert plan.prepayment_lump_sum_amount > 0 or plan.prepayment_monthly_amount > 0
 
 
 def test_car_plan_generates_strategies_for_each_vehicle_source_candidate() -> None:
@@ -1828,11 +2112,86 @@ def test_car_plan_generates_strategies_for_each_vehicle_source_candidate() -> No
     assert len(strategies) == 12
     assert {item.vehicle_candidate_name for item in strategies} == {"compact ev", "large ev"}
     assert {item.vehicle_candidate_index for item in strategies} == {0, 1}
-    compact_target = next(item for item in strategies if item.vehicle_candidate_name == "compact ev" and item.strategy_key == "target")
-    large_target = next(item for item in strategies if item.vehicle_candidate_name == "large ev" and item.strategy_key == "target")
+    assert all(
+        len([item for item in strategies if item.vehicle_candidate_name == candidate]) <= 6
+        for candidate in {"compact ev", "large ev"}
+    )
+    assert all(
+        len([item for item in strategies if item.vehicle_candidate_name == candidate and item.strategy_key == "target"]) == 1
+        for candidate in {"compact ev", "large ev"}
+    )
+    compact_target = next(
+        item
+        for item in strategies
+        if item.vehicle_candidate_name == "compact ev"
+        and item.strategy_key == "target"
+    )
+    large_target = next(
+        item
+        for item in strategies
+        if item.vehicle_candidate_name == "large ev"
+        and item.strategy_key == "target"
+    )
     assert compact_target.total_price == 180_000
     assert large_target.total_price == 320_000
-    assert compact_target.variant == "compact ev | target"
+    assert compact_target.strategy_key == "target"
+    assert compact_target.variant.endswith("target")
+
+
+def test_car_plan_generates_strategies_for_each_vehicle_financing_option() -> None:
+    car_plan = CarPlanData(
+        enabled=True,
+        vehicle_plans=[
+            CarPlanData(
+                enabled=True,
+                name="commuter car",
+                total_price=180_000,
+                candidate_vehicles=[
+                    CarPlanData(
+                        enabled=True,
+                        name="compact ev",
+                        total_price=180_000,
+                        down_payment_ratio=0.3,
+                        financing_options=[
+                            VehicleFinancingOptionData(
+                                id="dealer_subsidy",
+                                name="经销商贴息方案",
+                                financing_type="dealer_subsidy",
+                                total_months=60,
+                                interest_free_months=24,
+                                later_annual_rate=0.0199,
+                            ),
+                            VehicleFinancingOptionData(
+                                id="standard_loan",
+                                name="普通贷款方案",
+                                financing_type="standard",
+                                total_months=48,
+                                interest_free_months=0,
+                                later_annual_rate=0.039,
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = calculate_affordability(
+        HouseholdData(cash_account_balance=300_000, monthly_expense=12_000, car_plan=car_plan),
+        ScenarioData(),
+        RulePackData(),
+    )
+
+    strategies = result.car_plan_analyses
+    assert len(strategies) == 6
+    assert {item.financing_option_name for item in strategies} == {"经销商贴息方案", "普通贷款方案"}
+    assert sum(1 for item in strategies if item.strategy_key == "cash") == 1
+    assert sum(1 for item in strategies if item.strategy_key == "target") == 1
+    subsidized_target = next(item for item in strategies if item.financing_option_name == "经销商贴息方案" and item.strategy_key == "target")
+    assert subsidized_target.total_months == 60
+    assert subsidized_target.interest_free_months == 24
+    assert subsidized_target.later_annual_rate == 0.0199
+    assert any(item.financing_option_name == "普通贷款方案" for item in strategies)
 
 
 def test_vehicle_purchase_events_can_be_ordered_around_home_purchase() -> None:
@@ -1885,9 +2244,18 @@ def test_manual_car_target_strategy_reflects_user_inputs() -> None:
                 enabled=True,
                 total_price=420_000,
                 down_payment_ratio=0.35,
-                total_months=72,
-                interest_free_months=12,
-                later_annual_rate=0.026,
+                financing_options=[
+                    VehicleFinancingOptionData(
+                        id="manual_dealer_offer",
+                        name="手动经销商方案",
+                        financing_type="dealer_subsidy",
+                        total_months=72,
+                        interest_free_months=12,
+                        later_annual_rate=0.026,
+                        min_down_payment_ratio=0.10,
+                        max_down_payment_ratio=1.0,
+                    )
+                ],
             ),
         ),
         ScenarioData(),
@@ -2127,7 +2495,7 @@ def test_second_hand_brick_mixed_age_limits_provident_loan_years() -> None:
     plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
     expected_25_year_payment = calculate_loan(
         plan.provident_loan_amount,
-        scenario.provident_rate,
+        plan.provident_rate,
         25,
         scenario.provident_repayment_method,
     ).first_month_payment
@@ -2149,6 +2517,69 @@ def test_second_hand_steel_concrete_age_allows_longer_provident_loan_years() -> 
     plan = result.purchase_plan_analyses[0]
     assert plan.provident_loan_years == 27
     assert "钢混结构" in "；".join(plan.provident_loan_year_limit_reasons)
+
+
+def test_provident_rate_comes_from_policy_pack_not_scenario() -> None:
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_first_home_rate_6_to_30_years": 0.0123,
+        }
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        property_type="新房",
+        loan_years=30,
+        provident_rate=0.19,
+    )
+    result = calculate_affordability(
+        HouseholdData(cash_account_balance=900_000, borrower_age=30, social_security_months=120),
+        scenario,
+        rules,
+    )
+
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    assert plan.provident_rate == pytest.approx(0.0123)
+    assert plan.provident_monthly_payment == pytest.approx(
+        calculate_loan(
+            plan.provident_loan_amount,
+            0.0123,
+            plan.provident_loan_years,
+            plan.provident_repayment_method,
+        ).first_month_payment,
+        abs=0.01,
+    )
+
+
+def test_deed_tax_rate_comes_from_policy_pack_by_home_count_and_area() -> None:
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "deed_tax_standard_area_sqm": 140,
+            "deed_tax_first_home_large_rate": 0.013,
+            "deed_tax_second_home_large_rate": 0.024,
+        }
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        area_sqm=160,
+        deed_tax_rate=0,
+    )
+    first_home = calculate_affordability(
+        HouseholdData(cash_account_balance=1_200_000, social_security_months=120),
+        scenario,
+        rules,
+    ).purchase_plan_analyses[0]
+    second_home = calculate_affordability(
+        HouseholdData(cash_account_balance=1_200_000, social_security_months=120, existing_home_count=1),
+        scenario,
+        rules,
+    ).purchase_plan_analyses[0]
+
+    assert first_home.deed_tax_rate == pytest.approx(0.013)
+    assert first_home.deed_tax_amount == pytest.approx(39_000)
+    assert second_home.deed_tax_rate == pytest.approx(0.024)
+    assert second_home.deed_tax_amount == pytest.approx(72_000)
 
 
 def test_renovated_old_community_uses_remaining_land_years_for_provident_term() -> None:
@@ -2877,7 +3308,13 @@ def test_auto_strategy_can_select_semiannual_loan_offset_for_material_principal_
         renovation_cost=0,
         moving_and_misc_cost=0,
     )
-    result = calculate_affordability(household, scenario, RulePackData())
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_municipal_monthly_repayment_withdrawal_supported": False,
+        }
+    )
+    result = calculate_affordability(household, scenario, rules)
     plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
     monthly_pf_deposit = sum(
         item.monthly_personal_housing_fund + item.monthly_employer_housing_fund
@@ -2935,7 +3372,7 @@ def test_semiannual_loan_offset_uses_available_balance_after_policy_threshold() 
     assert monthly_equivalent == pytest.approx(2_000 / 6)
 
 
-def test_provident_offset_only_relieves_provident_loan_cash_payment() -> None:
+def test_semiannual_provident_offset_does_not_replace_monthly_card_payment() -> None:
     rules = RulePackData(
         params={
             **RulePackData().params,
@@ -2985,13 +3422,13 @@ def test_provident_offset_only_relieves_provident_loan_cash_payment() -> None:
     assert plan.provident_loan_amount > 0
     assert offset_row.loan_offset_payment >= plan.provident_monthly_payment
     assert loan_row.provident_offset_payment == pytest.approx(offset_row.loan_offset_payment)
-    assert loan_row.provident_monthly_payment_relief == pytest.approx(
-        min(offset_row.loan_offset_payment, loan_row.provident_monthly_payment)
-    )
-    assert loan_row.cash_monthly_payment >= loan_row.commercial_monthly_payment
-    assert cashflow_row.house_payment == pytest.approx(loan_row.commercial_monthly_payment)
+    assert loan_row.provident_principal_offset_payment == pytest.approx(offset_row.loan_offset_payment)
+    assert loan_row.provident_monthly_withdrawal_payment == 0
+    assert loan_row.provident_monthly_payment_relief == 0
+    assert loan_row.cash_monthly_payment == pytest.approx(loan_row.total_monthly_payment)
+    assert cashflow_row.house_payment == pytest.approx(loan_row.home_monthly_payment)
     assert cashflow_row.provident_house_offset_payment == pytest.approx(offset_row.loan_offset_payment)
-    assert cashflow_row.provident_house_payment_relief == pytest.approx(loan_row.provident_monthly_payment_relief)
+    assert cashflow_row.provident_house_payment_relief == 0
 
 
 def test_purchase_agreed_cashflow_requires_explicit_policy_switch() -> None:
@@ -3064,7 +3501,8 @@ def test_loan_offset_cash_relief_uses_semiannual_payment_cap() -> None:
             **RulePackData().params,
             "provident_post_purchase_cashflow_enabled": True,
             "provident_monthly_withdrawal_after_purchase_enabled": True,
-            "provident_post_purchase_withdrawal_mode": "loan_offset",
+            "provident_post_purchase_strategy_mode": "manual",
+            "provident_post_purchase_withdrawal_mode": "semiannual_principal_offset",
         }
     )
     result = calculate_affordability(household, scenario, rules)
@@ -3072,7 +3510,173 @@ def test_loan_offset_cash_relief_uses_semiannual_payment_cap() -> None:
 
     assert plan.monthly_post_purchase_pf_withdrawal == pytest.approx(round(plan.provident_monthly_payment / 6, 2))
     assert plan.monthly_post_purchase_pf_withdrawal < plan.provident_monthly_payment
-    assert "公积金贷款冲还贷" in "；".join(plan.provident_extraction_notes)
+    assert "半年度冲本金" in "；".join(plan.provident_extraction_notes)
+
+
+def test_monthly_repayment_withdrawal_offsets_provident_payment_every_month() -> None:
+    household = HouseholdData(
+        cash_account_balance=2_500_000,
+        investments=0,
+        provident_fund_balance=0,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        social_security_months=180,
+        members=[
+            IncomeMember(name="样例成员A", monthly_salary_gross=80_000, annual_bonus=0),
+            IncomeMember(name="样例成员B", monthly_salary_gross=80_000, annual_bonus=0),
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        provident_account_repayment_strategy="monthly_repayment_withdrawal",
+    )
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    first_after_purchase = (plan.months_to_buy or 0) + 1
+    provident_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month == first_after_purchase
+    )
+    loan_row = next(
+        row
+        for row in result.loan_visualization
+        if row.plan_variant == plan.variant and row.month == first_after_purchase
+    )
+
+    assert plan.post_purchase_pf_strategy == "monthly_repayment_withdrawal"
+    assert provident_row.monthly_repayment_withdrawal == pytest.approx(
+        min(plan.provident_monthly_payment, provident_row.total_deposit)
+    )
+    assert provident_row.loan_offset_payment == 0
+    assert loan_row.provident_monthly_withdrawal_payment == pytest.approx(provident_row.monthly_repayment_withdrawal)
+    assert loan_row.provident_principal_offset_payment == 0
+    assert loan_row.provident_monthly_payment_relief == pytest.approx(provident_row.monthly_repayment_withdrawal)
+    assert loan_row.provident_loan_balance > 0
+
+
+def test_national_provident_member_uses_monthly_repayment_default_strategy() -> None:
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_municipal_monthly_repayment_withdrawal_supported": False,
+            "provident_municipal_semiannual_principal_offset_supported": True,
+            "provident_national_monthly_direct_offset_supported": True,
+        }
+    )
+    household = HouseholdData(
+        cash_account_balance=2_500_000,
+        investments=0,
+        monthly_expense=8_000,
+        social_security_months=180,
+        borrower_member_index=0,
+        members=[
+            IncomeMember(
+                name="国管成员",
+                provident_account_management_center="national",
+                monthly_salary_gross=80_000,
+                annual_bonus=0,
+            )
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        provident_account_repayment_strategy="auto",
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    first_after_purchase = (plan.months_to_buy or 0) + 1
+    provident_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month == first_after_purchase
+    )
+
+    assert plan.post_purchase_pf_strategy == "monthly_repayment_withdrawal_auto"
+    assert provident_row.monthly_repayment_withdrawal > 0
+    assert provident_row.loan_offset_payment == 0
+
+
+def test_auto_provident_strategy_can_switch_from_monthly_withdrawal_to_semiannual_offset() -> None:
+    household = HouseholdData(
+        cash_account_balance=900_000,
+        monthly_expense=18_000,
+        members=[
+            IncomeMember(
+                name="样例成员A",
+                provident_fund_balance=120_000,
+                income_stages=[
+                    IncomeStageData(
+                        name="当前收入",
+                        monthly_salary_gross=28_000,
+                        monthly_housing_fund=3_360,
+                        housing_fund_personal_rate=0.12,
+                        housing_fund_employer_rate=0.12,
+                    )
+                ],
+            )
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        provident_loan_amount=1_000_000,
+        commercial_loan_amount=500_000,
+        loan_years=25,
+        provident_account_repayment_strategy="auto",
+    )
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_municipal_monthly_repayment_withdrawal_supported": True,
+            "provident_municipal_semiannual_principal_offset_supported": True,
+            "provident_post_purchase_strategy_mode": "auto",
+            "provident_loan_offset_retained_balance": 10,
+        }
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    plan = next(
+        item
+        for item in result.purchase_plan_analyses
+        if item.months_to_buy is not None and item.post_purchase_pf_strategy.startswith("monthly_then_semiannual_offset_auto")
+    )
+    purchase_month = plan.months_to_buy or 0
+    first_month = purchase_month + 1
+    monthly_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month == first_month
+    )
+    later_offset_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month > purchase_month + 12 and row.loan_offset_payment > plan.provident_monthly_payment
+    )
+    switch_event = next(
+        event
+        for event in result.plan_events
+        if event.plan_variant == plan.variant and event.category == "provident" and "切换" in event.title
+    )
+
+    assert plan.post_purchase_pf_strategy_label.startswith("自动先按月提取")
+    assert monthly_row.monthly_repayment_withdrawal == pytest.approx(
+        min(plan.provident_monthly_payment, monthly_row.total_deposit)
+    )
+    assert monthly_row.loan_offset_payment == 0
+    assert later_offset_row.loan_offset_payment > plan.provident_monthly_payment
+    assert later_offset_row.monthly_repayment_withdrawal == 0
+    assert switch_event.month == purchase_month + 13
+    assert "两种模式互斥" in switch_event.detail
+    assert any("阶段切换" in note and "两种模式互斥" in note for note in plan.provident_extraction_notes)
 
 
 def test_beijing_loan_offset_is_semiannual_not_monthly() -> None:
@@ -3429,14 +4033,13 @@ def test_cashflow_and_loan_visualization_apply_provident_offset_before_cash_paym
     )
 
     assert loan_point.provident_offset_payment == pytest.approx(offset_point.loan_offset_payment)
-    cash_relief = min(offset_point.loan_offset_payment, loan_point.provident_monthly_payment)
-    assert loan_point.provident_monthly_payment_relief == pytest.approx(cash_relief)
-    assert loan_point.cash_monthly_payment == pytest.approx(loan_point.total_monthly_payment - cash_relief)
+    assert loan_point.provident_principal_offset_payment == pytest.approx(offset_point.loan_offset_payment)
+    assert loan_point.provident_monthly_withdrawal_payment == 0
+    assert loan_point.provident_monthly_payment_relief == 0
+    assert loan_point.cash_monthly_payment == pytest.approx(loan_point.total_monthly_payment)
     assert cashflow_point.provident_house_offset_payment == pytest.approx(offset_point.loan_offset_payment)
-    assert cashflow_point.provident_house_payment_relief == pytest.approx(cash_relief)
-    assert cashflow_point.house_payment == pytest.approx(
-        max(0, cashflow_point.house_contract_payment - cash_relief)
-    )
+    assert cashflow_point.provident_house_payment_relief == 0
+    assert cashflow_point.house_payment == pytest.approx(cashflow_point.house_contract_payment)
 
 
 def test_purchase_plan_explains_repayment_method_interest_tradeoff() -> None:
@@ -3560,6 +4163,7 @@ def test_household_numeric_fields_reject_invalid_values(field: str, value: float
         (CareerShockMemberSetting, {"layoff_age": 17}),
         (CarPlanData, {"total_months": 0}),
         (CarPlanData, {"later_annual_rate": 0.51}),
+        (VehicleFinancingOptionData, {"min_down_payment_ratio": 0.8, "max_down_payment_ratio": 0.2}),
         (PhasedLoanData, {"remaining_months": 0}),
         (PhasedLoanData, {"annual_rate": 0.21}),
         (ScheduledExpenseData, {"monthly_amount": -1}),

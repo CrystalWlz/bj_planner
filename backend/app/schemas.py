@@ -16,8 +16,17 @@ BuildingStructure = Literal["unknown", "brick_mixed", "steel_concrete"]
 RenovationFundingMode = Literal["after_purchase_saving", "upfront_cash"]
 InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
+ProvidentAccountManagementCenter = Literal["beijing_municipal", "national"]
 CommercialPrepaymentMode = Literal["auto", "manual", "none"]
+ProvidentAccountRepaymentStrategy = Literal[
+    "auto",
+    "monthly_repayment_withdrawal",
+    "semiannual_principal_offset",
+    "keep_in_account",
+]
 ExistingLoanPrepaymentMode = Literal["none", "manual", "auto"]
+PlanningGoalType = Literal["home", "vehicle", "renovation", "other"]
+PlanningTimingMode = Literal["auto_sequence", "parallel", "manual_month", "after_goal", "not_planned"]
 
 
 class IncomeMember(BaseModel):
@@ -25,6 +34,7 @@ class IncomeMember(BaseModel):
     birth_month: str = ""
     current_age: int = Field(30, ge=0, le=120)
     retirement_category: RetirementCategory = "male_60"
+    provident_account_management_center: ProvidentAccountManagementCenter = "beijing_municipal"
     provident_fund_balance: float = Field(0, ge=0)
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
@@ -95,6 +105,7 @@ class CareerShockMemberSetting(BaseModel):
     enabled: bool = False
     layoff_age: int = Field(35, ge=18, le=80)
     retirement_age: int = Field(63, ge=50, le=70)
+    freelance_income_monthly: float = Field(0, ge=0)
     pension_monthly: float = Field(0, ge=0)
     auto_pension_monthly: bool = True
     birth_month: str = ""
@@ -107,17 +118,47 @@ class CareerShockData(BaseModel):
     auto_unemployment_benefit: bool = True
     auto_self_social_insurance: bool = True
     auto_flexible_housing_fund: bool = True
-    auto_pension_income: bool = True
     unemployment_benefit_months: int = Field(24, ge=0, le=24)
     unemployment_benefit_monthly: float = Field(0, ge=0)
     self_social_insurance_monthly: float = Field(0, ge=0)
     self_housing_fund_monthly: float = Field(0, ge=0)
+
+
+class VehicleFinancingOptionData(BaseModel):
+    id: str = "three_year_two_year_subsidy"
+    name: str = "三年前两年贴息"
+    enabled: bool = True
+    financing_type: Literal["dealer_subsidy", "standard", "bank_loan", "cash_only"] = "dealer_subsidy"
+    total_months: int = Field(36, ge=1, le=120)
+    interest_free_months: int = Field(24, ge=0, le=120)
+    later_annual_rate: float = Field(0.0199, ge=0, le=0.5)
+    min_down_payment_ratio: float = Field(0.30, ge=0, le=1)
+    max_down_payment_ratio: float = Field(1.0, ge=0, le=1)
+    prepayment_allowed: bool = True
+    prepayment_allowed_after_month: int = Field(12, ge=1, le=120)
+    prepayment_policy_note: str = "以合同为准；常见车贷需要满一定期数后才允许提前还本。"
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def validate_down_payment_bounds(self) -> "VehicleFinancingOptionData":
+        if self.max_down_payment_ratio < self.min_down_payment_ratio:
+            raise ValueError("max_down_payment_ratio must be greater than or equal to min_down_payment_ratio")
+        return self
+
 
 class VehiclePlanData(BaseModel):
     enabled: bool = False
     name: str = "车辆计划"
     selected_strategy_variant: str = "手动设置"
     candidate_vehicles: list["VehiclePlanData"] = Field(default_factory=list)
+    financing_options: list[VehicleFinancingOptionData] = Field(default_factory=list)
+    selected_financing_option_id: str = ""
+    selected_financing_option_name: str = ""
+    selected_financing_type: str = ""
+    selected_financing_min_down_payment_ratio: float = Field(0.0, ge=0, le=1)
+    selected_financing_max_down_payment_ratio: float = Field(1.0, ge=0, le=1)
+    selected_financing_prepayment_allowed: bool = True
+    selected_financing_prepayment_policy_note: str = ""
     planning_sequence: int = Field(1, ge=1, le=50)
     purchase_timing_mode: Literal["auto_sequence", "parallel", "manual_month"] = "auto_sequence"
     after_previous_event_delay_months: int = Field(0, ge=0, le=240)
@@ -133,6 +174,9 @@ class VehiclePlanData(BaseModel):
     loan_prepayment_start_month: int = Field(1, ge=1, le=120)
     loan_prepayment_allowed_after_month: int = Field(12, ge=1, le=120)
     loan_prepayment_monthly_amount: float = Field(0, ge=0)
+    loan_prepayment_strategy_type: str = "none"
+    loan_prepayment_lump_sum_month: int = Field(0, ge=0, le=120)
+    loan_prepayment_lump_sum_amount: float = Field(0, ge=0)
     current_month_index: int = Field(1, ge=1, le=120)
     saving_start_date: str = "2026-07-01"
     monthly_operating_cost: float = Field(0, ge=0)
@@ -167,6 +211,40 @@ class PropertyPurchaseGoalData(BaseModel):
     after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
     earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
     notes: str = ""
+
+
+class PlanningGoalData(BaseModel):
+    schema_version: int = Field(27, ge=1)
+    goal_type: PlanningGoalType = "home"
+    name: str = "规划目标"
+    enabled: bool = True
+    priority: int = Field(1, ge=1, le=100)
+    timing_mode: PlanningTimingMode = "auto_sequence"
+    earliest_purchase_month: str = ""
+    earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
+    depends_on_goal_id: str = ""
+    delay_after_dependency_months: int = Field(0, ge=0, le=240)
+    allow_parallel: bool = False
+    selected_strategy_id: str = ""
+    target_params: dict[str, Any] = Field(default_factory=dict)
+    financing_preferences: dict[str, Any] = Field(default_factory=dict)
+    holding_cost_params: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    notes: str = ""
+
+
+class PlanningGoalRecord(BaseModel):
+    id: str
+    household_id: str | None = None
+    goal_type: PlanningGoalType
+    data: PlanningGoalData
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlanningGoalCreate(BaseModel):
+    household_id: str | None = None
+    data: PlanningGoalData
 
 
 class PhasedLoanData(BaseModel):
@@ -231,7 +309,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(23, ge=1)
+    schema_version: int = Field(27, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -294,7 +372,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(23, ge=1)
+    schema_version: int = Field(27, ge=1)
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
@@ -328,6 +406,7 @@ class ScenarioData(BaseModel):
     commercial_prepayment_start_month: int = Field(1, ge=1, le=360)
     commercial_prepayment_allowed_after_month: int = Field(12, ge=1, le=360)
     commercial_prepayment_monthly_amount: float = Field(0, ge=0)
+    provident_account_repayment_strategy: ProvidentAccountRepaymentStrategy = "auto"
     deed_tax_rate: float = Field(0.015, ge=0, le=0.2)
     broker_fee_rate: float = Field(0.022, ge=0, le=0.2)
     renovation_cost: float = Field(250000, ge=0)
@@ -374,7 +453,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(23, ge=1)
+    schema_version: int = Field(27, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -420,7 +499,12 @@ class RulePackData(BaseModel):
             "provident_monthly_withdrawal_after_purchase_enabled": False,
             "provident_post_purchase_cashflow_enabled": False,
             "provident_post_purchase_strategy_mode": "auto",
-            "provident_post_purchase_withdrawal_mode": "purchase_agreed",
+            "provident_post_purchase_withdrawal_mode": "monthly_repayment_withdrawal",
+            "provident_account_management_center": "beijing_municipal",
+            "provident_municipal_monthly_repayment_withdrawal_supported": True,
+            "provident_municipal_semiannual_principal_offset_supported": True,
+            "provident_national_monthly_direct_offset_supported": True,
+            "provident_national_deduction_order": "borrower_spouse_bank_card",
             "provident_balance_annual_interest_rate": 0.015,
             "micro_commercial_loan_ratio": 0.05,
             "micro_commercial_loan_ratio_min": 0.02,
@@ -429,6 +513,11 @@ class RulePackData(BaseModel):
             "caution_dti": 0.40,
             "danger_dti": 0.50,
             "default_deed_tax_rate": 0.015,
+            "deed_tax_standard_area_sqm": 140,
+            "deed_tax_first_home_standard_rate": 0.01,
+            "deed_tax_first_home_large_rate": 0.015,
+            "deed_tax_second_home_standard_rate": 0.01,
+            "deed_tax_second_home_large_rate": 0.02,
             "default_broker_fee_rate": 0.022,
             "rate_stress_add": 0.005,
             "income_stress_factor": 0.90,
@@ -518,7 +607,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(23, ge=1)
+    schema_version: int = Field(27, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -577,11 +666,22 @@ class CarLoanSummary(BaseModel):
     years_to_down_payment: float | None
     first_phase_monthly_payment: float
     later_phase_monthly_payment: float
+    contract_monthly_payment: float = 0.0
+    first_phase_interest_subsidy: float = 0.0
+    total_interest_subsidy: float = 0.0
+    borrower_total_interest: float = 0.0
     current_monthly_payment: float
+    prepayment_allowed: bool = True
     prepayment_enabled: bool = False
     prepayment_start_month: int = 1
     prepayment_allowed_after_month: int = 12
     prepayment_monthly_amount: float = 0.0
+    prepayment_strategy_type: str = "none"
+    prepayment_lump_sum_month: int = 0
+    prepayment_lump_sum_amount: float = 0.0
+    prepayment_total_extra_principal: float = 0.0
+    prepayment_net_benefit: float = 0.0
+    prepayment_explanation: str = ""
     actual_payoff_months: int = 0
     interest_saved_by_prepayment: float = 0.0
     total_interest: float
@@ -604,6 +704,9 @@ class CarPlanAnalysis(BaseModel):
     vehicle_name: str = "车辆计划"
     vehicle_candidate_index: int | None = None
     vehicle_candidate_name: str = ""
+    financing_option_id: str = ""
+    financing_option_name: str = ""
+    financing_type: str = ""
     strategy_key: str = ""
     purchase_delay_months: int
     months_to_buy: int | None
@@ -617,11 +720,22 @@ class CarPlanAnalysis(BaseModel):
     later_annual_rate: float
     first_phase_monthly_payment: float
     later_phase_monthly_payment: float
+    contract_monthly_payment: float = 0.0
+    first_phase_interest_subsidy: float = 0.0
+    total_interest_subsidy: float = 0.0
+    borrower_total_interest: float = 0.0
     expected_monthly_payment_after_purchase: float
+    prepayment_allowed: bool = True
     prepayment_enabled: bool = False
     prepayment_start_month: int = 1
     prepayment_allowed_after_month: int = 12
     prepayment_monthly_amount: float = 0.0
+    prepayment_strategy_type: str = "none"
+    prepayment_lump_sum_month: int = 0
+    prepayment_lump_sum_amount: float = 0.0
+    prepayment_total_extra_principal: float = 0.0
+    prepayment_net_benefit: float = 0.0
+    prepayment_explanation: str = ""
     actual_payoff_months: int = 0
     interest_saved_by_prepayment: float = 0.0
     total_interest: float
@@ -670,6 +784,12 @@ class PurchasePlanAnalysis(BaseModel):
     provident_loan_amount: float
     provident_policy_bonus: float
     provident_policy_cap: float
+    commercial_rate: float = 0.0
+    provident_rate: float = 0.0
+    deed_tax_rate: float = 0.0
+    broker_fee_rate: float = 0.0
+    deed_tax_amount: float = 0.0
+    broker_fee_amount: float = 0.0
     commercial_loan_years: int
     provident_loan_years: int
     provident_loan_year_limit_reasons: list[str]
@@ -754,6 +874,8 @@ class LoanVisualizationPoint(BaseModel):
     total_monthly_payment: float
     cash_monthly_payment: float
     provident_offset_payment: float = 0.0
+    provident_monthly_withdrawal_payment: float = 0.0
+    provident_principal_offset_payment: float = 0.0
     provident_monthly_payment_relief: float = 0.0
 
 
@@ -769,6 +891,7 @@ class ProvidentMemberAccountPoint(BaseModel):
     upfront_withdrawal: float
     post_transaction_withdrawal: float
     agreed_withdrawal: float
+    monthly_repayment_withdrawal: float = 0.0
     loan_offset_payment: float
     retirement_withdrawal: float = 0.0
     account_closed_by_retirement: bool = False
@@ -789,6 +912,7 @@ class ProvidentVisualizationPoint(BaseModel):
     upfront_withdrawal: float
     post_transaction_withdrawal: float
     agreed_withdrawal: float
+    monthly_repayment_withdrawal: float = 0.0
     loan_offset_payment: float
     retirement_withdrawal: float = 0.0
     total_inflow: float
@@ -1109,6 +1233,8 @@ class AnnualFinancialSummary(BaseModel):
     commercial_extra_principal_payment: float = 0.0
     vehicle_extra_principal_payment: float = 0.0
     provident_offset_payment: float = 0.0
+    provident_monthly_withdrawal_payment: float = 0.0
+    provident_principal_offset_payment: float = 0.0
     cash_monthly_payment: float = 0.0
     commercial_loan_balance_end: float = 0.0
     provident_loan_balance_end: float = 0.0
