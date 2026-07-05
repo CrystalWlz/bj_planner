@@ -10,15 +10,21 @@ from typing import Callable, Literal
 from .policies import get_policy
 from .schemas import (
     AccountSnapshotPoint,
+    AnnualFinancialSummary,
     AffordabilityResult,
     BonusTaxMethod,
     CarLoanSummary,
     CarPlanAnalysis,
     CarPlanData,
+    CareerShockProjection,
+    CareerShockMemberProjection,
     ElderlyDependentData,
     HouseholdData,
     IncomeMember,
     IncomeStageData,
+    InvestmentAllocationSummary,
+    InvestmentPlanRecommendation,
+    ExistingLoanVisualizationDetail,
     LoanSummary,
     LoanVisualizationPoint,
     AccountConceptSummary,
@@ -719,7 +725,7 @@ def _member_retirement_months_by_index(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = setting.retirement_age if setting else _policy_retirement_age_for_member(member, index)
+        retirement_age = _policy_retirement_age_for_member(member, index)
         retirement_start = _month_start_for_birth_month_or_age(
             current_month,
             effective_birth_month,
@@ -898,7 +904,7 @@ def _household_with_career_income_stages(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = setting.retirement_age if setting else _policy_retirement_age_for_member(member, index)
+        retirement_age = _policy_retirement_age_for_member(member, index)
         retirement_start = _month_start_for_birth_month_or_age(
             current,
             effective_birth_month,
@@ -1013,6 +1019,114 @@ def _household_with_career_income_stages(
         updated_members.append(member.model_copy(update={"income_stages": stages}))
 
     return household.model_copy(update={"members": updated_members, "career_shock_applied": True})
+
+
+def _format_month(value: date | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value.year:04d}-{value.month:02d}"
+
+
+def build_career_shock_projection(
+    household: HouseholdData,
+    rules: RulePackData,
+    *,
+    as_of: date | None = None,
+) -> CareerShockProjection:
+    current = as_of or date.today()
+    current_month = date(current.year, current.month, 1)
+    shock = household.career_shock
+    effective_household = _household_with_career_income_stages(household, rules, as_of=current_month)
+    unemployment_months = _career_shock_unemployment_months(household, shock)
+    first_unemployment = (
+        _unemployment_benefit_monthly_from_service(household.social_security_months, rules)
+        if shock.auto_unemployment_benefit
+        else max(0.0, shock.unemployment_benefit_monthly)
+    )
+    later_unemployment = float(rules.params.get("beijing_unemployment_benefit_after_12_months", 2129))
+    self_social = _career_shock_self_social_monthly(shock, rules)
+    flexible_housing = _career_shock_flexible_housing_fund_monthly(shock, rules)
+    settings_by_member = _career_shock_settings_by_member(household)
+    member_projections: list[CareerShockMemberProjection] = []
+    synthetic_prefix = "自动情景："
+
+    for index, member in enumerate(household.members):
+        setting = settings_by_member.get(member.name)
+        effective_member = effective_household.members[index] if index < len(effective_household.members) else member
+        generated_stages = [
+            stage
+            for stage in (effective_member.income_stages or [])
+            if stage.name.startswith(synthetic_prefix)
+        ]
+        effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
+        effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
+        retirement_age = _policy_retirement_age_for_member(member, index)
+        retirement_start = _month_start_for_birth_month_or_age(
+            current_month,
+            effective_birth_month,
+            effective_current_age,
+            retirement_age,
+        )
+        layoff_age = setting.layoff_age if setting else 35
+        layoff_start = (
+            _month_start_for_birth_month_or_age(
+                current_month,
+                effective_birth_month,
+                effective_current_age,
+                layoff_age,
+            )
+            if setting
+            else None
+        )
+        pension_monthly = (
+            _estimate_auto_pension_monthly(member, setting, rules, retirement_start, current_month)
+            if setting
+            else 0.0
+        )
+        notes = [
+            "收入阶段由后端按职业冲击规则生成，前端只展示生成结果。",
+            f"退休年龄按成员退休身份和规则包取 {retirement_age} 岁。",
+        ]
+        if setting and setting.enabled:
+            notes.append(
+                f"裁员后最多 {unemployment_months} 个月按失业金阶段测算，之后进入灵活就业自缴阶段直到退休。"
+            )
+        else:
+            notes.append("该成员未启用职业冲击，只生成退休养老金阶段。")
+
+        member_projections.append(
+            CareerShockMemberProjection(
+                member_name=member.name,
+                enabled=bool(setting.enabled) if setting else False,
+                layoff_age=layoff_age,
+                retirement_age=retirement_age,
+                layoff_month=_format_month(layoff_start),
+                retirement_month=_format_month(retirement_start),
+                unemployment_benefit_months=unemployment_months if setting and setting.enabled else 0,
+                unemployment_benefit_monthly=round(first_unemployment, 2) if setting and setting.enabled else 0.0,
+                later_unemployment_benefit_monthly=round(later_unemployment, 2) if setting and setting.enabled else 0.0,
+                self_social_insurance_monthly=round(self_social, 2) if setting and setting.enabled else 0.0,
+                flexible_housing_fund_monthly=round(flexible_housing, 2) if setting and setting.enabled else 0.0,
+                pension_monthly=round(pension_monthly, 2),
+                generated_stages=generated_stages,
+                notes=notes,
+            )
+        )
+
+    return CareerShockProjection(
+        enabled=bool(shock.enabled),
+        unemployment_benefit_months=unemployment_months,
+        unemployment_benefit_monthly=round(first_unemployment, 2),
+        later_unemployment_benefit_monthly=round(later_unemployment, 2),
+        self_social_insurance_monthly=round(self_social, 2),
+        flexible_housing_fund_monthly=round(flexible_housing, 2),
+        effective_members=effective_household.members,
+        member_projections=member_projections,
+        notes=[
+            "职业冲击、失业金、自缴社保、自缴公积金和养老金估算均由后端计算。",
+            "前端手动参数只改变输入配置，保存后由后端重新生成收入阶段和现金流。",
+        ],
+    )
 
 def _parse_year_month(value: str | None) -> tuple[int, int] | None:
     if not value:
@@ -1860,6 +1974,52 @@ def _phased_loan_state_at(
     return balance, payment
 
 
+def _phased_loan_phase_at(
+    loan: PhasedLoanData,
+    months_from_now: int,
+    *,
+    as_of: date | None = None,
+) -> str:
+    current = as_of or date.today()
+    target_month = _month_after(current, max(0, months_from_now))
+    start_month = _parse_month(loan.interest_start_month)
+    interest_only_until = _parse_month(loan.interest_only_until)
+    if start_month is None or interest_only_until is None or loan.principal <= 0:
+        return "配置待校验"
+    if _month_distance(target_month, start_month) > 0:
+        return "未开始计息"
+    if _month_distance(target_month, interest_only_until) >= 0:
+        return "只还利息"
+    balance, payment = _phased_loan_state_at(loan, months_from_now, as_of=as_of)
+    if balance <= 0 and payment <= 0:
+        return "已结清"
+    return "等额本金" if loan.repayment_method == "equal_principal" else "等额本息"
+
+
+def _existing_loan_details_at(
+    loans: list[PhasedLoanData],
+    months_from_now: int,
+    *,
+    as_of: date | None = None,
+) -> list[ExistingLoanVisualizationDetail]:
+    details: list[ExistingLoanVisualizationDetail] = []
+    for index, loan in enumerate(loans, start=1):
+        balance, payment = _phased_loan_state_at(loan, months_from_now, as_of=as_of)
+        if balance <= 0 and payment <= 0:
+            continue
+        details.append(
+            ExistingLoanVisualizationDetail(
+                name=loan.name or f"已有贷款 {index}",
+                borrower=loan.borrower,
+                loan_type=loan.loan_type or "other",
+                phase=_phased_loan_phase_at(loan, months_from_now, as_of=as_of),
+                balance=round(balance, 2),
+                monthly_payment=round(payment, 2),
+            )
+        )
+    return details
+
+
 def calculate_car_loan(
     plan: CarPlanData,
     *,
@@ -2522,6 +2682,84 @@ def _choose_auto_vehicle_prepayment(
 
     if best is None:
         return False, allowed_after, allowed_after, 0.0
+    _, enabled, start_month, allowed_after, amount = best
+    return enabled, start_month, allowed_after, amount
+
+
+def _commercial_prepayment_mode(scenario: ScenarioData) -> str:
+    mode = getattr(scenario, "commercial_prepayment_mode", "auto") or "auto"
+    if mode in {"auto", "manual", "none"}:
+        return mode
+    return "manual" if scenario.commercial_prepayment_enabled else "auto"
+
+
+def _choose_auto_commercial_prepayment(
+    scenario: ScenarioData,
+    *,
+    commercial_loan: float,
+    regular_payment: LoanSummary,
+    post_purchase_cash_flow_with_pf: float,
+    post_purchase_monthly_expense: float,
+    required_liquidity_reserve: float,
+    cash_after_purchase: float,
+    minimum_cash_balance: float,
+) -> tuple[bool, int, int, float]:
+    total_months = max(1, scenario.loan_years * 12)
+    allowed_after = max(1, min(total_months, scenario.commercial_prepayment_allowed_after_month))
+    preferred_start = max(allowed_after, min(total_months, scenario.commercial_prepayment_start_month))
+    if commercial_loan <= 0 or regular_payment.total_interest <= 0:
+        return False, preferred_start, allowed_after, 0.0
+    if cash_after_purchase < required_liquidity_reserve or minimum_cash_balance < required_liquidity_reserve * 0.35:
+        return False, preferred_start, allowed_after, 0.0
+
+    cashflow_buffer = max(1000.0, post_purchase_monthly_expense * 0.12)
+    monthly_room = max(0.0, post_purchase_cash_flow_with_pf - cashflow_buffer)
+    if monthly_room < 1000:
+        return False, preferred_start, allowed_after, 0.0
+
+    manual_cap = max(0.0, scenario.commercial_prepayment_monthly_amount)
+    default_cap = min(20000.0, max(1000.0, commercial_loan * 0.012))
+    strategy_cap = min(monthly_room * 0.70, manual_cap if manual_cap > 0 else default_cap)
+    amount_candidates = {0.0}
+    if strategy_cap >= 1000:
+        for ratio in (0.25, 0.5, 0.75, 1.0):
+            amount = _round_down_to_step(strategy_cap * ratio, 1000)
+            if amount >= 1000:
+                amount_candidates.add(amount)
+
+    start_candidates = sorted({
+        preferred_start,
+        max(allowed_after, min(total_months, 12)),
+        max(allowed_after, min(total_months, 24)),
+    })
+    best: tuple[float, bool, int, int, float] | None = None
+    for amount in sorted(amount_candidates):
+        starts = start_candidates if amount > 0 else [preferred_start]
+        for start_month in starts:
+            projection = _loan_projection_with_prepayment(
+                commercial_loan,
+                scenario.commercial_rate,
+                total_months,
+                _commercial_repayment_method(scenario),
+                prepayment_monthly_amount=amount,
+                prepayment_start_month=start_month,
+            )
+            monthly_after_extra = post_purchase_cash_flow_with_pf - amount
+            interest_score = _clamp_score(projection.interest_saved_by_prepayment / max(regular_payment.total_interest, 1.0) * 10)
+            payoff_score = _clamp_score((total_months - projection.actual_payoff_months) / max(total_months, 1) * 10)
+            cashflow_score = _cash_flow_score(monthly_after_extra, post_purchase_monthly_expense)
+            liquidity_score = _ratio_score(min(cash_after_purchase, minimum_cash_balance), required_liquidity_reserve)
+            score = cashflow_score * 0.34 + liquidity_score * 0.20 + interest_score * 0.28 + payoff_score * 0.18
+            if monthly_after_extra < cashflow_buffer:
+                score -= 2.5
+            if amount > 0 and scenario.commercial_rate <= max(0.0, scenario.annual_investment_return) + 0.004:
+                score -= 1.2
+            candidate = (score, amount > 0, start_month, allowed_after, amount)
+            if best is None or candidate > best:
+                best = candidate
+
+    if best is None:
+        return False, preferred_start, allowed_after, 0.0
     _, enabled, start_month, allowed_after, amount = best
     return enabled, start_month, allowed_after, amount
 
@@ -3208,6 +3446,8 @@ def _post_purchase_cash_stress(
     income_at_month: Callable[[int], MonthlyIncomeProfile],
     car_monthly_cash_cost_at: Callable[[int], float],
     car_down_payment_at: Callable[[int], float] | None = None,
+    extra_monthly_payment: float = 0.0,
+    extra_payment_start_month: int = 1,
     horizon_months: int = 120,
 ) -> tuple[float, int | None, bool]:
     cash_balance = starting_cash
@@ -3216,8 +3456,11 @@ def _post_purchase_cash_stress(
     minimum_month: int | None = purchase_month
     pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
     pf_monthly_rate = max(0.0, pf_interest_rate) / 12
+    extra_monthly_payment = max(0.0, extra_monthly_payment)
+    extra_payment_start_month = max(1, extra_payment_start_month)
 
     for absolute_month in range(purchase_month + 1, purchase_month + horizon_months + 1):
+        repayment_month = max(1, absolute_month - purchase_month)
         income = income_at_month(absolute_month)
         pf_balance += pf_balance * pf_monthly_rate + income.monthly_pf_deposit
         free_cash_flow = (
@@ -3249,6 +3492,8 @@ def _post_purchase_cash_stress(
             pf_withdrawal = min(pf_balance, monthly_pf_withdrawal)
         pf_balance -= pf_withdrawal
         monthly_cash_delta = free_cash_flow + min(pf_withdrawal, provident_monthly_payment)
+        if extra_monthly_payment > 0 and repayment_month >= extra_payment_start_month:
+            monthly_cash_delta -= extra_monthly_payment
         monthly_cash_delta -= (
             car_down_payment_at(absolute_month)
             if car_down_payment_at is not None
@@ -3426,6 +3671,8 @@ def build_purchase_plan_analyses(
         ("较多商贷", "按北京最低首付测算，剩余贷款优先公积金后商贷。", 0.0, True, False, False),
     ]
 
+    scenario_commercial_prepayment_mode = _commercial_prepayment_mode(scenario)
+
     analyses: list[PurchasePlanAnalysis] = []
     for name, description, target_commercial, use_min_down, use_manual_mix, use_micro_strategy in variant_specs:
         provident_cap = 0.0
@@ -3534,11 +3781,18 @@ def build_purchase_plan_analyses(
                 provident_loan_years,
                 _provident_repayment_method(scenario),
             )
+            candidate_commercial_prepayment_allowed_after_month = max(
+                1,
+                min(scenario.loan_years * 12, scenario.commercial_prepayment_allowed_after_month),
+            )
+            candidate_commercial_prepayment_start_month = max(
+                candidate_commercial_prepayment_allowed_after_month,
+                max(1, min(scenario.loan_years * 12, scenario.commercial_prepayment_start_month)),
+            )
             candidate_commercial_prepayment = (
                 max(0.0, scenario.commercial_prepayment_monthly_amount)
-                if scenario.commercial_prepayment_enabled
+                if scenario_commercial_prepayment_mode == "manual"
                 and mix[4] > 0
-                and max(scenario.commercial_prepayment_start_month, scenario.commercial_prepayment_allowed_after_month) <= 1
                 else 0.0
             )
             return _post_purchase_cash_stress(
@@ -3548,14 +3802,15 @@ def build_purchase_plan_analyses(
                 starting_cash=candidate_cash_after_purchase,
                 starting_pf_balance=candidate_pf_after_extract,
                 total_monthly_payment=candidate_commercial_payment.first_month_payment
-                + candidate_provident_payment.first_month_payment
-                + candidate_commercial_prepayment,
+                + candidate_provident_payment.first_month_payment,
                 provident_monthly_payment=candidate_provident_payment.first_month_payment,
                 car_loan=car_loan,
                 expense_at_month=expense_at_month,
                 income_at_month=income_at_month,
                 car_monthly_cash_cost_at=car_monthly_cash_cost_at,
                 car_down_payment_at=car_down_payment_at,
+                extra_monthly_payment=candidate_commercial_prepayment,
+                extra_payment_start_month=candidate_commercial_prepayment_start_month,
             )
 
         best_failed_result: PurchaseCandidate | None = None
@@ -3755,15 +4010,16 @@ def build_purchase_plan_analyses(
             scenario.loan_years,
             _commercial_repayment_method(scenario),
         )
-        commercial_prepayment_monthly = (
-            max(0.0, scenario.commercial_prepayment_monthly_amount)
-            if scenario.commercial_prepayment_enabled and commercial_loan > 0
-            else 0.0
-        )
+        commercial_prepayment_mode = scenario_commercial_prepayment_mode
         commercial_prepayment_allowed_after_month = max(1, min(scenario.loan_years * 12, scenario.commercial_prepayment_allowed_after_month))
         commercial_prepayment_start_month = max(
             commercial_prepayment_allowed_after_month,
             max(1, min(scenario.loan_years * 12, scenario.commercial_prepayment_start_month)),
+        )
+        commercial_prepayment_monthly = (
+            max(0.0, scenario.commercial_prepayment_monthly_amount)
+            if commercial_prepayment_mode == "manual" and commercial_loan > 0
+            else 0.0
         )
         immediate_commercial_prepayment = commercial_prepayment_monthly if commercial_prepayment_start_month <= 1 else 0.0
         commercial_projection = _loan_projection_with_prepayment(
@@ -3849,6 +4105,60 @@ def build_purchase_plan_analyses(
             rules=rules,
         )
         post_purchase_cash_flow_with_pf = post_purchase_cash_flow + monthly_pf_withdrawal
+        if commercial_prepayment_mode == "auto" and commercial_loan > 0:
+            (
+                commercial_auto_prepayment_enabled,
+                commercial_prepayment_start_month,
+                commercial_prepayment_allowed_after_month,
+                commercial_prepayment_monthly,
+            ) = _choose_auto_commercial_prepayment(
+                scenario,
+                commercial_loan=commercial_loan,
+                regular_payment=commercial_payment,
+                post_purchase_cash_flow_with_pf=post_purchase_cash_flow_with_pf,
+                post_purchase_monthly_expense=post_purchase_monthly_expense,
+                required_liquidity_reserve=required_liquidity_reserve,
+                cash_after_purchase=cash_after_purchase,
+                minimum_cash_balance=minimum_cash_balance,
+            )
+            if not commercial_auto_prepayment_enabled:
+                commercial_prepayment_monthly = 0.0
+            immediate_commercial_prepayment = commercial_prepayment_monthly if commercial_prepayment_start_month <= 1 else 0.0
+            commercial_projection = _loan_projection_with_prepayment(
+                commercial_loan,
+                scenario.commercial_rate,
+                scenario.loan_years * 12,
+                _commercial_repayment_method(scenario),
+                prepayment_monthly_amount=commercial_prepayment_monthly,
+                prepayment_start_month=commercial_prepayment_start_month,
+            )
+            commercial_interest = (
+                commercial_projection.total_interest
+                if commercial_prepayment_monthly > 0
+                else commercial_payment.total_interest
+            )
+            if commercial_prepayment_monthly > 0 and months is not None:
+                minimum_cash_balance, minimum_cash_balance_month, cash_stress_ok = _post_purchase_cash_stress(
+                    household=household,
+                    rules=rules,
+                    purchase_month=post_purchase_month,
+                    starting_cash=cash_after_purchase,
+                    starting_pf_balance=pf_after_extract,
+                    total_monthly_payment=total_monthly_payment,
+                    provident_monthly_payment=provident_payment.first_month_payment,
+                    car_loan=car_loan,
+                    expense_at_month=expense_at_month,
+                    income_at_month=income_at_month,
+                    car_monthly_cash_cost_at=car_monthly_cash_cost_at,
+                    car_down_payment_at=car_down_payment_at,
+                    extra_monthly_payment=commercial_prepayment_monthly,
+                    extra_payment_start_month=commercial_prepayment_start_month,
+                )
+                cash_stress_shortfall = max(
+                    0.0,
+                    required_liquidity_reserve - cash_after_transaction,
+                    -minimum_cash_balance,
+                )
         renovation_included_upfront = scenario.renovation_funding_mode == "upfront_cash"
         renovation_saving_months: int | None = 0
         post_purchase_renovation_monthly_saving = 0.0
@@ -4021,6 +4331,7 @@ def build_purchase_plan_analyses(
                 provident_repayment_method=selected_provident_repayment_method,  # type: ignore[arg-type]
                 commercial_monthly_payment=round(commercial_payment.first_month_payment, 2),
                 provident_monthly_payment=round(provident_payment.first_month_payment, 2),
+                commercial_prepayment_mode=commercial_prepayment_mode,  # type: ignore[arg-type]
                 commercial_prepayment_enabled=commercial_prepayment_monthly > 0,
                 commercial_prepayment_start_month=commercial_prepayment_start_month,
                 commercial_prepayment_allowed_after_month=commercial_prepayment_allowed_after_month,
@@ -4142,12 +4453,13 @@ def build_loan_visualization(
         car_loan,
         vehicle_states=base_vehicle_states,
     )
-    existing_loan_by_month: dict[int, tuple[float, float]] = {}
+    existing_loan_by_month: dict[int, tuple[float, float, list[ExistingLoanVisualizationDetail]]] = {}
     for month in range(visualization_horizon + 1):
-        phased_loan_states = [_phased_loan_state_at(loan, month) for loan in household.phased_loans]
+        existing_loan_details = _existing_loan_details_at(household.phased_loans, month)
         existing_loan_by_month[month] = (
-            sum(balance for balance, _ in phased_loan_states),
-            base_existing_payment + sum(payment for _, payment in phased_loan_states),
+            sum(detail.balance for detail in existing_loan_details),
+            base_existing_payment + sum(detail.monthly_payment for detail in existing_loan_details),
+            existing_loan_details,
         )
     rows: list[LoanVisualizationPoint] = []
     for plan in purchase_plans:
@@ -4216,7 +4528,7 @@ def build_loan_visualization(
             provident_balance = max(0.0, provident_balance - cumulative_extra_provident_offset)
             provident_payment = plan.provident_monthly_payment if provident_balance > 0 else 0.0
             home_payment = commercial_payment + provident_payment
-            existing_loan_balance, existing_payment = existing_loan_by_month[month]
+            existing_loan_balance, existing_payment, existing_loan_details = existing_loan_by_month[month]
             total_payment = home_payment + commercial_extra_principal_payment + vehicle_payment + existing_payment
             cash_payment = max(0.0, total_payment - provident_cash_relief)
             rows.append(
@@ -4239,6 +4551,7 @@ def build_loan_visualization(
                     commercial_extra_principal_payment=round(commercial_extra_principal_payment, 2),
                     vehicle_extra_principal_payment=round(vehicle_extra_principal_payment, 2),
                     existing_monthly_payment=round(existing_payment, 2),
+                    existing_loan_details=existing_loan_details,
                     total_monthly_payment=round(total_payment, 2),
                     cash_monthly_payment=round(cash_payment, 2),
                     provident_offset_payment=round(provident_offset_payment, 2),
@@ -4614,6 +4927,154 @@ def _investment_allocation_for_month(
     excess_cash = max(0.0, cash_balance - reserve_target)
     sweep = min(excess_cash / 12, max(0.0, available_above_reserve - base))
     return max(0.0, base), max(0.0, sweep)
+
+
+INVESTMENT_RISK_LABELS = {
+    "cash": "现金保守",
+    "conservative": "稳健",
+    "balanced": "均衡",
+    "growth": "进取",
+}
+
+
+def build_investment_allocation_summary(
+    household: HouseholdData,
+    *,
+    monthly_surplus: float,
+    current_monthly_expense: float,
+) -> InvestmentAllocationSummary:
+    reserve_months = household.investment_cash_reserve_months or household.required_liquidity_months or 6
+    reserve_target = max(0.0, current_monthly_expense * reserve_months)
+    monthly_setting = 0.0 if household.investment_plan_name == "cash_only" else max(0.0, household.monthly_investment_amount)
+    allocation_household = household.model_copy(update={"monthly_investment_amount": monthly_setting})
+    base, sweep = _investment_allocation_for_month(
+        monthly_surplus=monthly_surplus,
+        cash_balance=household.cash_account_balance,
+        reserve_target=reserve_target,
+        household=allocation_household,
+    )
+    total = max(0.0, base + sweep)
+    buy_fee = total * max(0.0, household.investment_buy_fee_rate)
+    return InvestmentAllocationSummary(
+        monthly_surplus=round(max(0.0, monthly_surplus), 2),
+        reserve_target=round(reserve_target, 2),
+        reserve_gap=round(max(0.0, reserve_target - household.cash_account_balance), 2),
+        base_investment=round(base, 2),
+        cash_sweep_investment=round(sweep, 2),
+        total_investment=round(total, 2),
+        buy_fee=round(buy_fee, 2),
+        net_investment=round(max(0.0, total - buy_fee), 2),
+    )
+
+
+def build_investment_plan_recommendations(
+    household: HouseholdData,
+    scenario: ScenarioData,
+    *,
+    net_monthly_income: float,
+    current_monthly_expense: float,
+    effective_monthly_debt_payment: float,
+    car_loan: CarLoanSummary,
+) -> list[InvestmentPlanRecommendation]:
+    car_cost = (
+        car_loan.current_monthly_payment + car_loan.monthly_cash_operating_cost
+        if household.car_plan.enabled and car_loan.enabled and car_loan.purchase_delay_months <= 0
+        else max(0.0, household.car_plan.no_car_monthly_commute_cost)
+    )
+    monthly_surplus = max(0.0, net_monthly_income - current_monthly_expense - effective_monthly_debt_payment - car_cost)
+    current_cash = max(0.0, household.cash_account_balance)
+    total_liquid_assets = max(1.0, household.cash_account_balance + household.investments)
+    current_investment_ratio = max(0.0, household.investments) / total_liquid_assets
+    configured_reserve_months = max(
+        1.0,
+        household.investment_cash_reserve_months or household.required_liquidity_months or 6,
+    )
+    reserve_target = current_monthly_expense * configured_reserve_months
+    reserve_gap = max(0.0, reserve_target - current_cash)
+    cash_sweep = max(0.0, current_cash - reserve_target) / 12
+    base_investable = (
+        max(0.0, monthly_surplus * 0.25)
+        if reserve_gap > 0
+        else max(0.0, monthly_surplus * 0.55 + cash_sweep)
+    )
+    scenario_return = scenario.annual_investment_return if scenario.annual_investment_return is not None else 0.025
+
+    candidates = [
+        {
+            "variant": "先补现金安全垫",
+            "plan_name": "cash_reserve_first",
+            "risk_level": "conservative",
+            "description": "现金账户低于安全垫时压低定投，先把家庭风险缓冲补齐。",
+            "monthly_investment": round(max(0.0, min(monthly_surplus, monthly_surplus * 0.2 if reserve_gap > 0 else base_investable)) / 100) * 100,
+            "annual_return": max(0.015, scenario_return * 0.75),
+            "cash_reserve_months": max(configured_reserve_months, 6),
+            "equity_ratio": 0.20,
+            "bond_ratio": 0.50,
+            "cash_ratio": 0.30,
+            "reasons": [
+                "优先保护现金账户",
+                f"目标现金安全垫 {_money_text(reserve_target)}",
+                f"当前投资占流动资产 {current_investment_ratio:.1%}",
+            ],
+        },
+        {
+            "variant": "稳健定投",
+            "plan_name": "balanced_monthly_investment",
+            "risk_level": "balanced",
+            "description": "现金安全垫达标后维持中等定投，兼顾买房买车前的流动性。",
+            "monthly_investment": round(max(0.0, min(monthly_surplus, base_investable)) / 100) * 100,
+            "annual_return": max(0.02, scenario_return),
+            "cash_reserve_months": configured_reserve_months,
+            "equity_ratio": 0.35,
+            "bond_ratio": 0.45,
+            "cash_ratio": 0.20,
+            "reasons": [
+                "按月结余动态定投",
+                "现金超额会分 12 个月滚入投资",
+                f"预期年化 {max(0.02, scenario_return):.1%}",
+            ],
+        },
+        {
+            "variant": "提高长期收益",
+            "plan_name": "growth_monthly_investment",
+            "risk_level": "growth",
+            "description": "在现金垫充足时提高权益比例，适合目标事件还比较远的月份。",
+            "monthly_investment": round(max(0.0, min(monthly_surplus, base_investable * 1.25)) / 100) * 100,
+            "annual_return": max(0.025, scenario_return * 1.15),
+            "cash_reserve_months": max(3.0, configured_reserve_months - 1),
+            "equity_ratio": 0.50,
+            "bond_ratio": 0.35,
+            "cash_ratio": 0.15,
+            "reasons": [
+                "现金垫达标后提高权益仓位",
+                f"保留至少 {max(3.0, configured_reserve_months - 1):.0f} 个月支出",
+                "收益继续留在投资账户复利",
+            ],
+        },
+    ]
+    recommendations: list[InvestmentPlanRecommendation] = []
+    for item in candidates:
+        score = round(
+            max(
+                0,
+                min(
+                    100,
+                    68
+                    + (16 if reserve_gap > 0 and item["plan_name"] == "cash_reserve_first" else 0)
+                    + (10 if reserve_gap <= 0 and item["plan_name"] != "cash_reserve_first" else 0)
+                    + (8 if monthly_surplus > 0 else -16)
+                    - abs(float(item["cash_reserve_months"]) - configured_reserve_months) * 1.5,
+                ),
+            )
+        )
+        recommendations.append(
+            InvestmentPlanRecommendation(
+                **item,
+                risk_label=INVESTMENT_RISK_LABELS.get(str(item["risk_level"]), "自定义"),
+                score=score,
+            )
+        )
+    return sorted(recommendations, key=lambda item: item.score, reverse=True)
 
 
 def build_monthly_cashflow_visualization(
@@ -5109,6 +5570,116 @@ def build_monthly_cashflow_visualization(
     return rows, snapshots, ledger
 
 
+def build_annual_financial_summaries(
+    monthly_cashflow: list[MonthlyCashflowPoint],
+    account_snapshots: list[AccountSnapshotPoint],
+    loan_visualization: list[LoanVisualizationPoint],
+    provident_visualization: list[ProvidentVisualizationPoint],
+    *,
+    base_date: date | None = None,
+) -> list[AnnualFinancialSummary]:
+    if not monthly_cashflow:
+        return []
+
+    start = base_date or date.today()
+    base_month = date(start.year, start.month, 1)
+    snapshots_by_plan_month = {(row.plan_variant, row.month): row for row in account_snapshots}
+    loans_by_plan_month = {(row.plan_variant, row.month): row for row in loan_visualization}
+    provident_by_plan_month = {(row.plan_variant, row.month): row for row in provident_visualization}
+    groups: dict[tuple[str, int], dict[str, float | int | str]] = {}
+
+    cashflow_sum_fields = [
+        "cash_income",
+        "living_expense",
+        "scheduled_expense",
+        "debt_payment",
+        "house_payment",
+        "vehicle_payment",
+        "vehicle_operating_cost",
+        "investment_contribution",
+        "investment_return",
+        "investment_fee",
+        "investment_sell_proceeds",
+        "provident_deposit",
+        "provident_withdrawal",
+        "transaction_cash_out",
+        "transaction_cash_in",
+        "monthly_cash_delta",
+    ]
+    loan_sum_map = {
+        "commercial_payment": "commercial_monthly_payment",
+        "provident_payment": "provident_monthly_payment",
+        "vehicle_loan_payment": "vehicle_monthly_payment",
+        "existing_loan_payment": "existing_monthly_payment",
+        "commercial_extra_principal_payment": "commercial_extra_principal_payment",
+        "vehicle_extra_principal_payment": "vehicle_extra_principal_payment",
+        "provident_offset_payment": "provident_offset_payment",
+        "cash_monthly_payment": "cash_monthly_payment",
+    }
+
+    for row in sorted(monthly_cashflow, key=lambda item: (item.plan_variant, item.month)):
+        year, _ = _month_after(base_month, row.month)
+        key = (row.plan_variant, year)
+        group = groups.setdefault(
+            key,
+            {
+                "plan_variant": row.plan_variant,
+                "year": year,
+                "months": 0,
+                "last_month": -1,
+                **{field: 0.0 for field in cashflow_sum_fields},
+                **{field: 0.0 for field in loan_sum_map},
+            },
+        )
+        group["months"] = int(group["months"]) + 1
+        for field in cashflow_sum_fields:
+            group[field] = float(group[field]) + float(getattr(row, field, 0.0))
+
+        loan_row = loans_by_plan_month.get((row.plan_variant, row.month))
+        if loan_row:
+            for summary_field, loan_field in loan_sum_map.items():
+                group[summary_field] = float(group[summary_field]) + float(getattr(loan_row, loan_field, 0.0))
+
+        if row.month >= int(group["last_month"]):
+            group["last_month"] = row.month
+            snapshot = snapshots_by_plan_month.get((row.plan_variant, row.month))
+            loan_snapshot = loan_row
+            provident_snapshot = provident_by_plan_month.get((row.plan_variant, row.month))
+            group.update(
+                {
+                    "cash_balance_end": snapshot.cash_balance if snapshot else row.cash_balance,
+                    "investment_balance_end": snapshot.investment_balance if snapshot else row.investment_balance,
+                    "liquid_asset_value_end": snapshot.liquid_asset_value if snapshot else row.liquid_asset_value,
+                    "provident_balance_end": (
+                        provident_snapshot.balance_end
+                        if provident_snapshot
+                        else snapshot.provident_balance if snapshot else row.provident_balance
+                    ),
+                    "fixed_asset_value_end": snapshot.fixed_asset_value if snapshot else row.fixed_asset_value,
+                    "total_asset_value_end": snapshot.total_asset_value if snapshot else row.total_asset_value,
+                    "total_loan_balance_end": (
+                        loan_snapshot.total_loan_balance
+                        if loan_snapshot
+                        else snapshot.total_loan_balance if snapshot else row.total_loan_balance
+                    ),
+                    "net_worth_end": snapshot.net_worth if snapshot else row.net_worth,
+                    "commercial_loan_balance_end": loan_snapshot.commercial_loan_balance if loan_snapshot else 0.0,
+                    "provident_loan_balance_end": loan_snapshot.provident_loan_balance if loan_snapshot else 0.0,
+                    "vehicle_loan_balance_end": loan_snapshot.vehicle_loan_balance if loan_snapshot else 0.0,
+                    "existing_loan_balance_end": loan_snapshot.existing_loan_balance if loan_snapshot else 0.0,
+                }
+            )
+
+    summaries: list[AnnualFinancialSummary] = []
+    for group in sorted(groups.values(), key=lambda item: (str(item["plan_variant"]), int(item["year"]))):
+        payload = {key: value for key, value in group.items() if key != "last_month"}
+        for key, value in list(payload.items()):
+            if isinstance(value, float):
+                payload[key] = round(value, 2)
+        summaries.append(AnnualFinancialSummary(**payload))
+    return summaries
+
+
 def _money_text(amount: float) -> str:
     value = round(float(amount), 2)
     if abs(value) >= 10000:
@@ -5163,7 +5734,7 @@ def build_account_concepts() -> list[AccountConceptSummary]:
             code="loan_account",
             name="贷款账户",
             category="loan",
-            description="统一管理商业房贷、公积金贷款、车贷和阶段性既有贷款余额及月供；前端只展示后端返回的逐月余额和还款现金流。",
+            description="统一管理商业房贷、公积金贷款、车贷和已有贷款余额及月供；前端只展示后端返回的逐月余额和还款现金流。",
             managed_by="backend",
         ),
         AccountConceptSummary(
@@ -5721,9 +6292,16 @@ def calculate_affordability(
     *,
     stress_name: str | None = None,
 ) -> AffordabilityResult:
-    household = _household_with_career_income_stages(household, rules)
+    raw_household = household
     base_date = date.today()
     base_month = date(base_date.year, base_date.month, 1)
+    career_shock_projection = build_career_shock_projection(raw_household, rules, as_of=base_month)
+    household = raw_household.model_copy(
+        update={
+            "members": career_shock_projection.effective_members,
+            "career_shock_applied": True,
+        }
+    )
     parallel_workers = 1 if stress_name else _parallel_worker_count(rules, 4)
     params = rules.params
     min_down_payment_ratio = float(params.get("minimum_down_payment_ratio", 0.30))
@@ -5790,6 +6368,30 @@ def calculate_affordability(
     car_plan_analyses = build_car_plan_analyses(
         cashflow_household,
         net_monthly_income=net_monthly_income,
+    )
+    investment_plan_recommendations = build_investment_plan_recommendations(
+        cashflow_household,
+        scenario,
+        net_monthly_income=net_monthly_income,
+        current_monthly_expense=current_monthly_expense,
+        effective_monthly_debt_payment=effective_monthly_debt_payment,
+        car_loan=car_loan,
+    )
+    current_investment_allocation = build_investment_allocation_summary(
+        cashflow_household,
+        monthly_surplus=max(
+            0.0,
+            net_monthly_income
+            - current_monthly_expense
+            - effective_monthly_debt_payment
+            - _car_monthly_cash_cost_at(
+                cashflow_household.car_plan,
+                car_loan,
+                0,
+                vehicle_states=pre_home_vehicle_states,
+            ),
+        ),
+        current_monthly_expense=current_monthly_expense,
     )
 
     eligible, eligibility_notes = (
@@ -5875,6 +6477,13 @@ def calculate_affordability(
             loan_visualization,
             provident_visualization,
         )
+        annual_financial_summaries = build_annual_financial_summaries(
+            monthly_cashflow_visualization,
+            account_snapshots,
+            loan_visualization,
+            provident_visualization,
+            base_date=base_month,
+        )
         account_concepts = build_account_concepts()
         strategy_explanations = build_strategy_explanations(purchase_plan_analyses)
         plan_events = build_plan_events(
@@ -5894,6 +6503,7 @@ def calculate_affordability(
         monthly_cashflow_visualization = []
         account_snapshots = []
         monthly_ledger = []
+        annual_financial_summaries = []
         account_concepts = []
         strategy_explanations = []
         plan_events = []
@@ -5967,7 +6577,7 @@ def calculate_affordability(
 
     if not has_purchase_target:
         status = "不买房基线"
-        status_reason = "当前没有启用目标房源，系统只测算家庭现状、理财、车辆和既有贷款现金流。"
+        status_reason = "当前没有启用目标房源，系统只测算家庭现状、理财、车辆和已有贷款现金流。"
     elif not eligible:
         status = "不可行"
         status_reason = "购房资格条件未通过当前规则包。"
@@ -6013,6 +6623,10 @@ def calculate_affordability(
         tax_year_summaries=tax_year_summaries,
         tax_monthly_points=tax_monthly_points,
         tax_events=tax_events,
+        career_shock_projection=career_shock_projection,
+        investment_plan_recommendations=investment_plan_recommendations,
+        current_investment_allocation=current_investment_allocation,
+        annual_financial_summaries=annual_financial_summaries,
         purchase_plan_analyses=purchase_plan_analyses,
         yield_sensitivity=yield_sensitivity,
         monthly_cashflow_visualization=monthly_cashflow_visualization,
@@ -6031,7 +6645,7 @@ def calculate_affordability(
             "北京公积金贷款额度按当前规则包的每缴存年额度估算；夫妻分别缴存时，现阶段用家庭录入的社保/个税月数近似代表较长缴存年限。",
             f"北京公积金贷款期限按设定年限、30 年上限、借款人年龄和二手房房龄/土地剩余年限取短；当前测算：{'；'.join(provident_year_reasons)}。",
             "公积金提取区分交易前现金、交易后购房提取和购后账户留存：默认不把买房后的月缴存公积金计入自由现金流。",
-            "目前贷款在只还利息阶段按本金乘年利率除以 12 计入有效月债务，到期后按剩余期数转为等额本息或等额本金估算。",
+            "已有贷款在只还利息阶段按本金乘年利率除以 12 计入有效月债务，到期后按剩余期数转为等额本息或等额本金估算。",
             "等额本金场景使用首月月供评估现金流压力。",
             "工资薪金和全年一次性奖金按规则包税率表估算，未覆盖劳务报酬、经营所得等复杂申报情形。",
             "家庭支出按基础月支出叠加定时月支出测算；不符合税收养老条件的家庭支持支出只进入现金流，不进入个税专项附加扣除。",

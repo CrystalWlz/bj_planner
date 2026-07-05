@@ -16,6 +16,7 @@ BuildingStructure = Literal["unknown", "brick_mixed", "steel_concrete"]
 RenovationFundingMode = Literal["after_purchase_saving", "upfront_cash"]
 InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
+CommercialPrepaymentMode = Literal["auto", "manual", "none"]
 
 
 class IncomeMember(BaseModel):
@@ -178,7 +179,7 @@ class PropertyPurchaseGoalData(BaseModel):
 
 class PhasedLoanData(BaseModel):
     borrower: str = "成员 1"
-    name: str = "目前贷款"
+    name: str = "已有贷款"
     loan_type: Literal["mortgage", "car", "education", "consumer", "other"] = "other"
     principal: float = Field(0, ge=0)
     annual_rate: float = Field(0.028, ge=0, le=0.2)
@@ -201,6 +202,15 @@ class PhasedLoanSummary(BaseModel):
     current_monthly_payment: float
 
 
+class ExistingLoanVisualizationDetail(BaseModel):
+    name: str
+    borrower: str
+    loan_type: Literal["mortgage", "car", "education", "consumer", "other"]
+    phase: str
+    balance: float
+    monthly_payment: float
+
+
 class ScheduledExpenseData(BaseModel):
     name: str = "定时支出"
     monthly_amount: float = Field(0, ge=0)
@@ -219,7 +229,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(18, ge=1)
+    schema_version: int = Field(21, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -282,7 +292,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(18, ge=1)
+    schema_version: int = Field(21, ge=1)
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
@@ -311,6 +321,7 @@ class ScenarioData(BaseModel):
     repayment_method: RepaymentMethod = "equal_installment"
     commercial_repayment_method: RepaymentMethod = "equal_installment"
     provident_repayment_method: RepaymentMethod = "equal_installment"
+    commercial_prepayment_mode: CommercialPrepaymentMode = "auto"
     commercial_prepayment_enabled: bool = False
     commercial_prepayment_start_month: int = Field(1, ge=1, le=360)
     commercial_prepayment_allowed_after_month: int = Field(12, ge=1, le=360)
@@ -361,7 +372,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(18, ge=1)
+    schema_version: int = Field(21, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -490,7 +501,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(18, ge=1)
+    schema_version: int = Field(21, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -639,6 +650,7 @@ class PurchasePlanAnalysis(BaseModel):
     provident_repayment_method: RepaymentMethod
     commercial_monthly_payment: float
     provident_monthly_payment: float
+    commercial_prepayment_mode: CommercialPrepaymentMode = "none"
     commercial_prepayment_enabled: bool = False
     commercial_prepayment_start_month: int = 1
     commercial_prepayment_allowed_after_month: int = 12
@@ -708,6 +720,7 @@ class LoanVisualizationPoint(BaseModel):
     commercial_extra_principal_payment: float = 0.0
     vehicle_extra_principal_payment: float = 0.0
     existing_monthly_payment: float
+    existing_loan_details: list[ExistingLoanVisualizationDetail] = Field(default_factory=list)
     total_monthly_payment: float
     cash_monthly_payment: float
     provident_offset_payment: float = 0.0
@@ -971,6 +984,104 @@ class TaxEventPoint(BaseModel):
     source: str = "backend"
 
 
+class CareerShockMemberProjection(BaseModel):
+    member_name: str
+    enabled: bool = False
+    layoff_age: int = Field(35, ge=18, le=80)
+    retirement_age: int = Field(63, ge=45, le=80)
+    layoff_month: str | None = None
+    retirement_month: str | None = None
+    unemployment_benefit_months: int = Field(0, ge=0, le=24)
+    unemployment_benefit_monthly: float = 0.0
+    later_unemployment_benefit_monthly: float = 0.0
+    self_social_insurance_monthly: float = 0.0
+    flexible_housing_fund_monthly: float = 0.0
+    pension_monthly: float = 0.0
+    generated_stages: list[IncomeStageData] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class CareerShockProjection(BaseModel):
+    enabled: bool = False
+    unemployment_benefit_months: int = Field(0, ge=0, le=24)
+    unemployment_benefit_monthly: float = 0.0
+    later_unemployment_benefit_monthly: float = 0.0
+    self_social_insurance_monthly: float = 0.0
+    flexible_housing_fund_monthly: float = 0.0
+    effective_members: list[IncomeMember] = Field(default_factory=list)
+    member_projections: list[CareerShockMemberProjection] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class InvestmentAllocationSummary(BaseModel):
+    monthly_surplus: float = 0.0
+    reserve_target: float = 0.0
+    reserve_gap: float = 0.0
+    base_investment: float = 0.0
+    cash_sweep_investment: float = 0.0
+    total_investment: float = 0.0
+    buy_fee: float = 0.0
+    net_investment: float = 0.0
+
+
+class InvestmentPlanRecommendation(BaseModel):
+    variant: str
+    plan_name: str
+    risk_level: str
+    risk_label: str
+    description: str
+    monthly_investment: float = 0.0
+    annual_return: float = 0.0
+    cash_reserve_months: float = 0.0
+    equity_ratio: float = 0.0
+    bond_ratio: float = 0.0
+    cash_ratio: float = 0.0
+    score: int = Field(0, ge=0, le=100)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class AnnualFinancialSummary(BaseModel):
+    plan_variant: str
+    year: int
+    months: int
+    cash_income: float = 0.0
+    living_expense: float = 0.0
+    scheduled_expense: float = 0.0
+    debt_payment: float = 0.0
+    house_payment: float = 0.0
+    vehicle_payment: float = 0.0
+    vehicle_operating_cost: float = 0.0
+    investment_contribution: float = 0.0
+    investment_return: float = 0.0
+    investment_fee: float = 0.0
+    investment_sell_proceeds: float = 0.0
+    provident_deposit: float = 0.0
+    provident_withdrawal: float = 0.0
+    transaction_cash_out: float = 0.0
+    transaction_cash_in: float = 0.0
+    monthly_cash_delta: float = 0.0
+    cash_balance_end: float = 0.0
+    investment_balance_end: float = 0.0
+    liquid_asset_value_end: float = 0.0
+    provident_balance_end: float = 0.0
+    fixed_asset_value_end: float = 0.0
+    total_asset_value_end: float = 0.0
+    total_loan_balance_end: float = 0.0
+    net_worth_end: float = 0.0
+    commercial_payment: float = 0.0
+    provident_payment: float = 0.0
+    vehicle_loan_payment: float = 0.0
+    existing_loan_payment: float = 0.0
+    commercial_extra_principal_payment: float = 0.0
+    vehicle_extra_principal_payment: float = 0.0
+    provident_offset_payment: float = 0.0
+    cash_monthly_payment: float = 0.0
+    commercial_loan_balance_end: float = 0.0
+    provident_loan_balance_end: float = 0.0
+    vehicle_loan_balance_end: float = 0.0
+    existing_loan_balance_end: float = 0.0
+
+
 class StressResult(BaseModel):
     name: str
     status: str
@@ -1015,6 +1126,10 @@ class AffordabilityResult(BaseModel):
     tax_year_summaries: list[TaxYearSummary] = []
     tax_monthly_points: list[TaxMonthlyPoint] = []
     tax_events: list[TaxEventPoint] = []
+    career_shock_projection: CareerShockProjection | None = None
+    investment_plan_recommendations: list[InvestmentPlanRecommendation] = Field(default_factory=list)
+    current_investment_allocation: InvestmentAllocationSummary | None = None
+    annual_financial_summaries: list[AnnualFinancialSummary] = Field(default_factory=list)
     purchase_plan_analyses: list[PurchasePlanAnalysis]
     yield_sensitivity: list[YieldSensitivityPoint]
     monthly_cashflow_visualization: list[MonthlyCashflowPoint] = []

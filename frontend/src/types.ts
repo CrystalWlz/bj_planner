@@ -6,6 +6,7 @@ export type GreenBuildingLevel = "none" | "two_star" | "three_star";
 export type PrefabBuildingLevel = "none" | "A" | "AA" | "AAA";
 export type BuildingStructure = "unknown" | "brick_mixed" | "steel_concrete";
 export type RenovationFundingMode = "after_purchase_saving" | "upfront_cash";
+export type CommercialPrepaymentMode = "auto" | "manual" | "none";
 
 export interface IncomeMember {
   name: string;
@@ -69,6 +70,62 @@ export interface CareerShockData {
   unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
   self_housing_fund_monthly: number;
+}
+
+export interface CareerShockMemberProjection {
+  member_name: string;
+  enabled: boolean;
+  layoff_age: number;
+  retirement_age: number;
+  layoff_month: string | null;
+  retirement_month: string | null;
+  unemployment_benefit_months: number;
+  unemployment_benefit_monthly: number;
+  later_unemployment_benefit_monthly: number;
+  self_social_insurance_monthly: number;
+  flexible_housing_fund_monthly: number;
+  pension_monthly: number;
+  generated_stages: IncomeStageData[];
+  notes: string[];
+}
+
+export interface CareerShockProjection {
+  enabled: boolean;
+  unemployment_benefit_months: number;
+  unemployment_benefit_monthly: number;
+  later_unemployment_benefit_monthly: number;
+  self_social_insurance_monthly: number;
+  flexible_housing_fund_monthly: number;
+  effective_members: IncomeMember[];
+  member_projections: CareerShockMemberProjection[];
+  notes: string[];
+}
+
+export interface InvestmentAllocationSummary {
+  monthly_surplus: number;
+  reserve_target: number;
+  reserve_gap: number;
+  base_investment: number;
+  cash_sweep_investment: number;
+  total_investment: number;
+  buy_fee: number;
+  net_investment: number;
+}
+
+export interface InvestmentPlanRecommendation {
+  variant: string;
+  plan_name: string;
+  risk_level: string;
+  risk_label: string;
+  description: string;
+  monthly_investment: number;
+  annual_return: number;
+  cash_reserve_months: number;
+  equity_ratio: number;
+  bond_ratio: number;
+  cash_ratio: number;
+  score: number;
+  reasons: string[];
 }
 
 export interface VehiclePlanData {
@@ -146,6 +203,15 @@ export interface PhasedLoanData {
   remaining_months: number;
   interest_start_month: string;
   interest_only_until: string;
+}
+
+export interface ExistingLoanVisualizationDetail {
+  name: string;
+  borrower: string;
+  loan_type: "mortgage" | "car" | "education" | "consumer" | "other";
+  phase: string;
+  balance: number;
+  monthly_payment: number;
 }
 
 export interface ScheduledExpenseData {
@@ -242,6 +308,7 @@ export interface ScenarioData {
   repayment_method: RepaymentMethod;
   commercial_repayment_method: RepaymentMethod;
   provident_repayment_method: RepaymentMethod;
+  commercial_prepayment_mode: CommercialPrepaymentMode;
   commercial_prepayment_enabled: boolean;
   commercial_prepayment_start_month: number;
   commercial_prepayment_allowed_after_month: number;
@@ -500,6 +567,7 @@ export interface PurchasePlanAnalysis {
   provident_repayment_method: RepaymentMethod;
   commercial_monthly_payment: number;
   provident_monthly_payment: number;
+  commercial_prepayment_mode: CommercialPrepaymentMode;
   commercial_prepayment_enabled: boolean;
   commercial_prepayment_start_month: number;
   commercial_prepayment_allowed_after_month: number;
@@ -574,6 +642,7 @@ export interface LoanVisualizationPoint {
   commercial_extra_principal_payment: number;
   vehicle_extra_principal_payment: number;
   existing_monthly_payment: number;
+  existing_loan_details: ExistingLoanVisualizationDetail[];
   total_monthly_payment: number;
   cash_monthly_payment: number;
   provident_offset_payment: number;
@@ -743,6 +812,48 @@ export interface PlanEventPoint {
   source: string;
 }
 
+export interface AnnualFinancialSummary {
+  plan_variant: string;
+  year: number;
+  months: number;
+  cash_income: number;
+  living_expense: number;
+  scheduled_expense: number;
+  debt_payment: number;
+  house_payment: number;
+  vehicle_payment: number;
+  vehicle_operating_cost: number;
+  investment_contribution: number;
+  investment_return: number;
+  investment_fee: number;
+  investment_sell_proceeds: number;
+  provident_deposit: number;
+  provident_withdrawal: number;
+  transaction_cash_out: number;
+  transaction_cash_in: number;
+  monthly_cash_delta: number;
+  cash_balance_end: number;
+  investment_balance_end: number;
+  liquid_asset_value_end: number;
+  provident_balance_end: number;
+  fixed_asset_value_end: number;
+  total_asset_value_end: number;
+  total_loan_balance_end: number;
+  net_worth_end: number;
+  commercial_payment: number;
+  provident_payment: number;
+  vehicle_loan_payment: number;
+  existing_loan_payment: number;
+  commercial_extra_principal_payment: number;
+  vehicle_extra_principal_payment: number;
+  provident_offset_payment: number;
+  cash_monthly_payment: number;
+  commercial_loan_balance_end: number;
+  provident_loan_balance_end: number;
+  vehicle_loan_balance_end: number;
+  existing_loan_balance_end: number;
+}
+
 export interface AffordabilityResult {
   status: string;
   status_reason: string;
@@ -772,6 +883,10 @@ export interface AffordabilityResult {
   tax_year_summaries: TaxYearSummary[];
   tax_monthly_points: TaxMonthlyPoint[];
   tax_events: TaxEventPoint[];
+  career_shock_projection: CareerShockProjection | null;
+  investment_plan_recommendations: InvestmentPlanRecommendation[];
+  current_investment_allocation: InvestmentAllocationSummary | null;
+  annual_financial_summaries: AnnualFinancialSummary[];
   purchase_plan_analyses: PurchasePlanAnalysis[];
   yield_sensitivity: YieldSensitivityPoint[];
   monthly_cashflow_visualization: MonthlyCashflowPoint[];

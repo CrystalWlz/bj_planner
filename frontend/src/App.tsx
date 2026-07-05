@@ -57,12 +57,13 @@ import type {
   BonusTaxMethod,
   CarPlanAnalysis,
   CarPlanData,
-  CareerShockMemberSetting,
   CareerShockData,
+  CommercialPrepaymentMode,
   ElderlyDependentData,
   HouseholdData,
   IncomeMember,
   IncomeStageData,
+  InvestmentPlanRecommendation,
   ProvidentMemberAccountPoint,
   PurchasePlanAnalysis,
   RecordEnvelope,
@@ -104,6 +105,14 @@ const piePalette = [
   "var(--chart-extra-2)",
   "var(--chart-extra-3)",
   "var(--chart-extra-4)"
+];
+
+const existingLoanPalette = [
+  visualColors.expense,
+  visualColors.deduction,
+  visualColors.baseline,
+  visualColors.danger,
+  "var(--chart-extra-2)"
 ];
 
 const bonusTaxMethodLabels: Record<BonusTaxMethod, string> = {
@@ -217,13 +226,6 @@ const retirementCategoryLabels: Record<IncomeMember["retirement_category"], stri
   female_50: "女职工原50岁（延至55岁）"
 };
 
-function policyRetirementAgeForMember(member: Partial<IncomeMember> | undefined, index: number) {
-  const category = member?.retirement_category ?? defaultRetirementCategoryForMember(index);
-  if (category === "female_50") return 55;
-  if (category === "female_55") return 58;
-  return 63;
-}
-
 function normalizeCareerShockForMembers(
   rawShock: Partial<CareerShockData> | Record<string, unknown> | undefined,
   members: IncomeMember[]
@@ -238,7 +240,7 @@ function normalizeCareerShockForMembers(
       member_name: memberName,
       enabled: existing?.enabled ?? false,
       layoff_age: existing?.layoff_age ?? 35,
-      retirement_age: policyRetirementAgeForMember(member, index),
+      retirement_age: existing?.retirement_age ?? 63,
       pension_monthly: existing?.pension_monthly ?? 0,
       auto_pension_monthly: existing?.auto_pension_monthly ?? true
     };
@@ -333,22 +335,6 @@ type StrategyRecommendation = {
   reasons: string[];
 };
 
-type InvestmentPlanRecommendation = {
-  variant: string;
-  planName: string;
-  riskLevel: string;
-  riskLabel: string;
-  description: string;
-  monthlyInvestment: number;
-  annualReturn: number;
-  cashReserveMonths: number;
-  equityRatio: number;
-  bondRatio: number;
-  cashRatio: number;
-  score: number;
-  reasons: string[];
-};
-
 type ScenarioComparison = {
   scenario: RecordEnvelope<ScenarioData>;
   result: AffordabilityResult;
@@ -388,6 +374,7 @@ function createTargetScenarioData(sequence: number): ScenarioData {
     repayment_method: "equal_installment",
     commercial_repayment_method: "equal_installment",
     provident_repayment_method: "equal_installment",
+    commercial_prepayment_mode: "auto",
     commercial_prepayment_enabled: false,
     commercial_prepayment_start_month: 1,
     commercial_prepayment_allowed_after_month: 12,
@@ -421,6 +408,7 @@ function completeScenarioDefaults(record: RecordEnvelope<ScenarioData>, index: n
       after_previous_purchase_delay_months: record.data.after_previous_purchase_delay_months ?? 0,
       investment_withdrawal_mode: record.data.investment_withdrawal_mode ?? "auto",
       investment_min_balance_after_purchase: record.data.investment_min_balance_after_purchase ?? 0,
+      commercial_prepayment_mode: record.data.commercial_prepayment_mode ?? (record.data.commercial_prepayment_enabled ? "manual" : "auto"),
       commercial_prepayment_enabled: record.data.commercial_prepayment_enabled ?? false,
       commercial_prepayment_start_month: record.data.commercial_prepayment_start_month ?? 1,
       commercial_prepayment_allowed_after_month: record.data.commercial_prepayment_allowed_after_month ?? 12,
@@ -477,9 +465,9 @@ const parameterExplanations: Record<string, string> = {
   预估年收益: "按当前投资资产和测算年化粗略估算的一年收益，用于直觉参考。",
   折合月收益: "把预估年收益平均到每个月，仅用于展示；真实收益会波动。",
   当前可动用现金: "今天可随时用于首付、应急和日常支出的现金，不包含已投入理财的资产。",
-  基础月支出: "从现在起每月固定发生的生活支出，不含家庭支持支出、房贷、车贷和目前贷款等单独项目。",
+  基础月支出: "从现在起每月固定发生的生活支出，不含家庭支持支出、房贷、车贷和已有贷款等单独项目。",
   当前实际月支出: "基础月支出加上当前已经生效的定时支出，用于判断现金安全垫。",
-  "其他固定还款/月": "除下方单独建模的目前贷款外，每月固定发生但暂不推导余额的还款；目前贷款会自动加进测算。",
+  "其他固定还款/月": "除下方单独建模的已有贷款外，每月固定发生但暂不推导余额的还款；已有贷款会自动加进测算。",
   支出名称: "定时支出的名称，会直接显示在月现金流里，例如家庭支持支出。",
   定时月支出: "从开始月份起每月发生的额外家庭支出。用于现金流，不一定能抵扣个税。",
   开始月份: "该项支出从哪个月份开始计入现金流。",
@@ -549,6 +537,10 @@ const parameterExplanations: Record<string, string> = {
   贷款年限: "贷款总年限。公积金贷款还会额外受年龄、房龄、土地年限等政策约束。",
   商贷还款: "商业贷款还款方式。等额本息稳定，等额本金前高后低。",
   公积金还款: "公积金贷款还款方式。会影响首月月供、平均月供和现金流压力。",
+  商贷提前还本策略: "选择是否让后端自动生成商贷额外还本。自动模式会根据买后现金流、安全垫、合同允许月份和节省利息决定是否还、从何时还、每月还多少；手动指定则按下方参数固定测算。",
+  商贷提前还本上限: "自动模式下作为每月额外还本上限，填 0 表示由系统按商贷本金和现金流自动设定；手动模式下表示每月额外还本金额。",
+  希望起始还本月: "从第几个商贷还款月开始额外还本金；若早于合同允许月份，后端会自动顺延。",
+  合同允许最早月: "银行合同允许提前还本的最早还款月。不同银行可能有一年后、金额限制或违约金，建议按实际合同填写。",
   契税比例: "交易契税占房价比例，计入买房交易现金需求。",
   中介费比例: "中介服务费占房价比例，计入交易现金需求。",
   装修预算: "预计装修需要的总资金。可选择交易前准备或买房后慢慢攒。",
@@ -624,15 +616,15 @@ const parameterExplanations: Record<string, string> = {
   "高风险 DTI": "负债收入比较高的阈值，超过该值会显著压低幸福指数和可行性。"
 };
 
-type MonthlyInvestmentAllocation = {
-  baseInvestment: number;
-  cashSweepInvestment: number;
-  totalInvestment: number;
-};
-
 const repaymentMethodLabels: Record<RepaymentMethod, string> = {
   equal_installment: "等额本息",
   equal_principal: "等额本金"
+};
+
+const commercialPrepaymentModeLabels: Record<CommercialPrepaymentMode, string> = {
+  auto: "策略自动生成",
+  manual: "手动指定",
+  none: "不提前还本"
 };
 
 const existingLoanTypeLabels: Record<NonNullable<PhasedLoanData["loan_type"]>, string> = {
@@ -870,222 +862,6 @@ function incomeStagesForMember(member: IncomeMember) {
   }));
 }
 
-function monthStartForAge(baseDate: Date, currentAge: number, targetAge: number) {
-  return addMonths(new Date(baseDate.getFullYear(), baseDate.getMonth(), 1), Math.max(0, targetAge - currentAge) * 12);
-}
-
-function monthStartForBirthMonthOrAge(baseDate: Date, birthMonth: string | undefined, currentAge: number, targetAge: number) {
-  const parsed = parseMonthValue(birthMonth);
-  if (parsed) {
-    const target = new Date(parsed.year + targetAge, parsed.month - 1, 1);
-    const currentMonth = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1);
-    return target < currentMonth ? currentMonth : target;
-  }
-  return monthStartForAge(baseDate, currentAge, targetAge);
-}
-
-function unemploymentBenefitMonthsFromService(serviceMonths: number) {
-  if (serviceMonths < 12) return 0;
-  if (serviceMonths < 60) return 12;
-  if (serviceMonths < 120) return 18;
-  return 24;
-}
-
-function unemploymentBenefitMonthlyFromService(serviceMonths: number, rulePack: RulePackData) {
-  const params = rulePack.params ?? {};
-  if (serviceMonths >= 240) return Number(params.beijing_unemployment_benefit_20y_plus ?? 2286);
-  if (serviceMonths >= 180) return Number(params.beijing_unemployment_benefit_15_to_20y ?? 2215);
-  if (serviceMonths >= 120) return Number(params.beijing_unemployment_benefit_10_to_15y ?? 2188);
-  if (serviceMonths >= 60) return Number(params.beijing_unemployment_benefit_5_to_10y ?? 2156);
-  if (serviceMonths >= 12) return Number(params.beijing_unemployment_benefit_under_5y ?? 2129);
-  return 0;
-}
-
-function autoSelfSocialInsuranceMonthly(rulePack: RulePackData) {
-  const params = rulePack.params ?? {};
-  const floor = Number(params.beijing_social_base_floor ?? 7162);
-  const ceiling = Number(params.beijing_social_base_ceiling ?? 35811);
-  const rawBase = Number(params.flexible_employment_social_base ?? floor);
-  const base = Math.max(floor, Math.min(rawBase, ceiling));
-  const pension = base * Number(params.flexible_employment_pension_rate ?? 0.2);
-  const unemployment = base * Number(params.flexible_employment_unemployment_rate ?? 0.01);
-  const medical = Number(params.flexible_employment_medical_monthly ?? 584.92);
-  return Math.max(0, pension + unemployment + medical);
-}
-
-function autoFlexibleHousingFundMonthly(rulePack: RulePackData, shock?: CareerShockData) {
-  const params = rulePack.params ?? {};
-  if (shock && !shock.auto_flexible_housing_fund) return Math.max(0, shock.self_housing_fund_monthly ?? 0);
-  if (params.flexible_employment_housing_fund_enabled === false) return 0;
-  const floor = Number(params.beijing_housing_fund_base_floor ?? 2540);
-  const ceiling = Number(params.beijing_housing_fund_base_ceiling ?? 35811);
-  const rawBase = Number(params.flexible_employment_housing_fund_base ?? floor);
-  const base = Math.max(floor, Math.min(rawBase, ceiling));
-  const rate = Math.max(0, Math.min(Number(params.flexible_employment_housing_fund_rate ?? 0.12), 0.24));
-  return Math.max(0, base * rate);
-}
-
-function monthsBetween(baseDate: Date, targetDate: Date) {
-  return Math.max(
-    0,
-    (targetDate.getFullYear() - baseDate.getFullYear()) * 12 + targetDate.getMonth() - baseDate.getMonth()
-  );
-}
-
-function formatDateInputValue(date: Date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-function endOfPreviousMonth(monthStart: Date) {
-  return new Date(monthStart.getFullYear(), monthStart.getMonth(), 0);
-}
-
-function estimateAutoPensionMonthly(
-  member: IncomeMember,
-  setting: CareerShockMemberSetting,
-  rulePack: RulePackData,
-  retirementStart: Date,
-  baseDate: Date
-) {
-  if (!setting.auto_pension_monthly) return Math.max(0, setting.pension_monthly ?? 0);
-  const params = rulePack.params ?? {};
-  const monthsToRetirement = monthsBetween(baseDate, retirementStart);
-  const stages = incomeStagesForMember(member).sort((left, right) => left.start_date.localeCompare(right.start_date));
-  const currentStage = stages[stages.length - 1] ?? incomeStageFromMember(member);
-  const socialFloor = ruleParamNumber(rulePack, "beijing_social_base_floor", 7162);
-  const socialCeiling = ruleParamNumber(rulePack, "beijing_social_base_ceiling", 35811);
-  const currentSalary = Math.max(member.monthly_salary_gross ?? 0, currentStage.monthly_salary_gross ?? 0);
-  const contributionBase = Math.max(socialFloor, Math.min(currentSalary > 0 ? currentSalary : socialFloor, socialCeiling));
-  const flexibleBase = Math.max(
-    socialFloor,
-    Math.min(ruleParamNumber(rulePack, "flexible_employment_social_base", socialFloor), socialCeiling)
-  );
-  const averageSalaryNow = Math.max(
-    socialFloor,
-    Math.min(ruleParamNumber(rulePack, "pension_reference_average_salary", socialCeiling), socialCeiling)
-  );
-  const salaryGrowth = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_average_salary_growth_rate", 0.03), 0.1));
-  const projectedAverageSalary = averageSalaryNow * ((1 + salaryGrowth) ** (monthsToRetirement / 12));
-  const existingPaidYears = Math.max(ruleParamNumber(rulePack, "pension_default_paid_years", 15), Math.max(0, (member.current_age ?? 30) - 22));
-  const totalPaidYears = Math.max(15, existingPaidYears + monthsToRetirement / 12);
-  const indexedBase = (contributionBase + flexibleBase) / 2;
-  const basicPension = projectedAverageSalary * (1 + indexedBase / projectedAverageSalary) / 2 * totalPaidYears * 0.01;
-  const employeeRate = ruleParamNumber(rulePack, "employee_pension_rate", 0.08);
-  const flexibleRate = ruleParamNumber(rulePack, "flexible_employment_pension_rate", 0.2);
-  const accountReturn = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_personal_account_annual_return", 0.025), 0.08));
-  const existingAccount = contributionBase * employeeRate * 12 * existingPaidYears;
-  let futureAccount = 0;
-  for (let month = 0; month < monthsToRetirement; month += 1) {
-    futureAccount = (futureAccount + flexibleBase * flexibleRate * 0.4) * ((1 + accountReturn) ** (1 / 12));
-  }
-  const accountMonths = Math.max(1, ruleParamNumber(rulePack, "pension_personal_account_months", 139));
-  const rawPension = basicPension + (existingAccount + futureAccount) / accountMonths;
-  const floorRate = Math.max(0, Math.min(ruleParamNumber(rulePack, "pension_replacement_rate_floor", 0.2), 1));
-  const ceilingRate = Math.max(floorRate, Math.min(ruleParamNumber(rulePack, "pension_replacement_rate_ceiling", 0.65), 1.2));
-  return Math.max(projectedAverageSalary * floorRate, Math.min(rawPension, projectedAverageSalary * ceilingRate));
-}
-
-function zeroCashStage(template: IncomeStageData, name: string, start: Date, end: Date | null = null): IncomeStageData {
-  return {
-    ...template,
-    name,
-    stage_kind: "manual",
-    start_date: formatDateInputValue(start),
-    end_date: end ? formatDateInputValue(end) : null,
-    monthly_salary_gross: 0,
-    annual_bonus: 0,
-    annual_bonus_payout_month: template.annual_bonus_payout_month ?? 4,
-    monthly_freelance_income: 0,
-    monthly_non_taxable_income: 0,
-    monthly_extra_cash_expense: 0,
-    monthly_social_insurance: 0,
-    monthly_housing_fund: 0,
-    housing_fund_personal_rate: 0,
-    housing_fund_employer_rate: 0,
-    monthly_special_additional_deduction: 0,
-    other_annual_deductions: 0,
-    other_annual_taxable_income: 0,
-    payroll_contributions_enabled: false
-  };
-}
-
-function effectiveIncomeMembers(household: HouseholdData, rulePack: RulePackData, baseDate = new Date()): IncomeMember[] {
-  const shock = normalizeCareerShockForMembers(household.career_shock, household.members);
-  if (!shock.enabled) return household.members;
-  const syntheticPrefix = "自动情景：";
-  const unemploymentMonths = shock.auto_unemployment_benefit
-    ? unemploymentBenefitMonthsFromService(household.social_security_months ?? 0)
-    : Math.max(0, Math.min(shock.unemployment_benefit_months ?? 0, 24));
-  const firstUnemploymentMonthly = shock.auto_unemployment_benefit
-    ? unemploymentBenefitMonthlyFromService(household.social_security_months ?? 0, rulePack)
-    : shock.unemployment_benefit_monthly;
-  const laterUnemploymentMonthly = Number(rulePack.params.beijing_unemployment_benefit_after_12_months ?? 2129);
-  const selfSocialMonthly = shock.auto_self_social_insurance
-    ? autoSelfSocialInsuranceMonthly(rulePack)
-    : shock.self_social_insurance_monthly;
-  const flexibleHousingFundMonthly = autoFlexibleHousingFundMonthly(rulePack, shock);
-  const settingsByName = new Map(shock.member_settings.map((item) => [item.member_name, item]));
-  return household.members.map((member, memberIndex) => {
-    const originalStages = incomeStagesForMember(member).filter((stage) => !stage.name.startsWith(syntheticPrefix));
-    const template = originalStages[originalStages.length - 1] ?? incomeStageFromMember(member);
-    const setting = settingsByName.get(member.name);
-    const retirementAge = setting?.retirement_age ?? policyRetirementAgeForMember(member, memberIndex);
-    const retirementStart = monthStartForBirthMonthOrAge(baseDate, member.birth_month, member.current_age, retirementAge);
-    const pensionMonthly = setting
-      ? estimateAutoPensionMonthly(member, setting, rulePack, retirementStart, baseDate)
-      : 0;
-    const stages = [...originalStages];
-
-    if (setting?.enabled) {
-      const layoffStart = monthStartForBirthMonthOrAge(baseDate, member.birth_month, member.current_age, setting.layoff_age);
-      if (unemploymentMonths > 0 && layoffStart < retirementStart) {
-        const firstPeriodMonths = Math.min(unemploymentMonths, 12);
-        const firstEnd = addMonths(layoffStart, firstPeriodMonths - 1);
-        const boundedFirstEnd = firstEnd < retirementStart ? firstEnd : endOfPreviousMonth(retirementStart);
-        stages.push({
-          ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-失业金期`, layoffStart, boundedFirstEnd),
-          stage_kind: "unemployment",
-          monthly_freelance_income: 0,
-          monthly_non_taxable_income: firstUnemploymentMonthly
-        });
-        if (shock.auto_unemployment_benefit && unemploymentMonths > 12) {
-          const laterStart = addMonths(layoffStart, 12);
-          const laterEnd = addMonths(layoffStart, unemploymentMonths - 1);
-          const boundedLaterEnd = laterEnd < retirementStart ? laterEnd : endOfPreviousMonth(retirementStart);
-          if (laterStart < retirementStart) {
-            stages.push({
-              ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-失业金后续期`, laterStart, boundedLaterEnd),
-              stage_kind: "unemployment",
-              monthly_freelance_income: 0,
-              monthly_non_taxable_income: laterUnemploymentMonthly
-            });
-          }
-        }
-      }
-      const selfSocialStart = addMonths(layoffStart, unemploymentMonths);
-      if (selfSocialStart < retirementStart) {
-        stages.push({
-          ...zeroCashStage(template, `${syntheticPrefix}${setting.layoff_age}岁被裁员-灵活就业自缴社保期`, selfSocialStart, endOfPreviousMonth(retirementStart)),
-          stage_kind: "freelance",
-          monthly_freelance_income: 0,
-          monthly_social_insurance: selfSocialMonthly,
-          monthly_housing_fund: flexibleHousingFundMonthly
-        });
-      }
-    }
-
-    if (pensionMonthly > 0) {
-      stages.push({
-        ...zeroCashStage(template, `${syntheticPrefix}${retirementAge}岁退休-养老金`, retirementStart),
-        stage_kind: "pension",
-        monthly_non_taxable_income: pensionMonthly
-      });
-    }
-
-    return { ...member, income_stages: stages };
-  });
-}
-
 function incomeStageAt(member: IncomeMember, baseDate: Date, monthsFromNow = 0) {
   const targetDate = addMonths(baseDate, monthsFromNow);
   const targetMonth = { year: targetDate.getFullYear(), month: targetDate.getMonth() + 1 };
@@ -1099,11 +875,6 @@ function incomeStageAt(member: IncomeMember, baseDate: Date, monthsFromNow = 0) 
       return true;
     }) ?? stages[0]
   );
-}
-
-function ruleParamNumber(rulePack: RulePackData, key: string, fallback: number) {
-  const value = Number(rulePack.params[key]);
-  return Number.isFinite(value) ? value : fallback;
 }
 
 const investmentPlanOptions = [
@@ -1120,44 +891,6 @@ const investmentRiskLabels: Record<string, string> = {
   balanced: "均衡",
   growth: "进取"
 };
-
-function calculateMonthlyInvestmentAllocation({
-  monthlySurplus,
-  cashValue,
-  reserveTarget,
-  monthlyInvestmentSetting,
-  autoRebalance
-}: {
-  monthlySurplus: number;
-  cashValue: number;
-  reserveTarget: number;
-  monthlyInvestmentSetting: number;
-  autoRebalance: boolean;
-}): MonthlyInvestmentAllocation {
-  if (monthlyInvestmentSetting <= 0) {
-    return { baseInvestment: 0, cashSweepInvestment: 0, totalInvestment: 0 };
-  }
-
-  if (!autoRebalance) {
-    const baseInvestment = Math.min(monthlyInvestmentSetting, Math.max(0, monthlySurplus));
-    return { baseInvestment, cashSweepInvestment: 0, totalInvestment: baseInvestment };
-  }
-
-  const projectedCashBeforeInvestment = cashValue + monthlySurplus;
-  const availableAboveReserve = Math.max(0, projectedCashBeforeInvestment - reserveTarget);
-  if (availableAboveReserve <= 0) {
-    return { baseInvestment: 0, cashSweepInvestment: 0, totalInvestment: 0 };
-  }
-
-  const baseInvestment = Math.min(monthlyInvestmentSetting, Math.max(0, monthlySurplus), availableAboveReserve);
-  const excessCash = Math.max(0, cashValue - reserveTarget);
-  const cashSweepInvestment = Math.min(excessCash / 12, Math.max(0, availableAboveReserve - baseInvestment));
-  return {
-    baseInvestment,
-    cashSweepInvestment,
-    totalInvestment: baseInvestment + cashSweepInvestment
-  };
-}
 
 function buildStrategyRecommendations(
   plans: PurchasePlanAnalysis[],
@@ -1414,7 +1147,7 @@ export function App() {
 
   const updateArrayItem = <T, K extends keyof T>(items: T[], index: number, key: K, value: T[K]) => items.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: value } : item);
   const updatePhasedLoan = <K extends keyof PhasedLoanData>(index: number, key: K, value: PhasedLoanData[K]) => updateHousehold("phased_loans", updateArrayItem(phasedLoans, index, key, value));
-  const addPhasedLoan = () => updateHousehold("phased_loans", [...phasedLoans, { borrower: incomeMembers[0]?.name ?? "成员 1", name: "目前贷款", loan_type: "other", principal: 0, annual_rate: 0.028, repayment_method: "equal_installment", remaining_months: 120, interest_start_month: "2026-07", interest_only_until: "2028-07" }]);
+  const addPhasedLoan = () => updateHousehold("phased_loans", [...phasedLoans, { borrower: incomeMembers[0]?.name ?? "成员 1", name: "已有贷款", loan_type: "other", principal: 0, annual_rate: 0.028, repayment_method: "equal_installment", remaining_months: 120, interest_start_month: "2026-07", interest_only_until: "2028-07" }]);
   const removePhasedLoan = (index: number) => updateHousehold("phased_loans", phasedLoans.filter((_, itemIndex) => itemIndex !== index));
   const updateScheduledExpense = <K extends keyof ScheduledExpenseData>(index: number, key: K, value: ScheduledExpenseData[K]) => updateHousehold("scheduled_expenses", updateArrayItem(scheduledExpenses, index, key, value));
   const addScheduledExpense = () => updateHousehold("scheduled_expenses", [...scheduledExpenses, ...defaultScheduledExpenses]);
@@ -1513,7 +1246,7 @@ export function App() {
   if (!household || !activeRulePack) return <div className="loading-screen">初始化数据缺失</div>;
 
   const pageContent = (() => {
-    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} elderlyDependents={elderlyDependents} result={result} activeRulePack={activeRulePack.data} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
+    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} elderlyDependents={elderlyDependents} result={result} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
     if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} updateHousehold={updateHousehold} updateScenario={updateScenario} />;
     if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} addScenario={addScenario} removeScenario={removeScenario} result={result} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} calculationPending={calculationPending} />;
     if (activePage === "买车计划") return <CarPlanPage carPlan={carPlan} result={result} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} />;
@@ -1554,101 +1287,6 @@ export function App() {
   );
 }
 
-function buildInvestmentPlanRecommendations(
-  household: HouseholdData,
-  scenario: ScenarioData,
-  result: AffordabilityResult | null
-): InvestmentPlanRecommendation[] {
-  const netIncome = result?.household_net_monthly_income ?? household.monthly_income;
-  const carPurchasedNow =
-    Boolean(result && household.car_plan.enabled && result.car_loan.enabled && result.car_loan.purchase_delay_months <= 0);
-  const carMonthlyCashCost =
-    result && carPurchasedNow
-      ? result.car_loan.current_monthly_payment + result.car_loan.monthly_cash_operating_cost
-      : Math.max(0, household.car_plan.no_car_monthly_commute_cost ?? 0);
-  const effectiveDebt = result?.effective_monthly_debt_payment ?? household.monthly_debt_payment;
-  const currentMonthlyExpense = householdExpenseAt(household, new Date(), 0);
-  const monthlySurplus = Math.max(0, netIncome - currentMonthlyExpense - effectiveDebt - carMonthlyCashCost);
-  const currentCash = household.cash_account_balance;
-  const totalLiquidAssets = Math.max(1, household.cash_account_balance + household.investments);
-  const currentInvestmentRatio = household.investments / totalLiquidAssets;
-  const configuredReserveMonths = Math.max(
-    1,
-    household.investment_cash_reserve_months ?? household.required_liquidity_months ?? 6
-  );
-  const reserveTarget = currentMonthlyExpense * configuredReserveMonths;
-  const reserveGap = Math.max(0, reserveTarget - currentCash);
-  const cashSweep = Math.max(0, currentCash - reserveTarget) / 12;
-  const baseInvestable = reserveGap > 0 ? Math.max(0, monthlySurplus * 0.25) : Math.max(0, monthlySurplus * 0.55 + cashSweep);
-  const riskLevel = household.investment_risk_level ?? "conservative";
-  const scenarioReturn = scenario.annual_investment_return ?? 0.025;
-  const candidates: InvestmentPlanRecommendation[] = [
-    {
-      variant: "先补现金安全垫",
-      planName: "cash_reserve_first",
-      riskLevel: "conservative",
-      riskLabel: investmentRiskLabels.conservative,
-      description: "现金账户低于安全垫时压低定投，先把家庭风险缓冲补齐。",
-      monthlyInvestment: Math.round(Math.max(0, Math.min(monthlySurplus, reserveGap > 0 ? monthlySurplus * 0.2 : baseInvestable)) / 100) * 100,
-      annualReturn: Math.max(0.015, scenarioReturn * 0.75),
-      cashReserveMonths: Math.max(configuredReserveMonths, 6),
-      equityRatio: 0.2,
-      bondRatio: 0.5,
-      cashRatio: 0.3,
-      score: 0,
-      reasons: ["优先保护现金账户", `目标现金安全垫 ${money(reserveTarget)}`, `当前投资占流动资产 ${percent(currentInvestmentRatio)}`]
-    },
-    {
-      variant: "稳健定投",
-      planName: "balanced_monthly_investment",
-      riskLevel: "balanced",
-      riskLabel: investmentRiskLabels.balanced,
-      description: "现金安全垫达标后维持中等定投，兼顾买房买车前的流动性。",
-      monthlyInvestment: Math.round(Math.max(0, Math.min(monthlySurplus, baseInvestable)) / 100) * 100,
-      annualReturn: Math.max(0.02, scenarioReturn),
-      cashReserveMonths: configuredReserveMonths,
-      equityRatio: 0.35,
-      bondRatio: 0.45,
-      cashRatio: 0.2,
-      score: 0,
-      reasons: ["按月结余动态定投", `现金超额会分 12 个月滚入投资`, `预期年化 ${percent(Math.max(0.02, scenarioReturn))}`]
-    },
-    {
-      variant: "提高长期收益",
-      planName: "growth_monthly_investment",
-      riskLevel: "growth",
-      riskLabel: investmentRiskLabels.growth,
-      description: "在现金垫充足时提高权益比例，适合目标事件还比较远的月份。",
-      monthlyInvestment: Math.round(Math.max(0, Math.min(monthlySurplus, baseInvestable * 1.25)) / 100) * 100,
-      annualReturn: Math.max(0.025, scenarioReturn * 1.15),
-      cashReserveMonths: Math.max(3, configuredReserveMonths - 1),
-      equityRatio: 0.5,
-      bondRatio: 0.35,
-      cashRatio: 0.15,
-      score: 0,
-      reasons: ["现金垫达标后提高权益仓位", `保留至少 ${Math.max(3, configuredReserveMonths - 1)} 个月支出`, "收益继续留在投资账户复利"]
-    }
-  ];
-  return candidates
-    .map((item) => ({
-      ...item,
-      score: Math.round(
-        Math.max(
-          0,
-          Math.min(
-            100,
-            68 +
-              (reserveGap > 0 && item.planName === "cash_reserve_first" ? 16 : 0) +
-              (reserveGap <= 0 && item.planName !== "cash_reserve_first" ? 10 : 0) +
-              (monthlySurplus > 0 ? 8 : -16) -
-              Math.abs(item.cashReserveMonths - configuredReserveMonths) * 1.5
-          )
-        )
-      )
-    }))
-    .sort((left, right) => right.score - left.score);
-}
-
 function IncomePage({
   household,
   scenario,
@@ -1657,7 +1295,6 @@ function IncomePage({
   scheduledExpenses,
   elderlyDependents,
   result,
-  activeRulePack,
   updateHousehold,
   updateIncomeMember,
   addIncomeMember,
@@ -1682,7 +1319,6 @@ function IncomePage({
   scheduledExpenses: ScheduledExpenseData[];
   elderlyDependents: ElderlyDependentData[];
   result: AffordabilityResult | null;
-  activeRulePack: RulePackData;
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
   updateIncomeMember: <K extends keyof IncomeMember>(
     index: number,
@@ -1723,11 +1359,12 @@ function IncomePage({
 }) {
   const currentMonthlyExpense = householdExpenseAt(household, new Date(), 0);
   const careerShock = normalizeCareerShockForMembers(household.career_shock, incomeMembers);
-  const estimatedUnemploymentBenefitMonths = unemploymentBenefitMonthsFromService(household.social_security_months ?? 0);
-  const estimatedUnemploymentBenefitMonthly = unemploymentBenefitMonthlyFromService(household.social_security_months ?? 0, activeRulePack);
-  const estimatedLaterUnemploymentBenefitMonthly = Number(activeRulePack.params.beijing_unemployment_benefit_after_12_months ?? 2129);
-  const estimatedSelfSocialInsuranceMonthly = autoSelfSocialInsuranceMonthly(activeRulePack);
-  const estimatedFlexibleHousingFundMonthly = autoFlexibleHousingFundMonthly(activeRulePack, careerShock);
+  const careerShockProjection = result?.career_shock_projection ?? null;
+  const estimatedUnemploymentBenefitMonths = careerShockProjection?.unemployment_benefit_months ?? 0;
+  const estimatedUnemploymentBenefitMonthly = careerShockProjection?.unemployment_benefit_monthly ?? 0;
+  const estimatedLaterUnemploymentBenefitMonthly = careerShockProjection?.later_unemployment_benefit_monthly ?? 0;
+  const estimatedSelfSocialInsuranceMonthly = careerShockProjection?.self_social_insurance_monthly ?? 0;
+  const estimatedFlexibleHousingFundMonthly = careerShockProjection?.flexible_housing_fund_monthly ?? 0;
   const elderlyPolicyStatus = elderlyDeductionPolicyStatus(elderlyDependents, new Date());
   const phasedLoanPhaseSummary = (result?.phased_loan_summaries ?? []).reduce<Record<string, number>>((summary, loan) => {
     summary[loan.phase] = (summary[loan.phase] ?? 0) + 1;
@@ -1735,7 +1372,7 @@ function IncomePage({
   }, {});
   const phasedLoanSummaryText = phasedLoans.length > 0
     ? Object.entries(phasedLoanPhaseSummary).map(([phase, count]) => `${phase} ${count} 笔`).join("，") || "等待计算"
-    : "暂无目前贷款";
+    : "暂无已有贷款";
   const updateCareerShock = (patch: Partial<CareerShockData>) => {
     const merged = normalizeCareerShockForMembers({ ...careerShock, ...patch }, incomeMembers);
     updateHousehold("career_shock", merged);
@@ -1803,7 +1440,7 @@ function IncomePage({
     { label: "家庭成员与工资阶段", done: incomeMembers.some((member) => incomeStagesForMember(member).some((stage) => stage.monthly_salary_gross > 0 || stage.annual_bonus > 0)) },
     { label: "基础支出与定时支出", done: household.monthly_expense > 0 || scheduledExpenses.some((expense) => expense.monthly_amount > 0) },
     { label: "现金、投资和成员公积金账户", done: household.cash_account_balance > 0 || household.investments > 0 || incomeMembers.some((member) => (member.provident_fund_balance ?? 0) > 0) },
-    { label: "目前贷款、赡养扣除和职业冲击", done: phasedLoans.length > 0 || elderlyDependents.length > 0 || Boolean(household.career_shock?.enabled) },
+    { label: "已有贷款、赡养扣除和职业冲击", done: phasedLoans.length > 0 || elderlyDependents.length > 0 || Boolean(household.career_shock?.enabled) },
   ];
   const memberIncomeSection = (
     <section className="form-panel">
@@ -2447,25 +2084,19 @@ function IncomePage({
         </div>
         <div className="member-list compact-list career-member-list">
           {incomeMembers.map((member, index) => {
+            const projection = careerShockProjection?.member_projections.find((item) => item.member_name === member.name);
             const setting = careerShock.member_settings[index] ?? {
               member_name: member.name || `成员 ${index + 1}`,
               enabled: false,
               layoff_age: 35,
-              retirement_age: policyRetirementAgeForMember(member, index),
+              retirement_age: projection?.retirement_age ?? 63,
               pension_monthly: 0,
               auto_pension_monthly: careerShock.auto_pension_income ?? true
             };
-            const policyRetirementAge = policyRetirementAgeForMember(member, index);
-            const retirementStartDate = monthStartForBirthMonthOrAge(today, member.birth_month, memberAges[index] ?? member.current_age ?? 30, policyRetirementAge);
-            const estimatedPensionMonthly = estimateAutoPensionMonthly(member, setting, activeRulePack, retirementStartDate, today);
-            const layoffDate = formatMonthDate(
-              today,
-              monthsBetween(today, monthStartForBirthMonthOrAge(today, member.birth_month, memberAges[index] ?? member.current_age ?? 30, setting.layoff_age))
-            );
-            const retirementDate = formatMonthDate(
-              today,
-              monthsBetween(today, retirementStartDate)
-            );
+            const policyRetirementAge = projection?.retirement_age;
+            const estimatedPensionMonthly = projection?.pension_monthly ?? 0;
+            const layoffDate = projection?.layoff_month ?? "等待后端计算";
+            const retirementDate = projection?.retirement_month ?? "等待后端计算";
             return (
               <section className="member-card loan-card career-member-card" key={`career-shock-${index}`}>
                 <div className="member-card-head">
@@ -2477,7 +2108,9 @@ function IncomePage({
                   />
                 </div>
                 <div className="form-grid structured-settings">
-                  <NumberField label="裁员年龄" value={setting.layoff_age} min={18} max={80} step={1} onChange={(value) => updateMemberCareerShockSetting(index, { layoff_age: value })} />
+                  {setting.enabled ? (
+                    <NumberField label="裁员年龄" value={setting.layoff_age} min={18} max={80} step={1} onChange={(value) => updateMemberCareerShockSetting(index, { layoff_age: value })} />
+                  ) : null}
                   <SwitchField
                     label="自动估算养老金"
                     checked={setting.auto_pension_monthly ?? true}
@@ -2490,10 +2123,17 @@ function IncomePage({
                 <div className="read-only-grid">
                   <Metric label="当前年龄" value={member.birth_month ? `${memberAges[index]} 岁` : "待填写出生年月"} />
                   <Metric label="预计裁员月份" value={setting.enabled ? layoffDate : "未启用"} tone={setting.enabled ? "warn" : undefined} />
-                  <Metric label="政策退休年龄" value={`${policyRetirementAge} 岁`} />
+                  <Metric label="政策退休年龄" value={policyRetirementAge ? `${policyRetirementAge} 岁` : "等待后端计算"} />
                   <Metric label="预计退休月份" value={retirementDate} />
                   <Metric label="预计养老金/月" value={money(estimatedPensionMonthly)} />
                 </div>
+                {projection?.generated_stages?.length ? (
+                  <p className="field-hint">
+                    后端生成阶段：{projection.generated_stages.map((stage) => stage.name).join("；")}
+                  </p>
+                ) : (
+                  <p className="field-hint">等待后端生成职业冲击和退休阶段。</p>
+                )}
               </section>
             );
           })}
@@ -2589,13 +2229,13 @@ function IncomePage({
 
       <section className="form-panel income-workbench-card current-loans-panel income-span-full">
         <div className="member-header">
-          <PanelTitle icon={<WalletCards size={18} />} title="目前贷款" />
+          <PanelTitle icon={<WalletCards size={18} />} title="已有贷款" />
           <button className="ghost-button" onClick={addPhasedLoan}>
             <Plus size={16} /> 新增贷款
           </button>
         </div>
         <div className="loan-summary-strip">
-          <Metric label="目前贷款笔数" value={`${phasedLoans.length} 笔`} tone={phasedLoans.length > 0 ? "good" : undefined} />
+          <Metric label="已有贷款笔数" value={`${phasedLoans.length} 笔`} tone={phasedLoans.length > 0 ? "good" : undefined} />
           <Metric label="当前阶段分布" value={phasedLoanSummaryText} />
         </div>
         <div className="member-list compact-list">
@@ -2604,11 +2244,11 @@ function IncomePage({
             return (
               <section className="member-card loan-card" key={`phased-loan-${index}`}>
                 <div className="member-card-head">
-                  <strong>{index + 1}. {loan.name || "目前贷款"} · {existingLoanTypeLabels[loan.loan_type ?? "other"]} · {summary?.phase ?? "待计算"}</strong>
+                  <strong>{index + 1}. {loan.name || "已有贷款"} · {existingLoanTypeLabels[loan.loan_type ?? "other"]} · {summary?.phase ?? "待计算"}</strong>
                   <button
                     className="icon-button"
                     onClick={() => removePhasedLoan(index)}
-                    aria-label="删除目前贷款"
+                    aria-label="删除已有贷款"
                     type="button"
                   >
                     <Trash2 size={16} />
@@ -2695,7 +2335,7 @@ function IncomePage({
           })}
         </div>
         <p className="field-hint">
-          “其他固定还款/月”适合没有本金、利率或还款阶段明细的普通月债务；目前贷款适合已有房贷、车贷、消费贷、教育贷款等可建模账户。若某笔贷款有“到某月前只还利息、之后等额本息/等额本金”的安排，可填写“计息开始月”和“只还利息至”，后端会按真实月份推演贷款余额、阶段还款和现金流。
+          “其他固定还款/月”适合没有本金、利率或还款阶段明细的普通月债务；已有贷款适合已发生的房贷、车贷、消费贷、教育贷款等可建模账户。若某笔贷款有“到某月前只还利息、之后等额本息/等额本金”的安排，可填写“计息开始月”和“只还利息至”，后端会按真实月份推演贷款余额、阶段还款和现金流。
         </p>
       </section>
       </div>
@@ -2716,43 +2356,32 @@ function InvestmentPlanPage({
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
   updateScenario: <K extends keyof ScenarioData>(key: K, value: ScenarioData[K]) => void;
 }) {
-  const recommendations = useMemo(
-    () => buildInvestmentPlanRecommendations(household, scenario, result),
-    [household, result, scenario]
-  );
+  const recommendations = result?.investment_plan_recommendations ?? [];
   const recommendedInvestment = recommendations[0];
-  const netIncome = result?.household_net_monthly_income ?? household.monthly_income;
-  const effectiveDebt = result?.effective_monthly_debt_payment ?? household.monthly_debt_payment;
-  const carPurchasedNow =
-    Boolean(result && household.car_plan.enabled && result.car_loan.enabled && result.car_loan.purchase_delay_months <= 0);
-  const carMonthlyCashCost =
-    result && carPurchasedNow
-      ? result.car_loan.current_monthly_payment + result.car_loan.monthly_cash_operating_cost
-      : Math.max(0, household.car_plan.no_car_monthly_commute_cost ?? 0);
-  const currentMonthlyExpense = householdExpenseAt(household, new Date(), 0);
-  const monthlySurplus = Math.max(0, netIncome - currentMonthlyExpense - effectiveDebt - carMonthlyCashCost);
-  const reserveTarget = currentMonthlyExpense * (household.investment_cash_reserve_months ?? 6);
-  const reserveGap = Math.max(0, reserveTarget - household.cash_account_balance);
-  const currentInvestmentAllocation = calculateMonthlyInvestmentAllocation({
-    monthlySurplus,
-    cashValue: household.cash_account_balance,
-    reserveTarget,
-    monthlyInvestmentSetting: household.investment_plan_name === "cash_only" ? 0 : household.monthly_investment_amount ?? 0,
-    autoRebalance: household.investment_auto_rebalance ?? true
-  });
+  const currentInvestmentAllocation =
+    result?.current_investment_allocation ?? {
+      monthly_surplus: 0,
+      reserve_target: 0,
+      reserve_gap: 0,
+      base_investment: 0,
+      cash_sweep_investment: 0,
+      total_investment: 0,
+      buy_fee: 0,
+      net_investment: 0
+    };
   const manualRecommendation: InvestmentPlanRecommendation = {
     variant: "手动指定",
-    planName: "manual_investment",
-    riskLevel: household.investment_risk_level ?? "conservative",
-    riskLabel: investmentRiskLabels[household.investment_risk_level ?? "conservative"] ?? "自定义",
+    plan_name: "manual_investment",
+    risk_level: household.investment_risk_level ?? "conservative",
+    risk_label: investmentRiskLabels[household.investment_risk_level ?? "conservative"] ?? "自定义",
     description: "按上方手动填写的月定投、现金安全垫、资产比例和年化收益测算。",
-    monthlyInvestment: household.monthly_investment_amount ?? 0,
-    annualReturn: scenario.annual_investment_return ?? 0,
-    cashReserveMonths: household.investment_cash_reserve_months ?? 6,
-    equityRatio: household.investment_equity_ratio ?? 0.25,
-    bondRatio: household.investment_bond_ratio ?? 0.45,
-    cashRatio: household.investment_cash_ratio ?? 0.3,
-    score: Math.round(Math.max(0, Math.min(100, 72 + (reserveGap > 0 ? -8 : 8) + (monthlySurplus > 0 ? 6 : -10)))),
+    monthly_investment: household.monthly_investment_amount ?? 0,
+    annual_return: scenario.annual_investment_return ?? 0,
+    cash_reserve_months: household.investment_cash_reserve_months ?? 6,
+    equity_ratio: household.investment_equity_ratio ?? 0.25,
+    bond_ratio: household.investment_bond_ratio ?? 0.45,
+    cash_ratio: household.investment_cash_ratio ?? 0.3,
+    score: 0,
     reasons: [
       `使用当前已设定投 ${money(household.monthly_investment_amount ?? 0)}/月`,
       `现金安全垫按 ${household.investment_cash_reserve_months ?? 6} 个月支出控制`,
@@ -2761,28 +2390,30 @@ function InvestmentPlanPage({
   };
   const displayedRecommendations = [manualRecommendation, ...recommendations];
   const activeRecommendation =
-    displayedRecommendations.find((item) => item.planName === household.investment_plan_name) ?? manualRecommendation;
+    displayedRecommendations.find((item) => item.plan_name === household.investment_plan_name) ?? manualRecommendation;
   const investmentReasonText =
-    (recommendedInvestment?.monthlyInvestment ?? 0) > 0
-      ? `系统建议先保留现金安全垫 ${money(reserveTarget)}；现金垫不足时先补现金，现金垫超额时按节奏追加定投。当前最高分方案建议 ${money(recommendedInvestment?.monthlyInvestment ?? 0)}/月。`
-      : reserveGap > 0
-        ? `系统建议月定投为 0，是因为现金安全垫还差 ${money(reserveGap)}，当前月结余会优先补足现金池和购房首付，不先进入波动资产。`
-        : "系统建议月定投为 0，是因为当前最高分方案选择了“暂停定投保现金”；可在下方采用稳健/均衡/进取方案后再手动微调。";
+    !result
+      ? "等待后端计算理财推荐；推荐、月结余和安全垫都以后端返回为准。"
+      : (recommendedInvestment?.monthly_investment ?? 0) > 0
+        ? `系统建议先保留现金安全垫 ${money(currentInvestmentAllocation.reserve_target)}；现金垫不足时先补现金，现金垫超额时按节奏追加定投。当前最高分方案建议 ${money(recommendedInvestment?.monthly_investment ?? 0)}/月。`
+        : currentInvestmentAllocation.reserve_gap > 0
+          ? `系统建议月定投为 0，是因为现金安全垫还差 ${money(currentInvestmentAllocation.reserve_gap)}，当前月结余会优先补足现金池和购房首付，不先进入波动资产。`
+          : "系统建议月定投为 0，是因为当前最高分方案选择了“暂停定投保现金”；可在下方采用稳健/均衡/进取方案后再手动微调。";
   const allocationData = [
     { name: "权益", 比例: Math.round((household.investment_equity_ratio ?? 0.25) * 100) },
     { name: "固收", 比例: Math.round((household.investment_bond_ratio ?? 0.45) * 100) },
     { name: "现金", 比例: Math.round((household.investment_cash_ratio ?? 0.3) * 100) }
   ];
   const applyInvestmentPlan = (plan: InvestmentPlanRecommendation) => {
-    updateHousehold("investment_plan_name", plan.planName);
-    updateHousehold("investment_risk_level", plan.riskLevel);
-    updateHousehold("monthly_investment_amount", plan.monthlyInvestment);
-    updateHousehold("investment_cash_reserve_months", plan.cashReserveMonths);
-    updateHousehold("investment_equity_ratio", plan.equityRatio);
-    updateHousehold("investment_bond_ratio", plan.bondRatio);
-    updateHousehold("investment_cash_ratio", plan.cashRatio);
+    updateHousehold("investment_plan_name", plan.plan_name);
+    updateHousehold("investment_risk_level", plan.risk_level);
+    updateHousehold("monthly_investment_amount", plan.monthly_investment);
+    updateHousehold("investment_cash_reserve_months", plan.cash_reserve_months);
+    updateHousehold("investment_equity_ratio", plan.equity_ratio);
+    updateHousehold("investment_bond_ratio", plan.bond_ratio);
+    updateHousehold("investment_cash_ratio", plan.cash_ratio);
     updateHousehold("investment_auto_rebalance", true);
-    updateScenario("annual_investment_return", plan.annualReturn);
+    updateScenario("annual_investment_return", plan.annual_return);
   };
   const updateManualInvestmentHousehold = <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => {
     updateHousehold("investment_plan_name", "manual_investment");
@@ -2803,12 +2434,12 @@ function InvestmentPlanPage({
         </div>
         <div className="metric-grid">
           <Metric label="当前投资资产" value={money(household.investments)} />
-          <Metric label="系统建议月定投" value={money(recommendedInvestment?.monthlyInvestment ?? 0)} />
+          <Metric label="系统建议月定投" value={money(recommendedInvestment?.monthly_investment ?? 0)} />
           <Metric label="当前已设定投" value={money(household.monthly_investment_amount ?? 0)} />
-          <Metric label="当前月结余" value={money(monthlySurplus)} tone={monthlySurplus > 0 ? "good" : "bad"} />
-          <Metric label="现金安全垫目标" value={money(reserveTarget)} />
-          <Metric label="安全垫缺口" value={money(reserveGap)} tone={reserveGap > 0 ? "warn" : "good"} />
-          <Metric label="安全垫达标后追加定投" value={money(currentInvestmentAllocation.cashSweepInvestment)} tone={currentInvestmentAllocation.cashSweepInvestment > 0 ? "good" : undefined} />
+          <Metric label="当前月结余" value={money(currentInvestmentAllocation.monthly_surplus)} tone={currentInvestmentAllocation.monthly_surplus > 0 ? "good" : "bad"} />
+          <Metric label="现金安全垫目标" value={money(currentInvestmentAllocation.reserve_target)} />
+          <Metric label="安全垫缺口" value={money(currentInvestmentAllocation.reserve_gap)} tone={currentInvestmentAllocation.reserve_gap > 0 ? "warn" : "good"} />
+          <Metric label="安全垫达标后追加定投" value={money(currentInvestmentAllocation.cash_sweep_investment)} tone={currentInvestmentAllocation.cash_sweep_investment > 0 ? "good" : undefined} />
           <Metric label="测算年化" value={percent(household.investment_plan_name === "cash_only" ? 0 : scenario.annual_investment_return ?? 0)} />
         </div>
         <div className="strategy-current-panel">
@@ -2817,12 +2448,12 @@ function InvestmentPlanPage({
             <strong>{activeRecommendation?.variant ?? "手动设置"}</strong>
             <p>
               系统按“先保现金安全垫，再把月结余和超额现金逐步转入投资账户”的规则执行。
-              当前选中策略本月预计投入 {money(currentInvestmentAllocation.totalInvestment)}，其中基础定投 {money(currentInvestmentAllocation.baseInvestment)}、超额现金追加 {money(currentInvestmentAllocation.cashSweepInvestment)}。
+              当前选中策略本月预计投入 {money(currentInvestmentAllocation.total_investment)}，其中基础定投 {money(currentInvestmentAllocation.base_investment)}、超额现金追加 {money(currentInvestmentAllocation.cash_sweep_investment)}。
             </p>
           </div>
           <div>
             <span>风险与费用口径</span>
-            <strong>{activeRecommendation?.riskLabel ?? investmentRiskLabels[household.investment_risk_level ?? "conservative"]}</strong>
+            <strong>{activeRecommendation?.risk_label ?? investmentRiskLabels[household.investment_risk_level ?? "conservative"]}</strong>
             <p>
               收益留在投资账户内复利；买入手续费从当月投入中扣除，买房变现时由后端按卖出费率扣除后进入现金账户。
             </p>
@@ -2903,13 +2534,13 @@ function InvestmentPlanPage({
               </BarChart>
             </ResponsiveContainer>
             <div className="investment-rule-list">
-              <Row label="安全垫规则" value={reserveGap > 0 ? "先补现金" : "允许定投"} />
-              <Row label="基础定投" value={money(currentInvestmentAllocation.baseInvestment)} />
-              <Row label="安全垫达标后追加" value={money(currentInvestmentAllocation.cashSweepInvestment)} />
-              <Row label="实际本月定投" value={money(currentInvestmentAllocation.totalInvestment)} />
+              <Row label="安全垫规则" value={currentInvestmentAllocation.reserve_gap > 0 ? "先补现金" : "允许定投"} />
+              <Row label="基础定投" value={money(currentInvestmentAllocation.base_investment)} />
+              <Row label="安全垫达标后追加" value={money(currentInvestmentAllocation.cash_sweep_investment)} />
+              <Row label="实际本月定投" value={money(currentInvestmentAllocation.total_investment)} />
               <Row label="买入手续费率" value={percent(household.investment_buy_fee_rate ?? 0.0015)} />
               <Row label="卖出手续费率" value={percent(household.investment_sell_fee_rate ?? 0.005)} />
-              <Row label="月定投占结余" value={monthlySurplus > 0 ? percent(currentInvestmentAllocation.totalInvestment / monthlySurplus) : "0.0%"} />
+              <Row label="月定投占结余" value={currentInvestmentAllocation.monthly_surplus > 0 ? percent(currentInvestmentAllocation.total_investment / currentInvestmentAllocation.monthly_surplus) : "0.0%"} />
               <Row label="当前采用" value={activeRecommendation?.variant ?? "手动设置"} />
             </div>
           </section>
@@ -2923,15 +2554,15 @@ function InvestmentPlanPage({
         </div>
         <div className="strategy-grid">
           {displayedRecommendations.map((plan) => {
-            const active = household.investment_plan_name === plan.planName;
+            const active = household.investment_plan_name === plan.plan_name;
             return (
               <article className={`strategy-card investment-card ${active ? "active" : ""}`} key={plan.variant}>
                 <div className="strategy-card-head">
                   <strong>{plan.variant}</strong>
                   <StrategyStatePill
                     active={active}
-                    recommended={!active && plan.planName === recommendedInvestment?.planName}
-                    label={!active && plan.planName !== recommendedInvestment?.planName ? `${plan.score} 分` : undefined}
+                    recommended={!active && plan.plan_name === recommendedInvestment?.plan_name}
+                    label={!active && plan.plan_name !== recommendedInvestment?.plan_name ? `${plan.score} 分` : undefined}
                   />
                 </div>
                 <p>{plan.description}</p>
@@ -2941,15 +2572,15 @@ function InvestmentPlanPage({
                   ))}
                 </ul>
                 <div className="strategy-metrics">
-                  <Metric label="月定投" value={money(plan.monthlyInvestment)} />
-                  <Metric label="测算年化" value={percent(plan.annualReturn)} />
-                  <Metric label="风险类型" value={plan.riskLabel} />
-                  <Metric label="现金垫" value={`${plan.cashReserveMonths} 个月`} />
+                  <Metric label="月定投" value={money(plan.monthly_investment)} />
+                  <Metric label="测算年化" value={percent(plan.annual_return)} />
+                  <Metric label="风险类型" value={plan.risk_label} />
+                  <Metric label="现金垫" value={`${plan.cash_reserve_months} 个月`} />
                 </div>
                 <div className="investment-ratio-row">
-                  <span style={{ width: `${plan.equityRatio * 100}%` }} />
-                  <span style={{ width: `${plan.bondRatio * 100}%` }} />
-                  <span style={{ width: `${plan.cashRatio * 100}%` }} />
+                  <span style={{ width: `${plan.equity_ratio * 100}%` }} />
+                  <span style={{ width: `${plan.bond_ratio * 100}%` }} />
+                  <span style={{ width: `${plan.cash_ratio * 100}%` }} />
                 </div>
                 <p className="strategy-note">{plan.reasons.join("；")}</p>
                 <AdoptStrategyButton active={active} onClick={() => applyInvestmentPlan(plan)} />
@@ -3370,16 +3001,31 @@ function ScenarioPage({
                 <NumberField label="微量商贷手动比例" value={selectedScenario.data.micro_commercial_loan_ratio ?? 0} min={0} max={1} step={0.01} onChange={(value) => updateScenario("micro_commercial_loan_ratio", value)} />
                 <NumberField label="公积金利率" value={selectedScenario.data.provident_rate} min={0} max={0.2} step={0.0005} onChange={(value) => updateScenario("provident_rate", value)} />
                 <NumberField label="商贷利率" value={selectedScenario.data.commercial_rate} min={0} max={0.2} step={0.0005} onChange={(value) => updateScenario("commercial_rate", value)} />
-                <SwitchField
-                  label="商贷提前还本"
-                  checked={selectedScenario.data.commercial_prepayment_enabled ?? false}
-                  onChange={(checked) => updateScenario("commercial_prepayment_enabled", checked)}
-                />
-                {(selectedScenario.data.commercial_prepayment_enabled ?? false) ? (
+                <Field label="商贷提前还本策略">
+                  <select
+                    value={selectedScenario.data.commercial_prepayment_mode ?? "auto"}
+                    onChange={(event) => {
+                      const mode = event.target.value as CommercialPrepaymentMode;
+                      updateScenario("commercial_prepayment_mode", mode);
+                      updateScenario("commercial_prepayment_enabled", mode === "manual");
+                    }}
+                  >
+                    <option value="auto">策略自动生成</option>
+                    <option value="manual">手动指定</option>
+                    <option value="none">不提前还本</option>
+                  </select>
+                </Field>
+                {(selectedScenario.data.commercial_prepayment_mode ?? "auto") !== "none" ? (
                   <>
                     <NumberField label="希望起始还本月" value={selectedScenario.data.commercial_prepayment_start_month ?? 1} min={1} max={360} step={1} onChange={(value) => updateScenario("commercial_prepayment_start_month", value)} />
                     <NumberField label="合同允许最早月" value={selectedScenario.data.commercial_prepayment_allowed_after_month ?? 12} min={1} max={360} step={1} onChange={(value) => updateScenario("commercial_prepayment_allowed_after_month", value)} />
-                    <NumberField label="每月额外还本" value={selectedScenario.data.commercial_prepayment_monthly_amount ?? 0} min={0} step={1000} onChange={(value) => updateScenario("commercial_prepayment_monthly_amount", value)} />
+                    <NumberField
+                      label={(selectedScenario.data.commercial_prepayment_mode ?? "auto") === "manual" ? "每月额外还本" : "商贷提前还本上限"}
+                      value={selectedScenario.data.commercial_prepayment_monthly_amount ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateScenario("commercial_prepayment_monthly_amount", value)}
+                    />
                   </>
                 ) : null}
               </div>
@@ -3439,7 +3085,7 @@ function ScenarioPage({
             </section>
           </div>
           <p className="field-hint">
-            手动买入延后月数只作用于“手动指定”策略，系统会从该月份开始校验现金安全；微量商贷手动比例填 0 时由系统在政策规则上下限内自动寻找更早可买且商贷尽量少的比例，填入比例后按该比例固定测算。买房动用投资选择“自动优化提取”时，后端只卖出覆盖交易现金和安全垫所需的投资资产；选择“清空投资账户”才会在交易月全部变现；选择“手动保留余额”时按设定余额尽量保留长期投资。
+            手动买入延后月数只作用于“手动指定”策略，系统会从该月份开始校验现金安全；微量商贷手动比例填 0 时由系统在政策规则上下限内自动寻找更早可买且商贷尽量少的比例，填入比例后按该比例固定测算。商贷提前还本选择“策略自动生成”时，后端会在合同允许最早月之后按现金安全、买后结余和节省利息自动决定是否额外还本；选择“手动指定”时按你填写的起始月和每月金额测算。买房动用投资选择“自动优化提取”时，后端只卖出覆盖交易现金和安全垫所需的投资资产；选择“清空投资账户”才会在交易月全部变现；选择“手动保留余额”时按设定余额尽量保留长期投资。
           </p>
         </section>
       </div>
@@ -3534,6 +3180,13 @@ function ScenarioPage({
                     <Metric label="商贷年限" value={`${plan.commercial_loan_years} 年`} />
                     <Metric label="公积金还款" value={repaymentMethodLabels[plan.provident_repayment_method]} />
                     <Metric label="商贷还款" value={repaymentMethodLabels[plan.commercial_repayment_method]} />
+                    {plan.commercial_prepayment_enabled ? (
+                      <>
+                        <Metric label="商贷还本策略" value={commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]} tone="good" />
+                        <Metric label="额外还本/月" value={money(plan.commercial_prepayment_monthly_amount)} />
+                        <Metric label="节省商贷利息" value={money(plan.commercial_interest_saved_by_prepayment)} />
+                      </>
+                    ) : null}
                     <Metric label="本人公积金首付抵扣" value={money(plan.provident_upfront_extractable)} />
                     {planFamilySupportAmount > 0 ? (
                       <Metric label={planFamilySupportLabel || "亲属首付支持"} value={money(planFamilySupportAmount)} tone="good" />
@@ -3601,8 +3254,8 @@ function StrategyNarrative({
   const policyBasisText = `政策依据采用北京住房公积金官方口径：首套/二套分别读取规则包中的商贷和公积金最低首付比例，系统取更严格者；公积金贷款按“每缴存一年可贷 15 万元”随 ${purchaseMonthText} 的缴存时间增长，并受首套 ${money(1200000)}、二套 ${money(1000000)} 的基础最高额度、购房月收入还款能力和基本生活费保留约束。当前房源性质为「${propertyNatureText || "未标注"}」，符合绿色建筑、装配式建筑或超低能耗建筑时只取最高一项上浮，本方案上浮 ${money(plan.provident_policy_bonus)}，最终政策上限 ${money(plan.provident_policy_cap)}。`;
   const termBasisText = `贷款年限依据同时看手动设定年限、北京公积金最长 30 年、借款申请人年龄上限，以及二手房/老旧小区房龄或土地剩余年限；本方案采用公积金 ${plan.provident_loan_years} 年，理由：${plan.provident_loan_year_limit_reasons.join("；")}。`;
   const commercialPrepaymentText = plan.commercial_prepayment_enabled
-    ? ` 商贷合同按第 ${plan.commercial_prepayment_allowed_after_month} 个还款月后才允许提前还本估算，实际从第 ${plan.commercial_prepayment_start_month} 个还款月起每月额外还本金 ${money(plan.commercial_prepayment_monthly_amount)}；按合同月供不降、缩短期限估算，预计 ${plan.commercial_actual_payoff_months} 个月结清，节省商贷利息约 ${money(plan.commercial_interest_saved_by_prepayment)}。`
-    : "";
+    ? ` 商贷提前还本采用「${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}」：合同按第 ${plan.commercial_prepayment_allowed_after_month} 个还款月后才允许提前还本估算，实际从第 ${plan.commercial_prepayment_start_month} 个还款月起每月额外还本金 ${money(plan.commercial_prepayment_monthly_amount)}；按合同月供不降、缩短期限估算，预计 ${plan.commercial_actual_payoff_months} 个月结清，节省商贷利息约 ${money(plan.commercial_interest_saved_by_prepayment)}。`
+    : ` 商贷提前还本策略为「${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}」，当前方案未安排额外还本，按合同还款节奏测算。`;
   const repaymentDetailText = `买后还款按两笔贷款分开计算：公积金贷 ${money(plan.provident_loan_amount)}，${plan.provident_loan_years} 年，${repaymentMethodLabels[plan.provident_repayment_method]}，首月/月供约 ${money(plan.provident_monthly_payment)}；商贷 ${money(plan.commercial_loan_amount)}，${plan.commercial_loan_years} 年，${repaymentMethodLabels[plan.commercial_repayment_method]}，首月/月供约 ${money(plan.commercial_monthly_payment)}。两者合计合同月供约 ${money(plan.total_monthly_payment)}，全周期利息约 ${money(plan.total_interest)}。${commercialPrepaymentText}${plan.provident_repayment_advice ? ` ${plan.provident_repayment_advice}` : ""}`;
   const extractionNotesText = plan.provident_extraction_notes
     .map((note) => note.replace(/[。；\s]+$/u, ""))
@@ -4814,6 +4467,23 @@ function SelectedPlanVisualization({
   const plannedVehicleLoanAmount = Math.max(0, result.car_loan.loan_principal ?? 0);
   const selectedLoanPoint = loanVisualizationByMonth.get(safeSelectedMonthIndex);
   const selectedProvidentPoint = providentVisualizationByMonth.get(safeSelectedMonthIndex);
+  const selectedExistingLoanDetails = selectedLoanPoint?.existing_loan_details ?? [];
+  const selectedExistingLoanPaymentTotal = selectedExistingLoanDetails.reduce(
+    (sum, item) => sum + Math.max(0, item.monthly_payment || 0),
+    0
+  );
+  const selectedOtherFixedDebtPayment = Math.max(
+    0,
+    selectedLoanPoint
+      ? selectedLoanPoint.existing_monthly_payment - selectedExistingLoanPaymentTotal
+      : selectedMonth.regularDebtPayment
+  );
+  const selectedExistingLoanDescription = selectedExistingLoanDetails.length > 0
+    ? selectedExistingLoanDetails.map((item) => `${item.name} ${money(item.monthly_payment)}`).join("、")
+    : `已有贷款合计 ${money(selectedLoanPoint?.existing_monthly_payment ?? selectedMonth.phasedLoanPayment)}`;
+  const selectedExistingLoanBalanceDescription = selectedExistingLoanDetails.length > 0
+    ? selectedExistingLoanDetails.map((item) => `${item.name} ${money(item.balance)}`).join("、")
+    : `已有贷款 ${money(selectedLoanPoint?.existing_loan_balance ?? 0)}`;
   const maxViewStartMonth = Math.max(0, timelineEndMonth - viewWindowMonths + 1);
   const viewEndMonth = Math.min(timelineEndMonth, viewStartMonth + viewWindowMonths - 1);
   const visibleMonthlySeries = useMemo(
@@ -5037,7 +4707,7 @@ function SelectedPlanVisualization({
           商贷余额: Math.round(item.commercial_loan_balance),
           公积金贷余额: Math.round(item.provident_loan_balance),
           车贷余额: Math.round(item.vehicle_loan_balance),
-          既有贷款余额: Math.round(item.existing_loan_balance),
+          已有贷款余额: Math.round(item.existing_loan_balance),
           当月贷款还款: Math.round(item.total_monthly_payment),
           商贷月供: Math.round(item.commercial_monthly_payment),
           商贷额外还本: Math.round(item.commercial_extra_principal_payment ?? 0),
@@ -5057,7 +4727,7 @@ function SelectedPlanVisualization({
       item.总贷款余额 > 0 ||
       item.房贷余额 > 0 ||
       item.车贷余额 > 0 ||
-      item.既有贷款余额 > 0 ||
+      item.已有贷款余额 > 0 ||
       item.当月贷款还款 > 0 ||
       item.当月现金还款 > 0
   );
@@ -5141,13 +4811,31 @@ function SelectedPlanVisualization({
   );
   const selectedTaxYear = addMonths(timelineBaseDate, safeSelectedMonthIndex).getFullYear();
   const selectedYearTaxSummary = result.tax_year_summaries?.find((item) => item.year === selectedTaxYear);
-  const taxSummaryRows = selectedYearTaxSummary?.summaries ?? result.tax_summaries ?? [];
-  const annualTaxTotal =
-    selectedYearTaxSummary?.total_tax ?? result.annual_income_tax ?? taxSummaryRows.reduce((sum, item) => sum + item.total_tax, 0);
-  const annualTaxableIncome = selectedYearTaxSummary?.taxable_income ?? taxSummaryRows.reduce((sum, item) => sum + item.taxable_income, 0);
-  const annualGrossIncome = selectedYearTaxSummary?.gross_annual_income ?? taxSummaryRows.reduce((sum, item) => sum + item.gross_annual_income, 0);
-  const annualNetIncome = selectedYearTaxSummary?.net_annual_income ?? taxSummaryRows.reduce((sum, item) => sum + item.net_annual_income, 0);
+  const taxSummaryRows = selectedYearTaxSummary?.summaries ?? [];
+  const annualTaxTotal = selectedYearTaxSummary?.total_tax ?? 0;
+  const annualTaxableIncome = selectedYearTaxSummary?.taxable_income ?? 0;
+  const annualGrossIncome = selectedYearTaxSummary?.gross_annual_income ?? 0;
+  const annualNetIncome = selectedYearTaxSummary?.net_annual_income ?? 0;
   const selectedMonthTax = selectedMemberIncomeRows.reduce((sum, member) => sum + member.incomeTax, 0);
+  const selectedAnnualFinancialSummary = result.annual_financial_summaries?.find(
+    (item) => item.plan_variant === plan.variant && item.year === selectedTaxYear
+  );
+  const annualOperatingOutflow = selectedAnnualFinancialSummary
+    ? selectedAnnualFinancialSummary.living_expense +
+      selectedAnnualFinancialSummary.scheduled_expense +
+      selectedAnnualFinancialSummary.debt_payment +
+      selectedAnnualFinancialSummary.house_payment +
+      selectedAnnualFinancialSummary.vehicle_payment +
+      selectedAnnualFinancialSummary.vehicle_operating_cost
+    : 0;
+  const annualLoanPayment = selectedAnnualFinancialSummary
+    ? selectedAnnualFinancialSummary.commercial_payment +
+      selectedAnnualFinancialSummary.provident_payment +
+      selectedAnnualFinancialSummary.vehicle_loan_payment +
+      selectedAnnualFinancialSummary.existing_loan_payment +
+      selectedAnnualFinancialSummary.commercial_extra_principal_payment +
+      selectedAnnualFinancialSummary.vehicle_extra_principal_payment
+    : 0;
   const selectedMonthGrossIncome = selectedMemberIncomeRows.reduce(
     (sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly,
     0
@@ -5277,6 +4965,30 @@ function SelectedPlanVisualization({
       ? `买后自由现金流为负 ${money(Math.abs(plan.post_purchase_cash_flow))}，需要减少月供、降低用车成本或提高收入阶段。`
       : `买后自由现金流结余约 ${money(plan.post_purchase_cash_flow)}，贷后公积金策略为「${providentStrategyLabel(plan)}」，可继续评估装修和车贷节奏。`
   ];
+  const advisorEvidenceItems = [
+    {
+      label: "买入时间",
+      value: plan.months_to_buy === null
+        ? `30 年内暂未覆盖 ${scenario.name} 的交易现金要求。`
+        : `${formatMonthDate(timelineBaseDate, plan.months_to_buy)} 可进入交易，距今约 ${plan.years_to_buy ?? "超过30"} 年。`
+    },
+    {
+      label: "交易现金",
+      value: `当天自备资金 ${money(requiredCashAfterPf)}，交易后现金 ${money(plan.cash_after_transaction)}，安全垫目标 ${money(plan.required_liquidity_reserve)}。`
+    },
+    {
+      label: "压力现金",
+      value: stressCashSummary
+    },
+    {
+      label: "月供压力",
+      value: `买后自由现金流 ${money(plan.post_purchase_cash_flow)}，负债收入比 ${percent(plan.debt_to_income_ratio)}；当月贷款还款会继续按房贷、车贷和已有贷款拆分查看。`
+    },
+    {
+      label: "资产与体验",
+      value: `幸福指数 ${plan.happiness_score.toFixed(1)} / 10；理财按 ${percent(annualReturn)} 年化、买入费 ${percent(investmentBuyFeeRate)}、卖出费 ${percent(investmentSellFeeRate)} 推演，买房时投资账户保留约 ${money(purchaseInvestmentAfter)}。`
+    }
+  ];
   const selectedFamilySupportAmount = familySupportAmount(plan);
   const selectedFamilySupportLabel = familySupportLabel(plan);
   const transactionTaxAndFees = Math.max(0, plan.upfront_cash_required - plan.planned_down_payment - plan.renovation_cost);
@@ -5301,7 +5013,7 @@ function SelectedPlanVisualization({
     },
     {
       title: "贷款扣款要按月份看",
-      body: `房贷、车贷和既有贷款都会进入“贷款余额与月供”。北京公积金冲还贷按「${providentStrategyLabel(plan)}」在约定月份从公积金账户集中冲抵，非冲抵月仍按合同从银行卡扣公积金贷月供；具体每个月的扣款结构已经移到贷款图下方的月度饼图。`
+      body: `房贷、车贷和已有贷款都会进入“贷款余额与月供”。北京公积金冲还贷按「${providentStrategyLabel(plan)}」在约定月份从公积金账户集中冲抵，非冲抵月仍按合同从银行卡扣公积金贷月供；具体每个月的扣款结构已经移到贷款图下方的月度饼图。`
     },
     {
       title: "还款方式怎样影响还清速度",
@@ -5430,14 +5142,21 @@ function SelectedPlanVisualization({
     ...incomeMemberLegendData,
     ...incomeHouseholdFlowData
   ].filter((item) => item.value > 0);
+  const existingLoanExpensePieData = selectedExistingLoanDetails.length > 0
+    ? selectedExistingLoanDetails.map((item, index) => ({
+        name: item.name,
+        value: item.monthly_payment,
+        color: existingLoanPalette[index % existingLoanPalette.length]
+      }))
+    : [{ name: "已有贷款月供", value: selectedMonth.phasedLoanPayment, color: visualColors.expense }];
   const expensePieData = [
     ...selectedMemberIncomeRows.flatMap((member) => [
       { name: `${member.name}收入阶段额外现金支出`, value: member.extraCashExpense }
     ]),
     { name: "基础生活支出", value: selectedMonth.baseLivingExpense },
     ...selectedMonth.scheduledExpenseRows.map((item) => ({ name: item.name, value: item.amount })),
-    { name: "普通既有债务", value: selectedMonth.regularDebtPayment },
-    { name: "目前贷款", value: selectedMonth.phasedLoanPayment },
+    { name: "其他固定还款", value: selectedOtherFixedDebtPayment || selectedMonth.regularDebtPayment },
+    ...existingLoanExpensePieData,
     { name: "无车通勤成本", value: selectedMonth.noCarCommuteCost },
     { name: "车辆车贷", value: selectedMonth.firstCarLoanPayment },
     { name: "车辆电费", value: selectedMonth.firstCarEnergyCost },
@@ -5482,7 +5201,12 @@ function SelectedPlanVisualization({
       color: visualColors.vehicle
     },
     { name: "车贷额外还本", value: selectedLoanPoint?.vehicle_extra_principal_payment ?? 0, color: "var(--gold)" },
-    { name: "既有贷款月供", value: selectedLoanPoint?.existing_monthly_payment ?? 0, color: visualColors.expense }
+    { name: "其他固定还款", value: selectedOtherFixedDebtPayment, color: visualColors.expense },
+    ...selectedExistingLoanDetails.map((item, index) => ({
+      name: item.name,
+      value: item.monthly_payment,
+      color: existingLoanPalette[index % existingLoanPalette.length]
+    }))
   ].filter((item) => item.value > 0);
   const sumPieValues = (items: Array<{ value: number }>) =>
     items.reduce((sum, item) => sum + Math.max(0, Number(item.value) || 0), 0);
@@ -5601,7 +5325,7 @@ function SelectedPlanVisualization({
       rows: [
         ["基础生活支出", -selectedMonth.baseLivingExpense],
         ...selectedMonth.scheduledExpenseRows.map((item): [string, number] => [item.name, -item.amount]),
-        ["债务与目前贷款", -selectedMonth.debtPayment],
+        ["固定还款与已有贷款", -selectedMonth.debtPayment],
         ["通勤/用车", -selectedMonth.carCost],
         ["房贷现金还款", -selectedMonth.housePayment],
         ["公积金账户代扣房贷", selectedMonth.providentHouseOffsetPayment ?? 0],
@@ -5642,7 +5366,7 @@ function SelectedPlanVisualization({
       title: "贷款还款策略为什么这样",
       body:
         selectedLoanPoint && selectedLoanPoint.total_monthly_payment > 0
-          ? `房贷、车贷和既有贷款都属于贷款。当前月贷款还款 ${money(selectedLoanPoint.total_monthly_payment)}，其中房贷 ${money(selectedLoanPoint.home_monthly_payment)}、车贷 ${money(selectedLoanPoint.vehicle_monthly_payment)}、既有债务 ${money(selectedLoanPoint.existing_monthly_payment)}；商贷和车贷额外还本会作为本金支出计入当月还款，公积金冲还贷只降低现金还款压力，不把它记成收入。`
+          ? `房贷、车贷和已有贷款都属于贷款。当前月贷款还款 ${money(selectedLoanPoint.total_monthly_payment)}，其中房贷 ${money(selectedLoanPoint.home_monthly_payment)}、车贷 ${money(selectedLoanPoint.vehicle_monthly_payment)}、${selectedExistingLoanDescription}；商贷和车贷额外还本会作为本金支出计入当月还款，公积金冲还贷只降低现金还款压力，不把它记成收入。`
           : `当前月还没有实际贷款还款进入现金流；如果计划中有房贷或车贷，它们会从买房/买车发生月起进入贷款余额与月供曲线。`
     },
     {
@@ -5685,9 +5409,20 @@ function SelectedPlanVisualization({
         <div>
           <PanelTitle icon={<ShieldCheck size={18} />} title="顾问摘要" compact />
           <h3>{advisorTitle}</h3>
+          <p className="advisor-lead">{advisorSummary}</p>
           <details className="details-panel advisor-details">
-            <summary>查看顾问判断依据</summary>
-            <p>{advisorSummary}</p>
+            <summary>
+              <span>查看顾问判断依据</span>
+              <small>展开后按时间、现金、月供、资产体验拆开看</small>
+            </summary>
+            <div className="advisor-evidence-list">
+              {advisorEvidenceItems.map((item) => (
+                <div className="advisor-evidence-item" key={item.label}>
+                  <strong>{item.label}</strong>
+                  <span>{item.value}</span>
+                </div>
+              ))}
+            </div>
           </details>
         </div>
         <div className="advisor-actions">
@@ -5897,6 +5632,64 @@ function SelectedPlanVisualization({
             ))}
           </div>
         </div>
+      </section>
+
+      <section className="chart-block annual-financial-panel">
+        <div className="strategy-panel-head">
+          <PanelTitle icon={<WalletCards size={18} />} title="年度财务总览" compact />
+          <span>
+            {selectedTaxYear} 年按后端年度口径汇总，账户年末值取该年最后一个推演月份，不再由前端临时按曲线重算。
+          </span>
+        </div>
+        {selectedAnnualFinancialSummary ? (
+          <>
+            <div className="tax-kpi-grid">
+              <Metric label="年度现金收入" value={money(selectedAnnualFinancialSummary.cash_income)} />
+              <Metric label="年度日常与计划支出" value={money(annualOperatingOutflow)} />
+              <Metric label="年度贷款还款" value={money(annualLoanPayment)} />
+              <Metric
+                label="年度现金净变化"
+                value={money(selectedAnnualFinancialSummary.monthly_cash_delta)}
+                tone={selectedAnnualFinancialSummary.monthly_cash_delta >= 0 ? "good" : "warn"}
+              />
+              <Metric label="年末流动资产" value={money(selectedAnnualFinancialSummary.liquid_asset_value_end)} />
+              <Metric label="年末贷款余额" value={money(selectedAnnualFinancialSummary.total_loan_balance_end)} />
+              <Metric label="年末净资产" value={money(selectedAnnualFinancialSummary.net_worth_end)} />
+              <Metric label="年末公积金余额" value={money(selectedAnnualFinancialSummary.provident_balance_end)} />
+            </div>
+            <div className="tax-summary-panel annual-financial-breakdown">
+              <div>
+                <span>理财投入 / 收益 / 手续费</span>
+                <strong>
+                  {money(selectedAnnualFinancialSummary.investment_contribution)} / {money(selectedAnnualFinancialSummary.investment_return)} / {money(selectedAnnualFinancialSummary.investment_fee)}
+                </strong>
+              </div>
+              <div>
+                <span>交易现金流出 / 流入</span>
+                <strong>
+                  {money(selectedAnnualFinancialSummary.transaction_cash_out)} / {money(selectedAnnualFinancialSummary.transaction_cash_in)}
+                </strong>
+              </div>
+              <div>
+                <span>公积金缴存 / 提取 / 冲还贷</span>
+                <strong>
+                  {money(selectedAnnualFinancialSummary.provident_deposit)} / {money(selectedAnnualFinancialSummary.provident_withdrawal)} / {money(selectedAnnualFinancialSummary.provident_offset_payment)}
+                </strong>
+              </div>
+              <div>
+                <span>房贷 / 车贷 / 已有贷款</span>
+                <strong>
+                  {money(selectedAnnualFinancialSummary.commercial_payment + selectedAnnualFinancialSummary.provident_payment)} / {money(selectedAnnualFinancialSummary.vehicle_loan_payment)} / {money(selectedAnnualFinancialSummary.existing_loan_payment)}
+                </strong>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="chart-empty-state">
+            <strong>等待后端生成年度财务汇总</strong>
+            <span>年度现金流、账户和贷款摘要只展示后端计算结果；当前方案或年份还没有可用汇总。</span>
+          </div>
+        )}
       </section>
 
       <section className="chart-block tax-visual-chart">
@@ -6174,7 +5967,7 @@ function SelectedPlanVisualization({
                 <Line yAxisId="balance" type="monotone" dataKey="商贷余额" stroke={visualColors.property} strokeWidth={2.4} dot={false} />
                 <Line yAxisId="balance" type="monotone" dataKey="公积金贷余额" stroke={visualColors.provident} strokeWidth={2.4} dot={false} />
                 <Line yAxisId="balance" type="monotone" dataKey="车贷余额" stroke={visualColors.vehicle} strokeWidth={2.2} dot={false} />
-                <Line yAxisId="balance" type="monotone" dataKey="既有贷款余额" stroke={visualColors.expense} strokeWidth={2.1} strokeDasharray="4 4" dot={false} />
+                <Line yAxisId="balance" type="monotone" dataKey="已有贷款余额" stroke={visualColors.expense} strokeWidth={2.1} strokeDasharray="4 4" dot={false} />
                 <Line yAxisId="payment" type="monotone" dataKey="当月贷款还款" stroke={visualColors.warning} strokeWidth={2.0} strokeDasharray="3 3" dot={false} />
                 <Line yAxisId="payment" type="monotone" dataKey="商贷额外还本" stroke={visualColors.property} strokeWidth={1.9} strokeDasharray="7 4" dot={false} />
                 <Line yAxisId="payment" type="monotone" dataKey="车贷额外还本" stroke={visualColors.vehicle} strokeWidth={1.9} strokeDasharray="7 4" dot={false} />
@@ -6186,7 +5979,7 @@ function SelectedPlanVisualization({
             <div className="chart-empty-state">
               <strong>当前方案没有贷款账户变化</strong>
               <span>
-                当前已选策略没有商贷、公积金贷、车贷或可推演余额的既有贷款。
+                当前已选策略没有商贷、公积金贷、车贷或可推演余额的已有贷款。
               </span>
             </div>
           )}
@@ -6194,7 +5987,7 @@ function SelectedPlanVisualization({
             <div>
               <span>总贷款余额</span>
               <strong>{money(selectedLoanPoint?.total_loan_balance ?? 0)}</strong>
-              <small>后端按已选购房方案、车贷和目前贷款逐月测算</small>
+              <small>后端按已选购房方案、车贷和已有贷款逐月测算</small>
             </div>
             <div>
               <span>房贷余额</span>
@@ -6202,9 +5995,9 @@ function SelectedPlanVisualization({
               <small>商贷 {money(selectedLoanPoint?.commercial_loan_balance ?? 0)}，公积金贷 {money(selectedLoanPoint?.provident_loan_balance ?? 0)}；计划房贷 {money(plannedHomeLoanAmount)}</small>
             </div>
             <div>
-              <span>车贷与既有贷款</span>
+              <span>车贷与已有贷款</span>
               <strong>{money((selectedLoanPoint?.vehicle_loan_balance ?? 0) + (selectedLoanPoint?.existing_loan_balance ?? 0))}</strong>
-              <small>车贷 {money(selectedLoanPoint?.vehicle_loan_balance ?? 0)}，既有贷款 {money(selectedLoanPoint?.existing_loan_balance ?? 0)}；计划车贷 {money(plannedVehicleLoanAmount)}</small>
+              <small>车贷 {money(selectedLoanPoint?.vehicle_loan_balance ?? 0)}，{selectedExistingLoanBalanceDescription}；计划车贷 {money(plannedVehicleLoanAmount)}</small>
             </div>
             <div>
               <span>当月还款压力</span>
@@ -6248,7 +6041,7 @@ function SelectedPlanVisualization({
                   </div>
                 </div>
               ) : (
-                <p className="field-hint">当前月份没有贷款扣款；贷款发生后这里会展示商贷、公积金贷、车贷和既有贷款的当月扣款结构。</p>
+                <p className="field-hint">当前月份没有贷款扣款；贷款发生后这里会展示商贷、公积金贷、车贷和已有贷款的当月扣款结构。</p>
               )}
             </div>
           </div>
@@ -6257,12 +6050,12 @@ function SelectedPlanVisualization({
             <span><i className="home-loan-line" />商贷余额</span>
             <span><i className="provident-loan" />公积金贷余额</span>
             <span><i className="vehicle-loan-line" />车贷余额</span>
-            <span><i className="existing-loan-line" />既有贷款余额</span>
+            <span><i className="existing-loan-line" />已有贷款余额</span>
             <span><i className="provident-loan" />公积金账户冲抵</span>
             <span><i className="cash-payment-line" />当月现金还款</span>
           </div>
           <p className="field-hint">
-            贷款余额由后端统一生成，前端只展示结果。目前贷款按“未开始计息、只还利息、进入等额还款”逐月推进；普通既有债务如果没有本金配置，只计入还款压力，不推导余额。
+            贷款余额由后端统一生成，前端只展示结果。已有贷款按“未开始计息、只还利息、进入等额还款”逐月推进；其他固定还款如果没有本金配置，只计入还款压力，不推导余额。
           </p>
         </section>
 
@@ -6737,7 +6530,7 @@ function exportText(result: AffordabilityResult, scenario: ScenarioData, plan: P
     "",
     `税后月收入：${money(result.household_net_monthly_income)}`,
     `年度个税：${money(result.annual_income_tax)}`,
-    `目前贷款月供：${money(result.phased_loan_monthly_payment)}`,
+    `已有贷款月供：${money(result.phased_loan_monthly_payment)}`,
     "",
     "当前方案购房路径：",
     `预计买入时间：${plan.months_to_buy === null ? "30 年内暂不可达" : formatMonthDate(new Date(), plan.months_to_buy)}（约 ${plan.years_to_buy ?? "超过30"} 年）`,
@@ -6746,6 +6539,9 @@ function exportText(result: AffordabilityResult, scenario: ScenarioData, plan: P
     renovationText,
     `公积金贷：${money(plan.provident_loan_amount)}，${plan.provident_loan_years} 年，${repaymentMethodLabels[plan.provident_repayment_method]}，政策上限 ${money(plan.provident_policy_cap)}，政策上浮 ${money(plan.provident_policy_bonus)}`,
     `商贷：${money(plan.commercial_loan_amount)}，${plan.commercial_loan_years} 年，${repaymentMethodLabels[plan.commercial_repayment_method]}`,
+    plan.commercial_prepayment_enabled
+      ? `商贷提前还本：${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}，第 ${plan.commercial_prepayment_start_month} 个还款月起每月额外还本 ${money(plan.commercial_prepayment_monthly_amount)}，预计节省利息 ${money(plan.commercial_interest_saved_by_prepayment)}`
+      : `商贷提前还本：${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}，当前方案不安排额外还本`,
     `合计月供：${money(plan.total_monthly_payment)}，交易当下现金：${money(plan.cash_after_transaction)}，购房后公积金到账后现金：${money(plan.cash_after_purchase)}`,
     `买后自由现金月结余：${money(plan.post_purchase_cash_flow)}，贷后公积金策略：${providentStrategyLabel(plan)}，按策略折算后的现金压力：${money(plan.post_purchase_cash_flow_with_pf_withdrawal)}/月`,
     `公积金还款方式建议：${plan.provident_repayment_advice || "无"}`,
@@ -6907,6 +6703,11 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       ["商贷年限", plan.commercial_loan_years],
       ["商贷还款方式", repaymentMethodLabels[plan.commercial_repayment_method]],
       ["商贷月供", plan.commercial_monthly_payment],
+      ["商贷提前还本策略", commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]],
+      ["商贷提前还本是否启用", plan.commercial_prepayment_enabled],
+      ["商贷提前还本起始月", plan.commercial_prepayment_start_month],
+      ["商贷每月额外还本", plan.commercial_prepayment_monthly_amount],
+      ["商贷提前还本节省利息", plan.commercial_interest_saved_by_prepayment],
       ["合计月供", plan.total_monthly_payment],
       ["全周期利息", plan.total_interest],
       ["购房后预计公积金提取到账", plan.provident_post_transaction_extractable],
@@ -6981,7 +6782,7 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       "基础生活支出",
       "定时支出",
       "普通固定还款",
-      "目前贷款还款",
+      "已有贷款还款",
       "房贷现金还款",
       "房贷合同还款",
       "公积金账户代扣房贷",
@@ -7076,13 +6877,13 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       "公积金贷余额",
       "房贷余额",
       "车贷余额",
-      "目前贷款余额",
+      "已有贷款余额",
       "总贷款余额",
       "商贷月供",
       "公积金贷合同月供",
       "房贷合同月供",
       "车贷月供",
-      "目前贷款月供",
+      "已有贷款月供",
       "贷款还款合计",
       "现金还款",
       "公积金账户冲抵"

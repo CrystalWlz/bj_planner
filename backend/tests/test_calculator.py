@@ -385,6 +385,66 @@ def test_affordability_result_contains_backend_tax_timeline() -> None:
     assert result.tax_monthly_points[0].member_points[0].member_name == "member_a"
 
 
+def test_affordability_result_contains_backend_annual_financial_summary() -> None:
+    result = calculate_affordability(
+        HouseholdData(
+            cash_account_balance=1_200_000,
+            investments=120_000,
+            monthly_expense=12_000,
+            members=[
+                IncomeMember(name="member_a", monthly_salary_gross=30_000, annual_bonus=60_000),
+                IncomeMember(name="member_b", monthly_salary_gross=18_000, annual_bonus=20_000),
+            ],
+            car_plan=CarPlanData(
+                enabled=True,
+                total_price=180_000,
+                down_payment_ratio=0.4,
+                purchase_delay_months=8,
+            ),
+        ),
+        ScenarioData(total_price=3_000_000, renovation_cost=80_000),
+        RulePackData(params={**RulePackData().params, "backend_parallel_workers": 1}),
+    )
+
+    assert result.annual_financial_summaries
+    plan = result.purchase_plan_analyses[0]
+    summary = next(item for item in result.annual_financial_summaries if item.plan_variant == plan.variant)
+    base_month = date.today().replace(day=1)
+    rows = [
+        item
+        for item in result.monthly_cashflow_visualization
+        if item.plan_variant == summary.plan_variant
+        and calculator_module._month_after(base_month, item.month)[0] == summary.year
+    ]
+    assert rows
+    last_month = max(item.month for item in rows)
+    snapshot = next(
+        item
+        for item in result.account_snapshots
+        if item.plan_variant == summary.plan_variant and item.month == last_month
+    )
+    loan_row = next(
+        item
+        for item in result.loan_visualization
+        if item.plan_variant == summary.plan_variant and item.month == last_month
+    )
+    provident_row = next(
+        item
+        for item in result.provident_visualization
+        if item.plan_variant == summary.plan_variant and item.month == last_month
+    )
+
+    assert summary.months == len(rows)
+    assert summary.cash_income == pytest.approx(sum(item.cash_income for item in rows))
+    assert summary.investment_contribution == pytest.approx(sum(item.investment_contribution for item in rows))
+    assert summary.cash_balance_end == pytest.approx(snapshot.cash_balance)
+    assert summary.investment_balance_end == pytest.approx(snapshot.investment_balance)
+    assert summary.total_loan_balance_end == pytest.approx(loan_row.total_loan_balance)
+    assert summary.provident_balance_end == pytest.approx(provident_row.balance_end)
+    assert summary.commercial_loan_balance_end == pytest.approx(loan_row.commercial_loan_balance)
+    assert summary.provident_loan_balance_end == pytest.approx(loan_row.provident_loan_balance)
+
+
 def test_income_member_defaults_to_one_income_stage() -> None:
     member = IncomeMember(
         monthly_salary_gross=30_000,
@@ -489,7 +549,14 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
             ],
         ),
         members=[
-            IncomeMember(name="我", current_age=30, monthly_salary_gross=20_000, annual_bonus=0, monthly_special_additional_deduction=0),
+            IncomeMember(
+                name="我",
+                current_age=30,
+                retirement_category="female_50",
+                monthly_salary_gross=20_000,
+                annual_bonus=0,
+                monthly_special_additional_deduction=0,
+            ),
             IncomeMember(name="成员B", current_age=28, monthly_salary_gross=12_000, annual_bonus=0, monthly_special_additional_deduction=0),
         ],
     )
@@ -497,7 +564,7 @@ def test_career_shock_adds_layoff_self_social_and_pension_income_stages() -> Non
     before_layoff = household_monthly_income_profile_at(household, rule, as_of=date(2026, 7, 1))
     unemployment = household_monthly_income_profile_at(household, rule, months_from_now=12, as_of=date(2026, 7, 1))
     self_social = household_monthly_income_profile_at(household, rule, months_from_now=14, as_of=date(2026, 7, 1))
-    pension = household_monthly_income_profile_at(household, rule, months_from_now=240, as_of=date(2026, 7, 1))
+    pension = household_monthly_income_profile_at(household, rule, months_from_now=300, as_of=date(2026, 7, 1))
 
     assert unemployment.non_taxable_income == pytest.approx(2_000)
     assert unemployment.net_income < before_layoff.net_income
@@ -586,12 +653,20 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
                 )
             ],
         ),
-        members=[IncomeMember(name="样例成员", current_age=30, monthly_salary_gross=20_000, annual_bonus=0)],
+        members=[
+            IncomeMember(
+                name="样例成员",
+                current_age=30,
+                retirement_category="female_50",
+                monthly_salary_gross=20_000,
+                annual_bonus=0,
+            )
+        ],
     )
 
     unemployment = household_monthly_income_profile_at(household, rule, months_from_now=12, as_of=date(2026, 7, 1))
     flexible = household_monthly_income_profile_at(household, rule, months_from_now=30, as_of=date(2026, 7, 1))
-    pension = household_monthly_income_profile_at(household, rule, months_from_now=240, as_of=date(2026, 7, 1))
+    pension = household_monthly_income_profile_at(household, rule, months_from_now=300, as_of=date(2026, 7, 1))
 
     assert unemployment.non_taxable_income == pytest.approx(2200)
     assert unemployment.gross_income == pytest.approx(2200)
@@ -600,6 +675,79 @@ def test_career_shock_supports_freelance_income_flexible_housing_fund_and_auto_p
     assert flexible.monthly_pf_deposit == pytest.approx(720)
     assert flexible.gross_income == pytest.approx(0)
     assert pension.non_taxable_income > 0
+
+
+def test_affordability_exposes_backend_career_shock_projection() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        social_security_months=120,
+        members=[
+            IncomeMember(
+                name="样例成员A",
+                birth_month="2001-08",
+                monthly_salary_gross=30_000,
+                annual_bonus=60_000,
+            )
+        ],
+        career_shock=CareerShockData(
+            enabled=True,
+            auto_unemployment_benefit=True,
+            auto_self_social_insurance=True,
+            auto_flexible_housing_fund=True,
+            member_settings=[
+                CareerShockMemberSetting(
+                    member_name="样例成员A",
+                    enabled=True,
+                    layoff_age=35,
+                    retirement_age=50,
+                    auto_pension_monthly=True,
+                )
+            ],
+        ),
+    )
+
+    result = calculate_affordability(household, ScenarioData(total_price=0), rule)
+
+    assert result.career_shock_projection is not None
+    projection = result.career_shock_projection.member_projections[0]
+    assert projection.member_name == "样例成员A"
+    assert projection.enabled is True
+    assert projection.retirement_age == 63
+    assert projection.unemployment_benefit_months == 24
+    assert projection.unemployment_benefit_monthly > 0
+    assert projection.self_social_insurance_monthly > 0
+    assert projection.pension_monthly > 0
+    assert any(stage.name.startswith("自动情景：") for stage in projection.generated_stages)
+    assert any(
+        stage.name.startswith("自动情景：")
+        for stage in result.career_shock_projection.effective_members[0].income_stages
+    )
+
+
+def test_affordability_exposes_backend_investment_recommendations() -> None:
+    household = HouseholdData(
+        cash_account_balance=200_000,
+        investments=50_000,
+        monthly_expense=10_000,
+        monthly_investment_amount=5_000,
+        investment_cash_reserve_months=6,
+        investment_auto_rebalance=True,
+        members=[
+            IncomeMember(name="样例成员A", monthly_salary_gross=30_000),
+        ],
+    )
+
+    result = calculate_affordability(household, ScenarioData(total_price=0), RulePackData())
+
+    assert result.investment_plan_recommendations
+    assert result.investment_plan_recommendations[0].plan_name in {
+        "cash_reserve_first",
+        "balanced_monthly_investment",
+        "growth_monthly_investment",
+    }
+    assert result.current_investment_allocation is not None
+    assert result.current_investment_allocation.reserve_target == pytest.approx(60_000)
+    assert result.current_investment_allocation.total_investment >= 0
 
 
 def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
@@ -1090,13 +1238,23 @@ def test_affordability_returns_backend_loan_visualization_series() -> None:
             monthly_debt_payment=1_000,
             phased_loans=[
                 PhasedLoanData(
-                    name="样例阶段性贷款",
+                    name="教育贷款A",
                     principal=120_000,
                     annual_rate=0.028,
                     remaining_months=120,
                     interest_start_month="2026-07",
                     interest_only_until="2028-07",
-                )
+                ),
+                PhasedLoanData(
+                    borrower="样例成员B",
+                    name="消费贷B",
+                    loan_type="consumer",
+                    principal=60_000,
+                    annual_rate=0.036,
+                    remaining_months=72,
+                    interest_start_month="2026-07",
+                    interest_only_until="2026-07",
+                ),
             ],
         ),
         ScenarioData(total_price=2_000_000, down_payment_amount=700_000),
@@ -1109,8 +1267,13 @@ def test_affordability_returns_backend_loan_visualization_series() -> None:
     rows = [item for item in result.loan_visualization if item.plan_variant == plan.variant]
 
     assert rows
-    assert rows[0].existing_loan_balance == pytest.approx(120_000)
+    assert rows[0].existing_loan_balance == pytest.approx(180_000)
     assert rows[0].existing_monthly_payment > 1_000
+    assert [item.name for item in rows[0].existing_loan_details] == ["教育贷款A", "消费贷B"]
+    assert sum(item.balance for item in rows[0].existing_loan_details) == pytest.approx(rows[0].existing_loan_balance)
+    assert rows[0].existing_monthly_payment == pytest.approx(
+        1_000 + sum(item.monthly_payment for item in rows[0].existing_loan_details)
+    )
     if plan.months_to_buy is not None:
         purchase_row = rows[plan.months_to_buy]
         later_row = rows[min(plan.months_to_buy + 12, len(rows) - 1)]
@@ -1208,6 +1371,7 @@ def test_commercial_and_vehicle_prepayment_reduce_interest_and_balances() -> Non
         provident_loan_amount=0,
         manual_purchase_delay_months=1,
         commercial_rate=0.04,
+        commercial_prepayment_mode="none",
         loan_years=20,
         deed_tax_rate=0,
         broker_fee_rate=0,
@@ -1216,6 +1380,7 @@ def test_commercial_and_vehicle_prepayment_reduce_interest_and_balances() -> Non
     )
     prepay_scenario = base_scenario.model_copy(
         update={
+            "commercial_prepayment_mode": "manual",
             "commercial_prepayment_enabled": True,
             "commercial_prepayment_start_month": 1,
             "commercial_prepayment_monthly_amount": 5_000,
@@ -1266,6 +1431,57 @@ def test_commercial_and_vehicle_prepayment_reduce_interest_and_balances() -> Non
     assert prepay_car.actual_payoff_months < base_car.total_months
     assert prepay_car.total_interest < base_car.total_interest
     assert prepay_car.interest_saved_by_prepayment > 0
+
+
+def test_auto_commercial_prepayment_is_chosen_from_cashflow_pressure() -> None:
+    roomy_household = HouseholdData(
+        cash_account_balance=1_600_000,
+        monthly_expense=8_000,
+        members=[IncomeMember(name="sample", monthly_salary_gross=90_000, annual_bonus=0)],
+        car_plan=CarPlanData(enabled=False, vehicle_plans=[]),
+    )
+    tight_household = HouseholdData(
+        cash_account_balance=900_000,
+        monthly_expense=24_000,
+        members=[IncomeMember(name="sample", monthly_salary_gross=28_000, annual_bonus=0)],
+        car_plan=CarPlanData(enabled=False, vehicle_plans=[]),
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        down_payment_amount=800_000,
+        commercial_loan_amount=1_000_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=1,
+        commercial_rate=0.045,
+        commercial_prepayment_mode="auto",
+        commercial_prepayment_allowed_after_month=12,
+        commercial_prepayment_monthly_amount=0,
+        loan_years=20,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+    no_prepay_scenario = scenario.model_copy(update={"commercial_prepayment_mode": "none"})
+
+    roomy_result = calculate_affordability(roomy_household, scenario, RulePackData())
+    no_prepay_result = calculate_affordability(roomy_household, no_prepay_scenario, RulePackData())
+    tight_result = calculate_affordability(tight_household, scenario, RulePackData())
+
+    roomy_plan = {item.variant: item for item in roomy_result.purchase_plan_analyses}["手动指定"]
+    no_prepay_plan = {item.variant: item for item in no_prepay_result.purchase_plan_analyses}["手动指定"]
+    tight_plan = {item.variant: item for item in tight_result.purchase_plan_analyses}["手动指定"]
+
+    assert roomy_plan.commercial_prepayment_mode == "auto"
+    assert roomy_plan.commercial_prepayment_enabled
+    assert roomy_plan.commercial_prepayment_start_month >= roomy_plan.commercial_prepayment_allowed_after_month
+    assert roomy_plan.commercial_prepayment_monthly_amount > 0
+    assert roomy_plan.commercial_interest_saved_by_prepayment > 0
+    assert roomy_plan.total_interest < no_prepay_plan.total_interest
+
+    assert tight_plan.commercial_prepayment_mode == "auto"
+    assert not tight_plan.commercial_prepayment_enabled
+    assert tight_plan.commercial_prepayment_monthly_amount == 0
 
 
 def test_affordability_returns_backend_account_cashflow_series() -> None:
@@ -2976,7 +3192,7 @@ def test_provident_account_closes_and_transfers_to_cash_at_retirement() -> None:
 def test_timeline_and_account_curves_extend_past_retirement() -> None:
     current_month = date(date.today().year, date.today().month, 1)
     retirement_month = calculator_module._add_months(current_month, 2)
-    birth_month = f"{retirement_month.year - 50}-{retirement_month.month:02d}"
+    birth_month = f"{retirement_month.year - 55}-{retirement_month.month:02d}"
     household = HouseholdData(
         cash_account_balance=800_000,
         investments=50_000,
@@ -2995,11 +3211,12 @@ def test_timeline_and_account_curves_extend_past_retirement() -> None:
             ],
         ),
         members=[
-            IncomeMember(
-                name="样例成员",
-                birth_month=birth_month,
-                provident_fund_balance=80_000,
-                monthly_salary_gross=20_000,
+                IncomeMember(
+                    name="样例成员",
+                    birth_month=birth_month,
+                    retirement_category="female_50",
+                    provident_fund_balance=80_000,
+                    monthly_salary_gross=20_000,
                 annual_bonus=0,
             ),
         ],
@@ -3023,7 +3240,7 @@ def test_timeline_and_account_curves_extend_past_retirement() -> None:
 
     assert max(cashflow_months) >= 122
     assert any(event.month == 2 and "退休-养老金" in event.title and "养老金" in event.detail for event in events)
-    assert any(event.month >= 122 and event.title == "退休后长期观察窗口" for event in events)
+    assert any(event.month >= 120 and event.title == "退休后长期观察窗口" for event in events)
 
 
 def test_provident_loan_offset_uses_borrower_account_before_other_members() -> None:

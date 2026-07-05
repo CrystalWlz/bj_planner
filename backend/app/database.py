@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData
 
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 21
 
 
 def default_db_path() -> Path:
@@ -433,6 +433,9 @@ def _normalize_household(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("investment_sell_fee_rate", 0.005)
     data.setdefault("scheduled_expenses", [])
     data.setdefault("phased_loans", [])
+    for loan in data["phased_loans"]:
+        if isinstance(loan, dict) and loan.get("name") == "目前贷款":
+            loan["name"] = "已有贷款"
     data.setdefault("elderly_dependents", [])
     data.setdefault("property_goals", [])
     _normalize_car_plan(data)
@@ -452,6 +455,10 @@ def _normalize_scenario(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("after_previous_purchase_delay_months", 0)
     data.setdefault("investment_withdrawal_mode", "auto")
     data.setdefault("investment_min_balance_after_purchase", 0)
+    if "commercial_prepayment_mode" not in data:
+        data["commercial_prepayment_mode"] = (
+            "manual" if bool(data.get("commercial_prepayment_enabled")) else "auto"
+        )
     data.setdefault("commercial_prepayment_enabled", False)
     data.setdefault("commercial_prepayment_start_month", 1)
     data.setdefault("commercial_prepayment_allowed_after_month", 12)

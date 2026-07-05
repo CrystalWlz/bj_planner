@@ -38,6 +38,23 @@
 - 不要频繁推送。除非用户明确要求，完成工作后只做本地修改和本地验证。
 - 发布前必须跑隐私扫描；推送优先使用 `.\scripts\push_public.ps1`，不要绕过 pre-push 保护。
 
+## 编码与中文乱码防护
+
+- 代码、文档、测试和脚本统一按 UTF-8 保存。发现中文显示异常时，先判断是终端显示问题还是文件内容真的损坏，不要把终端里的乱码输出复制回源码。
+- Windows PowerShell 通过管道把含中文脚本传给 Python/Node 时，容易因为控制台编码、子进程 stdin/stdout 编码和文件编码不一致，把正常中文临时显示成乱码，甚至把脚本源码里的中文样本污染。含中文脚本优先保存为 UTF-8 文件后执行；临时管道脚本尽量保持 ASCII，必要时使用 Unicode 转义。
+- 联网、测试、扫描或生成文件前，如命令涉及中文路径、中文字符串或 Python/Node 管道，先设置：
+
+```powershell
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$Env:PYTHONIOENCODING = "utf-8"
+```
+
+- 检查中文乱码时运行 `python scripts/encoding_scan.py`。该脚本会严格验证文本文件是否可用 UTF-8 解码，并扫描替换符、问号替代串和 UTF-8/GBK 互相误读后的异常片段。
+- `scripts/encoding_scan.py` 自身不要写入原始乱码样本，使用 Unicode 转义维护样本，避免扫描脚本误报自己。
+- 如果扫描结果为 0 但终端仍显示乱码，优先修命令编码或输出方式；如果扫描命中真实源码行，再用 `Get-Content -Encoding utf8` 或编辑器确认上下文后修复。
+
 ## 后端规则
 
 - 新增或修改持久化字段时，同步更新 schema、当前数据库格式、默认初始化、API 测试和前端类型。
@@ -103,6 +120,12 @@ python scripts/privacy_scan.py --ref HEAD
 python scripts/privacy_scan.py
 ```
 
+编码扫描：
+
+```powershell
+python scripts/encoding_scan.py
+```
+
 发布脚本：
 
 ```powershell
@@ -128,5 +151,6 @@ Pop-Location
 
 - 后端逻辑、schema、数据库或政策包变化：运行后端 pytest。
 - 前端类型、页面、交互或可视化变化：运行 `npm run build`，必要时用浏览器检查关键页面。
+- 中文文案、脚本、README 或 AGENTS 变化：运行 `python scripts/encoding_scan.py`。
 - 涉及 Git 的任何改动：运行 `python scripts/privacy_scan.py`。
 - 准备发布：运行 `.\scripts\push_public.ps1`，不要手动绕过隐私扫描和推送保护。

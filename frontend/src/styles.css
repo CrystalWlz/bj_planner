@@ -2139,6 +2139,40 @@ option {
   line-height: 1.6;
 }
 
+.advisor-lead {
+  margin: 0;
+  max-width: 72ch;
+}
+
+.advisor-evidence-list {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px;
+}
+
+.advisor-evidence-item {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-soft) 76%, transparent);
+}
+
+.advisor-evidence-item strong {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.advisor-evidence-item span {
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .month-detail-panel .cash-flow-sections,
 .month-detail-panel .explanation-grid {
   padding: 0 12px 12px;
@@ -4254,6 +4288,11 @@ option {
   .provident-balance-summary,
   .pie-layout {
     grid-template-columns: 1fr;
+  }
+
+  .advisor-evidence-item {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 
   .form-grid.two,
