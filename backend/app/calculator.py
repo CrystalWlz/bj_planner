@@ -7,6 +7,34 @@ from functools import lru_cache
 from math import ceil
 from typing import Callable, Literal
 
+from .domain.loans import (
+    LoanComputation,
+    LoanMonthProjection,
+    LoanProjection,
+    calculate_loan,
+    installment_balance_after_payments as _installment_balance_after_payments,
+    loan_balance_after_monthly_payments as _loan_balance_after_monthly_payments,
+    loan_balance_after_payments as _loan_balance_after_payments,
+    loan_principal_for_payment_cap as _loan_principal_for_payment_cap,
+    loan_projection_point_after_payments as _loan_projection_point_after_payments,
+    loan_projection_with_prepayment as _loan_projection_with_prepayment,
+    vehicle_loan_point_after_payments as _vehicle_loan_point_after_payments,
+    vehicle_loan_projection as _vehicle_loan_projection,
+)
+from .domain.time import (
+    add_months as _add_months,
+    end_of_previous_month as _end_of_previous_month,
+    format_year_month_tuple as _format_year_month_tuple,
+    month_after as _month_after,
+    month_distance as _month_distance,
+    month_start_for_age as _month_start_for_age,
+    month_start_for_birth_month_or_age as _month_start_for_birth_month_or_age,
+    month_tuple_to_date as _month_tuple_to_date,
+    months_between_months as _months_between_months,
+    parse_iso_date as _parse_iso_date,
+    parse_month as _parse_month,
+    parse_year_month as _parse_year_month,
+)
 from .policies import get_policy
 from .schemas import (
     AccountSnapshotPoint,
@@ -16,13 +44,17 @@ from .schemas import (
     CarLoanSummary,
     CarPlanAnalysis,
     CarPlanData,
+    CareerShockMemberSetting,
     CareerShockProjection,
     CareerShockMemberProjection,
+    ChildPlanStrategyPoint,
+    DailyExpenseStageData,
     ElderlyDependentData,
     HouseholdData,
     IncomeMember,
     IncomeStageData,
     InvestmentAllocationSummary,
+    InvestmentTaxProfileData,
     InvestmentPlanRecommendation,
     ExistingLoanVisualizationDetail,
     LoanSummary,
@@ -34,8 +66,12 @@ from .schemas import (
     ProvidentMemberAccountPoint,
     ProvidentVisualizationPoint,
     PurchasePlanAnalysis,
+    RentExpenseStageData,
     RulePackData,
+    ScheduledExpenseData,
     ScenarioData,
+    SocialSecurityMemberAccountPoint,
+    SocialSecurityVisualizationPoint,
     StrategyExplanationPoint,
     StressResult,
     PhasedLoanData,
@@ -44,6 +80,7 @@ from .schemas import (
     TaxMemberMonthlyPoint,
     TaxMonthlyPoint,
     TaxEventPoint,
+    TaxStrategyItem,
     TaxYearSummary,
     VehiclePlanData,
     VehicleFinancingOptionData,
@@ -73,34 +110,6 @@ DEFAULT_BONUS_BRACKETS = [
 
 
 @dataclass(frozen=True)
-class LoanComputation:
-    first_month_payment: float
-    average_month_payment: float
-    total_interest: float
-
-
-@dataclass(frozen=True)
-class LoanMonthProjection:
-    balance_start: float
-    interest: float
-    contract_payment: float
-    extra_principal_payment: float
-    total_payment: float
-    balance_end: float
-    interest_subsidy: float = 0.0
-    gross_contract_payment: float = 0.0
-
-
-@dataclass(frozen=True)
-class LoanProjection:
-    points: tuple[LoanMonthProjection, ...]
-    total_interest: float
-    actual_payoff_months: int
-    interest_saved_by_prepayment: float
-    total_interest_subsidy: float = 0.0
-
-
-@dataclass(frozen=True)
 class VehiclePrepaymentChoice:
     enabled: bool
     strategy_type: str
@@ -127,7 +136,21 @@ class MonthlyIncomeProfile:
     income_tax: float
     monthly_pf_deposit: float
     non_taxable_income: float = 0.0
+    pension_income: float = 0.0
     extra_cash_expense: float = 0.0
+
+
+@dataclass(frozen=True)
+class ContributionDetails:
+    personal_social: float
+    personal_housing_fund: float
+    employer_social: float
+    employer_housing_fund: float
+    social_base: float
+    employee_pension: float
+    employee_medical: float
+    employee_medical_fixed: float
+    employee_unemployment: float
 
 
 @dataclass(frozen=True)
@@ -198,298 +221,6 @@ def _parallel_worker_count(rules: RulePackData, task_count: int) -> int:
     return max(1, min(configured, task_count, 8))
 
 
-def calculate_loan(principal: float, annual_rate: float, years: int, method: str) -> LoanComputation:
-    if principal <= 0 or years <= 0:
-        return LoanComputation(0, 0, 0)
-
-    months = years * 12
-    monthly_rate = annual_rate / 12
-
-    if monthly_rate <= 0:
-        monthly_payment = principal / months
-        return LoanComputation(monthly_payment, monthly_payment, 0)
-
-    if method == "equal_principal":
-        principal_per_month = principal / months
-        first_month_payment = principal_per_month + principal * monthly_rate
-        total_interest = monthly_rate * principal_per_month * months * (months + 1) / 2
-        average_month_payment = (principal + total_interest) / months
-        return LoanComputation(first_month_payment, average_month_payment, total_interest)
-
-    factor = (1 + monthly_rate) ** months
-    monthly_payment = principal * monthly_rate * factor / (factor - 1)
-    total_interest = monthly_payment * months - principal
-    return LoanComputation(monthly_payment, monthly_payment, total_interest)
-
-
-def _loan_projection_with_prepayment(
-    principal: float,
-    annual_rate: float,
-    total_months: int,
-    method: str,
-    *,
-    prepayment_monthly_amount: float = 0.0,
-    prepayment_start_month: int = 1,
-) -> LoanProjection:
-    if principal <= 0 or total_months <= 0:
-        return LoanProjection((), 0.0, 0, 0.0)
-
-    monthly_rate = annual_rate / 12
-    extra_monthly = max(0.0, prepayment_monthly_amount)
-    start_month = max(1, int(prepayment_start_month))
-    fixed_payment = 0.0
-    baseline_interest = 0.0
-    principal_per_month = principal / total_months
-    if method != "equal_principal":
-        if monthly_rate <= 0:
-            fixed_payment = principal / total_months
-        else:
-            factor = (1 + monthly_rate) ** total_months
-            fixed_payment = principal * monthly_rate * factor / (factor - 1)
-            baseline_interest = fixed_payment * total_months - principal
-    elif monthly_rate > 0:
-        baseline_interest = monthly_rate * principal_per_month * total_months * (total_months + 1) / 2
-
-    balance = principal
-    total_interest = 0.0
-    points: list[LoanMonthProjection] = []
-    for month_index in range(1, total_months + 1):
-        if balance <= 0:
-            break
-        balance_start = balance
-        interest = max(0.0, balance_start * monthly_rate)
-        if method == "equal_principal":
-            scheduled_principal = min(balance_start, principal_per_month)
-            contract_payment = scheduled_principal + interest
-        else:
-            contract_payment = min(balance_start + interest, fixed_payment)
-            scheduled_principal = max(0.0, min(balance_start, contract_payment - interest))
-        balance_after_contract = max(0.0, balance_start - scheduled_principal)
-        extra_principal = min(
-            balance_after_contract,
-            extra_monthly if month_index >= start_month else 0.0,
-        )
-        balance = max(0.0, balance_after_contract - extra_principal)
-        total_interest += interest
-        points.append(
-            LoanMonthProjection(
-                balance_start=balance_start,
-                interest=interest,
-                contract_payment=contract_payment,
-                extra_principal_payment=extra_principal,
-                total_payment=contract_payment + extra_principal,
-                balance_end=balance,
-            )
-        )
-
-    interest_saved = max(0.0, baseline_interest - total_interest) if extra_monthly > 0 else 0.0
-    return LoanProjection(
-        points=tuple(points),
-        total_interest=total_interest,
-        actual_payoff_months=len(points),
-        interest_saved_by_prepayment=interest_saved,
-    )
-
-
-def _loan_projection_point_after_payments(
-    principal: float,
-    annual_rate: float,
-    total_months: int,
-    method: str,
-    elapsed_payments: int,
-    *,
-    prepayment_monthly_amount: float = 0.0,
-    prepayment_start_month: int = 1,
-) -> tuple[float, float, float]:
-    if principal <= 0 or total_months <= 0:
-        return 0.0, 0.0, 0.0
-    paid_months = max(0, int(elapsed_payments))
-    projection = _loan_projection_with_prepayment(
-        principal,
-        annual_rate,
-        total_months,
-        method,
-        prepayment_monthly_amount=prepayment_monthly_amount,
-        prepayment_start_month=prepayment_start_month,
-    )
-    if paid_months <= 0:
-        first_point = projection.points[0] if projection.points else None
-        return principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
-    if paid_months > len(projection.points):
-        return 0.0, 0.0, 0.0
-    previous = projection.points[paid_months - 1]
-    return previous.balance_end, previous.contract_payment, previous.extra_principal_payment
-
-
-def _loan_principal_for_payment_cap(
-    monthly_payment_cap: float,
-    annual_rate: float,
-    years: int,
-    method: str,
-) -> float:
-    if monthly_payment_cap <= 0 or years <= 0:
-        return 0.0
-    months = years * 12
-    monthly_rate = annual_rate / 12
-    if method == "equal_principal" or monthly_rate <= 0:
-        return monthly_payment_cap / (1 / months + monthly_rate)
-    factor = (1 + monthly_rate) ** months
-    return monthly_payment_cap * (factor - 1) / (monthly_rate * factor)
-
-
-def _loan_balance_after_payments(
-    principal: float,
-    annual_rate: float,
-    years: int,
-    method: str,
-    elapsed_payments: int,
-) -> float:
-    return _loan_balance_after_monthly_payments(
-        principal,
-        annual_rate,
-        years * 12,
-        method,
-        elapsed_payments,
-    )
-
-
-def _loan_balance_after_monthly_payments(
-    principal: float,
-    annual_rate: float,
-    total_months: int,
-    method: str,
-    elapsed_payments: int,
-) -> float:
-    if principal <= 0 or total_months <= 0:
-        return 0.0
-    paid_months = max(0, min(total_months, int(elapsed_payments)))
-    if paid_months <= 0:
-        return principal
-    if paid_months >= total_months:
-        return 0.0
-    monthly_rate = annual_rate / 12
-    if method == "equal_principal" or monthly_rate <= 0:
-        return max(0.0, principal - (principal / total_months) * paid_months)
-    factor = (1 + monthly_rate) ** total_months
-    monthly_payment = principal * monthly_rate * factor / (factor - 1)
-    return max(
-        0.0,
-        principal * (1 + monthly_rate) ** paid_months
-        - monthly_payment * (((1 + monthly_rate) ** paid_months - 1) / monthly_rate),
-    )
-
-
-def _installment_balance_after_payments(principal: float, total_months: int, elapsed_payments: int) -> float:
-    if principal <= 0 or total_months <= 0:
-        return 0.0
-    paid_months = max(0, min(total_months, int(elapsed_payments)))
-    return max(0.0, principal - (principal / total_months) * paid_months)
-
-
-def _vehicle_loan_projection(
-    principal: float,
-    total_months: int,
-    interest_free_months: int,
-    later_annual_rate: float,
-    *,
-    prepayment_monthly_amount: float = 0.0,
-    prepayment_start_month: int = 1,
-    prepayment_lump_sum_amount: float = 0.0,
-    prepayment_lump_sum_month: int = 0,
-) -> LoanProjection:
-    if principal <= 0 or total_months <= 0:
-        return LoanProjection((), 0.0, 0, 0.0)
-    subsidy_months = max(0, min(interest_free_months, total_months))
-    monthly_rate = later_annual_rate / 12
-    if monthly_rate <= 0:
-        gross_monthly_payment = principal / total_months
-    else:
-        factor = (1 + monthly_rate) ** total_months
-        gross_monthly_payment = principal * monthly_rate * factor / (factor - 1)
-
-    balance = principal
-    total_borrower_interest = 0.0
-    total_interest_subsidy = 0.0
-    baseline_borrower_interest = 0.0
-    extra_monthly = max(0.0, prepayment_monthly_amount)
-    start_month = max(1, int(prepayment_start_month))
-    lump_sum_amount = max(0.0, prepayment_lump_sum_amount)
-    lump_sum_month = max(0, int(prepayment_lump_sum_month))
-    points: list[LoanMonthProjection] = []
-    for month_index in range(1, total_months + 1):
-        if balance <= 0:
-            break
-        balance_start = balance
-        interest = max(0.0, balance_start * monthly_rate)
-        gross_contract_payment = min(balance_start + interest, gross_monthly_payment)
-        interest_subsidy = min(interest, gross_contract_payment) if month_index <= subsidy_months else 0.0
-        contract_payment = max(0.0, gross_contract_payment - interest_subsidy)
-        borrower_interest = max(0.0, interest - interest_subsidy)
-        scheduled_principal = max(0.0, min(balance_start, gross_contract_payment - interest))
-        balance_after_contract = max(0.0, balance_start - scheduled_principal)
-        scheduled_extra_principal = extra_monthly if month_index >= start_month else 0.0
-        lump_sum_principal = lump_sum_amount if lump_sum_month > 0 and month_index == lump_sum_month else 0.0
-        extra_principal = min(balance_after_contract, scheduled_extra_principal + lump_sum_principal)
-        balance = max(0.0, balance_after_contract - extra_principal)
-        total_borrower_interest += borrower_interest
-        total_interest_subsidy += interest_subsidy
-        points.append(
-            LoanMonthProjection(
-                balance_start=balance_start,
-                interest=interest,
-                contract_payment=contract_payment,
-                extra_principal_payment=extra_principal,
-                total_payment=contract_payment + extra_principal,
-                balance_end=balance,
-                interest_subsidy=interest_subsidy,
-                gross_contract_payment=gross_contract_payment,
-            )
-        )
-    if extra_monthly > 0 or lump_sum_amount > 0:
-        baseline_projection = _vehicle_loan_projection(
-            principal,
-            total_months,
-            subsidy_months,
-            later_annual_rate,
-            prepayment_monthly_amount=0.0,
-            prepayment_start_month=start_month,
-            prepayment_lump_sum_amount=0.0,
-            prepayment_lump_sum_month=0,
-        )
-        baseline_borrower_interest = baseline_projection.total_interest
-
-    return LoanProjection(
-        points=tuple(points),
-        total_interest=total_borrower_interest,
-        actual_payoff_months=len(points),
-        interest_saved_by_prepayment=max(0.0, baseline_borrower_interest - total_borrower_interest) if extra_monthly > 0 or lump_sum_amount > 0 else 0.0,
-        total_interest_subsidy=total_interest_subsidy,
-    )
-
-
-def _vehicle_loan_point_after_payments(loan: CarLoanSummary, elapsed_payments: int) -> tuple[float, float, float]:
-    if loan.loan_principal <= 0 or loan.total_months <= 0:
-        return 0.0, 0.0, 0.0
-    projection = _vehicle_loan_projection(
-        loan.loan_principal,
-        loan.total_months,
-        loan.interest_free_months,
-        loan.later_annual_rate,
-        prepayment_monthly_amount=loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0,
-        prepayment_start_month=loan.prepayment_start_month,
-        prepayment_lump_sum_amount=loan.prepayment_lump_sum_amount if loan.prepayment_enabled else 0.0,
-        prepayment_lump_sum_month=loan.prepayment_lump_sum_month if loan.prepayment_enabled else 0,
-    )
-    paid_months = max(0, int(elapsed_payments))
-    if paid_months <= 0:
-        first_point = projection.points[0] if projection.points else None
-        return loan.loan_principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
-    if paid_months > len(projection.points):
-        return 0.0, 0.0, 0.0
-    previous = projection.points[paid_months - 1]
-    return previous.balance_end, previous.contract_payment, previous.extra_principal_payment
-
-
 def _pick_bracket(amount: float, brackets: list[dict]) -> tuple[float, float]:
     for bracket in brackets:
         if amount <= float(bracket["threshold"]):
@@ -539,33 +270,73 @@ def _active_months_in_period(start_date: str, end_date: str | None, projection_y
 def _stage_bonus_payout_month(stage: IncomeStageData, projection_year: int) -> int | None:
     if stage.annual_bonus <= 0:
         return None
+    if stage.annual_bonus_payout_mode == "monthly_spread":
+        return None
     if _active_months_in_period(stage.start_date, stage.end_date, projection_year) <= 0:
         return None
     payout_month = max(1, min(12, stage.annual_bonus_payout_month))
     return payout_month if _stage_active_in_month(stage, projection_year, payout_month) else None
 
 
+def _stage_bonus_earning_months(stage: IncomeStageData, projection_year: int) -> int:
+    earning_start = _parse_year_month(stage.annual_bonus_earning_start_month)
+    earning_end = _parse_year_month(stage.annual_bonus_earning_end_month)
+    if earning_start and earning_end:
+        stage_start = _parse_year_month(stage.start_date[:7])
+        stage_end = _parse_year_month(stage.end_date[:7]) if stage.end_date else earning_end
+        start = max(earning_start, stage_start or earning_start)
+        end = min(earning_end, stage_end or earning_end)
+        return max(0, min(12, _month_distance(start, end) + 1))
+    return _active_months_in_period(stage.start_date, stage.end_date, projection_year)
+
+
+def _stage_monthly_spread_bonus_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
+    if stage.annual_bonus <= 0 or stage.annual_bonus_payout_mode != "monthly_spread":
+        return 0.0
+    if not _stage_active_in_month(stage, projection_year, month):
+        return 0.0
+    earning_start = _parse_year_month(stage.annual_bonus_earning_start_month)
+    earning_end = _parse_year_month(stage.annual_bonus_earning_end_month)
+    if earning_start and earning_end:
+        target = (projection_year, month)
+        if _month_distance(earning_start, target) < 0 or _month_distance(target, earning_end) < 0:
+            return 0.0
+    return stage.annual_bonus / 12
+
+
 def _stage_bonus_payout_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
     if _stage_bonus_payout_month(stage, projection_year) != month:
         return 0.0
-    active_months = _active_months_in_period(stage.start_date, stage.end_date, projection_year)
-    return stage.annual_bonus * active_months / 12
+    return stage.annual_bonus * min(12, _stage_bonus_earning_months(stage, projection_year)) / 12
+
+
+def _stage_bonus_cash_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
+    return _stage_bonus_payout_amount(stage, projection_year, month) + _stage_monthly_spread_bonus_amount(
+        stage,
+        projection_year,
+        month,
+    )
 
 
 def _clamp(value: float, floor: float, ceiling: float) -> float:
     return max(floor, min(value, ceiling))
 
 
-def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePackData) -> tuple[float, float, float, float]:
+def _beijing_contribution_details(member: IncomeMember | IncomeStageData, rules: RulePackData) -> ContributionDetails:
     if isinstance(member, IncomeStageData) and not member.payroll_contributions_enabled:
-        return (
-            max(0.0, member.monthly_social_insurance),
-            max(0.0, member.monthly_housing_fund),
-            0.0,
-            0.0,
+        return ContributionDetails(
+            personal_social=max(0.0, member.monthly_social_insurance),
+            personal_housing_fund=max(0.0, member.monthly_housing_fund),
+            employer_social=0.0,
+            employer_housing_fund=0.0,
+            social_base=0.0,
+            employee_pension=0.0,
+            employee_medical=0.0,
+            employee_medical_fixed=0.0,
+            employee_unemployment=0.0,
         )
     if member.monthly_salary_gross <= 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return ContributionDetails(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     params = rules.params
     social_base = _clamp(
         member.monthly_salary_gross,
@@ -582,11 +353,15 @@ def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePa
     personal_fund_rate = _clamp(member.housing_fund_personal_rate, fund_rate_floor, fund_rate_ceiling)
     employer_fund_rate = _clamp(member.housing_fund_employer_rate, fund_rate_floor, fund_rate_ceiling)
 
+    employee_pension = social_base * float(params.get("employee_pension_rate", 0.08))
+    employee_medical = social_base * float(params.get("employee_medical_rate", 0.02))
+    employee_medical_fixed = float(params.get("employee_medical_fixed", 3))
+    employee_unemployment = social_base * float(params.get("employee_unemployment_rate", 0.005))
     personal_social = (
-        social_base * float(params.get("employee_pension_rate", 0.08))
-        + social_base * float(params.get("employee_medical_rate", 0.02))
-        + float(params.get("employee_medical_fixed", 3))
-        + social_base * float(params.get("employee_unemployment_rate", 0.005))
+        employee_pension
+        + employee_medical
+        + employee_medical_fixed
+        + employee_unemployment
     )
     employer_social = (
         social_base * float(params.get("employer_pension_rate", 0.16))
@@ -596,50 +371,27 @@ def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePa
     )
     personal_housing_fund = fund_base * personal_fund_rate
     employer_housing_fund = fund_base * employer_fund_rate
-    return personal_social, personal_housing_fund, employer_social, employer_housing_fund
+    return ContributionDetails(
+        personal_social=personal_social,
+        personal_housing_fund=personal_housing_fund,
+        employer_social=employer_social,
+        employer_housing_fund=employer_housing_fund,
+        social_base=social_base,
+        employee_pension=employee_pension,
+        employee_medical=employee_medical,
+        employee_medical_fixed=employee_medical_fixed,
+        employee_unemployment=employee_unemployment,
+    )
 
 
-@lru_cache(maxsize=512)
-def _parse_iso_date(value: str | None, fallback: date) -> date:
-    if not value:
-        return fallback
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        return fallback
-
-
-def _add_months(base: date, months: int) -> date:
-    zero_based_month = base.month - 1 + months
-    return date(base.year + zero_based_month // 12, zero_based_month % 12 + 1, 1)
-
-
-def _end_of_previous_month(month_start: date) -> date:
-    if month_start.month == 1:
-        return date(month_start.year - 1, 12, 31)
-    return date(month_start.year, month_start.month - 1, 28)
-
-
-def _month_start_for_age(as_of: date, current_age: int, target_age: int) -> date:
-    months_until = max(0, (target_age - current_age) * 12)
-    return _add_months(date(as_of.year, as_of.month, 1), months_until)
-
-
-def _month_start_for_birth_month_or_age(
-    as_of: date,
-    birth_month_value: str | None,
-    current_age: int,
-    target_age: int,
-) -> date:
-    birth_month = _parse_year_month(birth_month_value)
-    if birth_month is not None:
-        target = date(birth_month[0] + target_age, birth_month[1], 1)
-        return max(date(as_of.year, as_of.month, 1), target)
-    return _month_start_for_age(as_of, current_age, target_age)
-
-
-def _months_between_months(start: date, end: date) -> int:
-    return (end.year - start.year) * 12 + (end.month - start.month)
+def _beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePackData) -> tuple[float, float, float, float]:
+    details = _beijing_contribution_details(member, rules)
+    return (
+        details.personal_social,
+        details.personal_housing_fund,
+        details.employer_social,
+        details.employer_housing_fund,
+    )
 
 
 def _retirement_tail_months(household: HouseholdData, *, as_of: date | None = None) -> int:
@@ -709,6 +461,7 @@ def _zero_cash_stage(template: IncomeStageData, name: str, start: date, end: dat
             "end_date": end.isoformat() if end else None,
             "monthly_salary_gross": 0,
             "annual_bonus": 0,
+            "annual_bonus_payout_mode": "lump_sum",
             "annual_bonus_payout_month": template.annual_bonus_payout_month,
             "monthly_freelance_income": 0,
             "monthly_non_taxable_income": 0,
@@ -832,6 +585,54 @@ def _career_shock_flexible_housing_fund_monthly(shock: "CareerShockData", rules:
     return round(base * rate, 2)
 
 
+def _career_shock_self_payment_monthly(shock: "CareerShockData", rules: RulePackData) -> float:
+    return round(
+        _career_shock_self_social_monthly(shock, rules)
+        + _career_shock_flexible_housing_fund_monthly(shock, rules),
+        2,
+    )
+
+
+def _career_shock_self_payment_at_month(
+    household: HouseholdData,
+    rules: RulePackData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+) -> float:
+    shock = household.career_shock
+    if not shock.enabled:
+        return 0.0
+    current = as_of or date.today()
+    current_month = date(current.year, current.month, 1)
+    target_month = _add_months(current_month, max(0, months_from_now))
+    settings_by_member = _career_shock_settings_by_member(household)
+    monthly_amount = _career_shock_self_payment_monthly(shock, rules)
+    total = 0.0
+    for index, member in enumerate(household.members):
+        setting = settings_by_member.get(member.name)
+        if not setting or not setting.enabled:
+            continue
+        effective_birth_month = member.birth_month or setting.birth_month
+        effective_current_age = member.current_age if member.birth_month else setting.current_age
+        layoff_start = _month_start_for_birth_month_or_age(
+            current_month,
+            effective_birth_month,
+            effective_current_age,
+            setting.layoff_age,
+        )
+        retirement_start = _month_start_for_birth_month_or_age(
+            current_month,
+            effective_birth_month,
+            effective_current_age,
+            _policy_retirement_age_for_member(member, index),
+        )
+        self_payment_start = _add_months(layoff_start, _career_shock_unemployment_months(household, shock))
+        if self_payment_start <= target_month < retirement_start:
+            total += monthly_amount
+    return round(total, 2)
+
+
 def _estimate_auto_pension_monthly(
     member: IncomeMember,
     setting: "CareerShockMemberSetting",
@@ -919,24 +720,8 @@ def _household_with_career_income_stages(
             if not stage.name.startswith(synthetic_prefix)
         ]
         if not stages:
-            stages = [
-                IncomeStageData(
-                    name="current",
-                    stage_kind="salary",
-                    start_date=member.employment_start_date,
-                    monthly_salary_gross=member.monthly_salary_gross,
-                    annual_bonus=member.annual_bonus,
-                    annual_bonus_payout_month=4,
-                    monthly_social_insurance=member.monthly_social_insurance,
-                    monthly_housing_fund=member.monthly_housing_fund,
-                    housing_fund_personal_rate=member.housing_fund_personal_rate,
-                    housing_fund_employer_rate=member.housing_fund_employer_rate,
-                    monthly_special_additional_deduction=member.monthly_special_additional_deduction,
-                    other_annual_deductions=member.other_annual_deductions,
-                    other_annual_taxable_income=member.other_annual_taxable_income,
-                    bonus_tax_method=member.bonus_tax_method,
-                )
-            ]
+            updated_members.append(member.model_copy(update={"income_stages": []}))
+            continue
         template = max(stages, key=lambda stage: _parse_iso_date(stage.start_date, date(1900, 1, 1)))
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
@@ -1027,7 +812,6 @@ def _household_with_career_income_stages(
                     )
             self_social_start = _add_months(layoff_start, unemployment_months)
             if self_social_start < retirement_start:
-                flexible_housing_fund = _career_shock_flexible_housing_fund_monthly(shock, active_rules)
                 stages.append(
                     _zero_cash_stage(
                         template,
@@ -1038,8 +822,6 @@ def _household_with_career_income_stages(
                         update={
                             "stage_kind": "freelance",
                             "monthly_freelance_income": shock_freelance_income,
-                            "monthly_social_insurance": _career_shock_self_social_monthly(shock, active_rules),
-                            "monthly_housing_fund": flexible_housing_fund,
                             "housing_fund_personal_rate": 0,
                             "housing_fund_employer_rate": 0,
                             "payroll_contributions_enabled": False,
@@ -1057,6 +839,88 @@ def _household_with_career_income_stages(
         updated_members.append(member.model_copy(update={"income_stages": stages}))
 
     return household.model_copy(update={"members": updated_members, "career_shock_applied": True})
+
+
+def _has_pension_stage_after(stages: list[IncomeStageData], retirement_start: date) -> bool:
+    for stage in stages:
+        if stage.stage_kind != "pension":
+            continue
+        stage_start = _parse_iso_date(stage.start_date, date(1900, 1, 1))
+        if stage_start >= retirement_start and stage.monthly_non_taxable_income > 0:
+            return True
+    return False
+
+
+def _household_with_pension_income_stages(
+    household: HouseholdData,
+    rules: RulePackData,
+    *,
+    as_of: date | None = None,
+) -> HouseholdData:
+    household = _household_with_career_income_stages(household, rules, as_of=as_of)
+    if not household.members:
+        return household
+
+    current = as_of or date.today()
+    current_month = date(current.year, current.month, 1)
+    settings_by_member = _career_shock_settings_by_member(household)
+    updated_members: list[IncomeMember] = []
+    changed = False
+    synthetic_prefix = "自动情景："
+
+    for index, member in enumerate(household.members):
+        stages = list(member.income_stages or [])
+        retirement_age = _policy_retirement_age_for_member(member, index)
+        setting = settings_by_member.get(member.name)
+        effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
+        effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
+        retirement_start = _month_start_for_birth_month_or_age(
+            current_month,
+            effective_birth_month,
+            effective_current_age,
+            retirement_age,
+        )
+        if _has_pension_stage_after(stages, retirement_start):
+            updated_members.append(member)
+            continue
+
+        template = max(
+            stages,
+            key=lambda stage: _parse_iso_date(stage.start_date, date(1900, 1, 1)),
+            default=IncomeStageData(name="退休前收入"),
+        )
+        pension_setting = setting or CareerShockMemberSetting(
+            member_name=member.name,
+            enabled=False,
+            retirement_age=retirement_age,
+            birth_month=member.birth_month,
+            current_age=member.current_age,
+        )
+        pension_monthly = _estimate_auto_pension_monthly(
+            member,
+            pension_setting,
+            rules,
+            retirement_start,
+            current_month,
+        )
+        if pension_monthly <= 0:
+            updated_members.append(member)
+            continue
+
+        stages.append(
+            _zero_cash_stage(template, f"{synthetic_prefix}{retirement_age}岁退休-养老金领取", retirement_start).model_copy(
+                update={
+                    "stage_kind": "pension",
+                    "monthly_non_taxable_income": pension_monthly,
+                }
+            )
+        )
+        changed = True
+        updated_members.append(member.model_copy(update={"income_stages": stages}))
+
+    if not changed:
+        return household
+    return household.model_copy(update={"members": updated_members})
 
 
 def _format_month(value: date | None) -> str | None:
@@ -1084,6 +948,7 @@ def build_career_shock_projection(
     later_unemployment = float(rules.params.get("beijing_unemployment_benefit_after_12_months", 2129))
     self_social = _career_shock_self_social_monthly(shock, rules)
     flexible_housing = _career_shock_flexible_housing_fund_monthly(shock, rules)
+    self_payment = round(self_social + flexible_housing, 2)
     settings_by_member = _career_shock_settings_by_member(household)
     member_projections: list[CareerShockMemberProjection] = []
     synthetic_prefix = "自动情景："
@@ -1147,6 +1012,7 @@ def build_career_shock_projection(
                 later_unemployment_benefit_monthly=round(later_unemployment, 2) if setting and setting.enabled else 0.0,
                 self_social_insurance_monthly=round(self_social, 2) if setting and setting.enabled else 0.0,
                 flexible_housing_fund_monthly=round(flexible_housing, 2) if setting and setting.enabled else 0.0,
+                self_payment_monthly=self_payment if setting and setting.enabled else 0.0,
                 pension_monthly=round(pension_monthly, 2),
                 generated_stages=generated_stages,
                 notes=notes,
@@ -1160,6 +1026,7 @@ def build_career_shock_projection(
         later_unemployment_benefit_monthly=round(later_unemployment, 2),
         self_social_insurance_monthly=round(self_social, 2),
         flexible_housing_fund_monthly=round(flexible_housing, 2),
+        self_payment_monthly=self_payment,
         effective_members=effective_household.members,
         member_projections=member_projections,
         notes=[
@@ -1167,20 +1034,6 @@ def build_career_shock_projection(
             "前端手动参数只改变输入配置，保存后由后端重新生成收入阶段和现金流。",
         ],
     )
-
-def _parse_year_month(value: str | None) -> tuple[int, int] | None:
-    if not value:
-        return None
-    try:
-        year_text, month_text = value.split("-", 1)
-        year = int(year_text)
-        month = int(month_text)
-    except (AttributeError, ValueError):
-        return None
-    if not 1 <= month <= 12:
-        return None
-    return year, month
-
 
 def _elderly_dependent_start_month(dependent: ElderlyDependentData) -> tuple[int, int] | None:
     birth_month = _parse_year_month(dependent.birth_month)
@@ -1211,6 +1064,277 @@ def _elderly_care_deduction_for_member_at(
     return min(deduction, 3000.0)
 
 
+def _deduction_item_active_in_month(item_start: str, item_end: str | None, target_month: date) -> bool:
+    start = _parse_year_month(item_start)
+    if start is None:
+        return False
+    target = (target_month.year, target_month.month)
+    if _month_distance(start, target) < 0:
+        return False
+    end = _parse_year_month(item_end)
+    return end is None or _month_distance(target, end) >= 0
+
+
+def _child_plan_birth_month(child: object) -> tuple[int, int] | None:
+    birth_month = _parse_year_month(getattr(child, "birth_month", ""))
+    if birth_month is not None:
+        return birth_month
+    planned_start = _parse_year_month(getattr(child, "planned_birth_start_month", ""))
+    planned_end = _parse_year_month(getattr(child, "planned_birth_end_month", ""))
+    planned_single = _parse_year_month(getattr(child, "planned_birth_month", ""))
+    if planned_start is not None and planned_end is not None:
+        return planned_start if _month_distance(planned_start, planned_end) >= 0 else planned_end
+    if planned_start is not None:
+        return planned_start
+    if planned_end is not None:
+        return planned_end
+    if planned_single is not None:
+        return planned_single
+    return _parse_year_month(getattr(child, "planned_birth_month", ""))
+
+
+def _child_age_months(child: object, target_month: date) -> int | None:
+    birth_month = _child_plan_birth_month(child)
+    if birth_month is None:
+        return None
+    return _month_distance(birth_month, (target_month.year, target_month.month))
+
+
+def _personal_pension_deduction_for_member_at(
+    household: HouseholdData | None,
+    member_name: str,
+    target_month: date,
+    rules: RulePackData,
+) -> float:
+    if household is None:
+        return 0.0
+    cap = max(0.0, float(rules.params.get("personal_pension_deduction_annual_cap", 12000)))
+    member = next((item for item in household.members if item.name == member_name), None)
+    if member is None or not bool(getattr(member, "personal_pension_account_enabled", False)):
+        return 0.0
+    open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
+    if open_mode == "none":
+        return 0.0
+    open_month = _parse_year_month(getattr(member, "personal_pension_account_open_month", ""))
+    target = (target_month.year, target_month.month)
+    if open_mode == "manual" and open_month is not None and _month_distance(open_month, target) < 0:
+        return 0.0
+    mode = str(getattr(member, "personal_pension_contribution_mode", "none") or "none")
+    if mode == "none":
+        return 0.0
+    start = _parse_year_month(getattr(member, "personal_pension_contribution_start_month", ""))
+    end = _parse_year_month(getattr(member, "personal_pension_contribution_end_month", "") or "")
+    if start is not None and _month_distance(start, target) < 0:
+        return 0.0
+    if end is not None and _month_distance(target, end) < 0:
+        return 0.0
+    if mode == "auto_tax_optimal":
+        stage = _income_stage_for_month(member, target_month.year, target_month.month)
+        if stage is None or stage.stage_kind in {"pension", "unemployment"}:
+            return 0.0
+        taxable_cash_income = (
+            stage.monthly_salary_gross
+            + stage.monthly_freelance_income
+            + stage.other_annual_taxable_income / 12
+            + _stage_bonus_cash_amount(stage, target_month.year, target_month.month)
+        )
+        if taxable_cash_income <= 0:
+            return 0.0
+        annual_target = cap
+    elif mode == "fixed_monthly":
+        annual_target = max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0))) * 12
+    else:
+        annual_target = max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0)))
+    return min(annual_target, cap) / 12 if cap else annual_target / 12
+
+
+def _personal_pension_cash_contribution_for_member_at(
+    member: IncomeMember,
+    target_month: date,
+    rules: RulePackData,
+) -> float:
+    if not bool(getattr(member, "personal_pension_account_enabled", False)):
+        return 0.0
+    open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
+    if open_mode == "none":
+        return 0.0
+    open_month = _parse_year_month(getattr(member, "personal_pension_account_open_month", ""))
+    target = (target_month.year, target_month.month)
+    if open_mode == "manual" and open_month is not None and _month_distance(open_month, target) < 0:
+        return 0.0
+    mode = str(getattr(member, "personal_pension_contribution_mode", "none") or "none")
+    if mode == "none":
+        return 0.0
+    start = _parse_year_month(getattr(member, "personal_pension_contribution_start_month", ""))
+    end = _parse_year_month(getattr(member, "personal_pension_contribution_end_month", "") or "")
+    if start is not None and _month_distance(start, target) < 0:
+        return 0.0
+    if end is not None and _month_distance(target, end) < 0:
+        return 0.0
+    cap = max(0.0, float(rules.params.get("personal_pension_deduction_annual_cap", 12000)))
+    if mode == "auto_tax_optimal":
+        stage = _income_stage_for_month(member, target_month.year, target_month.month)
+        if stage is None or stage.stage_kind in {"pension", "unemployment"}:
+            return 0.0
+        taxable_cash_income = (
+            stage.monthly_salary_gross
+            + stage.monthly_freelance_income
+            + stage.other_annual_taxable_income / 12
+            + _stage_bonus_cash_amount(stage, target_month.year, target_month.month)
+        )
+        if taxable_cash_income <= 0:
+            return 0.0
+        return cap / 12 if cap else 0.0
+    if mode == "fixed_monthly":
+        return max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0)))
+    if mode == "fixed_annual":
+        contribution_month = max(1, min(12, int(getattr(member, "personal_pension_contribution_month", 12) or 12)))
+        if target_month.month != contribution_month:
+            return 0.0
+        return max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0)))
+    return 0.0
+
+
+def _auto_child_special_deduction_for_member_at(
+    household: HouseholdData | None,
+    member_name: str,
+    target_month: date,
+    rules: RulePackData,
+) -> float:
+    if household is None:
+        return 0.0
+    infant_monthly = float(rules.params.get("infant_care_deduction_monthly", 2000))
+    education_monthly = float(rules.params.get("child_education_deduction_monthly", 2000))
+    total = 0.0
+    for child in household.child_plans:
+        if not child.enabled or child.tax_deduction_owner != member_name:
+            continue
+        age_months = _child_age_months(child, target_month)
+        if age_months is not None and 0 <= age_months < 36:
+            total += infant_monthly
+            continue
+        education_start = _parse_year_month(child.education_start_month)
+        if education_start is not None and _month_distance(education_start, (target_month.year, target_month.month)) >= 0:
+            total += education_monthly
+    return total
+
+
+def _configured_special_deduction_for_member_at(
+    household: HouseholdData | None,
+    member_name: str,
+    target_month: date,
+    rules: RulePackData,
+    *,
+    include_annual_settlement: bool = False,
+) -> float:
+    if household is None:
+        return 0.0
+    params = rules.params
+    monthly_total = 0.0
+    rent_total = 0.0
+    mortgage_total = 0.0
+    annual_total = 0.0
+    for item in household.special_deductions:
+        if not item.enabled or item.member_name != member_name:
+            continue
+        if not _deduction_item_active_in_month(item.start_month, item.end_month, target_month):
+            continue
+        if item.settlement_mode == "annual_settlement":
+            if include_annual_settlement:
+                if item.deduction_type == "serious_illness":
+                    threshold = float(params.get("serious_illness_medical_threshold", 15000))
+                    cap = float(params.get("serious_illness_medical_cap", 80000))
+                    annual_total += min(cap, max(0.0, item.annual_amount - threshold))
+                else:
+                    annual_total += max(0.0, item.annual_amount)
+            continue
+        if item.deduction_type == "housing_rent":
+            rent_total += item.monthly_amount or float(params.get("beijing_housing_rent_deduction_monthly", 1500))
+        elif item.deduction_type == "mortgage_interest":
+            used = max(0, item.claimed_months_used)
+            elapsed = _month_distance(_parse_year_month(item.start_month) or (target_month.year, target_month.month), (target_month.year, target_month.month))
+            max_months = int(params.get("first_home_mortgage_interest_max_months", 240))
+            if item.is_first_home_loan and used + elapsed < max_months:
+                mortgage_total += item.monthly_amount or float(params.get("first_home_mortgage_interest_deduction_monthly", 1000))
+        elif item.deduction_type == "child_education":
+            monthly_total += item.monthly_amount or float(params.get("child_education_deduction_monthly", 2000))
+        elif item.deduction_type == "infant_care":
+            monthly_total += item.monthly_amount or float(params.get("infant_care_deduction_monthly", 2000))
+        elif item.deduction_type == "personal_pension":
+            monthly_total += min(item.annual_amount or item.monthly_amount * 12, float(params.get("personal_pension_deduction_annual_cap", 12000))) / 12
+        else:
+            monthly_total += max(0.0, item.monthly_amount)
+    if bool(params.get("rent_and_mortgage_deduction_mutually_exclusive", True)):
+        monthly_total += max(rent_total, mortgage_total)
+    else:
+        monthly_total += rent_total + mortgage_total
+    return monthly_total + (annual_total if include_annual_settlement and target_month.month == 12 else 0.0)
+
+
+def _auto_housing_special_deduction_for_member_at(
+    household: HouseholdData | None,
+    member_name: str,
+    target_month: date,
+    rules: RulePackData,
+) -> float:
+    if household is None or not household.members or household.members[0].name != member_name:
+        return 0.0
+    for item in household.special_deductions:
+        if (
+            item.enabled
+            and item.member_name == member_name
+            and item.deduction_type in {"housing_rent", "mortgage_interest"}
+            and _deduction_item_active_in_month(item.start_month, item.end_month, target_month)
+        ):
+            return 0.0
+    for stage in household.rent_expense_stages:
+        if stage.rent_amount <= 0:
+            continue
+        start = _parse_iso_date(stage.start_month, date(1900, 1, 1))
+        end = _parse_iso_date(stage.end_month, date(9999, 12, 31)) if stage.end_month else date(9999, 12, 31)
+        if start <= target_month <= end:
+            return float(rules.params.get("beijing_housing_rent_deduction_monthly", 1500))
+    return 0.0
+
+
+def _structured_special_deduction_for_member_at(
+    household: HouseholdData | None,
+    member_name: str,
+    target_month: date,
+    rules: RulePackData,
+    *,
+    include_annual_settlement: bool = False,
+) -> float:
+    return (
+        _elderly_care_deduction_for_member_at(household, member_name, target_month)
+        + _auto_child_special_deduction_for_member_at(household, member_name, target_month, rules)
+        + _auto_housing_special_deduction_for_member_at(household, member_name, target_month, rules)
+        + _personal_pension_deduction_for_member_at(household, member_name, target_month, rules)
+        + _configured_special_deduction_for_member_at(
+            household,
+            member_name,
+            target_month,
+            rules,
+            include_annual_settlement=include_annual_settlement,
+        )
+    )
+
+
+def _investment_effective_tax_rate(household: HouseholdData) -> float:
+    profile = household.investment_tax_profile or InvestmentTaxProfileData()
+    weighted_rate = (
+        profile.deposit_interest_ratio * profile.deposit_interest_tax_rate
+        + profile.fund_dividend_ratio * profile.fund_dividend_tax_rate
+        + profile.stock_dividend_short_ratio * profile.stock_dividend_short_holding_tax_rate
+        + profile.stock_dividend_long_ratio * profile.stock_dividend_long_holding_tax_rate
+        + profile.bond_interest_ratio * profile.bond_interest_tax_rate
+        + profile.overseas_asset_ratio * profile.overseas_asset_tax_rate
+    )
+    if weighted_rate > 0:
+        return max(0.0, min(1.0, weighted_rate))
+    return max(0.0, min(1.0, household.investment_taxable_return_ratio * household.investment_return_tax_rate))
+
+
 def _stage_active_in_month(stage: IncomeStageData, year: int, month: int) -> bool:
     month_start = date(year, month, 1)
     start = _parse_iso_date(stage.start_date, date(1900, 1, 1))
@@ -1219,30 +1343,34 @@ def _stage_active_in_month(stage: IncomeStageData, year: int, month: int) -> boo
 
 
 def _income_stage_for_month(member: IncomeMember, year: int, month: int) -> IncomeStageData | None:
-    stages = member.income_stages or [
-        IncomeStageData(
-            name="current",
-            start_date=member.employment_start_date,
-            monthly_salary_gross=member.monthly_salary_gross,
-            annual_bonus=member.annual_bonus,
-            annual_bonus_payout_month=4,
-            monthly_social_insurance=member.monthly_social_insurance,
-            monthly_housing_fund=member.monthly_housing_fund,
-            housing_fund_personal_rate=member.housing_fund_personal_rate,
-            housing_fund_employer_rate=member.housing_fund_employer_rate,
-            monthly_special_additional_deduction=member.monthly_special_additional_deduction,
-            other_annual_deductions=member.other_annual_deductions,
-            other_annual_taxable_income=member.other_annual_taxable_income,
-            bonus_tax_method=member.bonus_tax_method,
-        )
-    ]
+    stages = member.income_stages or []
     active = [stage for stage in stages if _stage_active_in_month(stage, year, month)]
     if not active:
         return None
     return max(active, key=lambda stage: _parse_iso_date(stage.start_date, date(1900, 1, 1)))
 
 
-def _stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData) -> BonusTaxMethod:
+def _annual_bonus_separate_tax_available(rules: RulePackData, target_year: int) -> bool:
+    periods = rules.params.get("annual_bonus_policy_periods")
+    if isinstance(periods, list):
+        for period in periods:
+            if not isinstance(period, dict):
+                continue
+            start = _parse_iso_date(str(period.get("effective_from") or ""), date(1900, 1, 1))
+            end = _parse_iso_date(str(period.get("effective_to") or ""), date(9999, 12, 31))
+            if start.year <= target_year <= end.year:
+                return bool(period.get("separate_tax_enabled", True))
+    if bool(rules.params.get("annual_bonus_separate_tax_default_continues", True)):
+        return True
+    valid_until = _parse_iso_date(str(rules.params.get("annual_bonus_separate_tax_valid_until") or ""), date(9999, 12, 31))
+    return target_year <= valid_until.year
+
+
+def _stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData, target_year: int | None = None) -> BonusTaxMethod:
+    if stage.annual_bonus_payout_mode == "monthly_spread":
+        return "merged"
+    if target_year is not None and not _annual_bonus_separate_tax_available(rules, target_year):
+        return "merged"
     method = stage.bonus_tax_method
     if method in {"merged", "separate"}:
         return method
@@ -1334,20 +1462,22 @@ def _member_cumulative_salary_tax_state(
             stage_key = id(stage)
             selected_bonus_method = selected_method_cache.get(stage_key)
             if selected_bonus_method is None:
-                selected_bonus_method = _stage_selected_bonus_method(stage, rules)
+                selected_bonus_method = _stage_selected_bonus_method(stage, rules, year)
                 selected_method_cache[stage_key] = selected_bonus_method
             active_months += 1
             cumulative_income += stage.monthly_salary_gross
             cumulative_income += stage.monthly_freelance_income
             cumulative_income += stage.other_annual_taxable_income / 12
+            cumulative_income += _stage_monthly_spread_bonus_amount(stage, year, month)
             if selected_bonus_method == "merged":
                 cumulative_income += _stage_bonus_payout_amount(stage, year, month)
             cumulative_social_and_fund += personal_social + personal_housing_fund
             cumulative_special_deduction += stage.monthly_special_additional_deduction
-            cumulative_special_deduction += _elderly_care_deduction_for_member_at(
+            cumulative_special_deduction += _structured_special_deduction_for_member_at(
                 household,
                 member.name,
                 target_date,
+                rules,
             )
             cumulative_other_deduction += stage.other_annual_deductions / 12
         current_taxable_income, current_tax = cumulative_tax_value()
@@ -1372,7 +1502,7 @@ def _member_monthly_income_profile(
         return MonthlyIncomeProfile(0, 0, 0, 0, 0, 0, 0, 0)
 
     personal_social, personal_housing_fund, employer_social, employer_housing_fund = _beijing_contributions(stage, rules)
-    selected_bonus_method = _stage_selected_bonus_method(stage, rules)
+    selected_bonus_method = _stage_selected_bonus_method(stage, rules, target_month.year)
     previous_cumulative_tax, cumulative_tax = _member_cumulative_salary_tax_pair(
         member,
         rules,
@@ -1381,11 +1511,13 @@ def _member_monthly_income_profile(
         household,
     )
     salary_tax = max(0.0, cumulative_tax - previous_cumulative_tax)
-    bonus_payout = _stage_bonus_payout_amount(stage, target_month.year, target_month.month)
+    lump_sum_bonus_payout = _stage_bonus_payout_amount(stage, target_month.year, target_month.month)
+    monthly_spread_bonus = _stage_monthly_spread_bonus_amount(stage, target_month.year, target_month.month)
+    bonus_payout = lump_sum_bonus_payout + monthly_spread_bonus
     bonus_tax_due = 0.0
     if selected_bonus_method == "separate":
         bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
-        bonus_tax_due = _bonus_tax(bonus_payout, bonus_brackets) if bonus_payout > 0 else 0.0
+        bonus_tax_due = _bonus_tax(lump_sum_bonus_payout, bonus_brackets) if lump_sum_bonus_payout > 0 else 0.0
 
     taxable_cash_income = (
         stage.monthly_salary_gross
@@ -1393,9 +1525,12 @@ def _member_monthly_income_profile(
         + bonus_payout
         + stage.other_annual_taxable_income / 12
     )
+    pension_income = stage.monthly_non_taxable_income if stage.stage_kind == "pension" else 0.0
     gross_income = taxable_cash_income + stage.monthly_non_taxable_income
     income_tax = salary_tax + bonus_tax_due
-    net_income = gross_income - personal_social - personal_housing_fund - income_tax - stage.monthly_extra_cash_expense
+    personal_pension_contribution = _personal_pension_cash_contribution_for_member_at(member, target_month, rules)
+    extra_cash_expense = stage.monthly_extra_cash_expense + personal_pension_contribution
+    net_income = gross_income - personal_social - personal_housing_fund - income_tax - extra_cash_expense
     return MonthlyIncomeProfile(
         gross_income=round(gross_income, 2),
         net_income=round(net_income, 2),
@@ -1406,7 +1541,8 @@ def _member_monthly_income_profile(
         income_tax=round(income_tax, 2),
         monthly_pf_deposit=round(personal_housing_fund + employer_housing_fund, 2),
         non_taxable_income=round(stage.monthly_non_taxable_income, 2),
-        extra_cash_expense=round(stage.monthly_extra_cash_expense, 2),
+        pension_income=round(pension_income, 2),
+        extra_cash_expense=round(extra_cash_expense, 2),
     )
 
 
@@ -1417,7 +1553,7 @@ def household_monthly_income_profile_at(
     *,
     as_of: date | None = None,
 ) -> MonthlyIncomeProfile:
-    household = _household_with_career_income_stages(household, rules, as_of=as_of)
+    household = _household_with_pension_income_stages(household, rules, as_of=as_of)
     current = as_of or date.today()
     year, month = _month_after(current, max(0, months_from_now))
     target_month = date(year, month, 1)
@@ -1447,6 +1583,7 @@ def household_monthly_income_profile_at(
         income_tax=round(sum(item.income_tax for item in member_profiles), 2),
         monthly_pf_deposit=round(sum(item.monthly_pf_deposit for item in member_profiles), 2),
         non_taxable_income=round(sum(item.non_taxable_income for item in member_profiles), 2),
+        pension_income=round(sum(item.pension_income for item in member_profiles), 2),
         extra_cash_expense=round(sum(item.extra_cash_expense for item in member_profiles), 2),
     )
 
@@ -1461,22 +1598,7 @@ def _member_tax_summary(
     bonus_brackets = list(params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
     standard_deduction = float(params.get("personal_standard_deduction_annual", 60000))
     projection_year = int(params.get("_income_projection_year", 2027))
-    stages = member.income_stages or [
-        IncomeStageData(
-            name="当前收入",
-            start_date=member.employment_start_date,
-            monthly_salary_gross=member.monthly_salary_gross,
-            annual_bonus=member.annual_bonus,
-            monthly_social_insurance=member.monthly_social_insurance,
-            monthly_housing_fund=member.monthly_housing_fund,
-            housing_fund_personal_rate=member.housing_fund_personal_rate,
-            housing_fund_employer_rate=member.housing_fund_employer_rate,
-            monthly_special_additional_deduction=member.monthly_special_additional_deduction,
-            other_annual_deductions=member.other_annual_deductions,
-            other_annual_taxable_income=member.other_annual_taxable_income,
-            bonus_tax_method=member.bonus_tax_method,
-        )
-    ]
+    stages = member.income_stages or []
 
     active_months = 0
     salary_annual = 0.0
@@ -1504,10 +1626,14 @@ def _member_tax_summary(
         active_months += stage_months
         salary_annual += stage.monthly_salary_gross * stage_months
         salary_annual += stage.monthly_freelance_income * stage_months
-        bonus_annual += sum(
-            _stage_bonus_payout_amount(stage, projection_year, month)
+        stage_bonus_annual = sum(
+            _stage_bonus_cash_amount(stage, projection_year, month)
             for month in range(1, 13)
         )
+        if stage.annual_bonus_payout_mode == "monthly_spread":
+            salary_annual += stage_bonus_annual
+        else:
+            bonus_annual += stage_bonus_annual
         non_taxable_income += stage.monthly_non_taxable_income * stage_months
         extra_cash_expense += stage.monthly_extra_cash_expense * stage_months
         other_taxable_income += stage.other_annual_taxable_income * stage_ratio
@@ -1521,18 +1647,26 @@ def _member_tax_summary(
         for month in range(1, 13):
             if _income_stage_for_month(member, projection_year, month) != stage:
                 continue
-            special_deductions += _elderly_care_deduction_for_member_at(
+            special_deductions += _structured_special_deduction_for_member_at(
                 household,
                 member.name,
                 date(projection_year, month, 1),
+                rules,
+                include_annual_settlement=True,
+            )
+            extra_cash_expense += _personal_pension_cash_contribution_for_member_at(
+                member,
+                date(projection_year, month, 1),
+                rules,
             )
 
     common_deductions = standard_deduction + social_and_fund + special_deductions + other_deductions
 
     salary_taxable = max(0.0, salary_annual + other_taxable_income - common_deductions)
     separate_salary_tax = _progressive_tax(salary_taxable, annual_brackets)
-    separate_bonus_tax = _bonus_tax(bonus_annual, bonus_brackets)
-    separate_total_tax = separate_salary_tax + separate_bonus_tax
+    separate_available = _annual_bonus_separate_tax_available(rules, projection_year)
+    separate_bonus_tax = _bonus_tax(bonus_annual, bonus_brackets) if separate_available else 0.0
+    separate_total_tax = separate_salary_tax + separate_bonus_tax if separate_available else float("inf")
 
     merged_taxable = max(
         0.0,
@@ -1543,7 +1677,14 @@ def _member_tax_summary(
     )
     merged_total_tax = _progressive_tax(merged_taxable, annual_brackets)
 
-    method = member.bonus_tax_method
+    stage_methods = {
+        _stage_selected_bonus_method(stage, rules, projection_year)
+        for stage in stages
+        if _active_months_in_period(stage.start_date, stage.end_date, projection_year) > 0
+    }
+    method = next(iter(stage_methods)) if len(stage_methods) == 1 else member.bonus_tax_method
+    if not separate_available and method == "separate":
+        method = "merged"
     if method == "merged":
         selected_method: BonusTaxMethod = "merged"
         taxable_income = merged_taxable
@@ -1592,7 +1733,7 @@ def _member_tax_summary(
 
 
 def calculate_household_tax(household: HouseholdData, rules: RulePackData) -> tuple[list[TaxMemberSummary], float, float, float]:
-    household = _household_with_career_income_stages(household, rules)
+    household = _household_with_pension_income_stages(household, rules)
     if not household.members:
         gross_monthly = household.monthly_income
         return [], gross_monthly, gross_monthly, 0.0
@@ -1613,7 +1754,7 @@ def calculate_household_tax(household: HouseholdData, rules: RulePackData) -> tu
 
 
 def calculate_household_tax_for_year(household: HouseholdData, rules: RulePackData, year: int) -> TaxYearSummary:
-    household = _household_with_career_income_stages(household, rules)
+    household = _household_with_pension_income_stages(household, rules)
     projected_rules = rules.model_copy(
         update={
             "params": {
@@ -1659,7 +1800,7 @@ def _build_tax_member_monthly_point(
         return None
 
     personal_social, personal_housing_fund, employer_social, employer_housing_fund = _beijing_contributions(stage, rules)
-    selected_bonus_method = _stage_selected_bonus_method(stage, rules)
+    selected_bonus_method = _stage_selected_bonus_method(stage, rules, target_month.year)
     tax_state = _member_cumulative_salary_tax_state(
         member,
         rules,
@@ -1668,18 +1809,28 @@ def _build_tax_member_monthly_point(
         household,
     )
     salary_tax = max(0.0, tax_state.current_tax - tax_state.previous_tax)
-    bonus_income = _stage_bonus_payout_amount(stage, target_month.year, target_month.month)
+    lump_sum_bonus_income = _stage_bonus_payout_amount(stage, target_month.year, target_month.month)
+    monthly_spread_bonus = _stage_monthly_spread_bonus_amount(stage, target_month.year, target_month.month)
+    bonus_income = lump_sum_bonus_income + monthly_spread_bonus
     bonus_tax_due = 0.0
-    if selected_bonus_method == "separate" and bonus_income > 0:
+    if selected_bonus_method == "separate" and lump_sum_bonus_income > 0:
         bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
-        bonus_tax_due = _bonus_tax(bonus_income, bonus_brackets)
+        bonus_tax_due = _bonus_tax(lump_sum_bonus_income, bonus_brackets)
 
     other_taxable_income = stage.monthly_freelance_income + stage.other_annual_taxable_income / 12
-    elderly_care_deduction = _elderly_care_deduction_for_member_at(household, member.name, target_month)
+    structured_deduction = _structured_special_deduction_for_member_at(
+        household,
+        member.name,
+        target_month,
+        rules,
+    )
     other_deduction = stage.other_annual_deductions / 12
     total_tax = salary_tax + bonus_tax_due
+    pension_income = stage.monthly_non_taxable_income if stage.stage_kind == "pension" else 0.0
     gross_income = stage.monthly_salary_gross + bonus_income + other_taxable_income + stage.monthly_non_taxable_income
-    net_income = gross_income - personal_social - personal_housing_fund - total_tax - stage.monthly_extra_cash_expense
+    personal_pension_contribution = _personal_pension_cash_contribution_for_member_at(member, target_month, rules)
+    extra_cash_expense = stage.monthly_extra_cash_expense + personal_pension_contribution
+    net_income = gross_income - personal_social - personal_housing_fund - total_tax - extra_cash_expense
 
     return TaxMemberMonthlyPoint(
         month=absolute_month,
@@ -1693,12 +1844,13 @@ def _build_tax_member_monthly_point(
         bonus_income=round(bonus_income, 2),
         other_taxable_income=round(other_taxable_income, 2),
         non_taxable_income=round(stage.monthly_non_taxable_income, 2),
+        pension_income=round(pension_income, 2),
         personal_social=round(personal_social, 2),
         personal_housing_fund=round(personal_housing_fund, 2),
         employer_social=round(employer_social, 2),
         employer_housing_fund=round(employer_housing_fund, 2),
         special_additional_deduction=round(stage.monthly_special_additional_deduction, 2),
-        elderly_care_deduction=round(elderly_care_deduction, 2),
+        elderly_care_deduction=round(structured_deduction, 2),
         other_deduction=round(other_deduction, 2),
         cumulative_taxable_income=round(tax_state.cumulative_taxable_income, 2),
         salary_tax=round(salary_tax, 2),
@@ -1716,7 +1868,7 @@ def build_tax_monthly_points(
     base_date: date | None = None,
     horizon_months: int = 840,
 ) -> list[TaxMonthlyPoint]:
-    household = _household_with_career_income_stages(household, rules, as_of=base_date)
+    household = _household_with_pension_income_stages(household, rules, as_of=base_date)
     current = base_date or date.today()
     current_month = date(current.year, current.month, 1)
     rows: list[TaxMonthlyPoint] = []
@@ -1755,6 +1907,7 @@ def build_tax_monthly_points(
                 employer_housing_fund=round(sum(item.employer_housing_fund for item in member_points), 2),
                 monthly_pf_deposit=round(sum(item.personal_housing_fund + item.employer_housing_fund for item in member_points), 2),
                 non_taxable_income=round(sum(item.non_taxable_income for item in member_points), 2),
+                pension_income=round(sum(item.pension_income for item in member_points), 2),
                 extra_cash_expense=round(sum(max(0.0, item.gross_salary + item.bonus_income + item.other_taxable_income + item.non_taxable_income - item.personal_social - item.personal_housing_fund - item.total_income_tax - item.net_income) for item in member_points), 2),
                 member_points=member_points,
             )
@@ -1770,7 +1923,7 @@ def build_tax_events(
     base_date: date | None = None,
     horizon_months: int = 840,
 ) -> list[TaxEventPoint]:
-    household = _household_with_career_income_stages(household, rules, as_of=base_date)
+    household = _household_with_pension_income_stages(household, rules, as_of=base_date)
     current = base_date or date.today()
     current_month = date(current.year, current.month, 1)
     end_year, end_month = _month_after(current_month, max(0, horizon_months))
@@ -1839,6 +1992,248 @@ def build_tax_events(
     return sorted(events, key=lambda item: (item.month, item.member_name, item.event_type))
 
 
+def _active_rent_deduction_window(
+    household: HouseholdData,
+    *,
+    base_date: date,
+    horizon_months: int,
+) -> tuple[str, str | None] | None:
+    end_year, end_month = _month_after(base_date, max(0, horizon_months))
+    horizon_end = date(end_year, end_month, 1)
+    starts: list[date] = []
+    ends: list[date] = []
+    for stage in household.rent_expense_stages:
+        if stage.rent_amount <= 0:
+            continue
+        start = _parse_iso_date(stage.start_month, base_date)
+        end = _parse_iso_date(stage.end_month, horizon_end) if stage.end_month else horizon_end
+        if end < base_date or start > horizon_end:
+            continue
+        starts.append(max(start, base_date))
+        ends.append(min(end, horizon_end))
+    if not starts:
+        return None
+    start = min(starts)
+    end = max(ends) if ends else None
+    return f"{start.year:04d}-{start.month:02d}", f"{end.year:04d}-{end.month:02d}" if end and end < horizon_end else None
+
+
+def _first_personal_pension_tax_optimal_month(
+    member: IncomeMember,
+    *,
+    base_date: date,
+    horizon_months: int,
+) -> str:
+    for offset in range(max(0, horizon_months) + 1):
+        year, month = _month_after(base_date, offset)
+        stage = _income_stage_for_month(member, year, month)
+        if stage is None or stage.stage_kind in {"pension", "unemployment"}:
+            continue
+        taxable_income = (
+            stage.monthly_salary_gross
+            + stage.monthly_freelance_income
+            + stage.other_annual_taxable_income / 12
+            + _stage_bonus_cash_amount(stage, year, month)
+        )
+        if taxable_income > 0:
+            return f"{year:04d}-{month:02d}"
+    return ""
+
+
+def build_tax_strategy_items(
+    household: HouseholdData,
+    scenario: ScenarioData,
+    rules: RulePackData,
+    *,
+    base_date: date | None = None,
+    horizon_months: int = 840,
+    selected_purchase_month: int | None = None,
+) -> list[TaxStrategyItem]:
+    current = base_date or date.today()
+    current_month = date(current.year, current.month, 1)
+    params = rules.params
+    member_name = household.members[0].name if household.members else ""
+    rent_monthly = float(params.get("beijing_housing_rent_deduction_monthly", 1500))
+    mortgage_monthly = float(params.get("first_home_mortgage_interest_deduction_monthly", 1000))
+    max_mortgage_months = int(params.get("first_home_mortgage_interest_max_months", 240))
+    rent_window = _active_rent_deduction_window(household, base_date=current_month, horizon_months=horizon_months)
+
+    items: list[TaxStrategyItem] = []
+    if rent_window:
+        rent_status: Literal["auto_enabled", "available"] = "auto_enabled"
+        rent_reason = "检测到家庭存在租房支出阶段，税务策略默认把北京住房租金专项附加扣除纳入月度预扣预缴。"
+        if selected_purchase_month is not None and mortgage_monthly > rent_monthly:
+            rent_status = "available"
+            rent_reason = "购房后首套住房贷款利息扣除金额高于租金扣除；租房期仍可用，购房后由策略切换到房贷利息口径。"
+        items.append(
+            TaxStrategyItem(
+                deduction_type="housing_rent",
+                title="北京住房租金专项附加扣除",
+                status=rent_status,
+                member_name=member_name,
+                monthly_amount=round(rent_monthly, 2),
+                start_month=rent_window[0],
+                end_month=rent_window[1],
+                reason=rent_reason,
+                conflicts_with=["mortgage_interest"],
+                source="event",
+            )
+        )
+    else:
+        items.append(
+            TaxStrategyItem(
+                deduction_type="housing_rent",
+                title="北京住房租金专项附加扣除",
+                status="not_applicable",
+                monthly_amount=round(rent_monthly, 2),
+                reason="当前没有检测到租房支出阶段；不由用户手动打开，等租房事件存在时再自动纳入税务策略。",
+                conflicts_with=["mortgage_interest"],
+                source="backend_auto",
+            )
+        )
+
+    has_home_target = bool(getattr(scenario, "enabled", False)) and selected_purchase_month is not None
+    if has_home_target:
+        purchase_year, purchase_month = _month_after(current_month, max(0, selected_purchase_month or 0))
+        mortgage_status: Literal["auto_enabled", "available"] = "auto_enabled"
+        mortgage_reason = "检测到已选购房策略形成首套住房贷款事件，税务策略从购房还贷月开始考虑首套住房贷款利息专项附加扣除。"
+        if rent_window and rent_monthly >= mortgage_monthly:
+            mortgage_status = "available"
+            mortgage_reason = "同月住房租金扣除高于或等于首套房贷利息扣除，策略优先使用租金口径；房贷利息作为可切换备选保留。"
+        items.append(
+            TaxStrategyItem(
+                deduction_type="mortgage_interest",
+                title="首套住房贷款利息专项附加扣除",
+                status=mortgage_status,
+                member_name=member_name,
+                monthly_amount=round(mortgage_monthly, 2),
+                start_month=f"{purchase_year:04d}-{purchase_month:02d}",
+                end_month=_format_year_month_tuple(_month_after(date(purchase_year, purchase_month, 1), max(0, max_mortgage_months - 1))) if max_mortgage_months > 0 else None,
+                reason=mortgage_reason,
+                conflicts_with=["housing_rent"],
+                source="event",
+            )
+        )
+    else:
+        items.append(
+            TaxStrategyItem(
+                deduction_type="mortgage_interest",
+                title="首套住房贷款利息专项附加扣除",
+                status="not_applicable",
+                monthly_amount=round(mortgage_monthly, 2),
+                reason="当前选中规划没有形成购房还贷事件，首套住房贷款利息扣除暂不启用。",
+                conflicts_with=["housing_rent"],
+                source="backend_auto",
+            )
+        )
+
+    child_monthly = float(params.get("child_education_deduction_monthly", 2000))
+    infant_monthly = float(params.get("infant_care_deduction_monthly", 2000))
+    for child in household.child_plans:
+        if not child.enabled:
+            continue
+        birth_month = _child_plan_birth_month_for_strategy(child, as_of=current_month, home_purchase_month=selected_purchase_month, rules=rules)
+        if birth_month:
+            items.append(
+                TaxStrategyItem(
+                    deduction_type="infant_care",
+                    title=f"{child.name}婴幼儿照护扣除",
+                    status="auto_enabled" if child.tax_deduction_owner else "available",
+                    member_name=child.tax_deduction_owner,
+                    monthly_amount=round(infant_monthly, 2),
+                    start_month=_format_year_month_tuple(birth_month),
+                    end_month=_format_year_month_tuple(_month_after(date(birth_month[0], birth_month[1], 1), 35)),
+                    reason="子女出生节点由养娃计划生成；3岁以下婴幼儿照护扣除由税务策略按申报成员自动纳入。",
+                    source="event",
+                )
+            )
+        education_start = _parse_year_month(child.education_start_month)
+        if education_start:
+            items.append(
+                TaxStrategyItem(
+                    deduction_type="child_education",
+                    title=f"{child.name}子女教育扣除",
+                    status="auto_enabled" if child.tax_deduction_owner else "available",
+                    member_name=child.tax_deduction_owner,
+                    monthly_amount=round(child_monthly, 2),
+                    start_month=_format_year_month_tuple(education_start),
+                    reason="教育阶段开始月来自养娃计划；扣除归属按税务策略和申报成员处理。",
+                    source="event",
+                )
+            )
+
+    for member in household.members:
+        if bool(getattr(member, "personal_pension_account_enabled", False)):
+            open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
+            contribution_mode = str(getattr(member, "personal_pension_contribution_mode", "auto_tax_optimal") or "auto_tax_optimal")
+            recommended_start = _first_personal_pension_tax_optimal_month(
+                member,
+                base_date=current_month,
+                horizon_months=horizon_months,
+            )
+            configured_open_month = str(getattr(member, "personal_pension_account_open_month", "") or "")
+            configured_contribution_start = str(getattr(member, "personal_pension_contribution_start_month", "") or "")
+            strategy_start_month = (
+                configured_open_month
+                if open_mode == "manual" and configured_open_month
+                else configured_contribution_start
+                if configured_contribution_start
+                else recommended_start
+            )
+            status = "auto_enabled" if open_mode == "auto_tax_optimal" and contribution_mode == "auto_tax_optimal" else "manual_enabled"
+            if open_mode == "none" or contribution_mode == "none":
+                status = "not_applicable"
+            reason = (
+                f"税务策略建议在 {strategy_start_month or '首次有应税工作收入时'} 开户并开始按年度扣除上限缴存；"
+                "个人养老金与基本养老保险个人账户不同，缴费环节可在年度 12000 元上限内税前扣除，投资环节暂不征税，领取环节按规则包税率估算。"
+                if status == "auto_enabled"
+                else "个人养老金开户或缴存由用户手动控制；后端仍会按手动月份、缴存方式、年度扣除上限和领取税率纳入税务策略。"
+            )
+            items.append(
+                TaxStrategyItem(
+                    deduction_type="personal_pension",
+                    title=f"{member.name}个人养老金税前扣除",
+                    status=status,
+                    member_name=member.name,
+                    annual_amount=round(float(params.get("personal_pension_deduction_annual_cap", 12000)), 2),
+                    start_month=strategy_start_month,
+                    end_month=getattr(member, "personal_pension_contribution_end_month", "") or None,
+                    reason=reason,
+                    source="backend_auto",
+                )
+            )
+
+    for item in household.special_deductions:
+        if not item.enabled:
+            continue
+        items.append(
+            TaxStrategyItem(
+                deduction_type=item.deduction_type,
+                title=item.name,
+                status="manual_enabled",
+                member_name=item.member_name,
+                monthly_amount=round(item.monthly_amount, 2),
+                annual_amount=round(item.annual_amount, 2),
+                start_month=item.start_month,
+                end_month=item.end_month,
+                reason="这是用户手动覆盖项，会和自动税务策略一起交给后端税务计算；住房租金和首套房贷利息仍按互斥规则处理。",
+                conflicts_with=["mortgage_interest"] if item.deduction_type == "housing_rent" else ["housing_rent"] if item.deduction_type == "mortgage_interest" else [],
+                source="manual",
+            )
+        )
+
+    order = {
+        "housing_rent": 0,
+        "mortgage_interest": 1,
+        "child_education": 2,
+        "infant_care": 3,
+        "personal_pension": 4,
+        "continuing_education": 5,
+        "serious_illness": 6,
+    }
+    return sorted(items, key=lambda item: (order.get(item.deduction_type, 99), item.member_name, item.start_month))
+
+
 def _loan_summary(principal: float, rate: float, years: int, method: str) -> LoanSummary | None:
     if principal <= 0:
         return None
@@ -1854,61 +2249,385 @@ def _loan_summary(principal: float, rate: float, years: int, method: str) -> Loa
     )
 
 
-def _parse_month(value: str) -> tuple[int, int] | None:
-    try:
-        year_text, month_text = value.split("-", 1)
-        year = int(year_text)
-        month = int(month_text)
-    except (ValueError, AttributeError):
-        return None
-    if not 1 <= month <= 12:
-        return None
-    return year, month
-
-
-def _month_distance(start: tuple[int, int], end: tuple[int, int]) -> int:
-    return (end[0] - start[0]) * 12 + end[1] - start[1]
-
-
-def _month_after(base: date, months_from_now: int) -> tuple[int, int]:
-    zero_based_month = base.month - 1 + months_from_now
-    return base.year + zero_based_month // 12, zero_based_month % 12 + 1
-
-
 def monthly_household_expense_at(
     household: HouseholdData,
     months_from_now: int = 0,
     *,
     as_of: date | None = None,
+    rules: RulePackData | None = None,
+    home_purchase_month: int | None = None,
 ) -> float:
     current = as_of or date.today()
     target_month = _month_after(current, max(0, months_from_now))
-    stage = _household_expense_stage_at(household, months_from_now, as_of=current)
+    stage = _daily_expense_stage_at(household, months_from_now, as_of=current)
     base_living_expense = stage.base_living_expense if stage else household.monthly_expense
     rent_cash_expense = _rent_cash_payment_at(household, months_from_now, as_of=current)
     scheduled_total = 0.0
     for item in household.scheduled_expenses:
-        start_month = _parse_month(item.start_month)
-        end_month = _parse_month(item.end_month) if item.end_month else None
-        if start_month is None or _month_distance(start_month, target_month) < 0:
-            continue
-        if end_month is not None and _month_distance(target_month, end_month) < 0:
-            continue
-        if item.frequency == "annual_once" and target_month[1] != item.annual_occurrence_month:
-            continue
-        scheduled_total += item.monthly_amount
-    return max(0.0, base_living_expense + rent_cash_expense + scheduled_total)
+        if _scheduled_expense_occurs_in_month(item, target_month):
+            scheduled_total += item.monthly_amount
+    child_expense = _child_plan_monthly_expense_at(household, target_month, as_of=current, home_purchase_month=home_purchase_month, rules=rules)
+    career_shock_self_payment = (
+        _career_shock_self_payment_at_month(household, rules, months_from_now, as_of=current)
+        if rules is not None
+        else 0.0
+    )
+    return max(0.0, base_living_expense + rent_cash_expense + scheduled_total + child_expense + career_shock_self_payment)
 
 
-def _household_expense_stage_at(
+def _child_plan_birth_month_for_strategy(
+    child: object,
+    *,
+    as_of: date,
+    home_purchase_month: int | None = None,
+    rules: RulePackData | None = None,
+) -> tuple[int, int] | None:
+    actual = _parse_year_month(getattr(child, "birth_month", ""))
+    if actual is not None:
+        return actual
+    start = _parse_year_month(getattr(child, "planned_birth_start_month", ""))
+    end = _parse_year_month(getattr(child, "planned_birth_end_month", ""))
+    single = _parse_year_month(getattr(child, "planned_birth_month", ""))
+    if start is None and end is None and single is not None:
+        start = single
+        end = single
+    if start is not None or end is not None:
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        if start is None or end is None:
+            return None
+        if _month_distance(start, end) < 0:
+            start, end = end, start
+        earliest = start
+        if getattr(child, "timing_mode", "") == "after_first_home" and home_purchase_month is not None:
+            delay = int((rules.params if rules else {}).get("child_plan_birth_after_home_delay_months", 12))
+            after_home = _month_after(as_of, max(0, home_purchase_month + delay))
+            if _month_distance(earliest, after_home) > 0:
+                earliest = after_home
+        return earliest if _month_distance(earliest, end) >= 0 else end
+    if getattr(child, "timing_mode", "") == "after_first_home":
+        if home_purchase_month is None:
+            return None
+        delay = int((rules.params if rules else {}).get("child_plan_birth_after_home_delay_months", 12))
+        return _month_after(as_of, max(0, home_purchase_month + delay))
+    return None
+
+
+def _child_plan_stage_expense_at(
+    child: object,
+    target_month: tuple[int, int],
+    *,
+    as_of: date,
+    home_purchase_month: int | None = None,
+    rules: RulePackData | None = None,
+) -> tuple[float, list[tuple[str, float]]]:
+    birth_month = _child_plan_birth_month_for_strategy(child, as_of=as_of, home_purchase_month=home_purchase_month, rules=rules)
+    if birth_month is None:
+        return 0.0, []
+    total = 0.0
+    components: list[tuple[str, float]] = []
+    target_date = _month_tuple_to_date(target_month)
+    birth_date = _month_tuple_to_date(birth_month)
+    age_months = _month_distance(birth_month, target_month)
+    months_until_birth = _month_distance(target_month, birth_month)
+    preparation_months = max(0, int(getattr(child, "preparation_months_before_birth", 6)))
+    pregnancy_months = max(0, int(getattr(child, "pregnancy_months_before_birth", 9)))
+    if months_until_birth > 0:
+        if months_until_birth <= pregnancy_months:
+            amount = float(getattr(child, "monthly_pregnancy_cost", 0))
+            total += amount
+            components.append(("孕期检查与营养", amount))
+        elif months_until_birth <= preparation_months:
+            amount = float(getattr(child, "monthly_preparation_cost", 0))
+            total += amount
+            components.append(("备孕准备", amount))
+        return max(0.0, total), [(name, value) for name, value in components if value > 0]
+    if age_months == 0:
+        for name, attr in [
+            ("生产医疗", "birth_medical_cost"),
+            ("产后恢复与月嫂", "postpartum_recovery_cost"),
+            ("新生儿初始用品", "initial_baby_supplies_cost"),
+        ]:
+            amount = float(getattr(child, attr, 0))
+            total += amount
+            components.append((name, amount))
+    if age_months >= 0:
+        if age_months < 36:
+            amount = float(getattr(child, "monthly_childcare_cost_before_kindergarten", 0))
+            total += amount
+            components.append(("婴幼儿月支出", amount))
+        else:
+            education_start = _parse_year_month(getattr(child, "education_start_month", ""))
+            if education_start is None:
+                kindergarten_start = (birth_month[0] + 3, birth_month[1])
+                primary_start = (birth_month[0] + 6, 9)
+                higher_start = (birth_month[0] + 18, 9)
+            else:
+                primary_start = education_start
+                kindergarten_start = (birth_month[0] + 3, birth_month[1])
+                higher_start = (education_start[0] + 12, education_start[1])
+            if target_month == kindergarten_start:
+                amount = float(getattr(child, "kindergarten_entry_cost", 0))
+                total += amount
+                components.append(("幼儿园入园一次性支出", amount))
+            if target_month == primary_start:
+                amount = float(getattr(child, "primary_school_entry_cost", 0))
+                total += amount
+                components.append(("中小学入学一次性支出", amount))
+            if target_month == higher_start:
+                amount = float(getattr(child, "higher_education_entry_cost", 0))
+                total += amount
+                components.append(("高等教育启动支出", amount))
+            if education_start is not None and _month_distance(education_start, target_month) >= 0:
+                if age_months < 18 * 12:
+                    amount = float(getattr(child, "monthly_primary_secondary_cost", 0))
+                    total += amount
+                    components.append(("中小学月支出", amount))
+                else:
+                    amount = float(getattr(child, "monthly_higher_education_cost", 0))
+                    total += amount
+                    components.append(("高等教育月支出", amount))
+            else:
+                amount = float(getattr(child, "monthly_kindergarten_cost", 0))
+                total += amount
+                components.append(("幼儿园月支出", amount))
+    return max(0.0, total), [(name, value) for name, value in components if value > 0]
+
+
+def _child_plan_monthly_expense_at(
     household: HouseholdData,
+    target_month: tuple[int, int],
+    *,
+    as_of: date | None = None,
+    home_purchase_month: int | None = None,
+    rules: RulePackData | None = None,
+) -> float:
+    total = 0.0
+    current = as_of or date.today()
+    for child in household.child_plans:
+        if not child.enabled:
+            continue
+        amount, _ = _child_plan_stage_expense_at(
+            child,
+            target_month,
+            as_of=current,
+            home_purchase_month=home_purchase_month,
+            rules=rules,
+        )
+        total += amount
+    return max(0.0, total)
+
+
+def _child_mother_member(household: HouseholdData) -> IncomeMember | None:
+    female_members = [member for member in household.members if member.sex == "female"]
+    return female_members[0] if female_members else None
+
+
+def _age_years_from_birth_month_at(birth_month: str, target_month: tuple[int, int]) -> float | None:
+    parsed = _parse_year_month(birth_month)
+    if parsed is None:
+        return None
+    return max(0.0, _month_distance(parsed, target_month) / 12)
+
+
+def _child_plan_happiness_score(
+    *,
+    first_year_cash_need: float,
+    total_to_age_18: float,
+    mother_age: float | None,
+    rules: RulePackData,
+) -> float:
+    advanced_age = float(rules.params.get("child_plan_advanced_maternal_age", 35))
+    cashflow_score = 10.0 if first_year_cash_need <= 80000 else max(0.0, 10 - (first_year_cash_need - 80000) / 30000)
+    long_term_score = 10.0 if total_to_age_18 <= 900000 else max(0.0, 10 - (total_to_age_18 - 900000) / 200000)
+    age_score = 8.0
+    if mother_age is not None:
+        if mother_age < 25:
+            age_score = 7.0
+        elif mother_age <= advanced_age:
+            age_score = 9.0
+        else:
+            age_score = max(3.0, 9.0 - (mother_age - advanced_age) * 0.8)
+    weights = rules.params.get("child_happiness_weights", {})
+    if not isinstance(weights, dict):
+        weights = {}
+    score = (
+        8.0 * float(weights.get("timing", 0.22))
+        + cashflow_score * float(weights.get("cashflow", 0.26))
+        + long_term_score * float(weights.get("liquidity", 0.20))
+        + age_score * float(weights.get("maternal_age", 0.18))
+        + 8.0 * float(weights.get("education_readiness", 0.14))
+    )
+    return round(max(0.0, min(10.0, score)), 2)
+
+
+def build_child_plan_strategies(
+    household: HouseholdData,
+    rules: RulePackData,
+    *,
+    home_purchase_month: int | None = None,
+    as_of: date | None = None,
+) -> list[ChildPlanStrategyPoint]:
+    current = date((as_of or date.today()).year, (as_of or date.today()).month, 1)
+    mother = _child_mother_member(household)
+    advanced_age = float(rules.params.get("child_plan_advanced_maternal_age", 35))
+    points: list[ChildPlanStrategyPoint] = []
+    for child in household.child_plans:
+        birth_month = _child_plan_birth_month_for_strategy(
+            child,
+            as_of=current,
+            home_purchase_month=home_purchase_month,
+            rules=rules,
+        )
+        birth_index = _month_distance((current.year, current.month), birth_month) if birth_month else None
+        prep_index = None
+        pregnancy_index = None
+        education_index = None
+        stages: list[dict[str, Any]] = []
+        first_year_cash_need = 0.0
+        total_to_age_18 = 0.0
+        monthly_now = _child_plan_stage_expense_at(
+            child,
+            (current.year, current.month),
+            as_of=current,
+            home_purchase_month=home_purchase_month,
+            rules=rules,
+        )[0] if child.enabled else 0.0
+        if birth_month is not None:
+            prep_start = _month_after(_month_tuple_to_date(birth_month), -max(0, child.preparation_months_before_birth))
+            pregnancy_start = _month_after(_month_tuple_to_date(birth_month), -max(0, child.pregnancy_months_before_birth))
+            prep_index = _month_distance((current.year, current.month), prep_start)
+            pregnancy_index = _month_distance((current.year, current.month), pregnancy_start)
+            education_start = _parse_year_month(child.education_start_month) or (birth_month[0] + 6, 9)
+            education_index = _month_distance((current.year, current.month), education_start)
+            for offset in range(max(0, birth_index or 0), max(0, (birth_index or 0) + 12)):
+                amount, _ = _child_plan_stage_expense_at(
+                    child,
+                    _month_after(current, offset),
+                    as_of=current,
+                    home_purchase_month=home_purchase_month,
+                    rules=rules,
+                )
+                first_year_cash_need += amount
+            horizon_months = max(0, (birth_index or 0) + 18 * 12)
+            for offset in range(max(0, prep_index), horizon_months + 1):
+                amount, _ = _child_plan_stage_expense_at(
+                    child,
+                    _month_after(current, offset),
+                    as_of=current,
+                    home_purchase_month=home_purchase_month,
+                    rules=rules,
+                )
+                total_to_age_18 += amount
+            stage_specs = [
+                ("备孕准备", prep_index, child.monthly_preparation_cost, "按月"),
+                ("孕期检查与营养", pregnancy_index, child.monthly_pregnancy_cost, "按月"),
+                ("生产医疗", birth_index, child.birth_medical_cost, "一次性"),
+                ("产后恢复与月嫂", birth_index, child.postpartum_recovery_cost, "一次性"),
+                ("新生儿初始用品", birth_index, child.initial_baby_supplies_cost, "一次性"),
+                ("婴幼儿照护", birth_index, child.monthly_childcare_cost_before_kindergarten, "0-3岁按月"),
+                ("幼儿园", (birth_index or 0) + 36 if birth_index is not None else None, child.monthly_kindergarten_cost, "按月"),
+                ("中小学", education_index, child.monthly_primary_secondary_cost, "按月"),
+                ("高等教育", (birth_index or 0) + 18 * 12 if birth_index is not None else None, child.monthly_higher_education_cost, "按月"),
+            ]
+            stages = [
+                {
+                    "name": name,
+                    "month_index": month_index,
+                    "month_label": _format_year_month_tuple(_month_after(current, month_index)) if month_index is not None else "",
+                    "amount": round(float(amount), 2),
+                    "frequency": frequency,
+                }
+                for name, month_index, amount, frequency in stage_specs
+                if amount > 0
+            ]
+        mother_age = _age_years_from_birth_month_at(mother.birth_month, birth_month) if mother and birth_month else None
+        warnings: list[str] = []
+        if not child.enabled:
+            warnings.append("该子女目标未纳入当前现金流测算。")
+        if birth_month is None:
+            warnings.append("尚未形成具体出生月；未设置时间范围时会等选中购房方案后按买房后开始计划推定。")
+        if mother is None:
+            warnings.append("家庭成员未设置女性成员，暂无法自动评估母亲生产年龄。")
+        if mother_age is not None and mother_age >= advanced_age:
+            warnings.append(f"按当前策略，母亲生产年龄约 {mother_age:.1f} 岁，已达到 {advanced_age:.0f} 岁高龄妊娠提示线，应预留更多医疗与时间弹性。")
+        if first_year_cash_need > 120000:
+            warnings.append("出生后首年现金需求较高，策略应同步检查现金安全垫和父母照护支出。")
+        happiness_score = _child_plan_happiness_score(
+            first_year_cash_need=first_year_cash_need,
+            total_to_age_18=total_to_age_18,
+            mother_age=mother_age,
+            rules=rules,
+        )
+        explanation = (
+            f"策略按{_format_year_month_tuple(birth_month) or '待定'}作为出生月推演；"
+            f"首年现金需求约 {_money_text(first_year_cash_need)}，18岁前口径累计约 {_money_text(total_to_age_18)}。"
+            f"幸福指数综合时间可控性、现金流压力、长期教育支出和母亲生产年龄风险，当前为 {happiness_score}/10。"
+        )
+        points.append(
+            ChildPlanStrategyPoint(
+                child_name=child.name,
+                enabled=child.enabled,
+                timing_mode=child.timing_mode,
+                expense_strategy_mode=child.expense_strategy_mode,
+                birth_month_index=birth_index,
+                birth_month_label=_format_year_month_tuple(birth_month),
+                preparation_start_month_index=prep_index,
+                pregnancy_start_month_index=pregnancy_index,
+                education_start_month_index=education_index,
+                mother_member_name=mother.name if mother else "",
+                mother_age_at_birth=round(mother_age, 2) if mother_age is not None else None,
+                happiness_score=happiness_score,
+                warnings=warnings,
+                monthly_cost_now=round(monthly_now, 2),
+                first_year_cash_need=round(first_year_cash_need, 2),
+                total_to_age_18=round(total_to_age_18, 2),
+                stages=stages,
+                explanation=explanation,
+            )
+        )
+    return points
+
+
+def _scheduled_expense_occurs_in_month(item: "ScheduledExpenseData", target_month: tuple[int, int]) -> bool:
+    start_month = _parse_month(item.start_month)
+    end_month = _parse_month(item.end_month) if item.end_month else None
+    if start_month is None:
+        return False
+    if item.frequency == "one_time":
+        resolved_month = _scheduled_one_time_month(item, start_month, end_month)
+        return resolved_month == target_month
+    if _month_distance(start_month, target_month) < 0:
+        return False
+    if end_month is not None and _month_distance(target_month, end_month) < 0:
+        return False
+    if item.frequency == "annual_once" and target_month[1] != item.annual_occurrence_month:
+        return False
+    return True
+
+
+def _scheduled_one_time_month(
+    item: "ScheduledExpenseData",
+    start_month: tuple[int, int],
+    end_month: tuple[int, int] | None,
+) -> tuple[int, int]:
+    if item.one_time_timing_mode != "flexible_range":
+        return start_month
+    if end_month is None or _month_distance(start_month, end_month) < 0:
+        return start_month
+    return end_month
+
+
+def _stage_at(
+    stages: list[Any],
     months_from_now: int = 0,
     *,
     as_of: date | None = None,
-) -> "HouseholdExpenseStageData | None":
+) -> Any | None:
     current = as_of or date.today()
     target_month = _month_after(current, max(0, months_from_now))
-    stages = household.household_expense_stages or []
     for stage in sorted(stages, key=lambda item: item.start_month):
         start_month = _parse_month(stage.start_month)
         end_month = _parse_month(stage.end_month) if stage.end_month else None
@@ -1920,25 +2639,43 @@ def _household_expense_stage_at(
     return None
 
 
+def _daily_expense_stage_at(
+    household: HouseholdData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+) -> "DailyExpenseStageData | None":
+    return _stage_at(household.daily_expense_stages or [], months_from_now, as_of=as_of)
+
+
+def _rent_expense_stage_at(
+    household: HouseholdData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+) -> "RentExpenseStageData | None":
+    return _stage_at(household.rent_expense_stages or [], months_from_now, as_of=as_of)
+
+
 def _base_living_expense_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
-    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    stage = _daily_expense_stage_at(household, months_from_now, as_of=as_of)
     return max(0.0, stage.base_living_expense if stage else household.monthly_expense)
 
 
 def _regular_debt_payment_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
-    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
-    return max(0.0, stage.other_fixed_debt_payment if stage else household.monthly_debt_payment)
+    return max(0.0, household.monthly_debt_payment)
 
 
 def _rent_cash_payment_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
-    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
-    if not stage or stage.rent_payment_mode != "cash":
+    stage = _rent_expense_stage_at(household, months_from_now, as_of=as_of)
+    if not stage:
         return 0.0
-    return _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
+    rent_cash_payment = _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of) if stage.rent_payment_mode == "cash" else 0.0
+    return rent_cash_payment + _rent_stage_service_fee_at(stage, months_from_now, as_of=as_of) + _rent_stage_broker_fee_at(stage, months_from_now, as_of=as_of)
 
 
 def _rent_provident_monthly_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
-    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    stage = _rent_expense_stage_at(household, months_from_now, as_of=as_of)
     if not stage:
         return max(0.0, household.monthly_rent_from_housing_fund)
     if stage.rent_payment_mode != "provident":
@@ -1946,7 +2683,7 @@ def _rent_provident_monthly_at(household: HouseholdData, months_from_now: int = 
     return _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
 
 
-def _rent_stage_payment_amount_at(stage: "HouseholdExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> float:
+def _rent_stage_payment_amount_at(stage: "RentExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> float:
     monthly_rent = max(0.0, stage.rent_amount)
     if monthly_rent <= 0:
         return 0.0
@@ -1959,6 +2696,35 @@ def _rent_stage_payment_amount_at(stage: "HouseholdExpenseStageData", months_fro
         return monthly_rent * 3
     elapsed = _month_distance(start_month, target_month)
     return monthly_rent * 3 if elapsed >= 0 and elapsed % 3 == 0 else 0.0
+
+
+def _rent_stage_elapsed_months(stage: "RentExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> int | None:
+    current = as_of or date.today()
+    target_month = _month_after(current, max(0, months_from_now))
+    start_month = _parse_month(stage.start_month)
+    if start_month is None:
+        return None
+    return _month_distance(start_month, target_month)
+
+
+def _rent_stage_service_fee_at(stage: "RentExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    rent_payment = _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
+    if rent_payment <= 0:
+        return 0.0
+    elapsed = _rent_stage_elapsed_months(stage, months_from_now, as_of=as_of)
+    if elapsed is None or elapsed < 0:
+        return 0.0
+    rate = stage.service_fee_first_year_rate if elapsed < 12 else stage.service_fee_later_year_rate
+    return max(0.0, rent_payment * max(0.0, rate))
+
+
+def _rent_stage_broker_fee_at(stage: "RentExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    elapsed = _rent_stage_elapsed_months(stage, months_from_now, as_of=as_of)
+    if elapsed != 0:
+        return 0.0
+    if stage.broker_fee_amount is not None:
+        return max(0.0, stage.broker_fee_amount)
+    return max(0.0, stage.rent_amount * stage.broker_fee_months)
 
 
 def _household_with_member_derived_profile(household: HouseholdData) -> HouseholdData:
@@ -2242,7 +3008,10 @@ def calculate_car_loan(
     *,
     initial_cash: float = 0,
     monthly_cash_savings_before_car: float = 0,
+    rules: RulePackData | None = None,
 ) -> CarLoanSummary:
+    rules = rules or RulePackData()
+    purchase_policy = _vehicle_purchase_policy_amounts(plan, rules, plan.purchase_delay_months)
     down_payment = max(0, plan.total_price * plan.down_payment_ratio)
     months_to_down: int | None
     if not plan.enabled or down_payment <= 0:
@@ -2263,6 +3032,9 @@ def calculate_car_loan(
             total_price=round(plan.total_price, 2),
             down_payment_ratio=plan.down_payment_ratio,
             down_payment=round(down_payment, 2),
+            purchase_tax=round(purchase_policy["purchase_tax"], 2),
+            purchase_tax_relief=round(purchase_policy["purchase_tax_relief"], 2),
+            annual_vehicle_vessel_tax=round(purchase_policy["annual_vehicle_vessel_tax"], 2),
             purchase_delay_months=plan.purchase_delay_months,
             loan_principal=0,
             months_to_down_payment=months_to_down,
@@ -2291,6 +3063,7 @@ def calculate_car_loan(
             total_months=plan.total_months,
             interest_free_months=plan.interest_free_months,
             later_annual_rate=plan.later_annual_rate,
+            policy_notes=purchase_policy["policy_notes"],
             **operating_cost,
         )
 
@@ -2356,6 +3129,9 @@ def calculate_car_loan(
         total_price=round(plan.total_price, 2),
         down_payment_ratio=plan.down_payment_ratio,
         down_payment=round(down_payment, 2),
+        purchase_tax=round(purchase_policy["purchase_tax"], 2),
+        purchase_tax_relief=round(purchase_policy["purchase_tax_relief"], 2),
+        annual_vehicle_vessel_tax=round(purchase_policy["annual_vehicle_vessel_tax"], 2),
         purchase_delay_months=plan.purchase_delay_months,
         loan_principal=round(principal, 2),
         months_to_down_payment=months_to_down,
@@ -2391,8 +3167,97 @@ def calculate_car_loan(
         total_months=total_months,
         interest_free_months=interest_free_months,
         later_annual_rate=plan.later_annual_rate,
+        policy_notes=purchase_policy["policy_notes"],
         **operating_cost,
     )
+
+
+def _is_new_energy_vehicle(plan: CarPlanData, rules: RulePackData) -> bool:
+    eligible_types = rules.params.get("new_energy_vehicle_types", ["pure_electric", "plug_in_hybrid", "range_extended", "fuel_cell"])
+    if not isinstance(eligible_types, list):
+        eligible_types = ["pure_electric", "plug_in_hybrid", "range_extended", "fuel_cell"]
+    return bool(plan.new_energy_catalog_eligible) and str(plan.energy_type) in {str(item) for item in eligible_types}
+
+
+def _vehicle_purchase_tax_and_relief(plan: CarPlanData, rules: RulePackData, purchase_month: int = 0) -> tuple[float, float]:
+    taxable_price = max(0.0, plan.total_price) * float(rules.params.get("vehicle_purchase_tax_taxable_price_ratio", 1 / 1.13))
+    gross_tax = taxable_price * float(rules.params.get("vehicle_purchase_tax_rate", 0.10))
+    if not _is_new_energy_vehicle(plan, rules):
+        return gross_tax, 0.0
+    today = date.today()
+    purchase_date = _add_months(date(today.year, today.month, 1), max(0, purchase_month))
+    exempt_until = _parse_year_month(str(rules.params.get("new_energy_vehicle_purchase_tax_exempt_until", "2025-12")))
+    half_until = _parse_year_month(str(rules.params.get("new_energy_vehicle_purchase_tax_half_until", "2027-12")))
+    target = (purchase_date.year, purchase_date.month)
+    if exempt_until is not None and _month_distance(target, exempt_until) >= 0:
+        relief = min(gross_tax, float(rules.params.get("new_energy_vehicle_purchase_tax_exemption_cap", 30000)))
+        return max(0.0, gross_tax - relief), relief
+    if half_until is not None and _month_distance(target, half_until) >= 0:
+        relief = min(gross_tax * 0.5, float(rules.params.get("new_energy_vehicle_purchase_tax_half_relief_cap", 15000)))
+        return max(0.0, gross_tax - relief), relief
+    return gross_tax, 0.0
+
+
+def _vehicle_vessel_tax_annual(plan: CarPlanData, rules: RulePackData) -> float:
+    return _vehicle_vessel_tax_annual_at(plan, rules, 0)
+
+
+def _vehicle_vessel_tax_annual_at(plan: CarPlanData, rules: RulePackData, month: int = 0) -> float:
+    if plan.vehicle_vessel_tax_annual_override is not None:
+        return max(0.0, plan.vehicle_vessel_tax_annual_override)
+    exempt_types = rules.params.get("new_energy_vehicle_vessel_tax_exempt_types", ["pure_electric", "fuel_cell"])
+    if isinstance(exempt_types, list) and str(plan.energy_type) in {str(item) for item in exempt_types}:
+        return 0.0
+    if str(plan.energy_type) in {"plug_in_hybrid", "range_extended"}:
+        today = date.today()
+        target_date = _add_months(date(today.year, today.month, 1), max(0, month))
+        exempt_until = _parse_year_month(str(rules.params.get("plug_in_hybrid_vehicle_vessel_tax_exempt_until", "2026-12")))
+        if exempt_until is not None and _month_distance((target_date.year, target_date.month), exempt_until) >= 0:
+            return 0.0
+        return max(0.0, float(rules.params.get("plug_in_hybrid_vehicle_vessel_tax_annual", 0)))
+    return max(0.0, float(rules.params.get("fuel_vehicle_vessel_tax_annual_default", 420)))
+
+
+def _vehicle_indicator_policy_notes(plan: CarPlanData, rules: RulePackData) -> list[str]:
+    if not bool(rules.params.get("beijing_small_passenger_indicator_required", True)):
+        return []
+    status = str(plan.beijing_license_indicator_status or "unknown")
+    if status == "already_have":
+        return ["已按拥有北京小客车指标处理，购车时间不再额外等待指标。"]
+    if status == "family_new_energy_pending":
+        return ["按北京家庭新能源指标等待处理；家庭积分优先于个人轮候，策略会叠加用户设定的预计等待月份。"]
+    if status == "personal_new_energy_pending":
+        return ["按北京个人新能源指标轮候处理；个人轮候存在较长不确定性，策略会叠加用户设定的预计等待月份。"]
+    if status == "not_eligible":
+        return ["当前标记为不具备北京小客车指标资格，购车策略应视为存在上牌前置风险。"]
+    return ["北京小客车上牌需要指标；当前未明确指标状态，建议在车辆需求里设置家庭/个人新能源指标或已获指标。"]
+
+
+def _vehicle_purchase_policy_amounts(plan: CarPlanData, rules: RulePackData, purchase_month: int = 0) -> dict[str, object]:
+    purchase_tax, relief = _vehicle_purchase_tax_and_relief(plan, rules, purchase_month)
+    annual_vehicle_vessel_tax = _vehicle_vessel_tax_annual_at(plan, rules, purchase_month)
+    notes = [
+        f"车辆购置税按不含增值税车价的 {float(rules.params.get('vehicle_purchase_tax_rate', 0.10)):.0%} 估算。"
+    ]
+    if relief > 0:
+        notes.append(f"当前能源类型按新能源车政策减免购置税约 {_money_text(relief)}。")
+    if annual_vehicle_vessel_tax <= 0:
+        if str(plan.energy_type) in {"plug_in_hybrid", "range_extended"}:
+            notes.append("车船税按购车月份仍处于新能源车船税优惠期估算为 0；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。")
+        else:
+            notes.append("车船税按当前能源类型估算为 0；纯电动乘用车通常因无排量不进入车船税征税口径。")
+    else:
+        if str(plan.energy_type) in {"plug_in_hybrid", "range_extended"}:
+            notes.append(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。")
+        else:
+            notes.append(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流。")
+    notes.extend(_vehicle_indicator_policy_notes(plan, rules))
+    return {
+        "purchase_tax": purchase_tax,
+        "purchase_tax_relief": relief,
+        "annual_vehicle_vessel_tax": annual_vehicle_vessel_tax,
+        "policy_notes": notes,
+    }
 
 
 def _estimate_car_operating_cost(plan: CarPlanData) -> dict[str, float]:
@@ -2557,7 +3422,9 @@ def _vehicle_loan_states(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
+    rules: RulePackData | None = None,
 ) -> list[VehicleLoanState]:
+    rules = rules or RulePackData()
     states: list[VehicleLoanState] = []
     for index, vehicle_plan in enumerate(
         _vehicle_plans(
@@ -2567,7 +3434,7 @@ def _vehicle_loan_states(
             include_after_home=include_after_home,
         )
     ):
-        loan = calculate_car_loan(vehicle_plan)
+        loan = calculate_car_loan(vehicle_plan, rules=rules)
         purchase_month = (
             loan.months_to_down_payment
             if loan.months_to_down_payment is not None
@@ -2639,7 +3506,6 @@ def _vehicle_candidate_plans(plan: CarPlanData) -> list[tuple[int | None, CarPla
 
 
 def _vehicle_financing_options(plan: CarPlanData) -> list[dict[str, object]]:
-    legacy_option_names = {"当前经销商金融方案", "当前普通贷款方案", "当前经销商贴息方案"}
     normalized_options = [
         option if isinstance(option, VehicleFinancingOptionData) else VehicleFinancingOptionData.model_validate(option)
         for option in plan.financing_options
@@ -2650,11 +3516,7 @@ def _vehicle_financing_options(plan: CarPlanData) -> list[dict[str, object]]:
         for option in normalized_options
         if option.enabled and option.total_months > 0
     ]
-    legacy_options = bool(enabled_options) and all(
-        str(option.get("id") or "") == "legacy_current" or str(option.get("name") or "") in legacy_option_names
-        for option in enabled_options
-    )
-    if not enabled_options or legacy_options:
+    if not enabled_options:
         enabled_options = _default_vehicle_financing_options()
     result: list[dict[str, object]] = []
     for option in enabled_options:
@@ -2704,7 +3566,9 @@ def _aggregate_car_loan(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
+    rules: RulePackData | None = None,
 ) -> CarLoanSummary:
+    rules = rules or RulePackData()
     vehicle_plans = _vehicle_plans(
         plan,
         scenario=scenario,
@@ -2712,9 +3576,19 @@ def _aggregate_car_loan(
         include_after_home=include_after_home,
     )
     if not vehicle_plans:
-        return calculate_car_loan(plan.model_copy(update={"enabled": False, "total_price": 0}), initial_cash=initial_cash, monthly_cash_savings_before_car=monthly_cash_savings_before_car)
+        return calculate_car_loan(
+            plan.model_copy(update={"enabled": False, "total_price": 0}),
+            initial_cash=initial_cash,
+            monthly_cash_savings_before_car=monthly_cash_savings_before_car,
+            rules=rules,
+        )
     loans = [
-        calculate_car_loan(vehicle_plan, initial_cash=initial_cash, monthly_cash_savings_before_car=monthly_cash_savings_before_car)
+        calculate_car_loan(
+            vehicle_plan,
+            initial_cash=initial_cash,
+            monthly_cash_savings_before_car=monthly_cash_savings_before_car,
+            rules=rules,
+        )
         for vehicle_plan in vehicle_plans
     ]
     first = loans[0]
@@ -2723,6 +3597,9 @@ def _aggregate_car_loan(
             "enabled": any(loan.enabled for loan in loans),
             "total_price": round(sum(loan.total_price for loan in loans), 2),
             "down_payment": round(sum(loan.down_payment for loan in loans), 2),
+            "purchase_tax": round(sum(loan.purchase_tax for loan in loans), 2),
+            "purchase_tax_relief": round(sum(loan.purchase_tax_relief for loan in loans), 2),
+            "annual_vehicle_vessel_tax": round(sum(loan.annual_vehicle_vessel_tax for loan in loans), 2),
             "loan_principal": round(sum(loan.loan_principal for loan in loans), 2),
             "current_monthly_payment": round(sum(loan.current_monthly_payment for loan in loans), 2),
             "total_interest": round(sum(loan.total_interest for loan in loans), 2),
@@ -2733,6 +3610,7 @@ def _aggregate_car_loan(
             "monthly_cash_operating_cost": round(sum(loan.monthly_cash_operating_cost for loan in loans), 2),
             "monthly_depreciation_cost": round(sum(loan.monthly_depreciation_cost for loan in loans), 2),
             "monthly_total_ownership_cost": round(sum(loan.monthly_total_ownership_cost for loan in loans), 2),
+            "policy_notes": [note for loan in loans for note in loan.policy_notes],
             "months_to_down_payment": min(
                 (loan.months_to_down_payment for loan in loans if loan.months_to_down_payment is not None),
                 default=None,
@@ -2758,7 +3636,8 @@ def _car_annual_cash_cost_at(
     maintenance_growth = (1 + max(0.0, plan.annual_maintenance_growth_rate)) ** owning_year
     annual_insurance = max(0.0, loan.monthly_insurance_cost * 12) * insurance_growth
     annual_maintenance = max(0.0, loan.monthly_maintenance_cost * 12) * maintenance_growth
-    return annual_insurance + annual_maintenance
+    annual_vehicle_vessel_tax = max(0.0, loan.annual_vehicle_vessel_tax)
+    return annual_insurance + annual_maintenance + annual_vehicle_vessel_tax
 
 
 def _is_car_annual_cost_month(month: int, purchase_month: int | None) -> bool:
@@ -2844,12 +3723,16 @@ def _vehicle_cash_components_at(
         if _is_car_annual_cost_month(month, purchase_month)
         else 0.0
     )
-    base_annual = max(0.0, loan.monthly_insurance_cost * 12) + max(0.0, loan.monthly_maintenance_cost * 12)
+    base_annual = (
+        max(0.0, loan.monthly_insurance_cost * 12)
+        + max(0.0, loan.monthly_maintenance_cost * 12)
+        + max(0.0, loan.annual_vehicle_vessel_tax)
+    )
     insurance = 0.0
     maintenance = 0.0
     if annual_cost > 0 and base_annual > 0:
         insurance = annual_cost * max(0.0, loan.monthly_insurance_cost * 12) / base_annual
-        maintenance = annual_cost - insurance
+        maintenance = max(0.0, annual_cost - insurance)
     return {
         "payment": payment,
         "energy": loan.monthly_energy_cost,
@@ -2872,10 +3755,11 @@ def _car_down_payment_components_at(
     for index, _, loan, purchase_month in vehicle_states:
         if not loan.enabled or purchase_month != month:
             continue
+        transaction_cash = loan.down_payment + loan.purchase_tax
         if index == 0:
-            first += loan.down_payment
+            first += transaction_cash
         else:
-            extra += loan.down_payment
+            extra += transaction_cash
     return first, extra
 
 
@@ -2953,19 +3837,22 @@ def _wait_score(months: int | None, max_comfort_months: int) -> float:
 
 
 DEFAULT_PURCHASE_HAPPINESS_WEIGHTS = {
-    "living_quality": 0.12,
-    "commute": 0.10,
-    "education": 0.08,
-    "vehicle_convenience": 0.05,
-    "transaction_liquidity": 0.12,
+    "living_quality": 0.10,
+    "commute": 0.08,
+    "education": 0.07,
+    "vehicle_convenience": 0.04,
+    "vehicle_home_tradeoff": 0.04,
+    "transaction_liquidity": 0.09,
     "post_purchase_liquidity": 0.08,
-    "monthly_cashflow": 0.14,
-    "debt_to_income": 0.10,
-    "monthly_payment_pressure": 0.07,
+    "investment_continuity": 0.05,
+    "monthly_cashflow": 0.12,
+    "debt_to_income": 0.08,
+    "monthly_payment_pressure": 0.08,
     "loan_interest_pressure": 0.06,
+    "cash_shortfall": 0.06,
     "waiting_time": 0.04,
-    "renovation_readiness": 0.02,
-    "stress_resilience": 0.02,
+    "renovation_readiness": 0.04,
+    "stress_resilience": 0.07,
 }
 
 PURCHASE_HAPPINESS_FINANCIAL_KEYS = {
@@ -2975,6 +3862,8 @@ PURCHASE_HAPPINESS_FINANCIAL_KEYS = {
     "debt_to_income",
     "monthly_payment_pressure",
     "loan_interest_pressure",
+    "cash_shortfall",
+    "investment_continuity",
     "stress_resilience",
 }
 
@@ -3402,13 +4291,15 @@ def build_car_plan_analyses(
     *,
     net_monthly_income: float,
     annual_investment_return: float = 0.0,
+    rules: RulePackData | None = None,
 ) -> list[CarPlanAnalysis]:
+    rules = rules or RulePackData()
     vehicle_plans = _vehicle_plans(household.car_plan)
     if not vehicle_plans:
         return []
 
     initial_cash = household.cash_account_balance + household.investments
-    current_monthly_expense = monthly_household_expense_at(household)
+    current_monthly_expense = monthly_household_expense_at(household, rules=rules)
     monthly_savings_before_transport = max(
         0,
         net_monthly_income - current_monthly_expense - household.monthly_debt_payment,
@@ -3451,7 +4342,9 @@ def build_car_plan_analyses(
             financing_name = plan.selected_financing_option_name or "金融方案"
             financing_type = plan.selected_financing_type or ("dealer_subsidy" if plan.interest_free_months > 0 else "standard")
             variant_prefix = candidate_name if len(vehicle_plans) > 1 or len(candidate_options) > 1 else ""
-            delay_months = max(plan.purchase_delay_months, 12)
+            indicator_delay = max(0, plan.beijing_indicator_expected_delay_months)
+            base_purchase_delay = max(plan.purchase_delay_months, indicator_delay)
+            delay_months = max(base_purchase_delay, 12)
             no_prepayment = VehiclePrepaymentChoice(
                 enabled=False,
                 strategy_type="none",
@@ -3474,13 +4367,13 @@ def build_car_plan_analyses(
                 "accelerated_principal": [optimized_vehicle_down_ratio(plan, "accelerated_principal", plan.purchase_delay_months)],
                 "delay_purchase": [optimized_vehicle_down_ratio(plan, "delay_purchase", delay_months)],
             }
-            cash_spec = ("cash", "全款购买，不形成车贷，适合现金安全垫非常充足时。", plan.purchase_delay_months, 1, 0, 0.0)
+            cash_spec = ("cash", "全款购买，不形成车贷，适合现金安全垫非常充足时。", base_purchase_delay, 1, 0, 0.0)
             specs = [cash_spec] if financing_type == "cash_only" else [
-                ("target", "按当前车源和金融方案测算，适合细调首付、购车时间和是否提前还本。", plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
+                ("target", "按当前车源和金融方案测算，适合细调首付、购车时间和是否提前还本。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
                 cash_spec,
-                ("high_down_low_loan", "在经销商金融方案内选择较高首付比例，用较低贷款本金控制月供和总利息。", plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
-                ("low_down_keep_cash", "在经销商金融方案内选择较低首付比例，尽量保留购房现金和应急垫。", plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
-                ("accelerated_principal", "沿用经销商金融方案，系统比较一次性、分月和组合提前还本，选择净收益更好的还本节奏。", plan.purchase_delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
+                ("high_down_low_loan", "在经销商金融方案内选择较高首付比例，用较低贷款本金控制月供和总利息。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
+                ("low_down_keep_cash", "在经销商金融方案内选择较低首付比例，尽量保留购房现金和应急垫。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
+                ("accelerated_principal", "沿用经销商金融方案，系统比较一次性、分月和组合提前还本，选择净收益更好的还本节奏。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
                 ("delay_purchase", "延后购车并在经销商金融方案内搜索较稳首付比例，把现金优先留给购房窗口和安全垫。", delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
             ]
             for strategy_key, description, purchase_delay, total_months, interest_free_months, later_rate in specs:
@@ -3531,6 +4424,7 @@ def build_car_plan_analyses(
                         strategy_plan,
                         initial_cash=initial_cash,
                         monthly_cash_savings_before_car=monthly_savings_before_car,
+                        rules=rules,
                     )
                     if loan.loan_principal <= 1:
                         zero_loan_signature = (
@@ -3547,14 +4441,14 @@ def build_car_plan_analyses(
                         seen_zero_loan_signatures.add(zero_loan_signature)
                 if skip_strategy:
                     continue
-                required_cash = loan.down_payment + required_reserve
+                required_cash = loan.down_payment + loan.purchase_tax + required_reserve
                 cash_ready_month = _months_until_cash_target(initial_cash, monthly_savings_before_car, required_cash)
                 if cash_ready_month is None:
                     months_to_buy = None
-                    cash_after_purchase = initial_cash - loan.down_payment
+                    cash_after_purchase = initial_cash - loan.down_payment - loan.purchase_tax
                 else:
                     months_to_buy = max(purchase_delay, cash_ready_month)
-                    cash_after_purchase = initial_cash + monthly_savings_before_car * months_to_buy - loan.down_payment
+                    cash_after_purchase = initial_cash + monthly_savings_before_car * months_to_buy - loan.down_payment - loan.purchase_tax
                 expected_payment = max(loan.first_phase_monthly_payment, loan.later_phase_monthly_payment)
                 expected_total_payment = expected_payment + (loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0)
                 monthly_after_car = monthly_savings_before_transport - expected_total_payment - loan.monthly_cash_operating_cost
@@ -3574,6 +4468,9 @@ def build_car_plan_analyses(
                     f"down_payment_ratio:{down_ratio:.0%}",
                     f"cash_operating_cost_monthly:{round(loan.monthly_cash_operating_cost)}",
                     f"total_ownership_cost_monthly:{round(loan.monthly_total_ownership_cost)}",
+                    f"purchase_tax:{round(loan.purchase_tax)}",
+                    f"purchase_tax_relief:{round(loan.purchase_tax_relief)}",
+                    f"annual_vehicle_vessel_tax:{round(loan.annual_vehicle_vessel_tax)}",
                     "no_auto_loan" if loan.loan_principal == 0 else f"loan_principal:{round(loan.loan_principal)}",
                     (
                         f"auto_extra_principal:{loan.prepayment_strategy_type}, monthly:{round(loan.prepayment_monthly_amount)}, "
@@ -3589,6 +4486,7 @@ def build_car_plan_analyses(
                     else "no_extra_principal",
                     "manual_target" if strategy_key == "target" else "preserve_home_purchase_cash" if strategy_key in {"low_down_keep_cash", "delay_purchase"} else "reduce_long_term_auto_debt_pressure",
                 ]
+                notes.extend(loan.policy_notes)
                 analyses.append(
                     CarPlanAnalysis(
                         variant=" | ".join(
@@ -3611,6 +4509,9 @@ def build_car_plan_analyses(
                         total_price=round(plan.total_price, 2),
                         down_payment_ratio=down_ratio,
                         down_payment=loan.down_payment,
+                        purchase_tax=loan.purchase_tax,
+                        purchase_tax_relief=loan.purchase_tax_relief,
+                        annual_vehicle_vessel_tax=loan.annual_vehicle_vessel_tax,
                         loan_principal=loan.loan_principal,
                         total_months=loan.total_months,
                         interest_free_months=loan.interest_free_months,
@@ -3966,6 +4867,15 @@ def _housing_transaction_rate_amounts(
     return deed_rate, broker_rate, scenario.total_price * deed_rate, scenario.total_price * broker_rate
 
 
+def _seller_tax_pass_through_amount(scenario: ScenarioData) -> float:
+    if not scenario.seller_tax_pass_through_enabled:
+        return 0.0
+    configured = max(0.0, scenario.seller_tax_pass_through_amount)
+    if configured > 0:
+        return configured
+    return max(0.0, scenario.total_price * scenario.seller_tax_pass_through_rate)
+
+
 def _provident_loan_cap(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -4176,7 +5086,7 @@ def _purchase_cash_state_at_month(
         cash_before_transaction=cash_value,
         investment_before_transaction=investment_value,
         required_cash_after_pf=required_cash_after_pf,
-        required_liquidity_reserve=monthly_household_expense_at(household, month) * household.required_liquidity_months,
+        required_liquidity_reserve=monthly_household_expense_at(household, month, rules=rules) * household.required_liquidity_months,
         sell_fee_rate=sell_fee_rate,
         investment_enabled=household.investment_plan_name != "cash_only",
     )
@@ -4240,7 +5150,7 @@ def _rent_withdrawal_before_purchase(household: HouseholdData) -> float:
 def _quarterly_rent_withdrawal_before_purchase_at(household: HouseholdData, month: int) -> float:
     if household.existing_home_count > 0:
         return 0.0
-    stage = _household_expense_stage_at(household, month)
+    stage = _rent_expense_stage_at(household, month)
     if stage and stage.rent_payment_mode == "provident":
         return _rent_stage_payment_amount_at(stage, month)
     monthly_withdrawal = _rent_provident_monthly_at(household, month)
@@ -4726,14 +5636,20 @@ def build_purchase_plan_analyses(
             }
             | {micro_min_ratio, micro_default_ratio, micro_max_ratio}
         )
-    current_monthly_expense = monthly_household_expense_at(household)
+    current_monthly_expense = monthly_household_expense_at(household, rules=rules)
     monthly_expense_cache = {0: current_monthly_expense}
     monthly_income_cache: dict[int, MonthlyIncomeProfile] = {}
 
-    def expense_at_month(month: int) -> float:
-        if month not in monthly_expense_cache:
-            monthly_expense_cache[month] = monthly_household_expense_at(household, month)
-        return monthly_expense_cache[month]
+    def expense_at_month(month: int, home_purchase_month: int | None = None) -> float:
+        cache_key = (home_purchase_month if home_purchase_month is not None else -1) * 10000 + month
+        if cache_key not in monthly_expense_cache:
+            monthly_expense_cache[cache_key] = monthly_household_expense_at(
+                household,
+                month,
+                rules=rules,
+                home_purchase_month=home_purchase_month,
+            )
+        return monthly_expense_cache[cache_key]
 
     def income_at_month(month: int) -> MonthlyIncomeProfile:
         if month not in monthly_income_cache:
@@ -4750,6 +5666,7 @@ def build_purchase_plan_analyses(
         household.car_plan,
         scenario=scenario,
         include_after_home=False,
+        rules=rules,
     )
     car_cost_cache: dict[int, float] = {}
     car_down_payment_cache: dict[int, float] = {}
@@ -5371,6 +6288,13 @@ def build_purchase_plan_analyses(
         stress_liquidity_floor = min(required_liquidity_reserve, max(1.0, post_purchase_monthly_expense * 3))
         liquidity_score = _ratio_score(min(cash_after_transaction, minimum_cash_balance), stress_liquidity_floor)
         post_extract_liquidity_score = _ratio_score(cash_after_purchase, required_liquidity_reserve)
+        cash_shortfall_score = _clamp_score(
+            10 - max(0.0, cash_stress_shortfall, -minimum_cash_balance) / max(required_liquidity_reserve, 1.0) * 10
+        )
+        investment_continuity_score = _ratio_score(
+            investment_balance_after_purchase,
+            max(required_liquidity_reserve * 0.5, household.investments * 0.25, 1.0),
+        )
         flow_score = _cash_flow_score(post_purchase_cash_flow_with_pf, post_purchase_monthly_expense)
         dti_score = _dti_score(dti)
         payment_pressure_score = _clamp_score(10 - (total_monthly_payment + commercial_prepayment_monthly) / max(post_purchase_income.net_income, 1) / 0.45 * 10)
@@ -5416,6 +6340,17 @@ def build_purchase_plan_analyses(
             if post_purchase_car_cost > 0
             else _clamp_score(7 - (household.car_plan.no_car_monthly_commute_cost or 0) / max(post_purchase_income.net_income, 1) / 0.08 * 3)
         )
+        pre_home_vehicle_down_payment = sum(
+            loan.down_payment
+            for _, _, loan, vehicle_purchase_month in vehicle_states
+            if vehicle_purchase_month is not None and months is not None and vehicle_purchase_month <= months
+        )
+        pre_home_vehicle_monthly_cost = car_monthly_cash_cost_at(post_purchase_month)
+        vehicle_home_tradeoff_score = _clamp_score(
+            10
+            - pre_home_vehicle_down_payment / max(required_liquidity_reserve + upfront_cash, 1.0) * 8
+            - pre_home_vehicle_monthly_cost / max(post_purchase_income.net_income, 1.0) / 0.18 * 4
+        )
         loan_interest_pressure_score = _clamp_score(commercial_pressure_score * 0.55 + interest_score * 0.45)
         renovation_score = _renovation_readiness_score(
             scenario.renovation_cost,
@@ -5459,6 +6394,17 @@ def build_purchase_plan_analyses(
                     ),
                 },
                 {
+                    "key": "vehicle_home_tradeoff",
+                    "name": "买车对买房影响",
+                    "category": "timing",
+                    "score": vehicle_home_tradeoff_score,
+                    "note": (
+                        "买房前没有车辆首付或车贷现金压力。"
+                        if pre_home_vehicle_down_payment <= 0 and pre_home_vehicle_monthly_cost <= 0
+                        else f"买房前车辆首付约 {round(pre_home_vehicle_down_payment)}，购房锚点月车辆现金成本约 {round(pre_home_vehicle_monthly_cost)}，会挤占首付和月结余。"
+                    ),
+                },
+                {
                     "key": "transaction_liquidity",
                     "name": "买房当天现金安全",
                     "category": "finance",
@@ -5471,6 +6417,13 @@ def build_purchase_plan_analyses(
                     "category": "finance",
                     "score": post_extract_liquidity_score,
                     "note": f"买后现金 {round(cash_after_purchase)}，目标安全垫 {round(required_liquidity_reserve)}。",
+                },
+                {
+                    "key": "investment_continuity",
+                    "name": "长期理财连续性",
+                    "category": "finance",
+                    "score": investment_continuity_score,
+                    "note": f"买房后投资账户约 {round(investment_balance_after_purchase)}；保留部分长期投资可降低把未来收益完全牺牲给首付的压力。",
                 },
                 {
                     "key": "monthly_cashflow",
@@ -5499,6 +6452,17 @@ def build_purchase_plan_analyses(
                     "category": "finance",
                     "score": loan_interest_pressure_score,
                     "note": f"商贷 {round(commercial_loan)}，全周期利息约 {round(commercial_interest + provident_payment.total_interest)}。",
+                },
+                {
+                    "key": "cash_shortfall",
+                    "name": "现金缺口风险",
+                    "category": "resilience",
+                    "score": cash_shortfall_score,
+                    "note": (
+                        "当前策略没有形成现金账户穿底或安全垫缺口。"
+                        if max(0.0, cash_stress_shortfall, -minimum_cash_balance) <= 0
+                        else f"综合交易、购后推演和压力情景，最大现金缺口约 {round(max(0.0, cash_stress_shortfall, -minimum_cash_balance))}。"
+                    ),
                 },
                 {
                     "key": "waiting_time",
@@ -5772,8 +6736,10 @@ def build_loan_visualization(
     base_monthly_debt_payment: float | None = None,
     provident_visualization: list[ProvidentVisualizationPoint] | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
+    rules: RulePackData | None = None,
 ) -> list[LoanVisualizationPoint]:
-    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario)
+    rules = rules or RulePackData()
+    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules)
     base_existing_payment = max(0.0, base_monthly_debt_payment if base_monthly_debt_payment is not None else household.monthly_debt_payment)
     provident_monthly_withdrawal_by_plan_month = {
         (row.plan_variant, row.month): row.monthly_repayment_withdrawal
@@ -5810,7 +6776,7 @@ def build_loan_visualization(
         plan_vehicle_states = (
             vehicle_states
             if vehicle_states is not None
-            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy)
+            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy, rules=rules)
         )
         cumulative_extra_provident_offset = 0.0
         for month in range(horizon_months + 1):
@@ -5923,7 +6889,7 @@ def _member_income_profiles_at(
     *,
     as_of: date | None = None,
 ) -> list[tuple[int, str, MonthlyIncomeProfile]]:
-    household = _household_with_career_income_stages(household, rules, as_of=as_of)
+    household = _household_with_pension_income_stages(household, rules, as_of=as_of)
     current = as_of or date.today()
     year, month = _month_after(current, max(0, months_from_now))
     target_month = date(year, month, 1)
@@ -5944,7 +6910,12 @@ def _initial_provident_member_accounts(household: HouseholdData, rules: RulePack
             }
         ]
 
-    explicit_balances = [max(0.0, getattr(member, "provident_fund_balance", 0.0)) for member in members]
+    explicit_balances = [
+        max(0.0, getattr(member, "provident_fund_balance", 0.0))
+        if bool(getattr(member, "provident_account_enabled", True))
+        else 0.0
+        for member in members
+    ]
     explicit_total = sum(explicit_balances)
     if explicit_total > 0:
         balances = explicit_balances
@@ -5965,6 +6936,8 @@ def _initial_provident_member_accounts(household: HouseholdData, rules: RulePack
             "member_index": index,
             "member_name": member.name,
             "balance": balances[index] if index < len(balances) else 0.0,
+            "enabled": bool(getattr(member, "provident_account_enabled", True)),
+            "open_month": getattr(member, "provident_account_open_month", "") or getattr(member, "family_join_month", ""),
         }
         for index, member in enumerate(members)
     ]
@@ -5972,6 +6945,241 @@ def _initial_provident_member_accounts(household: HouseholdData, rules: RulePack
 
 def _household_initial_provident_balance(household: HouseholdData, rules: RulePackData) -> float:
     return sum(float(account["balance"]) for account in _initial_provident_member_accounts(household, rules))
+
+
+def _initial_social_security_member_accounts(household: HouseholdData) -> list[dict[str, float | int | str]]:
+    return [
+        {
+            "member_index": index,
+            "member_name": member.name,
+            "pension_enabled": bool(getattr(member, "pension_account_enabled", True)),
+            "medical_enabled": bool(getattr(member, "medical_account_enabled", True)),
+            "pension_open_month": getattr(member, "pension_account_open_month", "") or getattr(member, "family_join_month", ""),
+            "medical_open_month": getattr(member, "medical_account_open_month", "") or getattr(member, "family_join_month", ""),
+            "pension_balance": max(0.0, member.pension_account_balance)
+            if bool(getattr(member, "pension_account_enabled", True))
+            else 0.0,
+            "medical_balance": max(0.0, member.medical_account_balance)
+            if bool(getattr(member, "medical_account_enabled", True))
+            else 0.0,
+        }
+        for index, member in enumerate(household.members)
+    ]
+
+
+def _account_open_in_month(open_month: object, target_month: date) -> bool:
+    parsed = _parse_year_month(str(open_month or ""))
+    if parsed is None:
+        return True
+    return _month_distance(parsed, (target_month.year, target_month.month)) >= 0
+
+
+def _age_at_month(member: IncomeMember, target_month: date) -> int | None:
+    birth = _parse_year_month(member.birth_month)
+    if birth is None:
+        return None
+    age = target_month.year - birth[0]
+    if target_month.month < birth[1]:
+        age -= 1
+    return max(0, age)
+
+
+def _social_security_member_points(
+    rows: list[dict[str, float | int | str | bool]],
+) -> list[SocialSecurityMemberAccountPoint]:
+    points: list[SocialSecurityMemberAccountPoint] = []
+    for row in rows:
+        points.append(
+            SocialSecurityMemberAccountPoint(
+                member_index=int(row["member_index"]),
+                member_name=str(row["member_name"]),
+                pension_balance_start=round(float(row["pension_balance_start"]), 2),
+                pension_contribution=round(float(row["pension_contribution"]), 2),
+                pension_interest=round(float(row["pension_interest"]), 2),
+                pension_balance_end=round(float(row["pension_balance_end"]), 2),
+                medical_balance_start=round(float(row["medical_balance_start"]), 2),
+                medical_contribution=round(float(row["medical_contribution"]), 2),
+                medical_retiree_transfer=round(float(row["medical_retiree_transfer"]), 2),
+                medical_interest=round(float(row["medical_interest"]), 2),
+                medical_outflow=round(float(row["medical_outflow"]), 2),
+                medical_balance_end=round(float(row["medical_balance_end"]), 2),
+                retired=bool(row["retired"]),
+            )
+        )
+    return points
+
+
+def _yearly_policy_rate(params: dict, table_key: str, fallback_key: str, year: int, fallback: float) -> float:
+    table = params.get(table_key)
+    if isinstance(table, dict):
+        value = table.get(str(year), table.get(year))
+        if value is not None:
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                pass
+    return max(0.0, float(params.get(fallback_key, fallback)))
+
+
+def _credit_months_from_params(params: dict, key: str, fallback: list[int]) -> set[int]:
+    raw = params.get(key, fallback)
+    if not isinstance(raw, list):
+        return set(fallback)
+    months: set[int] = set()
+    for item in raw:
+        try:
+            month = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= month <= 12:
+            months.add(month)
+    return months or set(fallback)
+
+
+def build_social_security_visualization(
+    household: HouseholdData,
+    rules: RulePackData,
+    purchase_plans: list[PurchasePlanAnalysis],
+    car_loan: CarLoanSummary | None,
+    *,
+    vehicle_states: list[VehicleLoanState] | None = None,
+    horizon_months: int | None = None,
+    as_of: date | None = None,
+) -> list[SocialSecurityVisualizationPoint]:
+    horizon = (
+        horizon_months
+        if horizon_months is not None
+        else _visualization_horizon_months(household, purchase_plans, car_loan or calculate_car_loan(CarPlanData()), vehicle_states=vehicle_states)
+    )
+    if not household.members or not purchase_plans:
+        return []
+
+    params = rules.params
+    pension_interest_credit_month = max(1, min(12, int(params.get("pension_personal_account_interest_credit_month", 12) or 12)))
+    medical_interest_credit_months = _credit_months_from_params(params, "medical_account_interest_credit_months", [3, 6, 9, 12])
+    medical_transfer_rate = max(0.0, float(params.get("medical_account_employee_transfer_rate", 0.02)))
+    retiree_under_70 = max(0.0, float(params.get("medical_account_retiree_monthly_transfer_under_70", 100)))
+    retiree_70_plus = max(0.0, float(params.get("medical_account_retiree_monthly_transfer_70_plus", 110)))
+    retiree_medical_outflow = max(0.0, float(params.get("medical_account_retiree_large_mutual_aid_monthly", 3)))
+    base = as_of or date.today()
+    base_month = date(base.year, base.month, 1)
+    retirement_months_by_member = _member_retirement_months_by_index(household, as_of=base_month)
+    monthly_member_income_cache: dict[int, list[tuple[int, str, MonthlyIncomeProfile]]] = {}
+
+    def member_income_at_month(month: int) -> dict[int, MonthlyIncomeProfile]:
+        if month not in monthly_member_income_cache:
+            monthly_member_income_cache[month] = _member_income_profiles_at(household, rules, month, as_of=base_month)
+        return {index: profile for index, _, profile in monthly_member_income_cache[month]}
+
+    rows: list[SocialSecurityVisualizationPoint] = []
+    for plan in purchase_plans:
+        account_states = _initial_social_security_member_accounts(household)
+        for month in range(horizon + 1):
+            target_year, target_month_number = _month_after(base_month, month)
+            target_month = date(target_year, target_month_number, 1)
+            profiles = member_income_at_month(month)
+            account_rows: list[dict[str, float | int | str | bool]] = []
+            for account in account_states:
+                member_index = int(account["member_index"])
+                member = household.members[member_index]
+                profile = profiles.get(member_index)
+                retirement_month = retirement_months_by_member.get(member_index, 999999)
+                retired = month >= retirement_month
+                pension_enabled = bool(account.get("pension_enabled", True)) and _account_open_in_month(account.get("pension_open_month", ""), target_month)
+                medical_enabled = bool(account.get("medical_enabled", True)) and _account_open_in_month(account.get("medical_open_month", ""), target_month)
+                pension_start = float(account["pension_balance"])
+                medical_start = float(account["medical_balance"])
+                pension_contribution = 0.0
+                medical_contribution = 0.0
+                medical_retiree_transfer = 0.0
+                medical_outflow = 0.0
+                if month > 0 and profile and not retired:
+                    stage = _income_stage_for_month(member, target_month.year, target_month.month)
+                    details = _beijing_contribution_details(stage, rules) if stage else ContributionDetails(0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    pension_contribution = details.employee_pension if pension_enabled else 0.0
+                    medical_contribution = details.social_base * medical_transfer_rate if medical_enabled else 0.0
+                elif month > 0 and retired and medical_enabled:
+                    age = _age_at_month(member, target_month)
+                    medical_retiree_transfer = retiree_70_plus if age is not None and age >= 70 else retiree_under_70
+                    medical_outflow = min(medical_start + medical_retiree_transfer, retiree_medical_outflow)
+                pension_rate = _yearly_policy_rate(
+                    params,
+                    "pension_personal_account_annual_credit_rates",
+                    "pension_personal_account_annual_return",
+                    target_month.year,
+                    0.025,
+                )
+                medical_rate = _yearly_policy_rate(
+                    params,
+                    "medical_account_annual_interest_rates",
+                    "medical_account_annual_interest_rate",
+                    target_month.year,
+                    0.0035,
+                )
+                pension_interest = (
+                    (pension_start + pension_contribution) * pension_rate
+                    if month > 0 and pension_enabled and target_month.month == pension_interest_credit_month
+                    else 0.0
+                )
+                medical_interest = (
+                    (medical_start + medical_contribution + medical_retiree_transfer - medical_outflow) * medical_rate / 4
+                    if month > 0 and medical_enabled and target_month.month in medical_interest_credit_months
+                    else 0.0
+                )
+                pension_end = max(0.0, pension_start + pension_contribution + pension_interest)
+                medical_end = max(0.0, medical_start + medical_contribution + medical_retiree_transfer - medical_outflow + medical_interest)
+                account_rows.append(
+                    {
+                        "member_index": member_index,
+                        "member_name": account["member_name"],
+                        "pension_balance_start": pension_start,
+                        "pension_contribution": pension_contribution,
+                        "pension_interest": pension_interest,
+                        "pension_balance_end": pension_end,
+                        "medical_balance_start": medical_start,
+                        "medical_contribution": medical_contribution,
+                        "medical_retiree_transfer": medical_retiree_transfer,
+                        "medical_interest": medical_interest,
+                        "medical_outflow": medical_outflow,
+                        "medical_balance_end": medical_end,
+                        "retired": retired,
+                    }
+                )
+
+            for index, account in enumerate(account_states):
+                account["pension_balance"] = float(account_rows[index]["pension_balance_end"])
+                account["medical_balance"] = float(account_rows[index]["medical_balance_end"])
+
+            member_accounts = _social_security_member_points(account_rows)
+            pension_balance_start = sum(item.pension_balance_start for item in member_accounts)
+            pension_contribution = sum(item.pension_contribution for item in member_accounts)
+            pension_interest = sum(item.pension_interest for item in member_accounts)
+            pension_balance_end = sum(item.pension_balance_end for item in member_accounts)
+            medical_balance_start = sum(item.medical_balance_start for item in member_accounts)
+            medical_contribution = sum(item.medical_contribution for item in member_accounts)
+            medical_retiree_transfer = sum(item.medical_retiree_transfer for item in member_accounts)
+            medical_interest = sum(item.medical_interest for item in member_accounts)
+            medical_outflow = sum(item.medical_outflow for item in member_accounts)
+            medical_balance_end = sum(item.medical_balance_end for item in member_accounts)
+            rows.append(
+                SocialSecurityVisualizationPoint(
+                    plan_variant=plan.variant,
+                    month=month,
+                    pension_balance_start=round(pension_balance_start, 2),
+                    pension_contribution=round(pension_contribution, 2),
+                    pension_interest=round(pension_interest, 2),
+                    pension_balance_end=round(pension_balance_end, 2),
+                    medical_balance_start=round(medical_balance_start, 2),
+                    medical_contribution=round(medical_contribution, 2),
+                    medical_retiree_transfer=round(medical_retiree_transfer, 2),
+                    medical_interest=round(medical_interest, 2),
+                    medical_outflow=round(medical_outflow, 2),
+                    medical_balance_end=round(medical_balance_end, 2),
+                    total_balance_end=round(pension_balance_end + medical_balance_end, 2),
+                    member_accounts=member_accounts,
+                )
+            )
+    return rows
 
 
 def _apply_provident_member_outflow(
@@ -6095,6 +7303,7 @@ def build_provident_visualization(
     rows: list[ProvidentVisualizationPoint] = []
     monthly_member_income_cache: dict[int, list[tuple[int, str, MonthlyIncomeProfile]]] = {}
     retirement_months_by_member = _member_retirement_months_by_index(household)
+    base_month = date.today()
 
     def member_income_at_month(month: int) -> list[tuple[int, str, MonthlyIncomeProfile]]:
         if month not in monthly_member_income_cache:
@@ -6115,10 +7324,13 @@ def build_provident_visualization(
                 retirement_month = retirement_months_by_member.get(member_index, 999999)
                 is_retired_account_month = month >= retirement_month
                 closes_this_month = month == retirement_month
+                account_open = bool(account.get("enabled", True))
+                target_year, target_month_number = _month_after(base_month, month)
+                account_open = account_open and _account_open_in_month(account.get("open_month", ""), date(target_year, target_month_number, 1))
                 balance_start = float(account["balance"])
-                personal_deposit = profile.personal_housing_fund if profile and month > 0 and not is_retired_account_month else 0.0
-                employer_deposit = profile.employer_housing_fund if profile and month > 0 and not is_retired_account_month else 0.0
-                interest = balance_start * pf_interest_rate if month > 0 and not is_retired_account_month else 0.0
+                personal_deposit = profile.personal_housing_fund if account_open and profile and month > 0 and not is_retired_account_month else 0.0
+                employer_deposit = profile.employer_housing_fund if account_open and profile and month > 0 and not is_retired_account_month else 0.0
+                interest = balance_start * pf_interest_rate if account_open and month > 0 and not is_retired_account_month else 0.0
                 balance_end = balance_start + personal_deposit + employer_deposit + interest
                 retirement_withdrawal = balance_end if closes_this_month and balance_end > 0 else 0.0
                 if retirement_withdrawal:
@@ -6458,10 +7670,13 @@ def build_monthly_cashflow_visualization(
     car_loan: CarLoanSummary,
     loan_visualization: list[LoanVisualizationPoint],
     provident_visualization: list[ProvidentVisualizationPoint],
+    social_security_visualization: list[SocialSecurityVisualizationPoint] | None = None,
     *,
     vehicle_states: list[VehicleLoanState] | None = None,
 ) -> tuple[list[MonthlyCashflowPoint], list[AccountSnapshotPoint], list[MonthlyLedgerEntry]]:
-    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario)
+    today = date.today()
+    base_month = date(today.year, today.month, 1)
+    base_vehicle_states = vehicle_states if vehicle_states is not None else _vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules)
     horizon = _visualization_horizon_months(
         household,
         purchase_plans,
@@ -6470,11 +7685,14 @@ def build_monthly_cashflow_visualization(
     )
     loan_by_plan_month = {(row.plan_variant, row.month): row for row in loan_visualization}
     provident_by_plan_month = {(row.plan_variant, row.month): row for row in provident_visualization}
+    social_security_by_plan_month = {
+        (row.plan_variant, row.month): row
+        for row in (social_security_visualization or [])
+    }
     monthly_return = scenario.annual_investment_return / 12
     buy_fee_rate = max(0.0, household.investment_buy_fee_rate)
     sell_fee_rate = max(0.0, household.investment_sell_fee_rate)
-    investment_tax_rate = max(0.0, min(1.0, household.investment_return_tax_rate))
-    investment_taxable_ratio = max(0.0, min(1.0, household.investment_taxable_return_ratio))
+    investment_effective_tax_rate = _investment_effective_tax_rate(household)
     investment_enabled = household.investment_plan_name != "cash_only"
     base_regular_debt_payment = _regular_debt_payment_at(household)
     rows: list[MonthlyCashflowPoint] = []
@@ -6491,14 +7709,14 @@ def build_monthly_cashflow_visualization(
 
     def expense_at_month(month: int) -> float:
         if month not in monthly_expense_cache:
-            monthly_expense_cache[month] = monthly_household_expense_at(household, month)
+            monthly_expense_cache[month] = monthly_household_expense_at(household, month, rules=rules)
         return monthly_expense_cache[month]
 
     for plan in purchase_plans:
         plan_vehicle_states = (
             vehicle_states
             if vehicle_states is not None
-            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy)
+            else _vehicle_loan_states(household.car_plan, scenario=scenario, home_purchase_month=plan.months_to_buy, rules=rules)
         )
         first_car_purchase_month = min(
             (purchase_month for _, _, _, purchase_month in plan_vehicle_states if purchase_month is not None),
@@ -6561,8 +7779,11 @@ def build_monthly_cashflow_visualization(
         for month in range(0, horizon + 1):
             entries: list[MonthlyLedgerEntry] = []
             cash_income = 0.0
+            pension_income = 0.0
             living_expense = 0.0
             scheduled_expense = 0.0
+            child_expense = 0.0
+            career_shock_self_payment = 0.0
             debt_payment = 0.0
             regular_debt_payment = 0.0
             phased_loan_payment = 0.0
@@ -6599,8 +7820,12 @@ def build_monthly_cashflow_visualization(
             phase = "购房前"
 
             provident_point = provident_by_plan_month.get((plan.variant, month))
+            social_security_point = social_security_by_plan_month.get((plan.variant, month))
             loan_point = loan_by_plan_month.get((plan.variant, month))
             provident_balance = provident_point.balance_end if provident_point else max(0.0, initial_provident_balance)
+            pension_account_balance = social_security_point.pension_balance_end if social_security_point else 0.0
+            medical_account_balance = social_security_point.medical_balance_end if social_security_point else 0.0
+            social_security_account_balance = pension_account_balance + medical_account_balance
             provident_deposit = provident_point.total_deposit if provident_point else 0.0
             provident_cash_receipt = (
                 provident_point.rent_withdrawal
@@ -6623,10 +7848,19 @@ def build_monthly_cashflow_visualization(
             if month > 0:
                 profile = income_at_month(month)
                 cash_income = profile.net_income
+                pension_income = profile.pension_income
                 total_expense = expense_at_month(month)
                 investment_reserve_target = max(0.0, total_expense * household.investment_cash_reserve_months)
                 living_expense = _base_living_expense_at(household, month)
-                scheduled_expense = max(0.0, total_expense - living_expense)
+                child_expense = _child_plan_monthly_expense_at(
+                    household,
+                    _month_after(base_month, month),
+                    as_of=base_month,
+                    home_purchase_month=plan.months_to_buy,
+                    rules=rules,
+                )
+                career_shock_self_payment = _career_shock_self_payment_at_month(household, rules, month)
+                scheduled_expense = max(0.0, total_expense - living_expense - child_expense - career_shock_self_payment)
                 regular_debt_payment = _regular_debt_payment_at(household, month)
                 debt_payment = loan_point.existing_monthly_payment if loan_point else regular_debt_payment
                 phased_loan_payment = max(0.0, debt_payment - regular_debt_payment)
@@ -6660,7 +7894,7 @@ def build_monthly_cashflow_visualization(
                             month=month,
                             account="cash",
                             category="vehicle_down_payment",
-                            label="车辆首付现金支出",
+                            label="车辆首付及购置税现金支出",
                             amount=-vehicle_down_payment,
                             direction="outflow",
                         )
@@ -6677,7 +7911,7 @@ def build_monthly_cashflow_visualization(
                     )
                     investment_return = investment_balance * monthly_return if investment_enabled else 0.0
                     if investment_return:
-                        investment_tax = max(0.0, investment_return) * investment_taxable_ratio * investment_tax_rate
+                        investment_tax = max(0.0, investment_return) * investment_effective_tax_rate
                         investment_balance = max(0.0, investment_balance + investment_return - investment_tax)
                     withdrawal = _investment_withdrawal_at_purchase(
                         scenario=scenario,
@@ -6749,7 +7983,7 @@ def build_monthly_cashflow_visualization(
                     investable_surplus = monthly_surplus - vehicle_down_payment
                     investment_return = investment_balance * monthly_return if investment_enabled else 0.0
                     if investment_return:
-                        investment_tax = max(0.0, investment_return) * investment_taxable_ratio * investment_tax_rate
+                        investment_tax = max(0.0, investment_return) * investment_effective_tax_rate
                         investment_balance = max(0.0, investment_balance + investment_return - investment_tax)
                     projected_cash_before_investment = cash_balance + investable_surplus
                     liquidity_sell_proceeds = 0.0
@@ -6797,7 +8031,19 @@ def build_monthly_cashflow_visualization(
                                 direction="inflow",
                             )
                         )
-                    if total_expense:
+                    if pension_income:
+                        entries.append(
+                            _ledger_entry(
+                                plan_variant=plan.variant,
+                                month=month,
+                                account="cash",
+                                category="pension_income",
+                                label="养老金领取入账",
+                                amount=pension_income,
+                                direction="inflow",
+                            )
+                        )
+                    if living_expense or scheduled_expense:
                         entries.append(
                             _ledger_entry(
                                 plan_variant=plan.variant,
@@ -6805,7 +8051,31 @@ def build_monthly_cashflow_visualization(
                                 account="cash",
                                 category="living_expense",
                                 label="家庭生活与定时支出",
-                                amount=-total_expense,
+                                amount=-(living_expense + scheduled_expense),
+                                direction="outflow",
+                            )
+                        )
+                    if child_expense:
+                        entries.append(
+                            _ledger_entry(
+                                plan_variant=plan.variant,
+                                month=month,
+                                account="cash",
+                                category="child_expense",
+                                label="养娃计划支出",
+                                amount=-child_expense,
+                                direction="outflow",
+                            )
+                        )
+                    if career_shock_self_payment:
+                        entries.append(
+                            _ledger_entry(
+                                plan_variant=plan.variant,
+                                month=month,
+                                account="cash",
+                                category="career_shock_self_payment",
+                                label="灵活就业自缴社保公积金",
+                                amount=-career_shock_self_payment,
                                 direction="outflow",
                             )
                         )
@@ -6864,6 +8134,7 @@ def build_monthly_cashflow_visualization(
                 + transaction_cash_in
                 - living_expense
                 - scheduled_expense
+                - career_shock_self_payment
                 - debt_payment
                 - house_payment
                 - vehicle_payment
@@ -6880,14 +8151,20 @@ def build_monthly_cashflow_visualization(
                     investment_balance=round(investment_balance, 2),
                     liquid_asset_value=round(liquid_asset_value, 2),
                     provident_balance=round(provident_balance, 2),
+                    pension_account_balance=round(pension_account_balance, 2),
+                    medical_account_balance=round(medical_account_balance, 2),
+                    social_security_account_balance=round(social_security_account_balance, 2),
                     fixed_asset_value=round(fixed_asset_value, 2),
                     total_asset_value=round(total_asset_value, 2),
                     total_loan_balance=round(total_loan_balance, 2),
                     net_worth=round(net_worth, 2),
                     monthly_cash_delta=round(monthly_cash_delta, 2),
                     cash_income=round(cash_income, 2),
+                    pension_income=round(pension_income, 2),
                     living_expense=round(living_expense, 2),
                     scheduled_expense=round(scheduled_expense, 2),
+                    child_expense=round(child_expense, 2),
+                    career_shock_self_payment=round(career_shock_self_payment, 2),
                     debt_payment=round(debt_payment, 2),
                     regular_debt_payment=round(regular_debt_payment, 2),
                     phased_loan_payment=round(phased_loan_payment, 2),
@@ -6940,6 +8217,9 @@ def build_monthly_cashflow_visualization(
                     investment_balance=round(investment_balance, 2),
                     liquid_asset_value=round(liquid_asset_value, 2),
                     provident_balance=round(provident_balance, 2),
+                    pension_account_balance=round(pension_account_balance, 2),
+                    medical_account_balance=round(medical_account_balance, 2),
+                    social_security_account_balance=round(social_security_account_balance, 2),
                     property_asset_value=round(property_asset_value, 2),
                     vehicle_asset_value=round(vehicle_asset_value, 2),
                     first_vehicle_asset_value=round(first_vehicle_asset_value, 2),
@@ -6958,6 +8238,7 @@ def build_annual_financial_summaries(
     account_snapshots: list[AccountSnapshotPoint],
     loan_visualization: list[LoanVisualizationPoint],
     provident_visualization: list[ProvidentVisualizationPoint],
+    social_security_visualization: list[SocialSecurityVisualizationPoint] | None = None,
     *,
     base_date: date | None = None,
 ) -> list[AnnualFinancialSummary]:
@@ -6969,12 +8250,19 @@ def build_annual_financial_summaries(
     snapshots_by_plan_month = {(row.plan_variant, row.month): row for row in account_snapshots}
     loans_by_plan_month = {(row.plan_variant, row.month): row for row in loan_visualization}
     provident_by_plan_month = {(row.plan_variant, row.month): row for row in provident_visualization}
+    social_security_by_plan_month = {
+        (row.plan_variant, row.month): row
+        for row in (social_security_visualization or [])
+    }
     groups: dict[tuple[str, int], dict[str, float | int | str]] = {}
 
     cashflow_sum_fields = [
         "cash_income",
+        "pension_income",
         "living_expense",
         "scheduled_expense",
+        "child_expense",
+        "career_shock_self_payment",
         "debt_payment",
         "house_payment",
         "vehicle_payment",
@@ -6986,6 +8274,12 @@ def build_annual_financial_summaries(
         "investment_sell_proceeds",
         "provident_deposit",
         "provident_withdrawal",
+        "pension_account_contribution",
+        "pension_account_interest",
+        "medical_account_contribution",
+        "medical_account_retiree_transfer",
+        "medical_account_interest",
+        "medical_account_outflow",
         "transaction_cash_out",
         "transaction_cash_in",
         "monthly_cash_delta",
@@ -7031,6 +8325,7 @@ def build_annual_financial_summaries(
             snapshot = snapshots_by_plan_month.get((row.plan_variant, row.month))
             loan_snapshot = loan_row
             provident_snapshot = provident_by_plan_month.get((row.plan_variant, row.month))
+            social_security_snapshot = social_security_by_plan_month.get((row.plan_variant, row.month))
             group.update(
                 {
                     "cash_balance_end": snapshot.cash_balance if snapshot else row.cash_balance,
@@ -7040,6 +8335,21 @@ def build_annual_financial_summaries(
                         provident_snapshot.balance_end
                         if provident_snapshot
                         else snapshot.provident_balance if snapshot else row.provident_balance
+                    ),
+                    "pension_account_balance_end": (
+                        social_security_snapshot.pension_balance_end
+                        if social_security_snapshot
+                        else snapshot.pension_account_balance if snapshot else row.pension_account_balance
+                    ),
+                    "medical_account_balance_end": (
+                        social_security_snapshot.medical_balance_end
+                        if social_security_snapshot
+                        else snapshot.medical_account_balance if snapshot else row.medical_account_balance
+                    ),
+                    "social_security_account_balance_end": (
+                        social_security_snapshot.total_balance_end
+                        if social_security_snapshot
+                        else snapshot.social_security_account_balance if snapshot else row.social_security_account_balance
                     ),
                     "fixed_asset_value_end": snapshot.fixed_asset_value if snapshot else row.fixed_asset_value,
                     "property_asset_value_end": row.property_asset_value,
@@ -7059,6 +8369,14 @@ def build_annual_financial_summaries(
                     "existing_loan_balance_end": loan_snapshot.existing_loan_balance if loan_snapshot else 0.0,
                 }
             )
+        social_security_row = social_security_by_plan_month.get((row.plan_variant, row.month))
+        if social_security_row:
+            group["pension_account_contribution"] = float(group["pension_account_contribution"]) + social_security_row.pension_contribution
+            group["pension_account_interest"] = float(group["pension_account_interest"]) + social_security_row.pension_interest
+            group["medical_account_contribution"] = float(group["medical_account_contribution"]) + social_security_row.medical_contribution
+            group["medical_account_retiree_transfer"] = float(group["medical_account_retiree_transfer"]) + social_security_row.medical_retiree_transfer
+            group["medical_account_interest"] = float(group["medical_account_interest"]) + social_security_row.medical_interest
+            group["medical_account_outflow"] = float(group["medical_account_outflow"]) + social_security_row.medical_outflow
 
     summaries: list[AnnualFinancialSummary] = []
     for group in sorted(groups.values(), key=lambda item: (str(item["plan_variant"]), int(item["year"]))):
@@ -7111,6 +8429,13 @@ def build_account_concepts() -> list[AccountConceptSummary]:
             name="公积金账户",
             category="provident",
             description="按政策口径单独管理，个人和单位缴存、账户利息、租房季度提取、购房相关提取、按月抵月供和半年度冲本金都在后端逐月记账；默认不作为自由现金收入。",
+            managed_by="backend",
+        ),
+        AccountConceptSummary(
+            code="social_security_personal_accounts",
+            name="养老与医保个人账户",
+            category="social_security",
+            description="后端按成员工资阶段和规则包逐月推演养老保险个人账户与医保个人账户。养老账户按个人养老缴费累积，医保账户按个人医保缴费及退休后定额划入累积；这类账户受政策用途限制，不作为现金账户或流动资产。",
             managed_by="backend",
         ),
         AccountConceptSummary(
@@ -7390,6 +8715,66 @@ def _append_retirement_account_events(
         )
 
 
+def _append_child_plan_events(
+    events: list[PlanEventPoint],
+    *,
+    household: HouseholdData,
+    rules: RulePackData,
+    plan_variant: str,
+    home_purchase_month: int | None,
+    current_month: date,
+) -> None:
+    for child_strategy in build_child_plan_strategies(
+        household,
+        rules,
+        home_purchase_month=home_purchase_month,
+        as_of=current_month,
+    ):
+        if not child_strategy.enabled:
+            continue
+        if child_strategy.preparation_start_month_index is not None and child_strategy.preparation_start_month_index >= 0:
+            _append_event(
+                events,
+                plan_variant=plan_variant,
+                month=child_strategy.preparation_start_month_index,
+                category="child",
+                title=f"{child_strategy.child_name}备孕准备",
+                detail="开始计入备孕准备支出；具体金额来自养娃计划支出口径。",
+            )
+        if child_strategy.pregnancy_start_month_index is not None and child_strategy.pregnancy_start_month_index >= 0:
+            _append_event(
+                events,
+                plan_variant=plan_variant,
+                month=child_strategy.pregnancy_start_month_index,
+                category="child",
+                title=f"{child_strategy.child_name}孕期支出",
+                detail="孕期检查、营养和时间弹性开始进入现金流测算。",
+            )
+        if child_strategy.birth_month_index is not None and child_strategy.birth_month_index >= 0:
+            detail = child_strategy.explanation
+            if child_strategy.warnings:
+                detail += " 风险提示：" + "；".join(child_strategy.warnings)
+            _append_event(
+                events,
+                plan_variant=plan_variant,
+                month=child_strategy.birth_month_index,
+                category="child",
+                title=f"{child_strategy.child_name}出生节点",
+                detail=detail,
+                amount=child_strategy.first_year_cash_need,
+                severity="warning" if child_strategy.warnings else "success",
+            )
+        if child_strategy.education_start_month_index is not None and child_strategy.education_start_month_index >= 0:
+            _append_event(
+                events,
+                plan_variant=plan_variant,
+                month=child_strategy.education_start_month_index,
+                category="child",
+                title=f"{child_strategy.child_name}教育阶段启动",
+                detail="教育阶段月支出和入学节点支出开始按养娃计划口径进入现金流；专项附加扣除仍由税务模块统一计算。",
+            )
+
+
 def build_plan_events(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -7473,6 +8858,14 @@ def build_plan_events(
             events,
             plan_variant=plan.variant,
             provident_rows=provident_by_plan.get(plan.variant, []),
+        )
+        _append_child_plan_events(
+            events,
+            household=household,
+            rules=rules,
+            plan_variant=plan.variant,
+            home_purchase_month=plan.months_to_buy,
+            current_month=current_month,
         )
         if retirement_window_end > 0:
             _append_event(
@@ -7619,11 +9012,12 @@ def build_plan_events(
         "income": 1,
         "investment": 2,
         "vehicle": 3,
-        "home_purchase": 4,
-        "loan": 5,
-        "provident": 6,
-        "renovation": 7,
-        "risk": 8,
+        "child": 4,
+        "home_purchase": 5,
+        "loan": 6,
+        "provident": 7,
+        "renovation": 8,
+        "risk": 9,
     }
     plan_order = {plan.variant: index for index, plan in enumerate(purchase_plans)}
     return sorted(events, key=lambda item: (plan_order.get(item.plan_variant, 999), item.month, category_order[item.category], item.title))
@@ -7704,14 +9098,16 @@ def calculate_affordability(
     raw_household = _household_with_member_derived_profile(household)
     base_date = date.today()
     base_month = date(base_date.year, base_date.month, 1)
-    current_expense_stage = _household_expense_stage_at(raw_household, as_of=base_month)
-    if current_expense_stage:
+    current_daily_expense_stage = _daily_expense_stage_at(raw_household, as_of=base_month)
+    current_rent_expense_stage = _rent_expense_stage_at(raw_household, as_of=base_month)
+    if current_daily_expense_stage or current_rent_expense_stage:
         raw_household = raw_household.model_copy(
             update={
-                "monthly_expense": current_expense_stage.base_living_expense,
-                "monthly_debt_payment": current_expense_stage.other_fixed_debt_payment,
-                "monthly_rent_from_housing_fund": current_expense_stage.rent_amount
-                if current_expense_stage.rent_payment_mode == "provident"
+                "monthly_expense": current_daily_expense_stage.base_living_expense
+                if current_daily_expense_stage
+                else raw_household.monthly_expense,
+                "monthly_rent_from_housing_fund": current_rent_expense_stage.rent_amount
+                if current_rent_expense_stage and current_rent_expense_stage.rent_payment_mode == "provident"
                 else 0.0,
             }
         )
@@ -7762,13 +9158,14 @@ def calculate_affordability(
     cashflow_household = household.model_copy(
         update={"monthly_debt_payment": effective_monthly_debt_payment}
     )
-    current_monthly_expense = monthly_household_expense_at(cashflow_household)
+    current_monthly_expense = monthly_household_expense_at(cashflow_household, rules=rules)
     current_income_profile = household_monthly_income_profile_at(cashflow_household, rules, 0)
     has_purchase_target = bool(scenario.enabled and scenario.total_price > 0)
     car_plan_analyses = build_car_plan_analyses(
         cashflow_household,
         net_monthly_income=net_monthly_income,
         annual_investment_return=scenario.annual_investment_return,
+        rules=rules,
     )
     effective_car_plan = _car_plan_with_selected_strategies(cashflow_household.car_plan, car_plan_analyses)
     cashflow_household = cashflow_household.model_copy(update={"car_plan": effective_car_plan})
@@ -7780,6 +9177,7 @@ def calculate_affordability(
             0,
             current_income_profile.net_income - current_monthly_expense - cashflow_household.monthly_debt_payment,
         ),
+        rules=rules,
     )
     purchase_strategy_car_loan = _aggregate_car_loan(
         cashflow_household.car_plan,
@@ -7790,13 +9188,15 @@ def calculate_affordability(
         ),
         scenario=scenario,
         include_after_home=False,
+        rules=rules,
     )
     pre_home_vehicle_states = _vehicle_loan_states(
         cashflow_household.car_plan,
         scenario=scenario,
         include_after_home=False,
+        rules=rules,
     )
-    vehicle_states = _vehicle_loan_states(cashflow_household.car_plan, scenario=scenario)
+    vehicle_states = _vehicle_loan_states(cashflow_household.car_plan, scenario=scenario, rules=rules)
     investment_plan_recommendations = build_investment_plan_recommendations(
         cashflow_household,
         scenario,
@@ -7840,7 +9240,15 @@ def calculate_affordability(
     upfront_renovation_cost = (
         scenario.renovation_cost if has_purchase_target and scenario.renovation_funding_mode == "upfront_cash" else 0
     )
-    taxes_and_fees = deed_tax + broker_fee + (scenario.moving_and_misc_cost if has_purchase_target else 0) + upfront_renovation_cost
+    seller_tax_pass_through = _seller_tax_pass_through_amount(scenario) if has_purchase_target else 0.0
+    taxes_and_fees = (
+        deed_tax
+        + broker_fee
+        + seller_tax_pass_through
+        + (scenario.moving_and_misc_cost if has_purchase_target else 0)
+        + upfront_renovation_cost
+    )
+    selected_home_purchase_month: int | None = None
     if stress_name is None and has_purchase_target:
         purchase_plan_analyses = build_purchase_plan_analyses(
             strategy_household,
@@ -7875,6 +9283,13 @@ def calculate_affordability(
                 )
                 yield_sensitivity = yield_future.result()
                 provident_visualization = provident_future.result()
+                social_security_visualization = build_social_security_visualization(
+                    strategy_household,
+                    rules,
+                    purchase_plan_analyses,
+                    car_loan,
+                    vehicle_states=vehicle_states,
+                )
         else:
             yield_sensitivity = build_yield_sensitivity(
                 strategy_household,
@@ -7894,6 +9309,13 @@ def calculate_affordability(
                 car_loan,
                 vehicle_states=vehicle_states,
             )
+            social_security_visualization = build_social_security_visualization(
+                strategy_household,
+                rules,
+                purchase_plan_analyses,
+                car_loan,
+                vehicle_states=vehicle_states,
+            )
         loan_visualization = build_loan_visualization(
             strategy_household,
             scenario,
@@ -7901,6 +9323,8 @@ def calculate_affordability(
             car_loan,
             base_monthly_debt_payment=household.monthly_debt_payment,
             provident_visualization=provident_visualization,
+            vehicle_states=vehicle_states,
+            rules=rules,
         )
         monthly_cashflow_visualization, account_snapshots, monthly_ledger = build_monthly_cashflow_visualization(
             strategy_household,
@@ -7910,12 +9334,14 @@ def calculate_affordability(
             car_loan,
             loan_visualization,
             provident_visualization,
+            social_security_visualization,
         )
         annual_financial_summaries = build_annual_financial_summaries(
             monthly_cashflow_visualization,
             account_snapshots,
             loan_visualization,
             provident_visualization,
+            social_security_visualization,
             base_date=base_month,
         )
         account_concepts = build_account_concepts()
@@ -7929,10 +9355,21 @@ def calculate_affordability(
             monthly_cashflow_visualization,
             provident_visualization,
         )
+        selected_home_purchase_month = next(
+            (plan.months_to_buy for plan in purchase_plan_analyses if plan.variant == scenario.selected_purchase_plan_variant and plan.months_to_buy is not None),
+            next((plan.months_to_buy for plan in purchase_plan_analyses if plan.months_to_buy is not None), None),
+        )
+        child_plan_strategies = build_child_plan_strategies(
+            strategy_household,
+            rules,
+            home_purchase_month=selected_home_purchase_month,
+            as_of=base_month,
+        )
     else:
         purchase_plan_analyses = []
         yield_sensitivity = []
         provident_visualization = []
+        social_security_visualization = []
         loan_visualization = []
         monthly_cashflow_visualization = []
         account_snapshots = []
@@ -7941,6 +9378,20 @@ def calculate_affordability(
         account_concepts = []
         strategy_explanations = []
         plan_events = []
+        child_plan_strategies = build_child_plan_strategies(
+            cashflow_household,
+            rules,
+            home_purchase_month=None,
+            as_of=base_month,
+        )
+    tax_strategy_items = build_tax_strategy_items(
+        household,
+        scenario,
+        rules,
+        base_date=base_month,
+        horizon_months=tax_horizon_months,
+        selected_purchase_month=selected_home_purchase_month,
+    )
     total_required_cash = stated_down_payment + taxes_and_fees + _car_down_payment_at(
         cashflow_household.car_plan,
         purchase_strategy_car_loan,
@@ -8057,9 +9508,11 @@ def calculate_affordability(
         tax_year_summaries=tax_year_summaries,
         tax_monthly_points=tax_monthly_points,
         tax_events=tax_events,
+        tax_strategy_items=tax_strategy_items,
         career_shock_projection=career_shock_projection,
         investment_plan_recommendations=investment_plan_recommendations,
         current_investment_allocation=current_investment_allocation,
+        child_plan_strategies=child_plan_strategies,
         annual_financial_summaries=annual_financial_summaries,
         purchase_plan_analyses=purchase_plan_analyses,
         yield_sensitivity=yield_sensitivity,
@@ -8068,6 +9521,7 @@ def calculate_affordability(
         monthly_ledger=monthly_ledger,
         loan_visualization=loan_visualization,
         provident_visualization=provident_visualization,
+        social_security_visualization=social_security_visualization,
         account_concepts=account_concepts,
         strategy_explanations=strategy_explanations,
         plan_events=plan_events,

@@ -75,7 +75,7 @@ def test_household_update_is_persisted(tmp_path: Path, monkeypatch) -> None:
     assert persisted["investment_plan_name"] == "稳健月度理财"
 
 
-def test_member_pension_auto_setting_persists_without_legacy_global_switch(tmp_path: Path, monkeypatch) -> None:
+def test_member_pension_auto_setting_persists_without_global_switch(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
     from app import database

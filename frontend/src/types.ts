@@ -1,7 +1,9 @@
 export type RepaymentMethod = "equal_installment" | "equal_principal";
 export type RuleStatus = "draft" | "active" | "archived";
 export type BonusTaxMethod = "separate" | "merged" | "best";
+export type AnnualBonusPayoutMode = "lump_sum" | "monthly_spread";
 export type IncomeStageKind = "salary" | "unemployment" | "freelance" | "pension" | "manual";
+export type FreelanceTaxMode = "labor_remuneration" | "business_income" | "other";
 export type GreenBuildingLevel = "none" | "two_star" | "three_star";
 export type PrefabBuildingLevel = "none" | "A" | "AA" | "AAA";
 export type BuildingStructure = "unknown" | "brick_mixed" | "steel_concrete";
@@ -12,9 +14,12 @@ export type ProvidentAccountRepaymentStrategy =
   | "monthly_repayment_withdrawal"
   | "semiannual_principal_offset"
   | "keep_in_account";
+export type PersonalPensionContributionMode = "none" | "auto_tax_optimal" | "fixed_monthly" | "fixed_annual";
+export type PersonalPensionOpenMode = "auto_tax_optimal" | "manual" | "none";
 
 export interface IncomeMember {
   name: string;
+  sex: "female" | "male" | "unspecified";
   family_join_month: string;
   birth_month: string;
   current_age: number;
@@ -28,6 +33,25 @@ export interface IncomeMember {
   initial_other_asset_value: number;
   initial_other_debt_balance: number;
   provident_fund_balance: number;
+  provident_account_enabled: boolean;
+  provident_account_open_month: string;
+  pension_account_balance: number;
+  pension_account_enabled: boolean;
+  pension_account_open_month: string;
+  medical_account_balance: number;
+  medical_account_enabled: boolean;
+  medical_account_open_month: string;
+  personal_pension_account_enabled: boolean;
+  personal_pension_account_balance: number;
+  personal_pension_open_mode: PersonalPensionOpenMode;
+  personal_pension_account_open_month: string;
+  personal_pension_contribution_mode: PersonalPensionContributionMode;
+  personal_pension_monthly_contribution: number;
+  personal_pension_annual_contribution_target: number;
+  personal_pension_contribution_month: number;
+  personal_pension_contribution_start_month: string;
+  personal_pension_contribution_end_month: string | null;
+  personal_pension_annual_return: number;
   monthly_salary_gross: number;
   annual_bonus: number;
   monthly_social_insurance: number;
@@ -50,8 +74,12 @@ export interface IncomeStageData {
   provident_account_management_center: "beijing_municipal" | "national";
   monthly_salary_gross: number;
   annual_bonus: number;
+  annual_bonus_payout_mode: AnnualBonusPayoutMode;
   annual_bonus_payout_month: number;
+  annual_bonus_earning_start_month: string;
+  annual_bonus_earning_end_month: string;
   monthly_freelance_income: number;
+  freelance_tax_mode: FreelanceTaxMode;
   monthly_non_taxable_income: number;
   monthly_extra_cash_expense: number;
   monthly_social_insurance: number;
@@ -99,6 +127,7 @@ export interface CareerShockMemberProjection {
   later_unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
   flexible_housing_fund_monthly: number;
+  self_payment_monthly: number;
   pension_monthly: number;
   generated_stages: IncomeStageData[];
   notes: string[];
@@ -111,6 +140,7 @@ export interface CareerShockProjection {
   later_unemployment_benefit_monthly: number;
   self_social_insurance_monthly: number;
   flexible_housing_fund_monthly: number;
+  self_payment_monthly: number;
   effective_members: IncomeMember[];
   member_projections: CareerShockMemberProjection[];
   notes: string[];
@@ -156,6 +186,16 @@ export interface VehiclePlanData {
   selected_financing_max_down_payment_ratio: number;
   selected_financing_prepayment_allowed: boolean;
   selected_financing_prepayment_policy_note: string;
+  energy_type: "pure_electric" | "plug_in_hybrid" | "range_extended" | "fuel_cell" | "fuel";
+  new_energy_catalog_eligible: boolean;
+  beijing_license_indicator_status:
+    | "unknown"
+    | "already_have"
+    | "family_new_energy_pending"
+    | "personal_new_energy_pending"
+    | "not_eligible";
+  beijing_indicator_expected_delay_months: number;
+  vehicle_vessel_tax_annual_override: number | null;
   planning_sequence: number;
   purchase_timing_mode: "auto_sequence" | "parallel" | "manual_month";
   after_previous_event_delay_months: number;
@@ -163,6 +203,9 @@ export interface VehiclePlanData {
   total_price: number;
   down_payment_ratio: number;
   down_payment: number;
+  purchase_tax: number;
+  purchase_tax_relief: number;
+  annual_vehicle_vessel_tax: number;
   purchase_delay_months: number;
   total_months: number;
   interest_free_months: number;
@@ -255,7 +298,8 @@ export interface ExistingLoanVisualizationDetail {
 export interface ScheduledExpenseData {
   name: string;
   monthly_amount: number;
-  frequency: "monthly" | "annual_once";
+  frequency: "monthly" | "annual_once" | "one_time";
+  one_time_timing_mode: "fixed_month" | "flexible_range";
   annual_occurrence_month: number;
   start_month: string;
   end_month: string | null;
@@ -263,13 +307,22 @@ export interface ScheduledExpenseData {
   notes: string;
 }
 
-export interface HouseholdExpenseStageData {
+export interface DailyExpenseStageData {
   name: string;
   start_month: string;
   end_month: string | null;
   base_living_expense: number;
-  other_fixed_debt_payment: number;
+}
+
+export interface RentExpenseStageData {
+  name: string;
+  start_month: string;
+  end_month: string | null;
   rent_amount: number;
+  broker_fee_months: number;
+  broker_fee_amount: number | null;
+  service_fee_first_year_rate: number;
+  service_fee_later_year_rate: number;
   rent_payment_mode: "cash" | "provident";
   rent_payment_frequency: "monthly" | "quarterly";
 }
@@ -280,6 +333,87 @@ export interface ElderlyDependentData {
   birth_month: string;
   is_only_child: boolean;
   shared_monthly_deduction: number;
+}
+
+export interface ChildPlanData {
+  name: string;
+  enabled: boolean;
+  timing_mode: "after_first_home" | "manual_month" | "not_planned";
+  expense_strategy_mode: "balanced" | "conservative" | "quality" | "manual";
+  planned_birth_month: string;
+  planned_birth_start_month: string;
+  planned_birth_end_month: string;
+  birth_month: string;
+  tax_deduction_owner: string;
+  education_start_month: string;
+  preparation_months_before_birth: number;
+  pregnancy_months_before_birth: number;
+  monthly_preparation_cost: number;
+  monthly_pregnancy_cost: number;
+  birth_medical_cost: number;
+  postpartum_recovery_cost: number;
+  initial_baby_supplies_cost: number;
+  monthly_childcare_cost_before_kindergarten: number;
+  monthly_kindergarten_cost: number;
+  monthly_primary_secondary_cost: number;
+  monthly_higher_education_cost: number;
+  kindergarten_entry_cost: number;
+  primary_school_entry_cost: number;
+  higher_education_entry_cost: number;
+  notes: string;
+}
+
+export interface SpecialDeductionItemData {
+  deduction_type:
+    | "child_education"
+    | "infant_care"
+    | "continuing_education"
+    | "serious_illness"
+    | "housing_rent"
+    | "mortgage_interest"
+    | "personal_pension";
+  name: string;
+  enabled: boolean;
+  member_name: string;
+  spouse_member_name: string;
+  child_name: string;
+  start_month: string;
+  end_month: string | null;
+  monthly_amount: number;
+  annual_amount: number;
+  settlement_mode: "monthly_withholding" | "annual_settlement";
+  is_first_home_loan: boolean;
+  claimed_months_used: number;
+  notes: string;
+}
+
+export interface TaxStrategyItem {
+  deduction_type: SpecialDeductionItemData["deduction_type"];
+  title: string;
+  status: "auto_enabled" | "manual_enabled" | "available" | "not_applicable" | "conflict";
+  member_name: string;
+  monthly_amount: number;
+  annual_amount: number;
+  start_month: string;
+  end_month: string | null;
+  reason: string;
+  conflicts_with: SpecialDeductionItemData["deduction_type"][];
+  source: "backend_auto" | "manual" | "event";
+}
+
+export interface InvestmentTaxProfileData {
+  deposit_interest_tax_rate: number;
+  fund_dividend_tax_rate: number;
+  stock_dividend_short_holding_tax_rate: number;
+  stock_dividend_long_holding_tax_rate: number;
+  bond_interest_tax_rate: number;
+  overseas_asset_tax_rate: number;
+  deposit_interest_ratio: number;
+  fund_dividend_ratio: number;
+  stock_dividend_short_ratio: number;
+  stock_dividend_long_ratio: number;
+  bond_interest_ratio: number;
+  overseas_asset_ratio: number;
 }
 
 export interface HouseholdData {
@@ -311,6 +445,7 @@ export interface HouseholdData {
   investment_sell_fee_rate: number;
   investment_taxable_return_ratio: number;
   investment_return_tax_rate: number;
+  investment_tax_profile: InvestmentTaxProfileData;
   required_liquidity_months: number;
   borrower_age: number;
   borrower_member_index: number;
@@ -320,8 +455,11 @@ export interface HouseholdData {
   property_goals: PropertyPurchaseGoalData[];
   phased_loans: PhasedLoanData[];
   scheduled_expenses: ScheduledExpenseData[];
-  household_expense_stages: HouseholdExpenseStageData[];
+  daily_expense_stages: DailyExpenseStageData[];
+  rent_expense_stages: RentExpenseStageData[];
   elderly_dependents: ElderlyDependentData[];
+  child_plans: ChildPlanData[];
+  special_deductions: SpecialDeductionItemData[];
   existing_home_count: number;
   existing_mortgage_count: number;
   has_beijing_hukou: boolean;
@@ -370,6 +508,9 @@ export interface ScenarioData {
   provident_account_repayment_strategy: ProvidentAccountRepaymentStrategy;
   deed_tax_rate: number;
   broker_fee_rate: number;
+  seller_tax_pass_through_enabled: boolean;
+  seller_tax_pass_through_rate: number;
+  seller_tax_pass_through_amount: number;
   renovation_cost: number;
   renovation_funding_mode: RenovationFundingMode;
   moving_and_misc_cost: number;
@@ -453,6 +594,7 @@ export interface CarLoanSummary {
   monthly_cash_operating_cost: number;
   monthly_depreciation_cost: number;
   monthly_total_ownership_cost: number;
+  policy_notes: string[];
 }
 
 export interface CarPlanAnalysis {
@@ -472,6 +614,9 @@ export interface CarPlanAnalysis {
   total_price: number;
   down_payment_ratio: number;
   down_payment: number;
+  purchase_tax: number;
+  purchase_tax_relief: number;
+  annual_vehicle_vessel_tax: number;
   loan_principal: number;
   total_months: number;
   interest_free_months: number;
@@ -579,6 +724,7 @@ export interface TaxMemberMonthlyPoint {
   bonus_income: number;
   other_taxable_income: number;
   non_taxable_income: number;
+  pension_income: number;
   personal_social: number;
   personal_housing_fund: number;
   employer_social: number;
@@ -609,6 +755,7 @@ export interface TaxMonthlyPoint {
   employer_housing_fund: number;
   monthly_pf_deposit: number;
   non_taxable_income: number;
+  pension_income: number;
   extra_cash_expense: number;
   member_points: TaxMemberMonthlyPoint[];
 }
@@ -791,6 +938,39 @@ export interface ProvidentVisualizationPoint {
   member_accounts: ProvidentMemberAccountPoint[];
 }
 
+export interface SocialSecurityMemberAccountPoint {
+  member_index: number;
+  member_name: string;
+  pension_balance_start: number;
+  pension_contribution: number;
+  pension_interest: number;
+  pension_balance_end: number;
+  medical_balance_start: number;
+  medical_contribution: number;
+  medical_retiree_transfer: number;
+  medical_interest: number;
+  medical_outflow: number;
+  medical_balance_end: number;
+  retired: boolean;
+}
+
+export interface SocialSecurityVisualizationPoint {
+  plan_variant: string;
+  month: number;
+  pension_balance_start: number;
+  pension_contribution: number;
+  pension_interest: number;
+  pension_balance_end: number;
+  medical_balance_start: number;
+  medical_contribution: number;
+  medical_retiree_transfer: number;
+  medical_interest: number;
+  medical_outflow: number;
+  medical_balance_end: number;
+  total_balance_end: number;
+  member_accounts: SocialSecurityMemberAccountPoint[];
+}
+
 export interface MonthlyLedgerEntry {
   plan_variant: string;
   month: number;
@@ -809,6 +989,9 @@ export interface AccountSnapshotPoint {
   investment_balance: number;
   liquid_asset_value: number;
   provident_balance: number;
+  pension_account_balance: number;
+  medical_account_balance: number;
+  social_security_account_balance: number;
   property_asset_value: number;
   vehicle_asset_value: number;
   first_vehicle_asset_value: number;
@@ -826,14 +1009,20 @@ export interface MonthlyCashflowPoint {
   investment_balance: number;
   liquid_asset_value: number;
   provident_balance: number;
+  pension_account_balance: number;
+  medical_account_balance: number;
+  social_security_account_balance: number;
   fixed_asset_value: number;
   total_asset_value: number;
   total_loan_balance: number;
   net_worth: number;
   monthly_cash_delta: number;
   cash_income: number;
+  pension_income: number;
   living_expense: number;
   scheduled_expense: number;
+  child_expense: number;
+  career_shock_self_payment: number;
   debt_payment: number;
   regular_debt_payment: number;
   phased_loan_payment: number;
@@ -878,10 +1067,31 @@ export interface MonthlyCashflowPoint {
   ledger_entries: MonthlyLedgerEntry[];
 }
 
+export interface ChildPlanStrategyPoint {
+  child_name: string;
+  enabled: boolean;
+  timing_mode: "after_first_home" | "manual_month" | "not_planned";
+  expense_strategy_mode: "balanced" | "conservative" | "quality" | "manual";
+  birth_month_index: number | null;
+  birth_month_label: string;
+  preparation_start_month_index: number | null;
+  pregnancy_start_month_index: number | null;
+  education_start_month_index: number | null;
+  mother_member_name: string;
+  mother_age_at_birth: number | null;
+  happiness_score: number;
+  warnings: string[];
+  monthly_cost_now: number;
+  first_year_cash_need: number;
+  total_to_age_18: number;
+  stages: Array<{ name: string; month_index: number | null; month_label: string; amount: number; frequency: string }>;
+  explanation: string;
+}
+
 export interface AccountConceptSummary {
   code: string;
   name: string;
-  category: "account" | "cash" | "investment" | "provident" | "fixed_asset" | "loan" | "policy";
+  category: "account" | "cash" | "investment" | "provident" | "social_security" | "fixed_asset" | "loan" | "policy";
   description: string;
   managed_by: "backend" | "user_input" | "policy";
 }
@@ -919,8 +1129,11 @@ export interface AnnualFinancialSummary {
   year: number;
   months: number;
   cash_income: number;
+  pension_income: number;
   living_expense: number;
   scheduled_expense: number;
+  child_expense: number;
+  career_shock_self_payment: number;
   debt_payment: number;
   house_payment: number;
   vehicle_payment: number;
@@ -932,6 +1145,15 @@ export interface AnnualFinancialSummary {
   investment_sell_proceeds: number;
   provident_deposit: number;
   provident_withdrawal: number;
+  pension_account_contribution: number;
+  pension_account_interest: number;
+  pension_account_balance_end: number;
+  medical_account_contribution: number;
+  medical_account_retiree_transfer: number;
+  medical_account_interest: number;
+  medical_account_outflow: number;
+  medical_account_balance_end: number;
+  social_security_account_balance_end: number;
   transaction_cash_out: number;
   transaction_cash_in: number;
   monthly_cash_delta: number;
@@ -992,9 +1214,11 @@ export interface AffordabilityResult {
   tax_year_summaries: TaxYearSummary[];
   tax_monthly_points: TaxMonthlyPoint[];
   tax_events: TaxEventPoint[];
+  tax_strategy_items: TaxStrategyItem[];
   career_shock_projection: CareerShockProjection | null;
   investment_plan_recommendations: InvestmentPlanRecommendation[];
   current_investment_allocation: InvestmentAllocationSummary | null;
+  child_plan_strategies: ChildPlanStrategyPoint[];
   annual_financial_summaries: AnnualFinancialSummary[];
   purchase_plan_analyses: PurchasePlanAnalysis[];
   yield_sensitivity: YieldSensitivityPoint[];
@@ -1003,6 +1227,7 @@ export interface AffordabilityResult {
   monthly_ledger: MonthlyLedgerEntry[];
   loan_visualization: LoanVisualizationPoint[];
   provident_visualization: ProvidentVisualizationPoint[];
+  social_security_visualization: SocialSecurityVisualizationPoint[];
   account_concepts: AccountConceptSummary[];
   strategy_explanations: StrategyExplanationPoint[];
   plan_events: PlanEventPoint[];

@@ -90,6 +90,41 @@ MOJIBAKE_PATTERNS = [
 ]
 
 MOJIBAKE_RE = re.compile("|".join(re.escape(item) for item in MOJIBAKE_PATTERNS))
+PRIVATE_USE_RE = re.compile(r"[\ue000-\uf8ff]")
+MOJIBAKE_RUN_CHARS = "".join(
+    chr(code)
+    for code in [
+        0x4E36,  # UTF-8 text decoded as GBK often starts with this family of characters.
+        0x9359,
+        0x935A,
+        0x934A,
+        0x9354,
+        0x9429,
+        0x93C8,
+        0x7B5B,
+        0x89D9,
+        0x74A7,
+        0x59AF,
+        0x7F03,
+        0x7A0B,
+        0x6769,
+        0x5B80,
+        0x59DD,
+        0x59E3,
+        0x4EB2,
+        0x52FC,
+        0x7BFE,
+        0x4F7A,
+        0x72B2,
+        0x7EF2,
+        0x7BA1,
+        0x9422,
+        0x93C4,
+        0x93C3,
+        0x934F,
+    ]
+)
+MOJIBAKE_RUN_RE = re.compile(f"[{re.escape(MOJIBAKE_RUN_CHARS)}]{{2,}}")
 
 
 def iter_text_files(root: Path) -> list[Path]:
@@ -117,7 +152,7 @@ def scan_encoding(root: Path) -> list[str]:
             issues.append(f"{relative}: invalid utf-8 at byte {exc.start}: {exc.reason}")
             continue
         for line_number, line in enumerate(text.splitlines(), 1):
-            if MOJIBAKE_RE.search(line):
+            if MOJIBAKE_RE.search(line) or PRIVATE_USE_RE.search(line) or MOJIBAKE_RUN_RE.search(line):
                 issues.append(f"{relative}:{line_number}: suspicious mojibake text")
     return issues
 
