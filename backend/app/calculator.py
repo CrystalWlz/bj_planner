@@ -1883,6 +1883,9 @@ def monthly_household_expense_at(
 ) -> float:
     current = as_of or date.today()
     target_month = _month_after(current, max(0, months_from_now))
+    stage = _household_expense_stage_at(household, months_from_now, as_of=current)
+    base_living_expense = stage.base_living_expense if stage else household.monthly_expense
+    rent_cash_expense = _rent_cash_payment_at(household, months_from_now, as_of=current)
     scheduled_total = 0.0
     for item in household.scheduled_expenses:
         start_month = _parse_month(item.start_month)
@@ -1891,8 +1894,94 @@ def monthly_household_expense_at(
             continue
         if end_month is not None and _month_distance(target_month, end_month) < 0:
             continue
+        if item.frequency == "annual_once" and target_month[1] != item.annual_occurrence_month:
+            continue
         scheduled_total += item.monthly_amount
-    return max(0.0, household.monthly_expense + scheduled_total)
+    return max(0.0, base_living_expense + rent_cash_expense + scheduled_total)
+
+
+def _household_expense_stage_at(
+    household: HouseholdData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+) -> "HouseholdExpenseStageData | None":
+    current = as_of or date.today()
+    target_month = _month_after(current, max(0, months_from_now))
+    stages = household.household_expense_stages or []
+    for stage in sorted(stages, key=lambda item: item.start_month):
+        start_month = _parse_month(stage.start_month)
+        end_month = _parse_month(stage.end_month) if stage.end_month else None
+        if start_month is None or _month_distance(start_month, target_month) < 0:
+            continue
+        if end_month is not None and _month_distance(target_month, end_month) < 0:
+            continue
+        return stage
+    return None
+
+
+def _base_living_expense_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    return max(0.0, stage.base_living_expense if stage else household.monthly_expense)
+
+
+def _regular_debt_payment_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    return max(0.0, stage.other_fixed_debt_payment if stage else household.monthly_debt_payment)
+
+
+def _rent_cash_payment_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    if not stage or stage.rent_payment_mode != "cash":
+        return 0.0
+    return _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
+
+
+def _rent_provident_monthly_at(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    stage = _household_expense_stage_at(household, months_from_now, as_of=as_of)
+    if not stage:
+        return max(0.0, household.monthly_rent_from_housing_fund)
+    if stage.rent_payment_mode != "provident":
+        return 0.0
+    return _rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
+
+
+def _rent_stage_payment_amount_at(stage: "HouseholdExpenseStageData", months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    monthly_rent = max(0.0, stage.rent_amount)
+    if monthly_rent <= 0:
+        return 0.0
+    if stage.rent_payment_frequency != "quarterly":
+        return monthly_rent
+    current = as_of or date.today()
+    target_month = _month_after(current, max(0, months_from_now))
+    start_month = _parse_month(stage.start_month)
+    if start_month is None:
+        return monthly_rent * 3
+    elapsed = _month_distance(start_month, target_month)
+    return monthly_rent * 3 if elapsed >= 0 and elapsed % 3 == 0 else 0.0
+
+
+def _household_with_member_derived_profile(household: HouseholdData) -> HouseholdData:
+    members = household.members or []
+    if not members:
+        return household
+    social_security_months = max((member.social_security_months for member in members), default=0)
+    income_tax_months = max((member.income_tax_months for member in members), default=0)
+    existing_home_count = sum(max(0, member.existing_home_count) for member in members)
+    existing_mortgage_count = sum(max(0, member.existing_mortgage_count) for member in members)
+    member_cash = sum(max(0.0, member.initial_cash_balance) for member in members)
+    member_investments = sum(max(0.0, member.initial_investments) for member in members)
+
+    update: dict[str, object] = {
+        "social_security_months": max(household.social_security_months, social_security_months, income_tax_months),
+        "existing_home_count": existing_home_count if existing_home_count > 0 else household.existing_home_count,
+        "existing_mortgage_count": existing_mortgage_count if existing_mortgage_count > 0 else household.existing_mortgage_count,
+    }
+    if member_cash > 0:
+        update["cash_account_balance"] = member_cash
+    if member_investments > 0:
+        update["investments"] = member_investments
+    return household.model_copy(update=update)
 
 
 def _equal_installment_monthly_payment(principal: float, annual_rate: float, months: int) -> float:
@@ -4145,11 +4234,16 @@ def _family_down_payment_upfront_support(
 def _rent_withdrawal_before_purchase(household: HouseholdData) -> float:
     if household.existing_home_count > 0:
         return 0.0
-    return max(0.0, household.monthly_rent_from_housing_fund)
+    return _rent_provident_monthly_at(household)
 
 
 def _quarterly_rent_withdrawal_before_purchase_at(household: HouseholdData, month: int) -> float:
-    monthly_withdrawal = _rent_withdrawal_before_purchase(household)
+    if household.existing_home_count > 0:
+        return 0.0
+    stage = _household_expense_stage_at(household, month)
+    if stage and stage.rent_payment_mode == "provident":
+        return _rent_stage_payment_amount_at(stage, month)
+    monthly_withdrawal = _rent_provident_monthly_at(household, month)
     if monthly_withdrawal <= 0 or month <= 0 or month % 3 != 0:
         return 0.0
     return monthly_withdrawal * 3
@@ -4171,19 +4265,53 @@ def _post_purchase_monthly_pf_withdrawal(
     return monthly_pf_deposit, "purchase_agreed"
 
 
-def _borrower_provident_account_management_center(household: HouseholdData, rules: RulePackData) -> str:
+def _normalized_provident_account_management_center(value: str | None) -> str | None:
+    center = str(value or "").strip().lower()
+    if center in {"national", "central_state", "guoguan", "state"}:
+        return "national"
+    if center in {"beijing_municipal", "municipal", "shiguan", "city"}:
+        return "beijing_municipal"
+    return None
+
+
+def _borrower_provident_account_management_center(
+    household: HouseholdData,
+    rules: RulePackData,
+    *,
+    months_from_now: int = 0,
+    as_of: date | None = None,
+) -> str:
     if household.members:
         index = max(0, min(household.borrower_member_index, len(household.members) - 1))
-        center = str(getattr(household.members[index], "provident_account_management_center", "") or "").strip().lower()
-        if center in {"national", "central_state", "guoguan", "state"}:
-            return "national"
-        if center in {"beijing_municipal", "municipal", "shiguan", "city"}:
-            return "beijing_municipal"
+        member = household.members[index]
+        current = as_of or date.today()
+        target = _add_months(date(current.year, current.month, 1), max(0, months_from_now))
+        stage = _income_stage_for_month(member, target.year, target.month)
+        center = _normalized_provident_account_management_center(
+            getattr(stage, "provident_account_management_center", None) if stage else None
+        )
+        if center:
+            return center
     return get_policy(rules).provident_account_management_center()
 
 
-def _policy_default_pf_account_strategy(rules: RulePackData, household: HouseholdData | None = None) -> str:
-    center = _borrower_provident_account_management_center(household, rules) if household else get_policy(rules).provident_account_management_center()
+def _policy_default_pf_account_strategy(
+    rules: RulePackData,
+    household: HouseholdData | None = None,
+    *,
+    months_from_now: int = 0,
+    as_of: date | None = None,
+) -> str:
+    center = (
+        _borrower_provident_account_management_center(
+            household,
+            rules,
+            months_from_now=months_from_now,
+            as_of=as_of,
+        )
+        if household
+        else get_policy(rules).provident_account_management_center()
+    )
     if center == "national" and bool(rules.params.get("provident_national_monthly_direct_offset_supported", True)):
         return "monthly_repayment_withdrawal"
     if bool(rules.params.get("provident_municipal_monthly_repayment_withdrawal_supported", True)):
@@ -4388,7 +4516,11 @@ def _post_purchase_pf_strategy(
     # post-purchase options. Prefer loan offset only when it materially improves the
     # household cash-pressure picture; keep deposits in the account when cash flow is
     # already comfortable or there is no provident loan to offset.
-    default_policy_strategy = _policy_default_pf_account_strategy(rules, household)
+    default_policy_strategy = _policy_default_pf_account_strategy(
+        rules,
+        household,
+        months_from_now=purchase_month,
+    )
     monthly_relief = (
         min(monthly_pf_deposit, provident_monthly_payment)
         if default_policy_strategy == "monthly_repayment_withdrawal" and monthly_pf_deposit > 0 and provident_monthly_payment > 0
@@ -6341,9 +6473,10 @@ def build_monthly_cashflow_visualization(
     monthly_return = scenario.annual_investment_return / 12
     buy_fee_rate = max(0.0, household.investment_buy_fee_rate)
     sell_fee_rate = max(0.0, household.investment_sell_fee_rate)
+    investment_tax_rate = max(0.0, min(1.0, household.investment_return_tax_rate))
+    investment_taxable_ratio = max(0.0, min(1.0, household.investment_taxable_return_ratio))
     investment_enabled = household.investment_plan_name != "cash_only"
-    current_phased_payment = sum(payment for _, payment in (_phased_loan_state_at(loan, 0) for loan in household.phased_loans))
-    base_regular_debt_payment = max(0.0, household.monthly_debt_payment - current_phased_payment)
+    base_regular_debt_payment = _regular_debt_payment_at(household)
     rows: list[MonthlyCashflowPoint] = []
     snapshots: list[AccountSnapshotPoint] = []
     ledger: list[MonthlyLedgerEntry] = []
@@ -6456,6 +6589,7 @@ def build_monthly_cashflow_visualization(
             investment_contribution_base = 0.0
             investment_contribution_cash_sweep = 0.0
             investment_return = 0.0
+            investment_tax = 0.0
             investment_fee = 0.0
             investment_buy_fee = 0.0
             investment_sell_fee = 0.0
@@ -6491,9 +6625,9 @@ def build_monthly_cashflow_visualization(
                 cash_income = profile.net_income
                 total_expense = expense_at_month(month)
                 investment_reserve_target = max(0.0, total_expense * household.investment_cash_reserve_months)
-                living_expense = household.monthly_expense
-                scheduled_expense = max(0.0, total_expense - household.monthly_expense)
-                regular_debt_payment = base_regular_debt_payment
+                living_expense = _base_living_expense_at(household, month)
+                scheduled_expense = max(0.0, total_expense - living_expense)
+                regular_debt_payment = _regular_debt_payment_at(household, month)
                 debt_payment = loan_point.existing_monthly_payment if loan_point else regular_debt_payment
                 phased_loan_payment = max(0.0, debt_payment - regular_debt_payment)
                 vehicle_projection = vehicle_projection_at(month)
@@ -6543,7 +6677,8 @@ def build_monthly_cashflow_visualization(
                     )
                     investment_return = investment_balance * monthly_return if investment_enabled else 0.0
                     if investment_return:
-                        investment_balance = max(0.0, investment_balance + investment_return)
+                        investment_tax = max(0.0, investment_return) * investment_taxable_ratio * investment_tax_rate
+                        investment_balance = max(0.0, investment_balance + investment_return - investment_tax)
                     withdrawal = _investment_withdrawal_at_purchase(
                         scenario=scenario,
                         cash_before_transaction=cash_balance + monthly_surplus,
@@ -6614,7 +6749,8 @@ def build_monthly_cashflow_visualization(
                     investable_surplus = monthly_surplus - vehicle_down_payment
                     investment_return = investment_balance * monthly_return if investment_enabled else 0.0
                     if investment_return:
-                        investment_balance = max(0.0, investment_balance + investment_return)
+                        investment_tax = max(0.0, investment_return) * investment_taxable_ratio * investment_tax_rate
+                        investment_balance = max(0.0, investment_balance + investment_return - investment_tax)
                     projected_cash_before_investment = cash_balance + investable_surplus
                     liquidity_sell_proceeds = 0.0
                     if (
@@ -6779,6 +6915,7 @@ def build_monthly_cashflow_visualization(
                     investment_contribution_base=round(investment_contribution_base, 2),
                     investment_contribution_cash_sweep=round(investment_contribution_cash_sweep, 2),
                     investment_return=round(investment_return, 2),
+                    investment_tax=round(investment_tax, 2),
                     investment_fee=round(investment_fee, 2),
                     investment_buy_fee=round(investment_buy_fee, 2),
                     investment_sell_fee=round(investment_sell_fee, 2),
@@ -6844,6 +6981,7 @@ def build_annual_financial_summaries(
         "vehicle_operating_cost",
         "investment_contribution",
         "investment_return",
+        "investment_tax",
         "investment_fee",
         "investment_sell_proceeds",
         "provident_deposit",
@@ -7563,9 +7701,20 @@ def calculate_affordability(
     stress_name: str | None = None,
     include_stress_tests: bool = False,
 ) -> AffordabilityResult:
-    raw_household = household
+    raw_household = _household_with_member_derived_profile(household)
     base_date = date.today()
     base_month = date(base_date.year, base_date.month, 1)
+    current_expense_stage = _household_expense_stage_at(raw_household, as_of=base_month)
+    if current_expense_stage:
+        raw_household = raw_household.model_copy(
+            update={
+                "monthly_expense": current_expense_stage.base_living_expense,
+                "monthly_debt_payment": current_expense_stage.other_fixed_debt_payment,
+                "monthly_rent_from_housing_fund": current_expense_stage.rent_amount
+                if current_expense_stage.rent_payment_mode == "provident"
+                else 0.0,
+            }
+        )
     career_shock_projection = build_career_shock_projection(raw_household, rules, as_of=base_month)
     household = raw_household.model_copy(
         update={

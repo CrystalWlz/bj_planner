@@ -91,13 +91,23 @@ def test_member_pension_auto_setting_persists_without_legacy_global_switch(tmp_p
                 **payload["members"][0],
                 "name": "Sample A",
                 "birth_month": "1999-01",
-                "provident_account_management_center": "national",
+                "income_stages": [
+                    {
+                        **payload["members"][0]["income_stages"][0],
+                        "provident_account_management_center": "national",
+                    }
+                ],
             },
             {
                 **payload["members"][0],
                 "name": "Sample B",
                 "birth_month": "2001-07",
-                "provident_account_management_center": "beijing_municipal",
+                "income_stages": [
+                    {
+                        **payload["members"][0]["income_stages"][0],
+                        "provident_account_management_center": "beijing_municipal",
+                    }
+                ],
             },
         ]
         payload["career_shock"] = {
@@ -132,8 +142,9 @@ def test_member_pension_auto_setting_persists_without_legacy_global_switch(tmp_p
     saved_shock = response.json()["data"]["career_shock"]
     assert "auto_pension_income" not in saved_shock
     assert "auto_pension_income" not in persisted["career_shock"]
-    assert persisted["members"][0]["provident_account_management_center"] == "national"
-    assert persisted["members"][1]["provident_account_management_center"] == "beijing_municipal"
+    assert "provident_account_management_center" not in persisted["members"][0]
+    assert persisted["members"][0]["income_stages"][0]["provident_account_management_center"] == "national"
+    assert persisted["members"][1]["income_stages"][0]["provident_account_management_center"] == "beijing_municipal"
     assert saved_shock["member_settings"][0]["freelance_income_monthly"] == 3500
     assert saved_shock["member_settings"][0]["auto_pension_monthly"] is False
     assert saved_shock["member_settings"][1]["auto_pension_monthly"] is True

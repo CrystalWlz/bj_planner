@@ -896,6 +896,14 @@ option {
   gap: 10px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .member-list {
   display: flex;
   flex-direction: column;
@@ -997,11 +1005,20 @@ option {
   padding: 10px;
 }
 
+.synthetic-stage-row {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+}
+
 .stage-row .member-card-head {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) minmax(260px, 1fr) auto;
   align-items: start;
   margin-bottom: 8px;
+}
+
+.synthetic-stage-row .member-card-head {
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1fr);
 }
 
 .stage-row .member-card-head .icon-button {

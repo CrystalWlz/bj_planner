@@ -62,6 +62,7 @@ import type {
   CareerShockData,
   CommercialPrepaymentMode,
   ElderlyDependentData,
+  HouseholdExpenseStageData,
   HouseholdData,
   IncomeMember,
   IncomeStageData,
@@ -329,12 +330,36 @@ const defaultScheduledExpenses: ScheduledExpenseData[] = [
   {
     name: "定时支出",
     monthly_amount: 0,
+    frequency: "monthly",
+    annual_occurrence_month: 1,
     start_month: "2026-07",
     end_month: null,
     tax_deductible_elderly_care: false,
     notes: ""
   }
 ];
+
+const defaultAnnualScheduledExpense: ScheduledExpenseData = {
+  name: "数码产品支出",
+  monthly_amount: 10000,
+  frequency: "annual_once",
+  annual_occurrence_month: 6,
+  start_month: "2026-06",
+  end_month: null,
+  tax_deductible_elderly_care: false,
+  notes: "一年一次的大额家庭消费支出，只在指定月份进入现金流。"
+};
+
+const defaultHouseholdExpenseStage: HouseholdExpenseStageData = {
+  name: "当前家庭支出",
+  start_month: "2026-07",
+  end_month: null,
+  base_living_expense: 0,
+  other_fixed_debt_payment: 0,
+  rent_amount: 0,
+  rent_payment_mode: "cash",
+  rent_payment_frequency: "monthly"
+};
 
 function defaultRetirementCategoryForMember(index: number): IncomeMember["retirement_category"] {
   return index === 0 ? "male_60" : "female_55";
@@ -411,10 +436,18 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
     const retirementCategory = member.retirement_category ?? defaultRetirementCategoryForMember(index);
     return {
       ...member,
+      family_join_month: member.family_join_month ?? "2026-07",
       birth_month: birthMonth,
       current_age: ageYearsFromBirthMonth(birthMonth) ?? member.current_age ?? 30,
       retirement_category: retirementCategory,
-      provident_account_management_center: member.provident_account_management_center ?? "beijing_municipal",
+      social_security_months: member.social_security_months ?? 0,
+      income_tax_months: member.income_tax_months ?? 0,
+      existing_home_count: member.existing_home_count ?? 0,
+      existing_mortgage_count: member.existing_mortgage_count ?? 0,
+      initial_cash_balance: member.initial_cash_balance ?? 0,
+      initial_investments: member.initial_investments ?? 0,
+      initial_other_asset_value: member.initial_other_asset_value ?? 0,
+      initial_other_debt_balance: member.initial_other_debt_balance ?? 0,
       provident_fund_balance: member.provident_fund_balance ?? 0
     };
   });
@@ -445,7 +478,26 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         prepayment_allowed_after_month: loan.prepayment_allowed_after_month ?? 1,
         prepayment_monthly_amount: loan.prepayment_monthly_amount ?? 0
       })),
-      scheduled_expenses: record.data.scheduled_expenses ?? [],
+      scheduled_expenses: (record.data.scheduled_expenses ?? []).map((expense) => ({
+        ...expense,
+        frequency: expense.frequency ?? "monthly",
+        annual_occurrence_month: expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1)
+      })),
+      household_expense_stages: (record.data.household_expense_stages?.length
+        ? record.data.household_expense_stages
+        : [{
+            ...defaultHouseholdExpenseStage,
+            base_living_expense: record.data.monthly_expense ?? 0,
+            other_fixed_debt_payment: record.data.monthly_debt_payment ?? 0,
+            rent_amount: record.data.monthly_rent_from_housing_fund ?? 0,
+            rent_payment_mode: (record.data.monthly_rent_from_housing_fund ?? 0) > 0 ? "provident" : "cash",
+            rent_payment_frequency: "monthly"
+          }]
+      ).map((stage) => ({
+        ...stage,
+        rent_payment_mode: (stage.rent_payment_mode === "provident" ? "provident" : "cash") as HouseholdExpenseStageData["rent_payment_mode"],
+        rent_payment_frequency: (stage.rent_payment_frequency === "quarterly" ? "quarterly" : "monthly") as HouseholdExpenseStageData["rent_payment_frequency"]
+      })),
       elderly_dependents: record.data.elderly_dependents ?? [],
       borrower_member_index: record.data.borrower_member_index ?? 0,
       family_provident_support_enabled: record.data.family_provident_support_enabled ?? false,
@@ -456,7 +508,9 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
       family_provident_monthly_salary: record.data.family_provident_monthly_salary ?? 0,
       family_provident_total_rate: record.data.family_provident_total_rate ?? 0.24,
       investment_buy_fee_rate: record.data.investment_buy_fee_rate ?? 0.0015,
-      investment_sell_fee_rate: record.data.investment_sell_fee_rate ?? 0.005
+      investment_sell_fee_rate: record.data.investment_sell_fee_rate ?? 0.005,
+      investment_taxable_return_ratio: record.data.investment_taxable_return_ratio ?? 0,
+      investment_return_tax_rate: record.data.investment_return_tax_rate ?? 0
     }
   };
 }
@@ -585,7 +639,6 @@ function purchaseStrategyDetails(plan: PurchasePlanAnalysis): string[] {
 
 const parameterExplanations: Record<string, string> = {
   家庭名称: "仅用于区分方案，不参与计算。建议写成便于识别的版本，例如“当前家庭基准版”。",
-  "租房提取公积金/月": "购房前按租房提取公积金的月均额度录入；现金流和可视化里按季度到账处理，不是工资公积金缴存额。",
   亲属首付支持: "可选情景：亲属用积蓄或符合条件的异地公积金帮助首付。积蓄支持按可支持金额计入；公积金支持按新房场景和账户余额增长估算，启用前应按实际政策核验。",
   支持资金来源: "选择亲属支持来自普通积蓄还是公积金账户。普通积蓄不受新房/二手房性质限制；公积金支持会按当前规则更保守地只在符合条件的新房里计入。",
   可支持首付金额: "亲属愿意且能够在购房交易时拿出的积蓄金额，用来减少家庭自己需要覆盖的交易现金。",
@@ -598,12 +651,21 @@ const parameterExplanations: Record<string, string> = {
   测算年化: "对投资资产使用的预期年化收益率，不是保证收益。风险越高，建议同时保留更厚现金垫。",
   预估年收益: "按当前投资资产和测算年化粗略估算的一年收益，用于直觉参考。",
   折合月收益: "把预估年收益平均到每个月，仅用于展示；真实收益会波动。",
+  应税收益比例: "理财收益中需要纳税的比例。默认 0，表示暂不对投资收益扣税；如果某类产品收益需要纳税，可在这里设置。",
+  理财收益税率: "对上方应税收益部分采用的估算税率。后端会从投资收益中扣除，不计入工资个税。",
   当前可动用现金: "今天可随时用于首付、应急和日常支出的现金，不包含已投入理财的资产。",
   基础月支出: "从现在起每月固定发生的生活支出，不含家庭支持支出、房贷、车贷和已有贷款等单独项目。",
+  家庭支出阶段: "家庭支出按阶段生效，用来模拟搬家、租房变化、赡养支出变化或生活方式变化。",
+  租房月支出: "该阶段每月租金。现金支付会进入现金家庭支出；公积金余额支付会进入公积金租房提取。",
+  租房支付方式: "现金付房租会直接消耗现金；公积金余额付房租按所选支付频率进入公积金账户租房提取，不作为工资现金收入。",
+  租房支付频率: "月付表示每月发生一次；季付表示从阶段开始月起每 3 个月支付 3 个月租金。",
   当前实际月支出: "基础月支出加上当前已经生效的定时支出，用于判断现金安全垫。",
   "其他固定还款/月": "除下方单独建模的已有贷款外，每月固定发生但暂不推导余额的还款；已有贷款会自动加进测算。",
   支出名称: "定时支出的名称，会直接显示在月现金流里，例如家庭支持支出。",
+  发生频率: "选择这项支出是每月发生，还是每年固定月份一次性发生。年度一次性支出不会被月均摊。",
   定时月支出: "从开始月份起每月发生的额外家庭支出。用于现金流，不一定能抵扣个税。",
+  支出金额: "这项支出在对应频率下发生的单次金额。每月支出每月扣除；一年一次支出只在指定月份扣除。",
+  年度发生月份: "一年一次支出的发生月份，例如每年 6 月购买数码产品。",
   开始月份: "该项支出从哪个月份开始计入现金流。",
   结束月份: "可选；填了以后，结束月份之后不再计入现金流。",
   归属成员: "老人专项扣除归属于哪位收入成员。按政策通常只能扣自己的父母，不能夫妻互转。",
@@ -611,6 +673,16 @@ const parameterExplanations: Record<string, string> = {
   出生月份: "用于判断老人满 60 周岁的月份；系统从满 60 周岁当月开始计算赡养老人专项附加扣除。",
   本人分摊扣除: "非独生子女时本人每月可申报的分摊额，个人上限通常为 1500 元/月。",
   成员名称: "收入成员名称。老人专项扣除、工资阶段和可视化明细会按这个名称关联。",
+  加入家庭月份: "该成员从哪个月份进入当前家庭财务共同体；后续会用于区分加入前后的账户和资产负债状态。",
+  社保月数: "该成员已累计的社保缴纳月数，用于购房资格、失业金待遇期限等政策判断。",
+  个税月数: "该成员已累计的个税缴纳月数；家庭资格展示会和社保月数一起取更有利的有效月数。",
+  已有住房套数: "该成员名下已有住房套数。家庭画像会按成员汇总展示，并影响购房资格、首套/二套和贷款策略。",
+  已有房贷笔数: "该成员名下仍计入政策判断的房贷笔数。家庭画像会按成员汇总展示。",
+  加入时现金: "成员加入家庭财务共同体时带入的现金账户余额。填写成员值后，后端会优先用成员合计作为家庭初始现金。",
+  加入时投资资产: "成员加入时带入的投资账户余额。填写成员值后，后端会优先用成员合计作为家庭初始投资账户。",
+  加入时公积金余额: "成员加入时的住房公积金账户余额。后端会按成员账户分别计算缴存、利息、提取和还贷。",
+  加入时其他资产: "不属于现金、投资、公积金的其他资产备注性金额，例如已持有车辆或其他可估值资产。",
+  加入时其他负债: "加入家庭时已有但未在“已有贷款”中细分建模的其他负债余额，仅用于画像和后续资产负债扩展。",
   阶段名称: "工资阶段的名称，例如当前收入、换工作后。用于识别不同收入时期。",
   阶段类型: "选择这一段收入的性质。工资就业会按工资薪金自动扣社保、公积金和个税；失业期、自由职业和养老金阶段会按你填写或系统生成的收入项测算。",
   开始日期: "该工资阶段从哪天开始生效；税费和公积金会按月份匹配阶段。",
@@ -623,7 +695,7 @@ const parameterExplanations: Record<string, string> = {
   "非税收入/月": "每月进入现金流但不并入工资薪金计税的收入，例如失业金、基础养老金等估算项。",
   "额外现金支出/月": "该收入阶段每月额外发生、但不属于社保公积金扣缴的现金支出。灵活就业自缴社保和自缴公积金请使用专门字段，避免重复计算。",
   工资社保扣缴: "开启时按工资薪金自动估算北京社保、公积金和个税；失业金、养老金等阶段应关闭。",
-  公积金中心口径: "该成员住房公积金账户归属口径。市管和国管贷后还款规则不同，购房策略会优先按借款申请人的口径自动选择按月抵月供或半年度冲本金。",
+  公积金中心口径: "该收入阶段对应工作单位的公积金管理口径。换工作后可在新阶段改为市管或国管，购房策略会按借款申请人在买房月份生效的阶段选择还贷规则。",
   个人公积金比例: "个人缴纳住房公积金比例，会减少税后现金但增加公积金账户余额。",
   单位公积金比例: "单位缴纳住房公积金比例，会进入公积金账户，但不是当月现金工资。",
   "专项附加/月": "除赡养老人外的每月专项附加扣除，例如子女教育、住房租金等。",
@@ -890,11 +962,26 @@ function birthMonthFromAge(age: number, today = new Date()) {
 }
 
 function householdExpenseAt(household: HouseholdData, baseDate: Date, monthsFromNow = 0) {
+  const stage = householdExpenseStageAt(household, baseDate, monthsFromNow);
+  const baseLivingExpense = stage?.base_living_expense ?? household.monthly_expense;
+  const rentCashExpense = stage?.rent_payment_mode === "cash" ? rentStagePaymentAt(stage, baseDate, monthsFromNow) : 0;
   return Math.max(
     0,
-    household.monthly_expense +
+    baseLivingExpense +
+      rentCashExpense +
       scheduledExpenseRowsAt(household, baseDate, monthsFromNow).reduce((sum, item) => sum + item.amount, 0)
   );
+}
+
+function rentStagePaymentAt(stage: HouseholdExpenseStageData, baseDate: Date, monthsFromNow = 0) {
+  const monthlyRent = Math.max(0, stage.rent_amount ?? 0);
+  if ((stage.rent_payment_frequency ?? "monthly") !== "quarterly") return monthlyRent;
+  const start = parseMonthValue(stage.start_month);
+  if (!start) return monthlyRent * 3;
+  const targetDate = addMonths(baseDate, monthsFromNow);
+  const targetMonth = { year: targetDate.getFullYear(), month: targetDate.getMonth() + 1 };
+  const elapsed = (targetMonth.year - start.year) * 12 + (targetMonth.month - start.month);
+  return elapsed >= 0 && elapsed % 3 === 0 ? monthlyRent * 3 : 0;
 }
 
 function scheduledExpenseRowsAt(household: HouseholdData, baseDate: Date, monthsFromNow = 0) {
@@ -905,9 +992,22 @@ function scheduledExpenseRowsAt(household: HouseholdData, baseDate: Date, months
     const end = parseMonthValue(item.end_month);
     if (!start || compareMonth(targetMonth, start) < 0) return [];
     if (end && compareMonth(targetMonth, end) > 0) return [];
+    if ((item.frequency ?? "monthly") === "annual_once" && targetMonth.month !== (item.annual_occurrence_month ?? start.month)) return [];
     const amount = Math.max(0, item.monthly_amount);
     return amount > 0 ? [{ name: item.name || "定时支出", amount }] : [];
   });
+}
+
+function householdExpenseStageAt(household: HouseholdData, baseDate: Date, monthsFromNow = 0) {
+  const targetDate = addMonths(baseDate, monthsFromNow);
+  const targetMonth = { year: targetDate.getFullYear(), month: targetDate.getMonth() + 1 };
+  return (household.household_expense_stages ?? []).find((stage) => {
+    const start = parseMonthValue(stage.start_month);
+    const end = parseMonthValue(stage.end_month);
+    if (!start || compareMonth(targetMonth, start) < 0) return false;
+    if (end && compareMonth(targetMonth, end) > 0) return false;
+    return true;
+  }) ?? null;
 }
 
 function elderlyDeductionStartMonth(dependent: ElderlyDependentData) {
@@ -979,6 +1079,7 @@ function incomeStageFromMember(member: IncomeMember): IncomeStageData {
     stage_kind: "salary",
     start_date: member.employment_start_date || "2026-07-01",
     end_date: null,
+    provident_account_management_center: "beijing_municipal",
     monthly_salary_gross: member.monthly_salary_gross,
     annual_bonus: member.annual_bonus,
     annual_bonus_payout_month: 4,
@@ -1002,6 +1103,7 @@ function incomeStagesForMember(member: IncomeMember) {
   return stages.map((stage) => ({
     ...stage,
     stage_kind: stage.stage_kind ?? "salary",
+    provident_account_management_center: stage.provident_account_management_center ?? "beijing_municipal",
     annual_bonus_payout_month: stage.annual_bonus_payout_month ?? 4,
     monthly_freelance_income: stage.monthly_freelance_income ?? 0,
     monthly_non_taxable_income: stage.monthly_non_taxable_income ?? 0,
@@ -1090,6 +1192,9 @@ export function App() {
   const carPlan = household?.data.car_plan ?? defaultCarPlan;
   const phasedLoans = household?.data.phased_loans ?? [];
   const scheduledExpenses = household?.data.scheduled_expenses ?? [];
+  const householdExpenseStages = household?.data.household_expense_stages?.length
+    ? household.data.household_expense_stages
+    : [defaultHouseholdExpenseStage];
   const elderlyDependents = household?.data.elderly_dependents ?? [];
   const selectedPlanVariant = selectedScenario
     ? selectedScenario.data.selected_purchase_plan_variant || selectedPlanVariants[selectedScenario.id] || ""
@@ -1186,10 +1291,18 @@ export function App() {
     if (!household) return;
     const nextMember: IncomeMember = {
       name: `成员 ${incomeMembers.length + 1}`,
+      family_join_month: "2026-07",
       birth_month: "",
       current_age: 30,
       retirement_category: defaultRetirementCategoryForMember(incomeMembers.length),
-      provident_account_management_center: "beijing_municipal",
+      social_security_months: 0,
+      income_tax_months: 0,
+      existing_home_count: 0,
+      existing_mortgage_count: 0,
+      initial_cash_balance: 0,
+      initial_investments: 0,
+      initial_other_asset_value: 0,
+      initial_other_debt_balance: 0,
       provident_fund_balance: 0,
       monthly_salary_gross: 0,
       annual_bonus: 0,
@@ -1204,10 +1317,18 @@ export function App() {
       bonus_tax_method: "best",
       income_stages: [incomeStageFromMember({
         name: `成员 ${incomeMembers.length + 1}`,
+        family_join_month: "2026-07",
         birth_month: "",
         current_age: 30,
         retirement_category: defaultRetirementCategoryForMember(incomeMembers.length),
-        provident_account_management_center: "beijing_municipal",
+        social_security_months: 0,
+        income_tax_months: 0,
+        existing_home_count: 0,
+        existing_mortgage_count: 0,
+        initial_cash_balance: 0,
+        initial_investments: 0,
+        initial_other_asset_value: 0,
+        initial_other_debt_balance: 0,
         provident_fund_balance: 0,
         monthly_salary_gross: 0,
         annual_bonus: 0,
@@ -1298,7 +1419,11 @@ export function App() {
   const removePhasedLoan = (index: number) => updateHousehold("phased_loans", phasedLoans.filter((_, itemIndex) => itemIndex !== index));
   const updateScheduledExpense = <K extends keyof ScheduledExpenseData>(index: number, key: K, value: ScheduledExpenseData[K]) => updateHousehold("scheduled_expenses", updateArrayItem(scheduledExpenses, index, key, value));
   const addScheduledExpense = () => updateHousehold("scheduled_expenses", [...scheduledExpenses, ...defaultScheduledExpenses]);
+  const addAnnualScheduledExpense = () => updateHousehold("scheduled_expenses", [...scheduledExpenses, defaultAnnualScheduledExpense]);
   const removeScheduledExpense = (index: number) => updateHousehold("scheduled_expenses", scheduledExpenses.filter((_, itemIndex) => itemIndex !== index));
+  const updateHouseholdExpenseStage = <K extends keyof HouseholdExpenseStageData>(index: number, key: K, value: HouseholdExpenseStageData[K]) => updateHousehold("household_expense_stages", updateArrayItem(householdExpenseStages, index, key, value));
+  const addHouseholdExpenseStage = () => updateHousehold("household_expense_stages", [...householdExpenseStages, { ...defaultHouseholdExpenseStage, name: `家庭支出阶段 ${householdExpenseStages.length + 1}` }]);
+  const removeHouseholdExpenseStage = (index: number) => updateHousehold("household_expense_stages", householdExpenseStages.filter((_, itemIndex) => itemIndex !== index));
   const updateElderlyDependent = <K extends keyof ElderlyDependentData>(index: number, key: K, value: ElderlyDependentData[K]) => updateHousehold("elderly_dependents", updateArrayItem(elderlyDependents, index, key, value));
   const addElderlyDependent = () => updateHousehold("elderly_dependents", [...elderlyDependents, { member_name: incomeMembers[0]?.name ?? "成员 1", relationship_label: "直系亲属老人", birth_month: "", is_only_child: false, shared_monthly_deduction: 1500 }]);
   const removeElderlyDependent = (index: number) => updateHousehold("elderly_dependents", elderlyDependents.filter((_, itemIndex) => itemIndex !== index));
@@ -1447,7 +1572,7 @@ export function App() {
   if (!household || !activeRulePack) return <div className="loading-screen">初始化数据缺失</div>;
 
   const pageContent = (() => {
-    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} elderlyDependents={elderlyDependents} result={result} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
+    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} householdExpenseStages={householdExpenseStages} elderlyDependents={elderlyDependents} result={result} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} addAnnualScheduledExpense={addAnnualScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateHouseholdExpenseStage={updateHouseholdExpenseStage} addHouseholdExpenseStage={addHouseholdExpenseStage} removeHouseholdExpenseStage={removeHouseholdExpenseStage} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
     if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
     if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} calculationPending={calculationPending} />;
     if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} calculationPending={calculationPending} />;
@@ -1494,6 +1619,7 @@ function IncomePage({
   incomeMembers,
   phasedLoans,
   scheduledExpenses,
+  householdExpenseStages,
   elderlyDependents,
   result,
   updateHousehold,
@@ -1509,7 +1635,11 @@ function IncomePage({
   removePhasedLoan,
   updateScheduledExpense,
   addScheduledExpense,
+  addAnnualScheduledExpense,
   removeScheduledExpense,
+  updateHouseholdExpenseStage,
+  addHouseholdExpenseStage,
+  removeHouseholdExpenseStage,
   updateElderlyDependent,
   addElderlyDependent,
   removeElderlyDependent
@@ -1519,6 +1649,7 @@ function IncomePage({
   incomeMembers: IncomeMember[];
   phasedLoans: PhasedLoanData[];
   scheduledExpenses: ScheduledExpenseData[];
+  householdExpenseStages: HouseholdExpenseStageData[];
   elderlyDependents: ElderlyDependentData[];
   result: AffordabilityResult | null;
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
@@ -1555,7 +1686,15 @@ function IncomePage({
     value: ScheduledExpenseData[K]
   ) => void;
   addScheduledExpense: () => void;
+  addAnnualScheduledExpense: () => void;
   removeScheduledExpense: (index: number) => void;
+  updateHouseholdExpenseStage: <K extends keyof HouseholdExpenseStageData>(
+    index: number,
+    key: K,
+    value: HouseholdExpenseStageData[K]
+  ) => void;
+  addHouseholdExpenseStage: () => void;
+  removeHouseholdExpenseStage: (index: number) => void;
   updateElderlyDependent: <K extends keyof ElderlyDependentData>(
     index: number,
     key: K,
@@ -1607,6 +1746,16 @@ function IncomePage({
   const borrowerMemberName = borrowerMember?.name || `成员 ${normalizedBorrowerMemberIndex + 1}`;
   const borrowerDisplayAge = memberAges[normalizedBorrowerMemberIndex] ?? household.borrower_age ?? 30;
   const borrowerAgeForPolicy = Math.min(68, Math.max(18, Math.round(borrowerDisplayAge ?? household.borrower_age ?? 30)));
+  const derivedSocialSecurityMonths = Math.max(
+    household.social_security_months ?? 0,
+    ...incomeMembers.map((member) => Math.max(member.social_security_months ?? 0, member.income_tax_months ?? 0))
+  );
+  const derivedExistingHomeCount = incomeMembers.reduce((sum, member) => sum + (member.existing_home_count ?? 0), 0) || household.existing_home_count || 0;
+  const derivedExistingMortgageCount = incomeMembers.reduce((sum, member) => sum + (member.existing_mortgage_count ?? 0), 0) || household.existing_mortgage_count || 0;
+  const derivedInitialCashBalance = incomeMembers.reduce((sum, member) => sum + (member.initial_cash_balance ?? 0), 0);
+  const derivedInitialInvestments = incomeMembers.reduce((sum, member) => sum + (member.initial_investments ?? 0), 0);
+  const derivedOtherAssetValue = incomeMembers.reduce((sum, member) => sum + (member.initial_other_asset_value ?? 0), 0);
+  const derivedOtherDebtBalance = incomeMembers.reduce((sum, member) => sum + (member.initial_other_debt_balance ?? 0), 0);
   const memberCompositionText = incomeMembers.length > 0
     ? `${incomeMembers.length} 人：${incomeMembers.map((member) => member.name || "未命名成员").join("、")}`
     : "待添加成员";
@@ -1659,28 +1808,16 @@ function IncomePage({
         <span className="section-subtle-note">成员增删、出生年月和年龄在家庭画像中维护</span>
       </div>
       <div className="member-list roomy">
-        {incomeMembers.map((member, index) => (
+        {incomeMembers.map((member, index) => {
+          const shockSetting = careerShock.member_settings[index];
+          const shockProjection = careerShockProjection?.member_projections.find((item) => item.member_name === member.name);
+          return (
           <section className="member-card" key={`member-${index}`}>
             <div className="member-card-head income-member-head">
               <div>
                 <strong>{member.name || `成员 ${index + 1}`}</strong>
                 <small>{incomeStagesForMember(member).length} 个收入阶段</small>
               </div>
-              <Field label="公积金中心口径">
-                <select
-                  value={member.provident_account_management_center ?? "beijing_municipal"}
-                  onChange={(event) =>
-                    updateIncomeMember(
-                      index,
-                      "provident_account_management_center",
-                      event.target.value as IncomeMember["provident_account_management_center"]
-                    )
-                  }
-                >
-                  <option value="beijing_municipal">北京市管</option>
-                  <option value="national">中央国家机关/国管</option>
-                </select>
-              </Field>
             </div>
             <div className="member-header compact-heading">
               <strong>收入阶段</strong>
@@ -1797,6 +1934,22 @@ function IncomePage({
                         onChange={(event) => updateIncomeStage(index, stageIndex, "end_date", event.target.value || null)}
                       />
                     </Field>
+                    <Field label="公积金中心口径">
+                      <select
+                        value={stage.provident_account_management_center ?? "beijing_municipal"}
+                        onChange={(event) =>
+                          updateIncomeStage(
+                            index,
+                            stageIndex,
+                            "provident_account_management_center",
+                            event.target.value as IncomeStageData["provident_account_management_center"]
+                          )
+                        }
+                      >
+                        <option value="beijing_municipal">北京市管</option>
+                        <option value="national">中央国家机关/国管</option>
+                      </select>
+                    </Field>
                     {showsSalaryControls ? (
                       <>
                         <NumberField
@@ -1892,12 +2045,45 @@ function IncomePage({
                 </section>
                 );
               })}
+              {shockSetting?.enabled ? (
+                <section className="stage-row synthetic-stage-row" key={`member-${index}-career-shock-stage`}>
+                  <div className="member-card-head">
+                    <ReadOnlyField label="阶段名称" value={`${shockSetting.layoff_age}岁职业冲击阶段`} />
+                    <ReadOnlyField label="阶段类型" value="失业金期 + 灵活就业自缴期" />
+                  </div>
+                  <div className="form-grid">
+                    <NumberField
+                      label="裁员年龄"
+                      value={shockSetting.layoff_age}
+                      min={18}
+                      max={80}
+                      step={1}
+                      onChange={(value) => updateMemberCareerShockSetting(index, { layoff_age: value })}
+                    />
+                    <NumberField
+                      label="冲击期自由职业收入/月"
+                      value={shockSetting.freelance_income_monthly ?? 0}
+                      min={0}
+                      step={100}
+                      onChange={(value) => updateMemberCareerShockSetting(index, { freelance_income_monthly: value })}
+                    />
+                  </div>
+                  <div className="read-only-grid">
+                    <Metric label="预计裁员月份" value={shockProjection?.layoff_month ?? "等待后端计算"} tone="warn" />
+                    <Metric label="预计退休月份" value={shockProjection?.retirement_month ?? "等待后端计算"} />
+                  </div>
+                  <p className="field-hint">
+                    这是职业冲击启用后由前端展示、后端生成的特殊收入阶段。失业金、灵活就业自缴社保和自缴公积金按规则包估算；这里填写的自由职业收入会进入该阶段现金流，默认不产生。
+                  </p>
+                </section>
+              ) : null}
             </div>
             <p className="field-hint">
               默认只有一段收入；新增阶段后，后端会按各阶段实际生效月份折算税费、年终奖和公积金。五险按北京社保基数、个人养老 8%、医疗 2%+3、失业 0.5% 自动计算。
             </p>
           </section>
-        ))}
+          );
+        })}
       </div>
     </section>
   );
@@ -1921,13 +2107,6 @@ function IncomePage({
           onChange={(value) => updateHousehold("investments", value)}
         />
         <NumberField
-          label="租房提取公积金/月"
-          value={household.monthly_rent_from_housing_fund ?? 0}
-          min={0}
-          step={100}
-          onChange={(value) => updateHousehold("monthly_rent_from_housing_fund", value)}
-        />
-        <NumberField
           label="现金安全垫月数"
           value={household.required_liquidity_months ?? 6}
           step={1}
@@ -1939,20 +2118,10 @@ function IncomePage({
       <div className="account-member-balances">
         <strong className="setting-group-title">成员公积金账户快照</strong>
         <div className="form-grid two">
-          {incomeMembers.map((member, index) => (
-            <NumberField
-              key={`provident-balance-${index}`}
-              label={`${member.name || `成员 ${index + 1}`}公积金余额`}
-              value={member.provident_fund_balance ?? 0}
-              min={0}
-              step={1000}
-              onChange={(value) => updateIncomeMember(index, "provident_fund_balance", value)}
-            />
-          ))}
         </div>
       </div>
       <p className="field-hint">
-        当前可动用现金和当前投资资产是今天手动录入的资产快照；租房提取公积金按月均额度录入，但可视化和现金流按季度到账；现金安全垫月数 = 买房后希望至少保留的生活费月数。成员公积金余额在后端按成员账户分别计息、缴存、提取、按月抵月供和半年度冲本金。
+        现金和投资账户可按当前家庭合计填写；成员加入家庭时的现金、投资、公积金、其他资产和负债在家庭画像的成员卡片中维护，并会用于派生家庭资格与初始状态。租房提取公积金按月均额度录入，但可视化和现金流按季度到账。
       </p>
     </section>
   );
@@ -2018,29 +2187,9 @@ function IncomePage({
                 checked={household.has_beijing_hukou}
                 onChange={(checked) => updateHousehold("has_beijing_hukou", checked)}
               />
-              <NumberField
-                label="社保/个税月数"
-                value={household.social_security_months}
-                step={1}
-                min={0}
-                onChange={(value) => updateHousehold("social_security_months", value)}
-              />
-              <NumberField
-                label="现有住房套数"
-                value={household.existing_home_count}
-                min={0}
-                max={10}
-                step={1}
-                onChange={(value) => updateHousehold("existing_home_count", value)}
-              />
-              <NumberField
-                label="现有房贷笔数"
-                value={household.existing_mortgage_count}
-                min={0}
-                max={10}
-                step={1}
-                onChange={(value) => updateHousehold("existing_mortgage_count", value)}
-              />
+              <Metric label="社保/个税月数" value={`${derivedSocialSecurityMonths} 个月`} />
+              <Metric label="现有住房套数" value={`${derivedExistingHomeCount} 套`} />
+              <Metric label="现有房贷笔数" value={`${derivedExistingMortgageCount} 笔`} />
             </div>
           </div>
           <div className="profile-config-block">
@@ -2142,6 +2291,13 @@ function IncomePage({
                         onChange={(event) => updateIncomeMember(index, "name", event.target.value)}
                       />
                     </Field>
+                    <Field label="加入家庭月份">
+                      <input
+                        type="month"
+                        value={member.family_join_month ?? "2026-07"}
+                        onChange={(event) => updateIncomeMember(index, "family_join_month", event.target.value)}
+                      />
+                    </Field>
                     <Field label="出生年月">
                       <input
                         type="month"
@@ -2165,13 +2321,78 @@ function IncomePage({
                       <span>当前年龄</span>
                       <strong>{member.birth_month ? `${memberAges[index] ?? member.current_age ?? 30} 岁` : "填写出生年月后自动计算"}</strong>
                     </div>
+                    <NumberField
+                      label="社保月数"
+                      value={member.social_security_months ?? 0}
+                      min={0}
+                      step={1}
+                      onChange={(value) => updateIncomeMember(index, "social_security_months", value)}
+                    />
+                    <NumberField
+                      label="个税月数"
+                      value={member.income_tax_months ?? 0}
+                      min={0}
+                      step={1}
+                      onChange={(value) => updateIncomeMember(index, "income_tax_months", value)}
+                    />
+                    <NumberField
+                      label="已有住房套数"
+                      value={member.existing_home_count ?? 0}
+                      min={0}
+                      max={10}
+                      step={1}
+                      onChange={(value) => updateIncomeMember(index, "existing_home_count", value)}
+                    />
+                    <NumberField
+                      label="已有房贷笔数"
+                      value={member.existing_mortgage_count ?? 0}
+                      min={0}
+                      max={10}
+                      step={1}
+                      onChange={(value) => updateIncomeMember(index, "existing_mortgage_count", value)}
+                    />
+                    <NumberField
+                      label="加入时现金"
+                      value={member.initial_cash_balance ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateIncomeMember(index, "initial_cash_balance", value)}
+                    />
+                    <NumberField
+                      label="加入时投资资产"
+                      value={member.initial_investments ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateIncomeMember(index, "initial_investments", value)}
+                    />
+                    <NumberField
+                      label="加入时公积金余额"
+                      value={member.provident_fund_balance ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateIncomeMember(index, "provident_fund_balance", value)}
+                    />
+                    <NumberField
+                      label="加入时其他资产"
+                      value={member.initial_other_asset_value ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateIncomeMember(index, "initial_other_asset_value", value)}
+                    />
+                    <NumberField
+                      label="加入时其他负债"
+                      value={member.initial_other_debt_balance ?? 0}
+                      min={0}
+                      step={1000}
+                      onChange={(value) => updateIncomeMember(index, "initial_other_debt_balance", value)}
+                    />
                   </div>
                 </section>
               ))}
             </div>
           </div>
           <p className="field-hint">
-            家庭画像先维护成员组成、出生年月和购房资格参数；收入、支出、账户和负债在下方按财务工作流分区维护。借款申请人年龄会自动跟随所选成员。
+            家庭画像先维护成员组成、出生年月、加入家庭时间以及加入时资产负债；家庭社保/个税月数、已有住房和已有房贷会从成员信息汇总显示。借款申请人年龄会自动跟随所选成员。
           </p>
         </section>
       </div>
@@ -2182,33 +2403,112 @@ function IncomePage({
       <section className="form-panel income-workbench-card expense-panel">
         <div className="member-header">
           <PanelTitle icon={<WalletCards size={18} />} title="家庭支出" />
-          <button className="ghost-button" onClick={addScheduledExpense}>
-            <Plus size={16} /> 新增定时支出
-          </button>
+          <div className="header-actions">
+            <button className="ghost-button" onClick={addHouseholdExpenseStage}>
+              <Plus size={16} /> 新增支出阶段
+            </button>
+            <button className="ghost-button" onClick={addScheduledExpense}>
+              <Plus size={16} /> 新增每月支出
+            </button>
+            <button className="ghost-button" onClick={addAnnualScheduledExpense}>
+              <Plus size={16} /> 新增年度支出
+            </button>
+          </div>
         </div>
         <div className="loan-summary-strip">
-          <Metric label="基础月支出" value={money(household.monthly_expense)} />
+          <Metric label="当前阶段基础支出" value={money(householdExpenseStageAt(household, new Date())?.base_living_expense ?? household.monthly_expense)} />
           <Metric label="当前实际月支出" value={money(currentMonthlyExpense)} />
           <Metric
-            label="定时月支出"
-            value={money(Math.max(0, currentMonthlyExpense - household.monthly_expense))}
+            label="本月定时支出"
+            value={money(Math.max(0, currentMonthlyExpense - (householdExpenseStageAt(household, new Date())?.base_living_expense ?? household.monthly_expense)))}
           />
         </div>
-        <div className="form-grid">
-          <NumberField
-            label="基础月支出"
-            value={household.monthly_expense}
-            min={0}
-            step={100}
-            onChange={(value) => updateHousehold("monthly_expense", value)}
-          />
-          <NumberField
-            label="其他固定还款/月"
-            value={household.monthly_debt_payment}
-            min={0}
-            step={100}
-            onChange={(value) => updateHousehold("monthly_debt_payment", value)}
-          />
+        <div className="member-list compact-list">
+          {householdExpenseStages.map((stage, index) => (
+            <section className="member-card loan-card" key={`household-expense-stage-${index}`}>
+              <div className="member-card-head">
+                <strong>{stage.name || `家庭支出阶段 ${index + 1}`}</strong>
+                <button
+                  className="icon-button"
+                  onClick={() => removeHouseholdExpenseStage(index)}
+                  disabled={householdExpenseStages.length <= 1}
+                  aria-label="删除家庭支出阶段"
+                  type="button"
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
+              <div className="form-grid">
+                <Field label="阶段名称">
+                  <input
+                    value={stage.name}
+                    onChange={(event) => updateHouseholdExpenseStage(index, "name", event.target.value)}
+                  />
+                </Field>
+                <Field label="开始月份">
+                  <input
+                    type="month"
+                    value={stage.start_month}
+                    onChange={(event) => updateHouseholdExpenseStage(index, "start_month", event.target.value)}
+                  />
+                </Field>
+                <Field label="结束月份">
+                  <input
+                    type="month"
+                    value={stage.end_month ?? ""}
+                    onChange={(event) => updateHouseholdExpenseStage(index, "end_month", event.target.value || null)}
+                  />
+                </Field>
+                <NumberField
+                  label="基础月支出"
+                  value={stage.base_living_expense}
+                  min={0}
+                  step={100}
+                  onChange={(value) => updateHouseholdExpenseStage(index, "base_living_expense", value)}
+                />
+                <NumberField
+                  label="其他固定还款/月"
+                  value={stage.other_fixed_debt_payment}
+                  min={0}
+                  step={100}
+                  onChange={(value) => updateHouseholdExpenseStage(index, "other_fixed_debt_payment", value)}
+                />
+                <NumberField
+                  label="租房月支出"
+                  value={stage.rent_amount}
+                  min={0}
+                  step={100}
+                  onChange={(value) => updateHouseholdExpenseStage(index, "rent_amount", value)}
+                />
+                <Field label="租房支付方式">
+                  <select
+                    value={stage.rent_payment_mode}
+                    onChange={(event) => updateHouseholdExpenseStage(index, "rent_payment_mode", event.target.value as HouseholdExpenseStageData["rent_payment_mode"])}
+                  >
+                    <option value="cash">现金付房租</option>
+                    <option value="provident">公积金余额付房租</option>
+                  </select>
+                </Field>
+                <Field label="租房支付频率">
+                  <select
+                    value={stage.rent_payment_frequency ?? "monthly"}
+                    onChange={(event) => updateHouseholdExpenseStage(index, "rent_payment_frequency", event.target.value as HouseholdExpenseStageData["rent_payment_frequency"])}
+                  >
+                    <option value="monthly">月付</option>
+                    <option value="quarterly">季付</option>
+                  </select>
+                </Field>
+              </div>
+              <p className="expense-note-display">
+                {stage.rent_payment_mode === "provident"
+                  ? `该阶段租房支出按公积金租房提取处理，后端按${stage.rent_payment_frequency === "quarterly" ? "季付" : "月付"}节奏进入公积金账户流水，不计为现金生活支出。`
+                  : `该阶段租房支出按${stage.rent_payment_frequency === "quarterly" ? "季付" : "月付"}节奏进入现金家庭支出。`}
+              </p>
+            </section>
+          ))}
+        </div>
+        <div className="member-header compact-heading">
+          <strong>定时额外支出</strong>
         </div>
         <div className="member-list compact-list">
           {scheduledExpenses.map((expense, index) => (
@@ -2231,13 +2531,35 @@ function IncomePage({
                     onChange={(event) => updateScheduledExpense(index, "name", event.target.value)}
                   />
                 </Field>
+                <Field label="发生频率">
+                  <select
+                    value={expense.frequency ?? "monthly"}
+                    onChange={(event) => {
+                      const frequency = event.target.value as ScheduledExpenseData["frequency"];
+                      updateScheduledExpense(index, "frequency", frequency);
+                    }}
+                  >
+                    <option value="monthly">每月发生</option>
+                    <option value="annual_once">一年一次</option>
+                  </select>
+                </Field>
                 <NumberField
-                  label="每月金额"
+                  label={(expense.frequency ?? "monthly") === "annual_once" ? "单次金额" : "每月金额"}
                   value={expense.monthly_amount}
                   min={0}
                   step={100}
                   onChange={(value) => updateScheduledExpense(index, "monthly_amount", value)}
                 />
+                {(expense.frequency ?? "monthly") === "annual_once" ? (
+                  <NumberField
+                    label="年度发生月份"
+                    value={expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1)}
+                    min={1}
+                    max={12}
+                    step={1}
+                    onChange={(value) => updateScheduledExpense(index, "annual_occurrence_month", Math.max(1, Math.min(12, Math.round(value || 1))))}
+                  />
+                ) : null}
                 <Field label="开始月份">
                   <input
                     type="month"
@@ -2260,7 +2582,7 @@ function IncomePage({
           ))}
         </div>
         <p className="field-hint">
-          基础月支出从现在起计入现金流；定时支出只在开始月份后计入。家庭支持支出本身只影响现金流；老人专项附加扣除由下方“赡养老人专项扣除”的出生月份、归属成员和分摊方式自动判断，{elderlyPolicyStatus.detail}
+          家庭基础支出、其他固定还款和租房支出都按阶段生效。现金付房租会进入现金家庭支出；公积金余额付房租会按租房提取口径进入公积金账户流水。每月额外支出从开始月份后逐月计入，年度一次性支出只在指定月份扣除，不会平均摊到每个月。家庭支持支出本身只影响现金流；老人专项附加扣除由下方“赡养老人专项扣除”的出生月份、归属成员和分摊方式自动判断，{elderlyPolicyStatus.detail}
         </p>
       </section>
 
@@ -2363,18 +2685,6 @@ function IncomePage({
                   />
                 </div>
                 <div className="form-grid structured-settings career-member-settings">
-                  {setting.enabled ? (
-                    <>
-                      <NumberField label="裁员年龄" value={setting.layoff_age} min={18} max={80} step={1} onChange={(value) => updateMemberCareerShockSetting(index, { layoff_age: value })} />
-                      <NumberField
-                        label="冲击期自由职业收入/月"
-                        value={setting.freelance_income_monthly ?? 0}
-                        min={0}
-                        step={100}
-                        onChange={(value) => updateMemberCareerShockSetting(index, { freelance_income_monthly: value })}
-                      />
-                    </>
-                  ) : null}
                   <SwitchField
                     label="自动估算养老金"
                     checked={setting.auto_pension_monthly ?? true}
@@ -2819,7 +3129,7 @@ function InvestmentPlanPage({
           </article>
           <article>
             <strong>3. 最后看买房前后影响</strong>
-            <span>买入手续费从定投资金扣除，收益留在投资账户复利；交易月需要变现时，后端再扣除卖出手续费。</span>
+            <span>买入手续费、卖出手续费和可配置的理财收益税都由后端进入账户推演；默认税率为 0，不臆造具体产品税负。</span>
           </article>
         </div>
         <div className="investment-layout">
@@ -2858,6 +3168,8 @@ function InvestmentPlanPage({
               <NumberField label="测算年化" value={scenario.annual_investment_return ?? 0.025} min={-0.5} max={0.5} step={0.001} onChange={updateManualInvestmentAnnualReturn} />
               <NumberField label="买入手续费率" value={household.investment_buy_fee_rate ?? 0.0015} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_buy_fee_rate", value)} />
               <NumberField label="卖出手续费率" value={household.investment_sell_fee_rate ?? 0.005} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_sell_fee_rate", value)} />
+              <NumberField label="应税收益比例" value={household.investment_taxable_return_ratio ?? 0} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_taxable_return_ratio", value)} />
+              <NumberField label="理财收益税率" value={household.investment_return_tax_rate ?? 0} min={0} max={1} step={0.01} onChange={(value) => updateManualInvestmentHousehold("investment_return_tax_rate", value)} />
             </div>
             <SwitchField
               label="自动再平衡"
@@ -2867,7 +3179,7 @@ function InvestmentPlanPage({
               className="section-switch"
             />
             <p className="field-hint">
-              达到现金安全垫后，系统会把超过安全垫的闲置现金按 12 个月节奏追加到定投；买入手续费从定投资金里扣除，理财收益留在投资资产里继续复利，买房变现时再扣卖出手续费。
+              达到现金安全垫后，系统会把超过安全垫的闲置现金按 12 个月节奏追加到定投；买入手续费从定投资金里扣除，税后理财收益留在投资资产里继续复利，买房变现时再扣卖出手续费。理财收益税默认 0，只有在你明确设置应税比例和税率时才扣。
             </p>
           </section>
           <section className="investment-allocation">
@@ -2888,6 +3200,7 @@ function InvestmentPlanPage({
               <Row label="实际本月定投" value={money(currentInvestmentAllocation.total_investment)} />
               <Row label="买入手续费率" value={percent(household.investment_buy_fee_rate ?? 0.0015)} />
               <Row label="卖出手续费率" value={percent(household.investment_sell_fee_rate ?? 0.005)} />
+              <Row label="理财收益税" value={`${percent(household.investment_taxable_return_ratio ?? 0)} 应税 × ${percent(household.investment_return_tax_rate ?? 0)} 税率`} />
               <Row label="月定投占结余" value={currentInvestmentAllocation.monthly_surplus > 0 ? percent(currentInvestmentAllocation.total_investment / currentInvestmentAllocation.monthly_surplus) : "0.0%"} />
               <Row label="当前采用" value={activeRecommendation?.variant ?? "手动设置"} />
             </div>
@@ -3221,7 +3534,7 @@ function ScenarioPage({
                   </button>
                   <div className="planning-goal-actions">
                     <button className="ghost-button small" type="button" onClick={() => firstScenario && setSelectedScenarioId(firstScenario.id)}>
-                      编辑
+                      选择需求
                     </button>
                     <button className="ghost-button small" type="button" onClick={() => addPropertyCandidate(group.sequence)}>
                       <Plus size={14} /> 候选
@@ -3240,52 +3553,9 @@ function ScenarioPage({
           {calculationPending ? (
             <p className="goal-updating-note">购房需求已更新，正在重新生成候选房源对比与贷款策略。</p>
           ) : null}
-          <div className="vehicle-source-toolbar property-source-toolbar">
-            <strong>{demandLabel(selectedDemand.sequence)}的候选房源</strong>
-            <button className="ghost-button small" type="button" onClick={() => addPropertyCandidate(selectedDemand.sequence)}>
-              <Plus size={14} /> 添加候选房源
-            </button>
-          </div>
-          <div className="vehicle-source-grid property-source-grid">
-            {selectedDemandScenarios.map((item, candidateIndex) => (
-              <article className={item.id === selectedScenario.id ? "vehicle-source-card active" : "vehicle-source-card"} key={item.id}>
-                <div className="vehicle-source-head">
-                  <button type="button" className="planning-goal-select compact-select" onClick={() => setSelectedScenarioId(item.id)}>
-                    <span className={item.data.enabled ? "goal-status enabled" : "goal-status paused"}>
-                      {item.data.enabled ? "纳入规划" : "已停用"}
-                    </span>
-                    <strong>{item.data.name || candidateLabel(candidateIndex)}</strong>
-                    <small>{money(item.data.total_price)} · {item.data.property_type}</small>
-                  </button>
-                  <button className="ghost-button small danger-action" type="button" onClick={() => void removeScenario(item.id)} aria-label={`删除候选房源 ${item.data.name}`}>
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-                <div className="planning-goal-actions">
-                  <button className="ghost-button small" type="button" onClick={() => setSelectedScenarioId(item.id)}>
-                    编辑
-                  </button>
-                  <button className="ghost-button small" type="button" onClick={() => duplicatePropertyCandidate(item)}>
-                    <Copy size={14} /> 复制
-                  </button>
-                  <button className="ghost-button small" type="button" onClick={() => updateScenarioRecord(item.id, { enabled: !item.data.enabled })}>
-                    {item.data.enabled ? "停用" : "启用"}
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
-          {selectedDemandScenarios.length === 0 ? (
-            <div className="empty-state compact-empty-state">
-              <span>这个购房需求还没有候选房源。</span>
-              <button className="primary-button" type="button" onClick={() => addPropertyCandidate(selectedDemand.sequence)}>
-                <Plus size={16} /> 添加候选房源
-              </button>
-            </div>
-          ) : null}
-          <div className="side-form structured-settings">
+          <div className="side-form structured-settings demand-settings-panel">
             <section className="setting-group">
-              <strong className="setting-group-title">购房需求</strong>
+              <strong className="setting-group-title">购房需求设定</strong>
               <div className="form-grid two">
                 <SwitchField
                   label={selectedDemandScenarios.some((item) => item.data.enabled) ? "纳入当前规划" : "暂不纳入规划"}
@@ -3321,7 +3591,51 @@ function ScenarioPage({
                 </Field>
               </div>
             </section>
-
+          </div>
+          <div className="vehicle-source-toolbar property-source-toolbar">
+            <strong>{demandLabel(selectedDemand.sequence)}的候选房源</strong>
+            <button className="ghost-button small" type="button" onClick={() => addPropertyCandidate(selectedDemand.sequence)}>
+              <Plus size={14} /> 添加候选房源
+            </button>
+          </div>
+          <div className="vehicle-source-grid property-source-grid">
+            {selectedDemandScenarios.map((item, candidateIndex) => (
+              <article className={item.id === selectedScenario.id ? "vehicle-source-card active" : "vehicle-source-card"} key={item.id}>
+                <div className="vehicle-source-head">
+                  <button type="button" className="planning-goal-select compact-select" onClick={() => setSelectedScenarioId(item.id)}>
+                    <span className={item.data.enabled ? "goal-status enabled" : "goal-status paused"}>
+                      {item.data.enabled ? "纳入规划" : "已停用"}
+                    </span>
+                    <strong>{item.data.name || candidateLabel(candidateIndex)}</strong>
+                    <small>{money(item.data.total_price)} · {item.data.property_type}</small>
+                  </button>
+                  <button className="ghost-button small danger-action" type="button" onClick={() => void removeScenario(item.id)} aria-label={`删除候选房源 ${item.data.name}`}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+                <div className="planning-goal-actions">
+                  <button className="ghost-button small" type="button" onClick={() => setSelectedScenarioId(item.id)}>
+                    选择房源
+                  </button>
+                  <button className="ghost-button small" type="button" onClick={() => duplicatePropertyCandidate(item)}>
+                    <Copy size={14} /> 复制
+                  </button>
+                  <button className="ghost-button small" type="button" onClick={() => updateScenarioRecord(item.id, { enabled: !item.data.enabled })}>
+                    {item.data.enabled ? "停用" : "启用"}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+          {selectedDemandScenarios.length === 0 ? (
+            <div className="empty-state compact-empty-state">
+              <span>这个购房需求还没有候选房源。</span>
+              <button className="primary-button" type="button" onClick={() => addPropertyCandidate(selectedDemand.sequence)}>
+                <Plus size={16} /> 添加候选房源
+              </button>
+            </div>
+          ) : null}
+          <div className="side-form structured-settings">
             <section className="setting-group">
               <strong className="setting-group-title">候选房源身份</strong>
               <div className="form-grid two">
@@ -5133,7 +5447,7 @@ function RulePage({
         { kind: "switch", key: "provident_upfront_purchase_extract_ratio_second_hand", label: "二手房交易前可提", trueValue: 1, falseValue: 0, description: "默认关闭；二手房通常更保守，避免把审核后到账资金误认为首付现金。" },
         { kind: "number", key: "provident_post_transaction_extract_ratio", label: "交易后提取到账比例", fallback: 1, min: 0, max: 1, step: 0.05, description: "购房完成后审核通过，公积金余额可回流银行卡的估算比例。" },
         { kind: "switch", key: "provident_post_purchase_cashflow_enabled", label: "购后公积金计入现金改善", description: "默认关闭；购后缴存仍进入公积金账户，不作为自由现金收入。" },
-        { kind: "select", key: "provident_account_management_center", label: "默认公积金中心兜底", fallback: "beijing_municipal", description: "仅在成员未设置公积金中心口径时兜底使用。真实家庭成员请优先在“成员工资与收入阶段”里分别设置市管或国管。", options: [{ value: "beijing_municipal", label: "北京市管" }, { value: "national", label: "中央国家机关/国管" }] },
+        { kind: "select", key: "provident_account_management_center", label: "默认公积金中心兜底", fallback: "beijing_municipal", description: "仅在收入阶段未设置公积金中心口径时兜底使用。真实收入阶段请优先在“成员工资与收入阶段”里分别设置市管或国管。", options: [{ value: "beijing_municipal", label: "北京市管" }, { value: "national", label: "中央国家机关/国管" }] },
         { kind: "select", key: "provident_post_purchase_withdrawal_mode", label: "手动购后处理模式", fallback: "monthly_repayment_withdrawal", description: "只在策略模式设为手动时使用。按月抵月供降低每月银行卡还款压力；半年度冲本金主要减少本金和期限。", options: [{ value: "monthly_repayment_withdrawal", label: "按月约定提取抵月供" }, { value: "semiannual_principal_offset", label: "半年度冲本金缩期" }, { value: "purchase_agreed", label: "普通购房约定提取" }] },
         { kind: "switch", key: "provident_municipal_monthly_repayment_withdrawal_supported", label: "市管支持按月抵月供", description: "北京市管公积金贷款可办理约定提取，按月提取偿还公积金贷款月供，不足部分由还款卡补扣。" },
         { kind: "switch", key: "provident_municipal_semiannual_principal_offset_supported", label: "市管支持半年度冲本金", description: "半年度冲还贷与约定提取互斥，系统按 1 月/7 月集中冲抵本金建模。" },
@@ -5744,6 +6058,7 @@ function SelectedPlanVisualization({
               monthlyInvestmentBuyFee: investmentBuyFee,
               monthlyInvestmentNet: Math.max(0, investmentContribution - investmentBuyFee),
               investmentReturn: item.investment_return,
+              investmentTax: item.investment_tax ?? 0,
               investmentSellFee,
               investmentSellProceeds: item.investment_sell_proceeds ?? 0,
               purchaseCashOut: item.transaction_cash_out,
@@ -6259,6 +6574,7 @@ function SelectedPlanVisualization({
         { name: "车贷现金还款", value: selectedAnnualFinancialSummary.vehicle_payment },
         { name: "养车现金支出", value: selectedAnnualFinancialSummary.vehicle_operating_cost },
         { name: "理财买入", value: selectedAnnualFinancialSummary.investment_contribution },
+        { name: "理财收益税", value: selectedAnnualFinancialSummary.investment_tax },
         { name: "理财手续费", value: selectedAnnualFinancialSummary.investment_fee },
         { name: "交易现金流出", value: selectedAnnualFinancialSummary.transaction_cash_out }
       ].filter((item) => item.value > 0)
@@ -6713,6 +7029,7 @@ function SelectedPlanVisualization({
     { name: "商贷月供", value: selectedMonth.commercialHousePayment },
     { name: "商贷额外还本", value: selectedMonth.commercialExtraPrincipalPayment ?? 0 },
     { name: "理财买入净额", value: selectedMonth.monthlyInvestmentNet },
+    { name: "理财收益税", value: selectedMonth.investmentTax },
     { name: "理财手续费", value: selectedMonth.monthlyInvestmentBuyFee + selectedMonth.investmentSellFee },
     { name: "购房交易现金", value: selectedMonth.houseTransactionCashOut },
     { name: "车辆首付", value: selectedMonth.carDownPaymentCashOut },
@@ -8562,6 +8879,7 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       "基础定投",
       "安全垫达标后追加定投",
       "投资收益",
+      "投资收益税",
       "投资买入手续费",
       "投资卖出手续费",
       "投资卖出到账",
@@ -8610,6 +8928,7 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       item.investment_contribution_base,
       item.investment_contribution_cash_sweep,
       item.investment_return,
+      item.investment_tax,
       item.investment_buy_fee,
       item.investment_sell_fee,
       item.investment_sell_proceeds,

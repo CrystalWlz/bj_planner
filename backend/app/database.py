@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .schemas import HouseholdData, MarketSnapshotData, PlanningGoalData, RulePackData, ScenarioData
 
 
-CURRENT_SCHEMA_VERSION = 28
+CURRENT_SCHEMA_VERSION = 34
 
 
 def default_db_path() -> Path:
@@ -717,14 +717,57 @@ def _normalize_members_and_career_shock(data: dict[str, Any]) -> None:
             continue
         name = str(member.get("name") or f"成员 {index + 1}")
         member.setdefault("birth_month", "")
+        member.setdefault("family_join_month", "2026-07")
         member.setdefault("current_age", 30)
         member.setdefault("retirement_category", _retirement_category_from_age(63 if index == 0 else 58, index))
-        center = str(member.get("provident_account_management_center") or "beijing_municipal").strip().lower()
-        member["provident_account_management_center"] = "national" if center in {"national", "central_state", "guoguan", "state"} else "beijing_municipal"
+        member.setdefault("social_security_months", 0)
+        member.setdefault("income_tax_months", 0)
+        member.setdefault("existing_home_count", 0)
+        member.setdefault("existing_mortgage_count", 0)
+        member.setdefault("initial_cash_balance", 0)
+        member.setdefault("initial_investments", 0)
+        member.setdefault("initial_other_asset_value", 0)
+        member.setdefault("initial_other_debt_balance", 0)
+        member_center = str(member.pop("provident_account_management_center", "") or "").strip().lower()
+        default_stage_center = (
+            "national"
+            if member_center in {"national", "central_state", "guoguan", "state"}
+            else "beijing_municipal"
+        )
+        if not isinstance(member.get("income_stages"), list) or not member.get("income_stages"):
+            member["income_stages"] = [
+                {
+                    "name": "当前收入",
+                    "stage_kind": "salary",
+                    "start_date": member.get("employment_start_date") or "2026-07-01",
+                    "end_date": None,
+                    "monthly_salary_gross": _safe_float(member.get("monthly_salary_gross")),
+                    "annual_bonus": _safe_float(member.get("annual_bonus")),
+                    "annual_bonus_payout_month": 4,
+                    "monthly_freelance_income": 0,
+                    "monthly_non_taxable_income": _safe_float(member.get("monthly_non_taxable_income")),
+                    "monthly_extra_cash_expense": _safe_float(member.get("monthly_extra_cash_expense")),
+                    "monthly_social_insurance": _safe_float(member.get("monthly_social_insurance")),
+                    "monthly_housing_fund": _safe_float(member.get("monthly_housing_fund")),
+                    "housing_fund_personal_rate": _safe_float(member.get("housing_fund_personal_rate"), 0.12),
+                    "housing_fund_employer_rate": _safe_float(member.get("housing_fund_employer_rate"), 0.12),
+                    "monthly_special_additional_deduction": _safe_float(member.get("monthly_special_additional_deduction")),
+                    "other_annual_deductions": _safe_float(member.get("other_annual_deductions")),
+                    "other_annual_taxable_income": _safe_float(member.get("other_annual_taxable_income")),
+                    "bonus_tax_method": member.get("bonus_tax_method") or "best",
+                    "payroll_contributions_enabled": True,
+                }
+            ]
         for stage in member.get("income_stages", []):
             if isinstance(stage, dict):
                 stage.setdefault("stage_kind", "salary")
                 stage.setdefault("annual_bonus_payout_month", 4)
+                center = str(stage.get("provident_account_management_center") or default_stage_center).strip().lower()
+                stage["provident_account_management_center"] = (
+                    "national"
+                    if center in {"national", "central_state", "guoguan", "state"}
+                    else "beijing_municipal"
+                )
                 stage.setdefault("monthly_freelance_income", 0)
         existing = existing_by_name.get(name, {})
         member_enabled = bool(existing.get("enabled")) if existing else False
@@ -751,7 +794,33 @@ def _normalize_household(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("family_savings_support_amount", 0)
     data.setdefault("investment_buy_fee_rate", 0.0015)
     data.setdefault("investment_sell_fee_rate", 0.005)
+    data.setdefault("investment_taxable_return_ratio", 0)
+    data.setdefault("investment_return_tax_rate", 0)
+    if not isinstance(data.get("household_expense_stages"), list) or not data.get("household_expense_stages"):
+        rent_amount = _safe_float(data.get("monthly_rent_from_housing_fund"))
+        data["household_expense_stages"] = [
+            {
+                "name": "当前家庭支出",
+                "start_month": "2026-07",
+                "end_month": None,
+                "base_living_expense": _safe_float(data.get("monthly_expense")),
+                "other_fixed_debt_payment": _safe_float(data.get("monthly_debt_payment")),
+                "rent_amount": rent_amount,
+                "rent_payment_mode": "provident" if rent_amount > 0 else "cash",
+                "rent_payment_frequency": "monthly",
+            }
+        ]
+    for stage in data.get("household_expense_stages", []):
+        if isinstance(stage, dict):
+            stage["rent_payment_mode"] = "provident" if stage.get("rent_payment_mode") == "provident" else "cash"
+            stage["rent_payment_frequency"] = "quarterly" if stage.get("rent_payment_frequency") == "quarterly" else "monthly"
     data.setdefault("scheduled_expenses", [])
+    for expense in data["scheduled_expenses"]:
+        if isinstance(expense, dict):
+            frequency = str(expense.get("frequency") or "monthly")
+            expense["frequency"] = "annual_once" if frequency == "annual_once" else "monthly"
+            default_month = _safe_int(str(expense.get("start_month") or "2026-01").split("-")[-1], 1)
+            expense.setdefault("annual_occurrence_month", max(1, min(12, default_month)))
     data.setdefault("phased_loans", [])
     for loan in data["phased_loans"]:
         if isinstance(loan, dict):

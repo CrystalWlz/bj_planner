@@ -15,10 +15,18 @@ export type ProvidentAccountRepaymentStrategy =
 
 export interface IncomeMember {
   name: string;
+  family_join_month: string;
   birth_month: string;
   current_age: number;
   retirement_category: "male_60" | "female_55" | "female_50";
-  provident_account_management_center: "beijing_municipal" | "national";
+  social_security_months: number;
+  income_tax_months: number;
+  existing_home_count: number;
+  existing_mortgage_count: number;
+  initial_cash_balance: number;
+  initial_investments: number;
+  initial_other_asset_value: number;
+  initial_other_debt_balance: number;
   provident_fund_balance: number;
   monthly_salary_gross: number;
   annual_bonus: number;
@@ -39,6 +47,7 @@ export interface IncomeStageData {
   stage_kind: IncomeStageKind;
   start_date: string;
   end_date: string | null;
+  provident_account_management_center: "beijing_municipal" | "national";
   monthly_salary_gross: number;
   annual_bonus: number;
   annual_bonus_payout_month: number;
@@ -246,10 +255,23 @@ export interface ExistingLoanVisualizationDetail {
 export interface ScheduledExpenseData {
   name: string;
   monthly_amount: number;
+  frequency: "monthly" | "annual_once";
+  annual_occurrence_month: number;
   start_month: string;
   end_month: string | null;
   tax_deductible_elderly_care: boolean;
   notes: string;
+}
+
+export interface HouseholdExpenseStageData {
+  name: string;
+  start_month: string;
+  end_month: string | null;
+  base_living_expense: number;
+  other_fixed_debt_payment: number;
+  rent_amount: number;
+  rent_payment_mode: "cash" | "provident";
+  rent_payment_frequency: "monthly" | "quarterly";
 }
 
 export interface ElderlyDependentData {
@@ -287,6 +309,8 @@ export interface HouseholdData {
   investment_auto_rebalance: boolean;
   investment_buy_fee_rate: number;
   investment_sell_fee_rate: number;
+  investment_taxable_return_ratio: number;
+  investment_return_tax_rate: number;
   required_liquidity_months: number;
   borrower_age: number;
   borrower_member_index: number;
@@ -296,6 +320,7 @@ export interface HouseholdData {
   property_goals: PropertyPurchaseGoalData[];
   phased_loans: PhasedLoanData[];
   scheduled_expenses: ScheduledExpenseData[];
+  household_expense_stages: HouseholdExpenseStageData[];
   elderly_dependents: ElderlyDependentData[];
   existing_home_count: number;
   existing_mortgage_count: number;
@@ -836,6 +861,7 @@ export interface MonthlyCashflowPoint {
   investment_contribution_base: number;
   investment_contribution_cash_sweep: number;
   investment_return: number;
+  investment_tax: number;
   investment_fee: number;
   investment_buy_fee: number;
   investment_sell_fee: number;
@@ -901,6 +927,7 @@ export interface AnnualFinancialSummary {
   vehicle_operating_cost: number;
   investment_contribution: number;
   investment_return: number;
+  investment_tax: number;
   investment_fee: number;
   investment_sell_proceeds: number;
   provident_deposit: number;

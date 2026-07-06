@@ -19,7 +19,7 @@ from app.calculator import (
     monthly_household_expense_at,
     summarize_phased_loans,
 )
-from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData, VehicleFinancingOptionData
+from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ElderlyDependentData, HouseholdData, HouseholdExpenseStageData, IncomeMember, IncomeStageData, RulePackData, ScenarioData, ScheduledExpenseData, PhasedLoanData, VehicleFinancingOptionData
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -205,6 +205,64 @@ def test_scheduled_family_support_expense_starts_in_2027_july_without_tax_deduct
     assert monthly_household_expense_at(household, as_of=date(2027, 6, 1)) == 8_000
     assert monthly_household_expense_at(household, as_of=date(2027, 7, 1)) == 11_500
     assert household.scheduled_expenses[0].tax_deductible_elderly_care is False
+
+
+def test_annual_once_scheduled_expense_only_hits_occurrence_month() -> None:
+    household = HouseholdData(
+        monthly_expense=8_000,
+        scheduled_expenses=[
+            ScheduledExpenseData(
+                name="数码产品支出",
+                monthly_amount=10_000,
+                frequency="annual_once",
+                annual_occurrence_month=6,
+                start_month="2027-01",
+                tax_deductible_elderly_care=False,
+            )
+        ],
+    )
+
+    assert monthly_household_expense_at(household, as_of=date(2027, 5, 1)) == 8_000
+    assert monthly_household_expense_at(household, as_of=date(2027, 6, 1)) == 18_000
+    assert monthly_household_expense_at(household, as_of=date(2028, 6, 1)) == 18_000
+
+
+def test_member_profile_fields_derive_household_policy_and_accounts() -> None:
+    household = HouseholdData(
+        cash_account_balance=10_000,
+        investments=20_000,
+        social_security_months=12,
+        existing_home_count=0,
+        existing_mortgage_count=0,
+        members=[
+            IncomeMember(
+                name="样例成员A",
+                social_security_months=36,
+                income_tax_months=60,
+                existing_home_count=1,
+                existing_mortgage_count=1,
+                initial_cash_balance=100_000,
+                initial_investments=50_000,
+            ),
+            IncomeMember(
+                name="样例成员B",
+                social_security_months=24,
+                income_tax_months=12,
+                existing_home_count=0,
+                existing_mortgage_count=1,
+                initial_cash_balance=20_000,
+                initial_investments=10_000,
+            ),
+        ],
+    )
+
+    derived = calculator_module._household_with_member_derived_profile(household)
+
+    assert derived.social_security_months == 60
+    assert derived.existing_home_count == 1
+    assert derived.existing_mortgage_count == 2
+    assert derived.cash_account_balance == 120_000
+    assert derived.investments == 60_000
 
 
 def test_member_income_tax_is_calculated_from_configured_salary_and_bonus() -> None:
@@ -1656,6 +1714,30 @@ def test_affordability_returns_backend_account_cashflow_series() -> None:
     assert snapshots[12].total_loan_balance == pytest.approx(loan_rows[12].total_loan_balance)
     assert snapshots[12].net_worth == pytest.approx(snapshots[12].total_asset_value - snapshots[12].total_loan_balance)
     assert any(item.category == "income" for item in result.monthly_ledger if item.plan_variant == plan.variant)
+
+
+def test_investment_return_tax_reduces_compounded_investment_balance() -> None:
+    household = HouseholdData(
+        cash_account_balance=50_000,
+        investments=100_000,
+        monthly_expense=0,
+        investment_taxable_return_ratio=1.0,
+        investment_return_tax_rate=0.20,
+        members=[IncomeMember(name="样例成员", monthly_salary_gross=0, annual_bonus=0)],
+    )
+    scenario = ScenarioData(total_price=10_000_000, annual_investment_return=0.12)
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = result.purchase_plan_analyses[0]
+    first_return_month = next(
+        item
+        for item in result.monthly_cashflow_visualization
+        if item.plan_variant == plan.variant and item.month == 1
+    )
+
+    assert first_return_month.investment_return == pytest.approx(1000)
+    assert first_return_month.investment_tax == pytest.approx(200)
+    assert first_return_month.investment_balance == pytest.approx(100_800)
 
 
 def test_account_balances_are_non_negative_but_net_worth_can_be_negative() -> None:
@@ -3577,9 +3659,17 @@ def test_national_provident_member_uses_monthly_repayment_default_strategy() -> 
         members=[
             IncomeMember(
                 name="国管成员",
-                provident_account_management_center="national",
                 monthly_salary_gross=80_000,
                 annual_bonus=0,
+                income_stages=[
+                    IncomeStageData(
+                        name="国管工作阶段",
+                        start_date="2026-07-01",
+                        provident_account_management_center="national",
+                        monthly_salary_gross=80_000,
+                        annual_bonus=0,
+                    )
+                ],
             )
         ],
     )
@@ -3604,6 +3694,56 @@ def test_national_provident_member_uses_monthly_repayment_default_strategy() -> 
     assert plan.post_purchase_pf_strategy == "monthly_repayment_withdrawal_auto"
     assert provident_row.monthly_repayment_withdrawal > 0
     assert provident_row.loan_offset_payment == 0
+
+
+def test_provident_center_uses_income_stage_at_purchase_month() -> None:
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_municipal_monthly_repayment_withdrawal_supported": False,
+            "provident_municipal_semiannual_principal_offset_supported": True,
+            "provident_national_monthly_direct_offset_supported": True,
+        }
+    )
+    household = HouseholdData(
+        cash_account_balance=2_500_000,
+        investments=0,
+        monthly_expense=8_000,
+        social_security_months=180,
+        borrower_member_index=0,
+        members=[
+            IncomeMember(
+                name="阶段切换成员",
+                monthly_salary_gross=80_000,
+                annual_bonus=0,
+                income_stages=[
+                    IncomeStageData(
+                        name="市管阶段",
+                        start_date="2026-07-01",
+                        end_date="2026-12-31",
+                        provident_account_management_center="beijing_municipal",
+                        monthly_salary_gross=80_000,
+                        annual_bonus=0,
+                    ),
+                    IncomeStageData(
+                        name="国管阶段",
+                        start_date="2027-01-01",
+                        provident_account_management_center="national",
+                        monthly_salary_gross=80_000,
+                        annual_bonus=0,
+                    ),
+                ],
+            )
+        ],
+    )
+    assert (
+        calculator_module._policy_default_pf_account_strategy(rules, household, months_from_now=0)
+        == "semiannual_principal_offset"
+    )
+    assert (
+        calculator_module._policy_default_pf_account_strategy(rules, household, months_from_now=8)
+        == "monthly_repayment_withdrawal"
+    )
 
 
 def test_auto_provident_strategy_can_switch_from_monthly_withdrawal_to_semiannual_offset() -> None:
@@ -4112,6 +4252,38 @@ def test_rent_provident_withdrawal_is_quarterly_before_purchase() -> None:
     assert _quarterly_rent_withdrawal_before_purchase_at(household, 3) == 18_000
     assert _quarterly_rent_withdrawal_before_purchase_at(household, 6) == 18_000
     assert _quarterly_rent_withdrawal_before_purchase_at(household_with_home, 3) == 0
+
+
+def test_household_expense_stages_support_cash_and_provident_rent() -> None:
+    household = HouseholdData(
+        monthly_expense=8_000,
+        monthly_debt_payment=1_000,
+        household_expense_stages=[
+            HouseholdExpenseStageData(
+                name="现金租房阶段",
+                start_month="2026-07",
+                end_month="2026-12",
+                base_living_expense=8_000,
+                other_fixed_debt_payment=1_000,
+                rent_amount=4_000,
+                rent_payment_mode="cash",
+            ),
+            HouseholdExpenseStageData(
+                name="公积金租房阶段",
+                start_month="2027-01",
+                base_living_expense=9_000,
+                other_fixed_debt_payment=2_000,
+                rent_amount=5_000,
+                rent_payment_mode="provident",
+                rent_payment_frequency="quarterly",
+            ),
+        ],
+    )
+
+    assert monthly_household_expense_at(household, as_of=date(2026, 8, 1)) == 12_000
+    assert monthly_household_expense_at(household, as_of=date(2027, 1, 1)) == 9_000
+    assert calculator_module._regular_debt_payment_at(household, as_of=date(2027, 1, 1)) == 2_000
+    assert _quarterly_rent_withdrawal_before_purchase_at(household, 6) == 15_000
 
 
 def test_purchase_plan_happiness_scores_have_explainable_breakdown() -> None:

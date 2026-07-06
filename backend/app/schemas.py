@@ -27,14 +27,25 @@ ProvidentAccountRepaymentStrategy = Literal[
 ExistingLoanPrepaymentMode = Literal["none", "manual", "auto"]
 PlanningGoalType = Literal["home", "vehicle", "renovation", "other"]
 PlanningTimingMode = Literal["auto_sequence", "parallel", "manual_month", "after_goal", "not_planned"]
+ScheduledExpenseFrequency = Literal["monthly", "annual_once"]
+RentPaymentMode = Literal["cash", "provident"]
+RentPaymentFrequency = Literal["monthly", "quarterly"]
 
 
 class IncomeMember(BaseModel):
     name: str = "成员 1"
+    family_join_month: str = "2026-07"
     birth_month: str = ""
     current_age: int = Field(30, ge=0, le=120)
     retirement_category: RetirementCategory = "male_60"
-    provident_account_management_center: ProvidentAccountManagementCenter = "beijing_municipal"
+    social_security_months: int = Field(0, ge=0)
+    income_tax_months: int = Field(0, ge=0)
+    existing_home_count: int = Field(0, ge=0, le=10)
+    existing_mortgage_count: int = Field(0, ge=0, le=10)
+    initial_cash_balance: float = Field(0, ge=0)
+    initial_investments: float = Field(0, ge=0)
+    initial_other_asset_value: float = Field(0, ge=0)
+    initial_other_debt_balance: float = Field(0, ge=0)
     provident_fund_balance: float = Field(0, ge=0)
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
@@ -62,6 +73,7 @@ class IncomeMember(BaseModel):
                     monthly_salary_gross=self.monthly_salary_gross,
                     annual_bonus=self.annual_bonus,
                     annual_bonus_payout_month=4,
+                    provident_account_management_center="beijing_municipal",
                     monthly_freelance_income=0,
                     monthly_non_taxable_income=self.monthly_non_taxable_income,
                     monthly_extra_cash_expense=self.monthly_extra_cash_expense,
@@ -83,6 +95,7 @@ class IncomeStageData(BaseModel):
     stage_kind: IncomeStageKind = "salary"
     start_date: str = "2026-07-01"
     end_date: str | None = None
+    provident_account_management_center: ProvidentAccountManagementCenter = "beijing_municipal"
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
     annual_bonus_payout_month: int = Field(4, ge=1, le=12)
@@ -214,7 +227,7 @@ class PropertyPurchaseGoalData(BaseModel):
 
 
 class PlanningGoalData(BaseModel):
-    schema_version: int = Field(27, ge=1)
+    schema_version: int = Field(34, ge=1)
     goal_type: PlanningGoalType = "home"
     name: str = "规划目标"
     enabled: bool = True
@@ -294,10 +307,23 @@ class ExistingLoanVisualizationDetail(BaseModel):
 class ScheduledExpenseData(BaseModel):
     name: str = "定时支出"
     monthly_amount: float = Field(0, ge=0)
+    frequency: ScheduledExpenseFrequency = "monthly"
+    annual_occurrence_month: int = Field(1, ge=1, le=12)
     start_month: str = "2026-07"
     end_month: str | None = None
     tax_deductible_elderly_care: bool = False
     notes: str = ""
+
+
+class HouseholdExpenseStageData(BaseModel):
+    name: str = "当前家庭支出"
+    start_month: str = "2026-07"
+    end_month: str | None = None
+    base_living_expense: float = Field(0, ge=0)
+    other_fixed_debt_payment: float = Field(0, ge=0)
+    rent_amount: float = Field(0, ge=0)
+    rent_payment_mode: RentPaymentMode = "cash"
+    rent_payment_frequency: RentPaymentFrequency = "monthly"
 
 
 class ElderlyDependentData(BaseModel):
@@ -309,7 +335,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class HouseholdData(BaseModel):
-    schema_version: int = Field(27, ge=1)
+    schema_version: int = Field(34, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -335,6 +361,8 @@ class HouseholdData(BaseModel):
     investment_auto_rebalance: bool = True
     investment_buy_fee_rate: float = Field(0.0015, ge=0, le=0.05)
     investment_sell_fee_rate: float = Field(0.005, ge=0, le=0.05)
+    investment_taxable_return_ratio: float = Field(0, ge=0, le=1)
+    investment_return_tax_rate: float = Field(0, ge=0, le=1)
     required_liquidity_months: float = Field(6, ge=0, le=36)
     borrower_age: int = Field(30, ge=18, le=68)
     borrower_member_index: int = Field(0, ge=0, le=20)
@@ -344,6 +372,7 @@ class HouseholdData(BaseModel):
     property_goals: list[PropertyPurchaseGoalData] = Field(default_factory=list)
     phased_loans: list[PhasedLoanData] = Field(default_factory=list)
     scheduled_expenses: list[ScheduledExpenseData] = Field(default_factory=list)
+    household_expense_stages: list[HouseholdExpenseStageData] = Field(default_factory=list)
     elderly_dependents: list[ElderlyDependentData] = Field(default_factory=list)
     existing_home_count: int = Field(0, ge=0, le=10)
     existing_mortgage_count: int = Field(0, ge=0, le=10)
@@ -372,7 +401,7 @@ class HouseholdCreate(BaseModel):
 
 
 class ScenarioData(BaseModel):
-    schema_version: int = Field(27, ge=1)
+    schema_version: int = Field(34, ge=1)
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
@@ -453,7 +482,7 @@ class ScenarioCreate(BaseModel):
 
 
 class RulePackData(BaseModel):
-    schema_version: int = Field(27, ge=1)
+    schema_version: int = Field(34, ge=1)
     name: str = "北京基准规则 2026 手动版"
     jurisdiction: str = "北京"
     category: str = "purchase_affordability"
@@ -607,7 +636,7 @@ class RulePackCreate(BaseModel):
 
 
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(27, ge=1)
+    schema_version: int = Field(34, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
@@ -992,6 +1021,7 @@ class MonthlyCashflowPoint(BaseModel):
     investment_contribution_base: float = 0.0
     investment_contribution_cash_sweep: float = 0.0
     investment_return: float
+    investment_tax: float = 0.0
     investment_fee: float
     investment_buy_fee: float = 0.0
     investment_sell_fee: float = 0.0
@@ -1207,6 +1237,7 @@ class AnnualFinancialSummary(BaseModel):
     vehicle_operating_cost: float = 0.0
     investment_contribution: float = 0.0
     investment_return: float = 0.0
+    investment_tax: float = 0.0
     investment_fee: float = 0.0
     investment_sell_proceeds: float = 0.0
     provident_deposit: float = 0.0
