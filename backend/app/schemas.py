@@ -29,6 +29,17 @@ ProvidentAccountRepaymentStrategy = Literal[
     "keep_in_account",
 ]
 ExistingLoanPrepaymentMode = Literal["none", "manual", "auto"]
+AccountCalibrationTarget = Literal[
+    "cash",
+    "investment",
+    "provident",
+    "pension",
+    "medical",
+    "property_asset",
+    "vehicle_asset",
+    "fixed_asset",
+    "total_loan",
+]
 PlanningGoalType = Literal["home", "vehicle", "renovation", "other"]
 PlanningTimingMode = Literal["auto_sequence", "parallel", "manual_month", "after_goal", "not_planned"]
 ScheduledExpenseFrequency = Literal["monthly", "annual_once", "one_time"]
@@ -50,7 +61,16 @@ SpecialDeductionSettlementMode = Literal["monthly_withholding", "annual_settleme
 PersonalPensionContributionMode = Literal["none", "auto_tax_optimal", "fixed_monthly", "fixed_annual"]
 PersonalPensionOpenMode = Literal["auto_tax_optimal", "manual", "none"]
 TaxStrategyStatus = Literal["auto_enabled", "manual_enabled", "available", "not_applicable", "conflict"]
-TaxStrategySource = Literal["backend_auto", "manual", "event"]
+TaxStrategySource = Literal["backend_auto", "strategy_auto", "manual", "event"]
+TaxStrategyTimelineCategory = Literal[
+    "deduction_assignment",
+    "deduction_switch",
+    "personal_pension",
+    "bonus_tax",
+    "investment_tax",
+    "annual_settlement",
+    "manual_override",
+]
 
 
 def default_retirement_category_for_sex(sex: str, fallback: RetirementCategory = "male_60") -> RetirementCategory:
@@ -150,7 +170,7 @@ class IncomeMember(BaseModel):
                 "provident_account_management_center": "beijing_municipal",
                 "monthly_freelance_income": 0,
                 "monthly_non_taxable_income": data.get("monthly_non_taxable_income", 0),
-                "monthly_extra_cash_expense": data.get("monthly_extra_cash_expense", 0),
+                "monthly_extra_cash_expense": 0,
                 "monthly_social_insurance": data.get("monthly_social_insurance", 0),
                 "monthly_housing_fund": data.get("monthly_housing_fund", 0),
                 "housing_fund_personal_rate": data.get("housing_fund_personal_rate", 0.12),
@@ -237,6 +257,30 @@ class VehicleFinancingOptionData(BaseModel):
         return self
 
 
+class VehicleIndicatorApplicantData(BaseModel):
+    enabled: bool = True
+    name: str = "家庭申请人"
+    relationship: Literal["main", "spouse", "child", "parent", "parent_in_law", "other"] = "other"
+    generation: Literal["self_generation", "child_generation", "parent_generation"] = "self_generation"
+    eligibility_type: Literal[
+        "beijing_household",
+        "beijing_work_residence_permit",
+        "beijing_residence_permit_social_tax",
+        "active_military_or_police",
+        "hongkong_macao_taiwan_foreign",
+        "unknown",
+    ] = "unknown"
+    has_valid_driver_license: bool = False
+    has_no_beijing_vehicle: bool = True
+    family_application_start_month: str = ""
+    personal_indicator_history_type: Literal["none", "ordinary_lottery", "new_energy_queue", "both"] = "none"
+    ordinary_lottery_steps: int = Field(0, ge=0, le=200)
+    new_energy_queue_start_month: str = ""
+    personal_history_points_override: float | None = Field(None, ge=0)
+    only_for_indicator_scoring: bool = True
+    notes: str = ""
+
+
 class VehiclePlanData(BaseModel):
     enabled: bool = False
     name: str = "车辆计划"
@@ -257,14 +301,37 @@ class VehiclePlanData(BaseModel):
         "already_have",
         "family_new_energy_pending",
         "personal_new_energy_pending",
+        "ordinary_indicator_pending",
         "not_eligible",
     ] = "unknown"
     beijing_indicator_expected_delay_months: int = Field(0, ge=0, le=240)
+    license_plate_rental_enabled: bool = False
+    license_plate_rental_upfront_fee: float = Field(20000, ge=0)
+    license_plate_rental_term_months: int = Field(36, ge=1, le=120)
+    license_plate_rental_renewal_fee: float = Field(20000, ge=0)
+    license_plate_rental_renewal_term_months: int = Field(36, ge=1, le=120)
+    license_plate_rental_after_term_mode: Literal["switch_to_own_indicator", "renew_until_own_indicator"] = "renew_until_own_indicator"
+    beijing_family_indicator_score_enabled: bool = False
+    beijing_family_indicator_application_start_month: str = ""
+    beijing_family_indicator_applicants: list[VehicleIndicatorApplicantData] = Field(default_factory=list)
+    beijing_family_indicator_generations: int = Field(1, ge=1, le=3)
+    beijing_family_indicator_has_spouse: bool = True
+    beijing_family_indicator_main_points: float = Field(2, ge=0)
+    beijing_family_indicator_spouse_points: float = Field(1, ge=0)
+    beijing_family_indicator_other_applicant_count: int = Field(0, ge=0, le=20)
+    beijing_family_indicator_other_points_total: float = Field(0, ge=0)
+    beijing_family_indicator_application_years: int = Field(0, ge=0, le=50)
+    beijing_family_indicator_current_cutoff_score: float = Field(36, ge=0)
+    beijing_family_indicator_cutoff_score_annual_change: float = Field(0, ge=-20, le=20)
+    beijing_family_indicator_last_config_year: int = Field(2026, ge=2020, le=2100)
+    beijing_family_indicator_annual_quota: int = Field(119200, ge=0)
     vehicle_vessel_tax_annual_override: float | None = Field(None, ge=0)
     planning_sequence: int = Field(1, ge=1, le=50)
     purchase_timing_mode: Literal["auto_sequence", "parallel", "manual_month"] = "auto_sequence"
     after_previous_event_delay_months: int = Field(0, ge=0, le=240)
     manual_purchase_delay_months: int = Field(0, ge=0, le=600)
+    planning_window_start_month: str = ""
+    planning_window_end_month: str = ""
     total_price: float = Field(0, ge=0)
     down_payment_ratio: float = Field(0.50, ge=0, le=1)
     down_payment: float = Field(0, ge=0)
@@ -293,7 +360,7 @@ class VehiclePlanData(BaseModel):
     annual_insurance_min: float = Field(0, ge=0)
     annual_insurance_growth_rate: float = Field(0.02, ge=0, le=0.2)
     depreciation_years: int = Field(8, ge=1, le=20)
-    vehicle_service_years: int = Field(15, ge=1, le=30)
+    vehicle_service_years: int = Field(10, ge=1, le=30)
     vehicle_retirement_mileage_km: float = Field(600000, ge=0, le=1000000)
     happiness_score: float = Field(6.5, ge=0, le=10)
     notes: str = ""
@@ -312,6 +379,8 @@ class PropertyPurchaseGoalData(BaseModel):
     planning_mode: Literal["after_previous_purchase", "parallel"] = "after_previous_purchase"
     after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
     earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
+    planning_window_start_month: str = ""
+    planning_window_end_month: str = ""
     notes: str = ""
 
 
@@ -324,6 +393,8 @@ class PlanningGoalData(BaseModel):
     timing_mode: PlanningTimingMode = "auto_sequence"
     earliest_purchase_month: str = ""
     earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
+    planning_window_start_month: str = ""
+    planning_window_end_month: str = ""
     depends_on_goal_id: str = ""
     delay_after_dependency_months: int = Field(0, ge=0, le=240)
     allow_parallel: bool = False
@@ -446,18 +517,18 @@ class ChildPlanData(BaseModel):
     education_start_month: str = ""
     preparation_months_before_birth: int = Field(6, ge=0, le=24)
     pregnancy_months_before_birth: int = Field(9, ge=0, le=12)
-    monthly_preparation_cost: float = Field(1000, ge=0)
-    monthly_pregnancy_cost: float = Field(2000, ge=0)
-    birth_medical_cost: float = Field(20000, ge=0)
-    postpartum_recovery_cost: float = Field(30000, ge=0)
-    initial_baby_supplies_cost: float = Field(15000, ge=0)
-    monthly_childcare_cost_before_kindergarten: float = Field(0, ge=0)
-    monthly_kindergarten_cost: float = Field(0, ge=0)
-    monthly_primary_secondary_cost: float = Field(0, ge=0)
-    monthly_higher_education_cost: float = Field(0, ge=0)
-    kindergarten_entry_cost: float = Field(0, ge=0)
-    primary_school_entry_cost: float = Field(0, ge=0)
-    higher_education_entry_cost: float = Field(0, ge=0)
+    monthly_preparation_cost: float = Field(1500, ge=0)
+    monthly_pregnancy_cost: float = Field(3000, ge=0)
+    birth_medical_cost: float = Field(30000, ge=0)
+    postpartum_recovery_cost: float = Field(40000, ge=0)
+    initial_baby_supplies_cost: float = Field(20000, ge=0)
+    monthly_childcare_cost_before_kindergarten: float = Field(4500, ge=0)
+    monthly_kindergarten_cost: float = Field(5000, ge=0)
+    monthly_primary_secondary_cost: float = Field(6000, ge=0)
+    monthly_higher_education_cost: float = Field(8000, ge=0)
+    kindergarten_entry_cost: float = Field(10000, ge=0)
+    primary_school_entry_cost: float = Field(15000, ge=0)
+    higher_education_entry_cost: float = Field(50000, ge=0)
     notes: str = ""
 
 
@@ -493,8 +564,18 @@ class InvestmentTaxProfileData(BaseModel):
     overseas_asset_ratio: float = Field(0, ge=0, le=1)
 
 
+class AccountCalibrationData(BaseModel):
+    enabled: bool = True
+    month: str = "2026-07"
+    target: AccountCalibrationTarget = "cash"
+    amount: float = Field(0, ge=0)
+    member_name: str = ""
+    reference_name: str = ""
+    note: str = ""
+
+
 class HouseholdData(BaseModel):
-    schema_version: int = Field(43, ge=1)
+    schema_version: int = Field(46, ge=1)
     name: str = "未命名家庭"
     monthly_income: float = Field(0, ge=0)
     monthly_expense: float = Field(0, ge=0)
@@ -537,6 +618,7 @@ class HouseholdData(BaseModel):
     elderly_dependents: list[ElderlyDependentData] = Field(default_factory=list)
     child_plans: list[ChildPlanData] = Field(default_factory=list)
     special_deductions: list[SpecialDeductionItemData] = Field(default_factory=list)
+    account_calibrations: list[AccountCalibrationData] = Field(default_factory=list)
     existing_home_count: int = Field(0, ge=0, le=10)
     existing_mortgage_count: int = Field(0, ge=0, le=10)
     has_beijing_hukou: bool = True
@@ -586,6 +668,8 @@ class ScenarioData(BaseModel):
     commercial_loan_amount: float = Field(0, ge=0)
     provident_loan_amount: float = Field(0, ge=0)
     manual_purchase_delay_months: int = Field(0, ge=0, le=360)
+    planning_window_start_month: str = ""
+    planning_window_end_month: str = ""
     micro_commercial_loan_ratio: float = Field(0, ge=0, le=1)
     commercial_rate: float = Field(0.035, ge=0, le=0.2)
     provident_rate: float = Field(0.026, ge=0, le=0.2)
@@ -721,17 +805,22 @@ class RulePackData(BaseModel):
             "new_energy_vehicle_purchase_tax_half_until": "2027-12",
             "new_energy_vehicle_purchase_tax_half_relief_cap": 15000,
             "new_energy_vehicle_types": ["pure_electric", "plug_in_hybrid", "range_extended", "fuel_cell"],
+            "vehicle_vessel_tax_passenger_not_taxable_types": ["pure_electric", "fuel_cell"],
             "new_energy_vehicle_vessel_tax_exempt_types": ["pure_electric", "fuel_cell"],
-            "plug_in_hybrid_vehicle_vessel_tax_annual": 0,
+            "beijing_new_energy_indicator_vehicle_types": ["pure_electric"],
+            "beijing_tail_restriction_exempt_vehicle_types": ["pure_electric"],
+            "plug_in_hybrid_vehicle_vessel_tax_annual": 420,
             "plug_in_hybrid_vehicle_vessel_tax_exempt_until": "2026-12",
             "fuel_vehicle_vessel_tax_annual_default": 420,
             "beijing_small_passenger_indicator_required": True,
             "beijing_new_energy_family_indicator_priority": True,
+            "beijing_family_new_energy_config_month": 5,
+            "beijing_family_new_energy_reference_annual_quota": 119200,
             "beijing_personal_new_energy_indicator_wait_risk_months": 60,
             "beijing_vehicle_policy_notes": [
                 "车辆购置税按不含增值税计税价格乘 10% 估算；新能源车按国家延续优化政策在 2025 年底前免征、2026-2027 年减半并受单车减税上限约束。",
-                "北京小客车上牌需要指标。家庭新能源指标优先于个人轮候，若未取得指标，购车策略应把预计等待月份纳入买车时间。",
-                "纯电动乘用车因无排量通常不属于车船税征税范围；插混、增程和燃油车按规则包或用户覆盖值估算年度车船税。",
+                "北京小客车上牌需要指标。北京新能源小客车指标默认只按纯电驱动车型处理；插混、增程、燃油车应按普通小客车指标或已获指标处理。家庭新能源等待时间按最近入围分数、年度指标量和家庭积分粗略估算。",
+                "纯电动、燃料电池乘用车因无排量通常不属于车船税征税范围；插混、增程乘用车按规则包配置的优惠期和优惠后税额估算，2027 年起默认不再按免征处理。",
             ],
             "rate_stress_add": 0.005,
             "income_stress_factor": 0.90,
@@ -917,6 +1006,9 @@ class CarLoanSummary(BaseModel):
     purchase_tax: float = 0.0
     purchase_tax_relief: float = 0.0
     annual_vehicle_vessel_tax: float = 0.0
+    license_plate_rental_initial_fee: float = 0.0
+    beijing_family_indicator_score: float = 0.0
+    beijing_family_indicator_estimated_wait_months: int | None = None
     purchase_delay_months: int
     loan_principal: float
     months_to_down_payment: int | None
@@ -975,6 +1067,9 @@ class CarPlanAnalysis(BaseModel):
     purchase_tax: float = 0.0
     purchase_tax_relief: float = 0.0
     annual_vehicle_vessel_tax: float = 0.0
+    license_plate_rental_initial_fee: float = 0.0
+    beijing_family_indicator_score: float = 0.0
+    beijing_family_indicator_estimated_wait_months: int | None = None
     loan_principal: float
     total_months: int
     interest_free_months: int
@@ -1282,6 +1377,7 @@ class MonthlyCashflowPoint(BaseModel):
     total_asset_value: float
     total_loan_balance: float
     net_worth: float
+    happiness_score: float = 0.0
     monthly_cash_delta: float
     cash_income: float
     pension_income: float = 0.0
@@ -1312,6 +1408,7 @@ class MonthlyCashflowPoint(BaseModel):
     first_vehicle_down_payment: float = 0.0
     second_vehicle_down_payment: float = 0.0
     vehicle_down_payment: float = 0.0
+    vehicle_plate_rental_payment: float = 0.0
     investment_contribution: float
     investment_contribution_base: float = 0.0
     investment_contribution_cash_sweep: float = 0.0
@@ -1321,6 +1418,9 @@ class MonthlyCashflowPoint(BaseModel):
     investment_buy_fee: float = 0.0
     investment_sell_fee: float = 0.0
     investment_sell_proceeds: float = 0.0
+    personal_pension_contribution: float = 0.0
+    personal_pension_return: float = 0.0
+    personal_pension_balance: float = 0.0
     provident_deposit: float
     provident_withdrawal: float
     transaction_cash_out: float
@@ -1423,6 +1523,7 @@ class TaxMemberMonthlyPoint(BaseModel):
     salary_tax: float
     bonus_tax: float
     total_income_tax: float
+    personal_pension_contribution: float = 0.0
     net_income: float
     selected_bonus_method: BonusTaxMethod
 
@@ -1473,10 +1574,30 @@ class TaxStrategyItem(BaseModel):
     member_name: str = ""
     monthly_amount: float = 0.0
     annual_amount: float = 0.0
+    estimated_tax_saving: float = 0.0
+    cash_contribution: float = 0.0
+    account_return_rate: float = 0.0
+    withdrawal_tax_rate: float = 0.0
     start_month: str = ""
     end_month: str | None = None
     reason: str = ""
     conflicts_with: list[str] = Field(default_factory=list)
+    source: TaxStrategySource = "backend_auto"
+
+
+class TaxStrategyTimelinePoint(BaseModel):
+    month: int
+    year: int
+    month_of_year: int
+    category: TaxStrategyTimelineCategory
+    title: str
+    action: str
+    member_name: str = ""
+    deduction_type: SpecialDeductionType | None = None
+    status: TaxStrategyStatus = "available"
+    amount: float = 0.0
+    estimated_tax_saving: float = 0.0
+    detail: str = ""
     source: TaxStrategySource = "backend_auto"
 
 
@@ -1557,6 +1678,9 @@ class AnnualFinancialSummary(BaseModel):
     investment_tax: float = 0.0
     investment_fee: float = 0.0
     investment_sell_proceeds: float = 0.0
+    personal_pension_contribution: float = 0.0
+    personal_pension_return: float = 0.0
+    personal_pension_balance_end: float = 0.0
     provident_deposit: float = 0.0
     provident_withdrawal: float = 0.0
     pension_account_contribution: float = 0.0
@@ -1645,6 +1769,7 @@ class AffordabilityResult(BaseModel):
     tax_monthly_points: list[TaxMonthlyPoint] = []
     tax_events: list[TaxEventPoint] = []
     tax_strategy_items: list[TaxStrategyItem] = []
+    tax_strategy_timeline: list[TaxStrategyTimelinePoint] = []
     career_shock_projection: CareerShockProjection | None = None
     investment_plan_recommendations: list[InvestmentPlanRecommendation] = Field(default_factory=list)
     current_investment_allocation: InvestmentAllocationSummary | None = None

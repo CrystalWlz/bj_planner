@@ -173,6 +173,29 @@ export interface InvestmentPlanRecommendation {
   reasons: string[];
 }
 
+export interface VehicleIndicatorApplicantData {
+  enabled: boolean;
+  name: string;
+  relationship: "main" | "spouse" | "child" | "parent" | "parent_in_law" | "other";
+  generation: "self_generation" | "child_generation" | "parent_generation";
+  eligibility_type:
+    | "beijing_household"
+    | "beijing_work_residence_permit"
+    | "beijing_residence_permit_social_tax"
+    | "active_military_or_police"
+    | "hongkong_macao_taiwan_foreign"
+    | "unknown";
+  has_valid_driver_license: boolean;
+  has_no_beijing_vehicle: boolean;
+  family_application_start_month: string;
+  personal_indicator_history_type: "none" | "ordinary_lottery" | "new_energy_queue" | "both";
+  ordinary_lottery_steps: number;
+  new_energy_queue_start_month: string;
+  personal_history_points_override: number | null;
+  only_for_indicator_scoring: boolean;
+  notes: string;
+}
+
 export interface VehiclePlanData {
   enabled: boolean;
   name: string;
@@ -193,19 +216,45 @@ export interface VehiclePlanData {
     | "already_have"
     | "family_new_energy_pending"
     | "personal_new_energy_pending"
+    | "ordinary_indicator_pending"
     | "not_eligible";
   beijing_indicator_expected_delay_months: number;
+  license_plate_rental_enabled: boolean;
+  license_plate_rental_upfront_fee: number;
+  license_plate_rental_term_months: number;
+  license_plate_rental_renewal_fee: number;
+  license_plate_rental_renewal_term_months: number;
+  license_plate_rental_after_term_mode: "switch_to_own_indicator" | "renew_until_own_indicator";
+  beijing_family_indicator_score_enabled: boolean;
+  beijing_family_indicator_application_start_month: string;
+  beijing_family_indicator_applicants: VehicleIndicatorApplicantData[];
+  beijing_family_indicator_generations: number;
+  beijing_family_indicator_has_spouse: boolean;
+  beijing_family_indicator_main_points: number;
+  beijing_family_indicator_spouse_points: number;
+  beijing_family_indicator_other_applicant_count: number;
+  beijing_family_indicator_other_points_total: number;
+  beijing_family_indicator_application_years: number;
+  beijing_family_indicator_current_cutoff_score: number;
+  beijing_family_indicator_cutoff_score_annual_change: number;
+  beijing_family_indicator_last_config_year: number;
+  beijing_family_indicator_annual_quota: number;
   vehicle_vessel_tax_annual_override: number | null;
   planning_sequence: number;
   purchase_timing_mode: "auto_sequence" | "parallel" | "manual_month";
   after_previous_event_delay_months: number;
   manual_purchase_delay_months: number;
+  planning_window_start_month: string;
+  planning_window_end_month: string;
   total_price: number;
   down_payment_ratio: number;
   down_payment: number;
   purchase_tax: number;
   purchase_tax_relief: number;
   annual_vehicle_vessel_tax: number;
+  license_plate_rental_initial_fee: number;
+  beijing_family_indicator_score: number;
+  beijing_family_indicator_estimated_wait_months: number | null;
   purchase_delay_months: number;
   total_months: number;
   interest_free_months: number;
@@ -266,6 +315,8 @@ export interface PropertyPurchaseGoalData {
   planning_mode: "after_previous_purchase" | "parallel";
   after_previous_purchase_delay_months: number;
   earliest_purchase_delay_months: number;
+  planning_window_start_month: string;
+  planning_window_end_month: string;
   notes: string;
 }
 
@@ -394,11 +445,31 @@ export interface TaxStrategyItem {
   member_name: string;
   monthly_amount: number;
   annual_amount: number;
+  estimated_tax_saving: number;
+  cash_contribution: number;
+  account_return_rate: number;
+  withdrawal_tax_rate: number;
   start_month: string;
   end_month: string | null;
   reason: string;
   conflicts_with: SpecialDeductionItemData["deduction_type"][];
-  source: "backend_auto" | "manual" | "event";
+  source: "backend_auto" | "strategy_auto" | "manual" | "event";
+}
+
+export interface TaxStrategyTimelinePoint {
+  month: number;
+  year: number;
+  month_of_year: number;
+  category: "deduction_assignment" | "deduction_switch" | "personal_pension" | "bonus_tax" | "investment_tax" | "annual_settlement" | "manual_override";
+  title: string;
+  action: string;
+  member_name: string;
+  deduction_type: SpecialDeductionItemData["deduction_type"] | null;
+  status: "auto_enabled" | "manual_enabled" | "available" | "not_applicable" | "conflict";
+  amount: number;
+  estimated_tax_saving: number;
+  detail: string;
+  source: "backend_auto" | "strategy_auto" | "manual" | "event";
 }
 
 export interface InvestmentTaxProfileData {
@@ -414,6 +485,27 @@ export interface InvestmentTaxProfileData {
   stock_dividend_long_ratio: number;
   bond_interest_ratio: number;
   overseas_asset_ratio: number;
+}
+
+export type AccountCalibrationTarget =
+  | "cash"
+  | "investment"
+  | "provident"
+  | "pension"
+  | "medical"
+  | "property_asset"
+  | "vehicle_asset"
+  | "fixed_asset"
+  | "total_loan";
+
+export interface AccountCalibrationData {
+  enabled: boolean;
+  month: string;
+  target: AccountCalibrationTarget;
+  amount: number;
+  member_name: string;
+  reference_name: string;
+  note: string;
 }
 
 export interface HouseholdData {
@@ -460,6 +552,7 @@ export interface HouseholdData {
   elderly_dependents: ElderlyDependentData[];
   child_plans: ChildPlanData[];
   special_deductions: SpecialDeductionItemData[];
+  account_calibrations: AccountCalibrationData[];
   existing_home_count: number;
   existing_mortgage_count: number;
   has_beijing_hukou: boolean;
@@ -493,6 +586,8 @@ export interface ScenarioData {
   commercial_loan_amount: number;
   provident_loan_amount: number;
   manual_purchase_delay_months: number;
+  planning_window_start_month: string;
+  planning_window_end_month: string;
   micro_commercial_loan_ratio: number;
   commercial_rate: number;
   provident_rate: number;
@@ -617,6 +712,9 @@ export interface CarPlanAnalysis {
   purchase_tax: number;
   purchase_tax_relief: number;
   annual_vehicle_vessel_tax: number;
+  license_plate_rental_initial_fee: number;
+  beijing_family_indicator_score: number;
+  beijing_family_indicator_estimated_wait_months: number | null;
   loan_principal: number;
   total_months: number;
   interest_free_months: number;
@@ -1016,6 +1114,7 @@ export interface MonthlyCashflowPoint {
   total_asset_value: number;
   total_loan_balance: number;
   net_worth: number;
+  happiness_score: number;
   monthly_cash_delta: number;
   cash_income: number;
   pension_income: number;
@@ -1046,6 +1145,7 @@ export interface MonthlyCashflowPoint {
   first_vehicle_down_payment: number;
   second_vehicle_down_payment: number;
   vehicle_down_payment: number;
+  vehicle_plate_rental_payment: number;
   investment_contribution: number;
   investment_contribution_base: number;
   investment_contribution_cash_sweep: number;
@@ -1055,6 +1155,9 @@ export interface MonthlyCashflowPoint {
   investment_buy_fee: number;
   investment_sell_fee: number;
   investment_sell_proceeds: number;
+  personal_pension_contribution: number;
+  personal_pension_return: number;
+  personal_pension_balance: number;
   provident_deposit: number;
   provident_withdrawal: number;
   transaction_cash_out: number;
@@ -1143,6 +1246,9 @@ export interface AnnualFinancialSummary {
   investment_tax: number;
   investment_fee: number;
   investment_sell_proceeds: number;
+  personal_pension_contribution: number;
+  personal_pension_return: number;
+  personal_pension_balance_end: number;
   provident_deposit: number;
   provident_withdrawal: number;
   pension_account_contribution: number;
@@ -1215,6 +1321,7 @@ export interface AffordabilityResult {
   tax_monthly_points: TaxMonthlyPoint[];
   tax_events: TaxEventPoint[];
   tax_strategy_items: TaxStrategyItem[];
+  tax_strategy_timeline: TaxStrategyTimelinePoint[];
   career_shock_projection: CareerShockProjection | null;
   investment_plan_recommendations: InvestmentPlanRecommendation[];
   current_investment_allocation: InvestmentAllocationSummary | null;

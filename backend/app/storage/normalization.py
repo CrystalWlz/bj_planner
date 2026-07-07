@@ -28,6 +28,90 @@ def safe_int(value: Any, fallback: int) -> int:
         return fallback
 
 
+ACCOUNT_CALIBRATION_TARGETS = {
+    "cash",
+    "investment",
+    "provident",
+    "pension",
+    "medical",
+    "property_asset",
+    "vehicle_asset",
+    "fixed_asset",
+    "total_loan",
+}
+CHILD_EXPENSE_DEFAULTS = {
+    "preparation_months_before_birth": 6,
+    "pregnancy_months_before_birth": 9,
+    "monthly_preparation_cost": 1500,
+    "monthly_pregnancy_cost": 3000,
+    "birth_medical_cost": 30000,
+    "postpartum_recovery_cost": 40000,
+    "initial_baby_supplies_cost": 20000,
+    "monthly_childcare_cost_before_kindergarten": 4500,
+    "monthly_kindergarten_cost": 5000,
+    "monthly_primary_secondary_cost": 6000,
+    "monthly_higher_education_cost": 8000,
+    "kindergarten_entry_cost": 10000,
+    "primary_school_entry_cost": 15000,
+    "higher_education_entry_cost": 50000,
+}
+
+
+def normalize_year_month(value: Any, fallback: str = "2026-07") -> str:
+    text = str(value or "").strip()
+    parts = text.split("-")
+    if len(parts) != 2:
+        return fallback
+    year = safe_int(parts[0], 0)
+    month = safe_int(parts[1], 0)
+    if year < 1900 or year > 2200 or month < 1 or month > 12:
+        return fallback
+    return f"{year:04d}-{month:02d}"
+
+
+def normalize_optional_year_month(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = normalize_year_month(text, "")
+    return normalized if normalized != "" else ""
+
+
+def normalize_account_calibrations(data: dict[str, Any]) -> None:
+    normalized: list[dict[str, Any]] = []
+    for item in data.get("account_calibrations") or []:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target") or "cash")
+        if target not in ACCOUNT_CALIBRATION_TARGETS:
+            target = "cash"
+        normalized.append(
+            {
+                "enabled": bool(item.get("enabled", True)),
+                "month": normalize_year_month(item.get("month"), "2026-07"),
+                "target": target,
+                "amount": max(0.0, safe_float(item.get("amount"), 0.0)),
+                "member_name": str(item.get("member_name") or ""),
+                "reference_name": str(item.get("reference_name") or ""),
+                "note": str(item.get("note") or ""),
+            }
+        )
+    data["account_calibrations"] = normalized
+
+
+def clear_income_stage_manual_cash_adjustments(data: dict[str, Any]) -> None:
+    data.pop("manual_adjustments", None)
+    for member_index, member in enumerate(data.get("members") or []):
+        if not isinstance(member, dict):
+            continue
+        for stage in member.get("income_stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            stage["monthly_extra_cash_expense"] = 0
+        if safe_float(member.get("monthly_extra_cash_expense"), 0.0) > 0:
+            member["monthly_extra_cash_expense"] = 0
+
+
 def planning_timing_from_scenario(scenario: dict[str, Any]) -> str:
     mode = str(scenario.get("purchase_planning_mode") or "after_previous_purchase")
     return "parallel" if mode == "parallel" else "auto_sequence"
@@ -66,6 +150,8 @@ def home_goal_from_scenario(
             "priority": max(1, safe_int(normalized_scenario.get("purchase_sequence"), 1)),
             "timing_mode": planning_timing_from_scenario(normalized_scenario),
             "earliest_purchase_delay_months": max(0, safe_int(normalized_scenario.get("manual_purchase_delay_months"), 0)),
+            "planning_window_start_month": normalize_optional_year_month(normalized_scenario.get("planning_window_start_month")),
+            "planning_window_end_month": normalize_optional_year_month(normalized_scenario.get("planning_window_end_month")),
             "delay_after_dependency_months": max(0, safe_int(normalized_scenario.get("after_previous_purchase_delay_months"), 0)),
             "allow_parallel": str(normalized_scenario.get("purchase_planning_mode") or "") == "parallel",
             "selected_strategy_id": str(normalized_scenario.get("selected_purchase_plan_variant") or ""),
@@ -96,6 +182,12 @@ def scenario_from_home_goal(goal_id: str, goal: dict[str, Any]) -> dict[str, Any
         0,
         safe_int(goal.get("earliest_purchase_delay_months"), safe_int(scenario.get("manual_purchase_delay_months"), 0)),
     )
+    scenario["planning_window_start_month"] = normalize_optional_year_month(
+        goal.get("planning_window_start_month") or scenario.get("planning_window_start_month")
+    )
+    scenario["planning_window_end_month"] = normalize_optional_year_month(
+        goal.get("planning_window_end_month") or scenario.get("planning_window_end_month")
+    )
     if goal.get("selected_strategy_id"):
         scenario["selected_purchase_plan_variant"] = str(goal.get("selected_strategy_id"))
     scenario["planning_goal_id"] = goal_id
@@ -122,6 +214,8 @@ def vehicle_goal_from_plan(
             "enabled": bool(vehicle_data.get("enabled", True)),
             "priority": max(1, safe_int(vehicle_data.get("planning_sequence"), index + 1)),
             "timing_mode": timing_mode,
+            "planning_window_start_month": normalize_optional_year_month(vehicle_data.get("planning_window_start_month")),
+            "planning_window_end_month": normalize_optional_year_month(vehicle_data.get("planning_window_end_month")),
             "earliest_purchase_delay_months": max(
                 0,
                 safe_int(vehicle_data.get("manual_purchase_delay_months"), safe_int(vehicle_data.get("purchase_delay_months"), 0)),
@@ -156,6 +250,12 @@ def vehicle_plan_from_goal(goal: dict[str, Any], index: int) -> dict[str, Any]:
         0,
         safe_int(goal.get("earliest_purchase_delay_months"), safe_int(vehicle.get("manual_purchase_delay_months"), 0)),
     )
+    vehicle["planning_window_start_month"] = normalize_optional_year_month(
+        goal.get("planning_window_start_month") or vehicle.get("planning_window_start_month")
+    )
+    vehicle["planning_window_end_month"] = normalize_optional_year_month(
+        goal.get("planning_window_end_month") or vehicle.get("planning_window_end_month")
+    )
     vehicle["after_previous_event_delay_months"] = max(
         0,
         safe_int(goal.get("delay_after_dependency_months"), safe_int(vehicle.get("after_previous_event_delay_months"), 0)),
@@ -179,6 +279,8 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("timing_mode", "auto_sequence")
     data.setdefault("earliest_purchase_month", "")
     data.setdefault("earliest_purchase_delay_months", 0)
+    data["planning_window_start_month"] = normalize_optional_year_month(data.get("planning_window_start_month"))
+    data["planning_window_end_month"] = normalize_optional_year_month(data.get("planning_window_end_month"))
     data.setdefault("depends_on_goal_id", "")
     data.setdefault("delay_after_dependency_months", 0)
     data.setdefault("allow_parallel", False)
@@ -291,6 +393,9 @@ def fill_vehicle_timing_defaults(vehicle: dict[str, Any], index: int) -> None:
     vehicle.setdefault("purchase_timing_mode", "auto_sequence")
     vehicle.setdefault("after_previous_event_delay_months", 0)
     vehicle.setdefault("manual_purchase_delay_months", max(0, safe_int(vehicle.get("purchase_delay_months"), 0)))
+    vehicle["planning_window_start_month"] = normalize_optional_year_month(vehicle.get("planning_window_start_month"))
+    vehicle["planning_window_end_month"] = normalize_optional_year_month(vehicle.get("planning_window_end_month"))
+    vehicle.setdefault("vehicle_service_years", 10)
     candidates = vehicle.get("candidate_vehicles")
     if isinstance(candidates, list):
         for candidate in candidates:
@@ -299,6 +404,13 @@ def fill_vehicle_timing_defaults(vehicle: dict[str, Any], index: int) -> None:
             candidate.setdefault("planning_sequence", safe_int(vehicle.get("planning_sequence"), index + 1))
             candidate.setdefault("purchase_timing_mode", vehicle.get("purchase_timing_mode") or "auto_sequence")
             candidate.setdefault("after_previous_event_delay_months", safe_int(vehicle.get("after_previous_event_delay_months"), 0))
+            candidate["planning_window_start_month"] = normalize_optional_year_month(
+                candidate.get("planning_window_start_month") or vehicle.get("planning_window_start_month")
+            )
+            candidate["planning_window_end_month"] = normalize_optional_year_month(
+                candidate.get("planning_window_end_month") or vehicle.get("planning_window_end_month")
+            )
+            candidate.setdefault("vehicle_service_years", safe_int(vehicle.get("vehicle_service_years"), 10))
             candidate.setdefault(
                 "manual_purchase_delay_months",
                 max(0, safe_int(candidate.get("purchase_delay_months") or vehicle.get("manual_purchase_delay_months"), 0)),
@@ -393,6 +505,7 @@ def normalize_car_plan(data: dict[str, Any]) -> None:
         return
     car_plan.setdefault("annual_maintenance_growth_rate", 0.03)
     car_plan.setdefault("annual_insurance_growth_rate", 0.02)
+    car_plan.setdefault("vehicle_service_years", 10)
 
     existing = car_plan.get("vehicle_plans")
     vehicle_plans = [item for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
@@ -557,7 +670,7 @@ def normalize_members_and_career_shock(data: dict[str, Any]) -> None:
                     "annual_bonus_payout_month": 4,
                     "monthly_freelance_income": 0,
                     "monthly_non_taxable_income": safe_float(member.get("monthly_non_taxable_income")),
-                    "monthly_extra_cash_expense": safe_float(member.get("monthly_extra_cash_expense")),
+                    "monthly_extra_cash_expense": 0,
                     "monthly_social_insurance": safe_float(member.get("monthly_social_insurance")),
                     "monthly_housing_fund": safe_float(member.get("monthly_housing_fund")),
                     "housing_fund_personal_rate": safe_float(member.get("housing_fund_personal_rate"), 0.12),
@@ -694,19 +807,15 @@ def normalize_household(data: dict[str, Any]) -> dict[str, Any]:
             child.setdefault("planned_birth_month", "")
             child.setdefault("planned_birth_start_month", "")
             child.setdefault("planned_birth_end_month", "")
-            child.setdefault("preparation_months_before_birth", 6)
-            child.setdefault("pregnancy_months_before_birth", 9)
-            child.setdefault("monthly_preparation_cost", 1000)
-            child.setdefault("monthly_pregnancy_cost", 2000)
-            child.setdefault("birth_medical_cost", 20000)
-            child.setdefault("postpartum_recovery_cost", 30000)
-            child.setdefault("initial_baby_supplies_cost", 15000)
-            child.setdefault("kindergarten_entry_cost", 0)
-            child.setdefault("primary_school_entry_cost", 0)
-            child.setdefault("higher_education_entry_cost", 0)
+            manual_child_expense = str(child.get("expense_strategy_mode") or "balanced") == "manual"
+            for key, fallback in CHILD_EXPENSE_DEFAULTS.items():
+                if key not in child or (not manual_child_expense and safe_float(child.get(key), 0.0) <= 0):
+                    child[key] = fallback
     data.setdefault("special_deductions", [])
     data.setdefault("investment_tax_profile", {})
     data.setdefault("property_goals", [])
+    clear_income_stage_manual_cash_adjustments(data)
+    normalize_account_calibrations(data)
     normalize_car_plan(data)
     normalize_members_and_career_shock(data)
     normalized = HouseholdData.model_validate(data).model_dump(mode="json")
@@ -720,6 +829,8 @@ def normalize_scenario(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("purchase_sequence", 1)
     data.setdefault("purchase_planning_mode", "after_previous_purchase")
     data.setdefault("after_previous_purchase_delay_months", 0)
+    data["planning_window_start_month"] = normalize_optional_year_month(data.get("planning_window_start_month"))
+    data["planning_window_end_month"] = normalize_optional_year_month(data.get("planning_window_end_month"))
     data.setdefault("investment_withdrawal_mode", "auto")
     data.setdefault("investment_min_balance_after_purchase", 0)
     commercial_prepayment_mode = str(

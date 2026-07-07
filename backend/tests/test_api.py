@@ -192,6 +192,8 @@ def test_scenario_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatch) -
                     "total_price": 3_200_000,
                     "purchase_sequence": 2,
                     "purchase_planning_mode": "parallel",
+                    "planning_window_start_month": "2028-01",
+                    "planning_window_end_month": "2029-12",
                     "selected_purchase_plan_variant": "微量商贷",
                 }
             },
@@ -209,11 +211,15 @@ def test_scenario_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatch) -
     assert created["data"]["total_price"] == 3_200_000
     assert goal["goal_type"] == "home"
     assert goal["data"]["target_params"]["total_price"] == 3_200_000
+    assert goal["data"]["planning_window_start_month"] == "2028-01"
+    assert goal["data"]["planning_window_end_month"] == "2029-12"
     assert goal["data"]["selected_strategy_id"] == "微量商贷"
     assert updated_goal["data"]["name"] == "示例房源 A 调整"
     assert projected["data"]["name"] == "示例房源 A 调整"
     assert projected["data"]["purchase_sequence"] == 3
     assert projected["data"]["purchase_planning_mode"] == "after_previous_purchase"
+    assert projected["data"]["planning_window_start_month"] == "2028-01"
+    assert projected["data"]["planning_window_end_month"] == "2029-12"
 
 
 def test_vehicle_plan_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatch) -> None:
@@ -251,6 +257,8 @@ def test_vehicle_plan_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatc
                     "total_price": 180_000,
                     "planning_sequence": 2,
                     "purchase_timing_mode": "parallel",
+                    "planning_window_start_month": "2028-06",
+                    "planning_window_end_month": "2029-06",
                 }
             ],
         }
@@ -271,8 +279,12 @@ def test_vehicle_plan_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatc
     assert vehicle_goals[0]["goal_type"] == "vehicle"
     assert vehicle_goals[0]["data"]["target_params"]["candidate_vehicles"][0]["name"] == "示例电车"
     assert vehicle_goals[0]["data"]["timing_mode"] == "parallel"
+    assert vehicle_goals[0]["data"]["planning_window_start_month"] == "2028-06"
+    assert vehicle_goals[0]["data"]["planning_window_end_month"] == "2029-06"
     assert projected_household["data"]["car_plan"]["vehicle_plans"][0]["name"] == "示例用车需求调整"
     assert projected_household["data"]["car_plan"]["vehicle_plans"][0]["planning_sequence"] == 4
+    assert projected_household["data"]["car_plan"]["vehicle_plans"][0]["planning_window_start_month"] == "2028-06"
+    assert projected_household["data"]["car_plan"]["vehicle_plans"][0]["planning_window_end_month"] == "2029-06"
 
 
 def test_invalid_household_payload_is_rejected(tmp_path: Path, monkeypatch) -> None:
@@ -336,7 +348,7 @@ def test_empty_vehicle_candidate_list_is_preserved_on_save(tmp_path: Path, monke
                     "annual_insurance_min": 4500,
                     "annual_insurance_growth_rate": 0.02,
                     "depreciation_years": 8,
-                    "vehicle_service_years": 15,
+                    "vehicle_service_years": 10,
                     "vehicle_retirement_mileage_km": 600000,
                     "happiness_score": 6.5,
                     "notes": "",

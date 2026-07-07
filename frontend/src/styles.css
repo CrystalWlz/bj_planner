@@ -23,19 +23,19 @@
   --green: #2f8662;
   --gold: #aa7c24;
   --red: #b14545;
-  --chart-cash: #2f6fcb;
-  --chart-investment: #269263;
-  --chart-provident: #1596ad;
+  --chart-cash: #2f8662;
+  --chart-investment: #5c6ed6;
+  --chart-provident: #2f78b8;
   --chart-debt: #d36a35;
   --chart-expense: #c44f63;
-  --chart-deduction: #b98a2a;
-  --chart-property: #8064d8;
-  --chart-vehicle: #d28318;
-  --chart-fixed-asset: #168373;
+  --chart-deduction: #2f78b8;
+  --chart-property: #c2922e;
+  --chart-vehicle: #d2a23a;
+  --chart-fixed-asset: #b98a2a;
   --chart-total-asset: #334155;
-  --chart-pension: #6d5bd0;
+  --chart-pension: #7b61d1;
   --chart-medical: #0f9f86;
-  --chart-baseline: #7463d8;
+  --chart-baseline: #5c6ed6;
   --chart-safe: #28724f;
   --chart-warning: #c98a24;
   --chart-danger: #b14545;
@@ -90,19 +90,19 @@
   --green: #79c6a0;
   --gold: #d8b36a;
   --red: #e78a93;
-  --chart-cash: #7fb1e8;
-  --chart-investment: #7bcf9b;
-  --chart-provident: #62c7d8;
+  --chart-cash: #79c6a0;
+  --chart-investment: #a9a2f2;
+  --chart-provident: #7fb1e8;
   --chart-debt: #e7a06a;
   --chart-expense: #e28391;
-  --chart-deduction: #d8b36a;
-  --chart-property: #b9a8ed;
+  --chart-deduction: #7fb1e8;
+  --chart-property: #e0bd74;
   --chart-vehicle: #e3b45c;
-  --chart-fixed-asset: #70c6bb;
+  --chart-fixed-asset: #d8b36a;
   --chart-total-asset: #d1d8e3;
   --chart-pension: #aca2ed;
   --chart-medical: #6ed6c2;
-  --chart-baseline: #aca2ed;
+  --chart-baseline: #a9a2f2;
   --chart-safe: #80cfa4;
   --chart-warning: #e0bd74;
   --chart-danger: #e78a93;
@@ -159,6 +159,7 @@ summary:focus-visible,
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   padding: 0 28px;
   background: var(--topbar-bg);
   border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
@@ -179,11 +180,17 @@ summary:focus-visible,
   position: sticky;
   top: 76px;
   z-index: 19;
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--blue) 34%, transparent) transparent;
 }
 
 .page-nav::-webkit-scrollbar {
-  display: none;
+  height: 4px;
+}
+
+.page-nav::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--blue) 34%, transparent);
 }
 
 .page-tab {
@@ -232,6 +239,11 @@ summary:focus-visible,
   gap: 10px;
 }
 
+.topbar-status {
+  width: 100%;
+  margin-top: -10px;
+}
+
 .page-workspace {
   flex: 1;
   width: 100%;
@@ -247,6 +259,10 @@ summary:focus-visible,
 }
 
 .strategy-workbench {
+  width: min(1440px, 100%);
+}
+
+.planner-page-shell {
   width: min(1440px, 100%);
 }
 
@@ -284,6 +300,65 @@ summary:focus-visible,
   border-radius: var(--radius);
   box-shadow: var(--shadow-soft);
   min-width: 0;
+}
+
+.planner-summary-band {
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.planner-summary-band p {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.workflow-section {
+  display: grid;
+  gap: 14px;
+}
+
+.workflow-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.workflow-section-head .panel-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.workflow-section-description {
+  flex: 1 1 360px;
+  max-width: 760px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: right;
+}
+
+.horizontal-card-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.horizontal-card-list.compact {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.workflow-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
 }
 
 .panel-title {
@@ -739,6 +814,40 @@ option {
 
 .account-member-balances {
   margin-top: 14px;
+}
+
+.account-calibration-panel {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.account-calibration-panel .section-title-row {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.account-calibration-panel .field-hint.compact {
+  margin: 4px 0 0;
+}
+
+.account-calibration-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.calibration-row {
+  display: grid;
+  grid-template-columns: minmax(108px, 0.8fr) minmax(150px, 1fr) minmax(180px, 1.1fr) minmax(160px, 1fr) minmax(220px, 1.3fr) var(--control-height);
+  gap: 10px;
+  align-items: end;
+}
+
+.calibration-row .icon-button {
+  align-self: end;
 }
 
 .member-account-snapshot {
@@ -1535,9 +1644,8 @@ option {
 
 .child-goal-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 360px));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 12px;
-  justify-content: start;
 }
 
 .child-goal-card {
@@ -1586,11 +1694,11 @@ option {
 
 .child-workbench-layout,
 .investment-workbench-layout {
-  grid-template-columns: minmax(300px, 0.34fr) minmax(0, 0.66fr);
+  grid-template-columns: 1fr;
 }
 
-.child-workbench-layout .strategy-side-panel,
-.investment-workbench-layout .strategy-side-panel {
+.child-goal-panel,
+.investment-strategy-panel {
   display: grid;
   align-content: start;
   gap: 14px;
@@ -1599,6 +1707,31 @@ option {
 .child-goal-panel .member-header,
 .tax-manual-panel .member-header {
   gap: 10px;
+}
+
+.investment-strategy-panel {
+  min-width: 0;
+}
+
+.investment-plan-grid {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.investment-side-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.investment-config-panel {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.investment-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+  gap: 14px;
+  align-items: start;
 }
 
 .child-config-list {
@@ -1933,7 +2066,8 @@ option {
 }
 
 .primary-button,
-.ghost-button {
+.ghost-button,
+.secondary-button {
   min-height: var(--button-height);
   display: inline-flex;
   align-items: center;
@@ -1960,6 +2094,12 @@ option {
   color: var(--muted-strong);
 }
 
+.secondary-button {
+  border: 1px solid color-mix(in srgb, var(--blue) 28%, var(--border));
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface-raised));
+  color: var(--blue);
+}
+
 .ghost-button.danger-action,
 .danger-action {
   color: var(--red);
@@ -1978,7 +2118,8 @@ option {
 }
 
 .primary-button:hover,
-.ghost-button:hover {
+.ghost-button:hover,
+.secondary-button:hover {
   transform: translateY(-1px);
 }
 
@@ -1991,8 +2132,14 @@ option {
   background: color-mix(in srgb, var(--blue) 5%, var(--surface-raised));
 }
 
+.secondary-button:hover {
+  border-color: color-mix(in srgb, var(--blue) 42%, var(--border));
+  background: color-mix(in srgb, var(--blue) 11%, var(--surface-raised));
+}
+
 .primary-button:disabled,
-.ghost-button:disabled {
+.ghost-button:disabled,
+.secondary-button:disabled {
   opacity: 0.65;
   cursor: not-allowed;
 }
@@ -2383,6 +2530,10 @@ option {
   order: 5;
 }
 
+.social-security-chart {
+  order: 6;
+}
+
 .cash-flow-sections {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2764,6 +2915,21 @@ option {
   padding: 18px;
   background: linear-gradient(180deg, var(--surface-raised), var(--surface));
   box-shadow: var(--shadow-soft);
+}
+
+.chart-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 14px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chart-subhead strong {
+  color: var(--text);
+  font-size: 13px;
 }
 
 .tax-visual-chart {
@@ -3864,6 +4030,99 @@ button.comparison-row:hover {
   padding: 10px;
 }
 
+.tax-strategy-timeline {
+  display: grid;
+  gap: 10px;
+}
+
+.tax-timeline-item {
+  display: grid;
+  grid-template-columns: 14px minmax(96px, 0.7fr) minmax(0, 2.4fr) minmax(150px, 0.9fr);
+  align-items: stretch;
+  gap: 12px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.tax-timeline-dot {
+  width: 10px;
+  min-height: 100%;
+  border-radius: 999px;
+  background: var(--blue);
+}
+
+.tax-timeline-dot.deduction {
+  background: var(--chart-deduction);
+}
+
+.tax-timeline-dot.pension {
+  background: var(--chart-pension);
+}
+
+.tax-timeline-dot.tax {
+  background: var(--chart-warning);
+}
+
+.tax-timeline-dot.investment {
+  background: var(--chart-investment);
+}
+
+.tax-timeline-dot.settlement {
+  background: var(--chart-provident);
+}
+
+.tax-timeline-dot.manual {
+  background: var(--muted-strong);
+}
+
+.tax-timeline-date,
+.tax-timeline-main,
+.tax-timeline-value {
+  min-width: 0;
+}
+
+.tax-timeline-date strong,
+.tax-timeline-title strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.tax-timeline-date span,
+.tax-timeline-main p,
+.tax-timeline-main small {
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.tax-timeline-main p,
+.tax-timeline-main small {
+  display: block;
+  margin: 4px 0 0;
+}
+
+.tax-timeline-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tax-timeline-value {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.tax-timeline-value .metric {
+  min-height: 48px;
+  padding: 9px;
+}
+
 .tax-manual-panel {
   margin-top: 14px;
 }
@@ -4201,7 +4460,7 @@ button.comparison-row:hover {
 }
 
 .ghost-button.small {
-  min-height: var(--button-height-sm);
+  min-height: max(var(--button-height-sm), 34px);
   padding: 0 10px;
   font-size: 12px;
 }
@@ -4833,6 +5092,35 @@ button.car-strategy-comparison-row:hover {
   margin-top: 12px;
 }
 
+.indicator-applicant-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+}
+
+.indicator-applicant-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.indicator-applicant-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.indicator-applicant-grid > .empty-state {
+  width: 100%;
+}
+
 .visual-header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(180px, 220px);
@@ -4937,12 +5225,11 @@ button.car-strategy-comparison-row:hover {
 }
 
 .error-text {
-  max-width: 420px;
+  max-width: min(900px, 100%);
   color: #b23b3b;
   font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.5;
+  white-space: normal;
 }
 
 .save-state {
@@ -5040,7 +5327,9 @@ button.car-strategy-comparison-row:hover {
 :root[data-theme="dark"] .investment-allocation,
 :root[data-theme="dark"] .investment-guide article,
 :root[data-theme="dark"] .tax-strategy-item,
+:root[data-theme="dark"] .tax-timeline-item,
 :root[data-theme="dark"] .tax-deduction-action,
+:root[data-theme="dark"] .planner-summary-band,
 :root[data-theme="dark"] .visual-summary-strip span,
 :root[data-theme="dark"] .car-notes span,
 :root[data-theme="dark"] .tax-summary-panel div,
@@ -5492,6 +5781,7 @@ button.car-strategy-comparison-row:hover {
   .attribution-bars,
   .attribution-pies,
   .strategy-current-panel,
+  .investment-config-grid,
   .vehicle-sequence-grid,
   .vehicle-source-grid,
   .compact-fields,
@@ -5520,6 +5810,35 @@ button.car-strategy-comparison-row:hover {
   .advisor-evidence-item {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+
+  .workflow-section-head {
+    display: grid;
+    gap: 6px;
+  }
+
+  .workflow-section-description {
+    max-width: none;
+    text-align: left;
+  }
+
+  .workflow-section-head > span {
+    max-width: none;
+    text-align: left;
+  }
+
+  .tax-timeline-item {
+    grid-template-columns: 10px minmax(0, 1fr);
+  }
+
+  .tax-timeline-date,
+  .tax-timeline-main,
+  .tax-timeline-value {
+    grid-column: 2;
+  }
+
+  .tax-timeline-value {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   }
 
   .form-grid.two,
@@ -5855,7 +6174,7 @@ button.car-strategy-comparison-row:hover {
     min-height: 0;
   }
 
-  .section-header h1,
+  .section-header h2,
   .recommend-title h3 {
     font-size: 22px;
     line-height: 1.25;
@@ -6156,7 +6475,7 @@ button.car-strategy-comparison-row:hover {
     padding: 12px 10px 24px;
   }
 
-  .section-header h1,
+  .section-header h2,
   .recommend-title h3 {
     font-size: 20px;
   }

@@ -55,6 +55,8 @@ import {
 } from "./api";
 import { money, numberInput, percent } from "./format";
 import type {
+  AccountCalibrationData,
+  AccountCalibrationTarget,
   AffordabilityResult,
   BonusTaxMethod,
   CarPlanAnalysis,
@@ -83,9 +85,24 @@ import type {
   SpecialDeductionItemData,
   SourceDocumentRecord,
   PhasedLoanData,
+  TaxStrategyItem,
+  TaxStrategyTimelinePoint,
+  VehicleIndicatorApplicantData,
   VehicleFinancingOptionData,
   VehiclePlanData
 } from "./types";
+
+const ACCOUNT_CALIBRATION_TARGET_OPTIONS: Array<{ value: AccountCalibrationTarget; label: string }> = [
+  { value: "cash", label: "现金账户" },
+  { value: "investment", label: "投资账户" },
+  { value: "provident", label: "公积金账户合计" },
+  { value: "pension", label: "养老个人账户合计" },
+  { value: "medical", label: "医保个人账户合计" },
+  { value: "property_asset", label: "房产估值" },
+  { value: "vehicle_asset", label: "车辆估值" },
+  { value: "fixed_asset", label: "固定资产合计" },
+  { value: "total_loan", label: "贷款余额合计" }
+];
 
 const visualColors = {
   cash: "var(--chart-cash)",
@@ -253,6 +270,55 @@ const normalizeVehicleFinancingOptions = (vehicle: Partial<VehiclePlanData>): Ve
   return defaultVehicleFinancingOptions().map((option, index) => normalizeVehicleFinancingOption(option, index, vehicle));
 };
 
+const defaultVehicleIndicatorApplicant = (index: number, patch: Partial<VehicleIndicatorApplicantData> = {}): VehicleIndicatorApplicantData => ({
+  enabled: true,
+  name: `指标申请人 ${index + 1}`,
+  relationship: index === 0 ? "main" : "other",
+  generation: "self_generation",
+  eligibility_type: "unknown",
+  has_valid_driver_license: index === 0,
+  has_no_beijing_vehicle: true,
+  family_application_start_month: "",
+  personal_indicator_history_type: "none",
+  ordinary_lottery_steps: 0,
+  new_energy_queue_start_month: "",
+  personal_history_points_override: null,
+  only_for_indicator_scoring: true,
+  notes: "",
+  ...patch
+});
+
+const normalizeVehicleIndicatorApplicants = (applicants?: Partial<VehicleIndicatorApplicantData>[]): VehicleIndicatorApplicantData[] =>
+  (applicants ?? []).map((applicant, index) => defaultVehicleIndicatorApplicant(index, applicant));
+
+function PlanningWindowFields({
+  startMonth,
+  endMonth,
+  onChange,
+  startLabel = "计划窗口开始",
+  endLabel = "计划窗口最晚",
+  hint = "不填则由系统按现金安全、政策限制和目标顺序自动选择；填写后，后端会在这个时间窗口内寻找更合适的具体月份。"
+}: {
+  startMonth: string;
+  endMonth: string;
+  onChange: (patch: { planning_window_start_month?: string; planning_window_end_month?: string }) => void;
+  startLabel?: string;
+  endLabel?: string;
+  hint?: string;
+}) {
+  return (
+    <>
+      <Field label={startLabel}>
+        <input type="month" value={startMonth} onChange={(event) => onChange({ planning_window_start_month: event.target.value })} />
+      </Field>
+      <Field label={endLabel}>
+        <input type="month" value={endMonth} onChange={(event) => onChange({ planning_window_end_month: event.target.value })} />
+      </Field>
+      <p className="field-hint form-grid-note">{hint}</p>
+    </>
+  );
+}
+
 const defaultCarPlan: CarPlanData = {
   enabled: false,
   name: "车辆计划",
@@ -270,15 +336,40 @@ const defaultCarPlan: CarPlanData = {
   new_energy_catalog_eligible: true,
   beijing_license_indicator_status: "unknown",
   beijing_indicator_expected_delay_months: 0,
+  license_plate_rental_enabled: false,
+  license_plate_rental_upfront_fee: 20000,
+  license_plate_rental_term_months: 36,
+  license_plate_rental_renewal_fee: 20000,
+  license_plate_rental_renewal_term_months: 36,
+  license_plate_rental_after_term_mode: "renew_until_own_indicator",
+  beijing_family_indicator_score_enabled: false,
+  beijing_family_indicator_application_start_month: "",
+  beijing_family_indicator_applicants: [],
+  beijing_family_indicator_generations: 1,
+  beijing_family_indicator_has_spouse: true,
+  beijing_family_indicator_main_points: 2,
+  beijing_family_indicator_spouse_points: 1,
+  beijing_family_indicator_other_applicant_count: 0,
+  beijing_family_indicator_other_points_total: 0,
+  beijing_family_indicator_application_years: 0,
+  beijing_family_indicator_current_cutoff_score: 36,
+  beijing_family_indicator_cutoff_score_annual_change: 0,
+  beijing_family_indicator_last_config_year: 2026,
+  beijing_family_indicator_annual_quota: 119200,
   vehicle_vessel_tax_annual_override: null,
   purchase_tax: 0,
   purchase_tax_relief: 0,
   annual_vehicle_vessel_tax: 0,
+  license_plate_rental_initial_fee: 0,
+  beijing_family_indicator_score: 0,
+  beijing_family_indicator_estimated_wait_months: null,
   vehicle_plans: [],
   planning_sequence: 1,
   purchase_timing_mode: "auto_sequence",
   after_previous_event_delay_months: 0,
   manual_purchase_delay_months: 0,
+  planning_window_start_month: "",
+  planning_window_end_month: "",
   total_price: 0,
   down_payment_ratio: 0.5,
   down_payment: 0,
@@ -307,7 +398,7 @@ const defaultCarPlan: CarPlanData = {
   annual_insurance_min: 0,
   annual_insurance_growth_rate: 0.02,
   depreciation_years: 8,
-  vehicle_service_years: 15,
+  vehicle_service_years: 10,
   vehicle_retirement_mileage_km: 600000,
   happiness_score: 6.5,
   notes: ""
@@ -425,19 +516,65 @@ const defaultChildPlan: ChildPlanData = {
   education_start_month: "",
   preparation_months_before_birth: 6,
   pregnancy_months_before_birth: 9,
-  monthly_preparation_cost: 1000,
-  monthly_pregnancy_cost: 2000,
-  birth_medical_cost: 20000,
-  postpartum_recovery_cost: 30000,
-  initial_baby_supplies_cost: 15000,
-  monthly_childcare_cost_before_kindergarten: 0,
-  monthly_kindergarten_cost: 0,
-  monthly_primary_secondary_cost: 0,
-  monthly_higher_education_cost: 0,
-  kindergarten_entry_cost: 0,
-  primary_school_entry_cost: 0,
-  higher_education_entry_cost: 0,
+  monthly_preparation_cost: 1500,
+  monthly_pregnancy_cost: 3000,
+  birth_medical_cost: 30000,
+  postpartum_recovery_cost: 40000,
+  initial_baby_supplies_cost: 20000,
+  monthly_childcare_cost_before_kindergarten: 4500,
+  monthly_kindergarten_cost: 5000,
+  monthly_primary_secondary_cost: 6000,
+  monthly_higher_education_cost: 8000,
+  kindergarten_entry_cost: 10000,
+  primary_school_entry_cost: 15000,
+  higher_education_entry_cost: 50000,
   notes: ""
+};
+
+const childExpensePresets: Record<ChildPlanData["expense_strategy_mode"], Partial<ChildPlanData>> = {
+  conservative: {
+    monthly_preparation_cost: 800,
+    monthly_pregnancy_cost: 1800,
+    birth_medical_cost: 15000,
+    postpartum_recovery_cost: 20000,
+    initial_baby_supplies_cost: 10000,
+    monthly_childcare_cost_before_kindergarten: 2500,
+    monthly_kindergarten_cost: 2500,
+    monthly_primary_secondary_cost: 3000,
+    monthly_higher_education_cost: 5000,
+    kindergarten_entry_cost: 5000,
+    primary_school_entry_cost: 8000,
+    higher_education_entry_cost: 30000,
+  },
+  balanced: {
+    monthly_preparation_cost: 1500,
+    monthly_pregnancy_cost: 3000,
+    birth_medical_cost: 30000,
+    postpartum_recovery_cost: 40000,
+    initial_baby_supplies_cost: 20000,
+    monthly_childcare_cost_before_kindergarten: 4500,
+    monthly_kindergarten_cost: 5000,
+    monthly_primary_secondary_cost: 6000,
+    monthly_higher_education_cost: 8000,
+    kindergarten_entry_cost: 10000,
+    primary_school_entry_cost: 15000,
+    higher_education_entry_cost: 50000,
+  },
+  quality: {
+    monthly_preparation_cost: 3000,
+    monthly_pregnancy_cost: 6000,
+    birth_medical_cost: 60000,
+    postpartum_recovery_cost: 80000,
+    initial_baby_supplies_cost: 40000,
+    monthly_childcare_cost_before_kindergarten: 8000,
+    monthly_kindergarten_cost: 9000,
+    monthly_primary_secondary_cost: 12000,
+    monthly_higher_education_cost: 15000,
+    kindergarten_entry_cost: 20000,
+    primary_school_entry_cost: 30000,
+    higher_education_entry_cost: 100000,
+  },
+  manual: {}
 };
 
 const defaultSpecialDeduction: SpecialDeductionItemData = {
@@ -544,6 +681,8 @@ function normalizeVehiclePlanData(vehicle: VehiclePlanData): VehiclePlanData {
     selected_financing_max_down_payment_ratio: vehicle.selected_financing_max_down_payment_ratio ?? 1,
     selected_financing_prepayment_allowed: vehicle.selected_financing_prepayment_allowed ?? true,
     selected_financing_prepayment_policy_note: vehicle.selected_financing_prepayment_policy_note ?? "",
+    planning_window_start_month: vehicle.planning_window_start_month ?? "",
+    planning_window_end_month: vehicle.planning_window_end_month ?? "",
     loan_prepayment_enabled: vehicle.loan_prepayment_enabled ?? false,
     loan_prepayment_start_month: vehicle.loan_prepayment_start_month ?? 1,
     loan_prepayment_allowed_after_month: vehicle.loan_prepayment_allowed_after_month ?? 12,
@@ -672,6 +811,15 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         ...item,
         end_month: item.end_month ?? null
       })),
+      account_calibrations: (record.data.account_calibrations ?? []).map((item) => ({
+        enabled: item.enabled ?? true,
+        month: item.month || "2026-07",
+        target: item.target ?? "cash",
+        amount: item.amount ?? 0,
+        member_name: item.member_name ?? "",
+        reference_name: item.reference_name ?? "",
+        note: item.note ?? ""
+      })),
       borrower_member_index: record.data.borrower_member_index ?? 0,
       family_provident_support_enabled: record.data.family_provident_support_enabled ?? false,
       family_provident_support_label: record.data.family_provident_support_label ?? "亲属异地公积金首付支持",
@@ -692,7 +840,7 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
   };
 }
 
-const pages = ["家庭财务", "购车计划", "购房计划", "理财计划", "养娃计划", "税务", "可视化", "政策规则", "导出方案"] as const;
+const pages = ["家庭财务", "购车计划", "购房计划", "理财计划", "养娃计划", "税务", "可视化", "记账校准", "政策规则", "导出方案"] as const;
 type PageName = (typeof pages)[number];
 type SaveState = "idle" | "dirty" | "saving" | "saved";
 type ThemeMode = "light" | "dark";
@@ -728,6 +876,8 @@ function createTargetScenarioData(sequence: number): ScenarioData {
     commercial_loan_amount: 0,
     provident_loan_amount: 0,
     manual_purchase_delay_months: 0,
+    planning_window_start_month: "",
+    planning_window_end_month: "",
     micro_commercial_loan_ratio: 0,
     commercial_rate: 0.035,
     provident_rate: 0.026,
@@ -879,8 +1029,21 @@ const parameterExplanations: Record<string, string> = {
   年终奖年额: "预计全年年终奖金额。可以选择发放月一次性入账，也可以选择按月均摊发放；后端会按不同发放模式进入对应税务口径。",
   奖金发放方式: "一次性发放按全年一次性奖金或并入综合所得测算；按月均摊会作为工资薪金收入进入每月累计预扣，不再走年终奖单独计税。",
   发放月份: "仅适用于发放月一次性发放模式。不同成员、不同工作阶段可以不同；税率和单独计税有效期仍由政策规则控制。",
+  奖金归属起始月: "用于折算这段收入阶段对应的年终奖或绩效归属月份。例如入职不满一年、换工作、绩效周期跨年时填写；它不是实际发钱的月份。",
+  奖金归属截止月: "用于折算这段收入阶段对应的年终奖或绩效归属月份。留空时后端按收入阶段生效期和发放月份推定；实际入账仍由“发放月份”和“奖金发放方式”决定。",
+  家庭指标开始月: "整个家庭开始按家庭单位参与北京小客车指标计算的月份。单个申请人有不同加入月份时，可在申请人卡片里单独覆盖。",
+  申请人名称: "只用于购车指标算分说明，不会自动加入家庭成员、收入、支出或现金流。",
+  家庭关系: "主申请人和配偶积分权重按 2 计，其他家庭申请人按 1 计。",
+  所属代际: "用于计算家庭代际数。比如加入一位符合条件的老人可形成父母一代，提高代际乘数，但不代表老人进入家庭财务现金流。",
+  资格口径: "北京家庭指标申请资格来源，例如北京户籍、北京工作居住证、北京居住证并满足连续社保/个税等。这里用于提示和说明，具体资格仍需按官方口径复核。",
+  加入家庭指标月: "该申请人从什么时候开始参与家庭指标计算。留空时使用上方家庭指标开始月。",
+  个人指标历史: "参与家庭指标前个人普通指标摇号阶梯或新能源轮候历史会影响基础分；如已有官方计算结果，也可用个人历史分覆盖。",
+  普通摇号阶梯数: "参与普通指标摇号积累的阶梯数，用于粗略折算家庭积分中的个人历史部分。",
+  新能源轮候开始月: "个人新能源指标轮候开始月份；后端按进入家庭申请前的满年数粗略折算历史积分。",
+  个人历史分覆盖: "如果已有官方系统给出的个人历史积分，可直接填写覆盖值；填 0 表示不用覆盖，按阶梯数和轮候开始月估算。",
+  仅参与指标算分: "开启后，这个人只作为北京家庭指标申请人参与积分说明，不进入家庭收入、支出、资产、贷款和现金流。",
   "非税收入/月": "每月进入现金流但不并入工资薪金计税的收入，例如失业金等；退休养老金会由后端按退休月份单独生成并在可视化中拆分展示。",
-  "额外现金支出/月": "该收入阶段每月额外发生、但不属于社保公积金扣缴的现金支出。灵活就业自缴社保和自缴公积金请使用专门字段，避免重复计算。",
+  记账校准: "当模型推演余额和真实账户余额不一致时，在记账校准页按月份校准现金、投资、公积金、贷款或固定资产。现金流偏差由账户余额校准吸收，不再在收入阶段里手动扣一笔现金流。",
   工资社保扣缴: "开启时按工资薪金自动估算北京社保、公积金和个税；失业金、养老金等阶段应关闭。",
   公积金中心口径: "该收入阶段对应工作单位的公积金管理口径。换工作后可在新阶段改为市管或国管，购房策略会按借款申请人在买房月份生效的阶段选择还贷规则。",
   个人公积金比例: "个人缴纳住房公积金比例，会减少税后现金但增加公积金账户余额。",
@@ -976,7 +1139,7 @@ const parameterExplanations: Record<string, string> = {
   年保险下限: "保险估算的最低年度金额，防止新车保险被低估。",
   保险年增长: "用于估算后续年份车险价格变化。系统只在年度保险付款月计入增长后的现金支出。",
   折旧年限: "用于估算车辆折旧成本，不代表真实卖车价格。",
-  车辆使用年限: "用于提示家庭何时考虑更新车辆。私家小微非营运车通常不是固定年限强制报废。",
+  车辆使用年限: "不是政策强制报废年限，而是家庭按性能衰减、维修经济性和用车体验设定的预计实际使用期；默认按 10 年估算。",
   "报废/更新里程": "按小微非营运载客汽车 60 万公里引导报废口径作为提示阈值，可按实际用车强度调整。",
   第二辆车: "启用后会在指定月份之后把第二辆车首付、车贷和养车成本叠加到购房现金流和可视化。",
   第二辆车总价: "第二辆车预算总价。",
@@ -1405,7 +1568,7 @@ function incomeStagesForMember(member: IncomeMember) {
     monthly_freelance_income: stage.monthly_freelance_income ?? 0,
     freelance_tax_mode: stage.freelance_tax_mode ?? "labor_remuneration",
     monthly_non_taxable_income: stage.monthly_non_taxable_income ?? 0,
-    monthly_extra_cash_expense: stage.monthly_extra_cash_expense ?? 0,
+    monthly_extra_cash_expense: 0,
     payroll_contributions_enabled: stage.payroll_contributions_enabled ?? true
   }));
 }
@@ -1454,6 +1617,17 @@ function recommendedPurchasePlan(plans: PurchasePlanAnalysis[]) {
 
 function purchaseRecommendationByVariant(plans: PurchasePlanAnalysis[]) {
   return new Map(plans.map((plan) => [plan.variant, plan]));
+}
+
+function userFacingError(action: string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err || "");
+  if (message === "Failed to fetch" || message.includes("NetworkError") || message.includes("fetch")) {
+    return `${action}失败：无法连接本地后端服务。请确认后端已启动，并检查 VITE_API_BASE 是否指向正确端口。`;
+  }
+  if (message.startsWith("{") || message.startsWith("<")) {
+    return `${action}失败：后端返回了无法直接展示的错误，请查看后端日志定位具体原因。`;
+  }
+  return `${action}失败：${message || "未知错误"}`;
 }
 
 
@@ -1796,13 +1970,16 @@ export function App() {
   const addElderlyDependent = () => updateHousehold("elderly_dependents", [...elderlyDependents, { member_name: incomeMembers[0]?.name ?? "成员 1", relationship_label: "直系亲属老人", birth_month: "", is_only_child: false, shared_monthly_deduction: 1500 }]);
   const removeElderlyDependent = (index: number) => updateHousehold("elderly_dependents", elderlyDependents.filter((_, itemIndex) => itemIndex !== index));
   const updateChildPlan = <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => updateHousehold("child_plans", updateArrayItem(childPlans, index, key, value));
+  const updateChildPlanPatch = (index: number, patch: Partial<ChildPlanData>) => {
+    updateHousehold("child_plans", childPlans.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+  };
   const addChildPlan = () => updateHouseholdPatch({
     child_plans: [
       ...childPlans,
       {
         ...defaultChildPlan,
-        name: `子女计划 ${childPlans.length + 1}`,
-        tax_deduction_owner: incomeMembers[0]?.name ?? ""
+        ...childExpensePresets.balanced,
+        name: `子女计划 ${childPlans.length + 1}`
       }
     ],
     child_count: Math.max(household.data.child_count ?? 0, childPlans.length + 1)
@@ -1909,7 +2086,7 @@ export function App() {
       setScenarioResults(Object.fromEntries(calculated));
       setCalculatedVersion(requestVersion);
     } catch (err) {
-      if (requestSeq === calculationSeqRef.current) setError(err instanceof Error ? err.message : "计算失败");
+      if (requestSeq === calculationSeqRef.current) setError(userFacingError("计算", err));
     } finally {
       if (requestSeq === calculationSeqRef.current) setIsCalculating(false);
     }
@@ -1941,7 +2118,7 @@ export function App() {
         setSaveState("dirty");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
+      setError(userFacingError("保存", err));
     } finally {
       setSaving(false);
     }
@@ -1958,7 +2135,7 @@ export function App() {
         setRulePacks(ruleRecords);
         setSelectedScenarioId(scenarioRecords[0]?.id ?? noPurchaseScenarioId);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : "加载失败"))
+      .catch((err) => setError(userFacingError("加载", err)))
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []);
@@ -1982,8 +2159,9 @@ export function App() {
 
   const pageContent = (() => {
     if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} dailyExpenseStages={dailyExpenseStages} rentExpenseStages={rentExpenseStages} elderlyDependents={elderlyDependents} result={result} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} addAnnualScheduledExpense={addAnnualScheduledExpense} addOneTimeScheduledExpense={addOneTimeScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateDailyExpenseStage={updateDailyExpenseStage} addDailyExpenseStage={addDailyExpenseStage} removeDailyExpenseStage={removeDailyExpenseStage} updateRentExpenseStage={updateRentExpenseStage} addRentExpenseStage={addRentExpenseStage} removeRentExpenseStage={removeRentExpenseStage} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
-    if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} specialDeductions={specialDeductions} result={result} updateHousehold={updateHousehold} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
-    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={result?.child_plan_strategies ?? []} updateChildPlan={updateChildPlan} addChildPlan={addChildPlan} removeChildPlan={removeChildPlan} />;
+    if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} childPlans={childPlans} specialDeductions={specialDeductions} result={result} updateHousehold={updateHousehold} updateChildPlan={updateChildPlan} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
+    if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} updateHousehold={updateHousehold} />;
+    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={result?.child_plan_strategies ?? []} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} addChildPlan={addChildPlan} removeChildPlan={removeChildPlan} />;
     if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
     if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} calculationPending={calculationPending} />;
     if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} calculationPending={calculationPending} />;
@@ -2000,7 +2178,6 @@ export function App() {
           <p>{isCalculating ? "后端正在重新计算" : saveState === "dirty" ? "有未保存修改" : "本地模型已就绪"}</p>
         </div>
         <div className="topbar-actions">
-          {error ? <span className="error-text">{error}</span> : null}
           <button className="ghost-button" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} type="button">
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />} {theme === "dark" ? "浅色" : "深色"}
           </button>
@@ -2011,6 +2188,7 @@ export function App() {
             <Save size={16} /> 保存本地
           </button>
         </div>
+        {error ? <div className="topbar-status error-text">{error}</div> : null}
       </header>
       <nav className="page-nav">
         {pages.map((page) => (
@@ -2128,6 +2306,7 @@ function IncomePage({
   addElderlyDependent: () => void;
   removeElderlyDependent: (index: number) => void;
 }) {
+  const today = new Date();
   const careerShock = normalizeCareerShockForMembers(household.career_shock, incomeMembers);
   const careerShockProjection = result?.career_shock_projection ?? null;
   const estimatedUnemploymentBenefitMonths = careerShockProjection?.unemployment_benefit_months ?? 0;
@@ -2160,7 +2339,6 @@ function IncomePage({
     const merged = normalizeCareerShockForMembers({ ...careerShock, member_settings: memberSettings }, incomeMembers);
     updateHousehold("career_shock", merged);
   };
-  const today = new Date();
   const currentRentStage = rentExpenseStageAt(household, today);
   const currentMonthlyExpense = householdExpenseAt(household, today, 0);
   const currentRentCashCost = currentRentStage ? rentStageCashCostAt(currentRentStage, today) : 0;
@@ -2322,6 +2500,7 @@ function IncomePage({
                     <button
                       className="icon-button"
                       onClick={() => removeIncomeStage(index, stageIndex)}
+                      aria-label="删除收入阶段"
                       title="删除收入阶段"
                       type="button"
                     >
@@ -2428,14 +2607,14 @@ function IncomePage({
                             onChange={(value) => updateIncomeStage(index, stageIndex, "annual_bonus_payout_month", Math.round(value))}
                           />
                         )}
-                        <Field label="奖金归属开始">
+                        <Field label="奖金归属起始月">
                           <input
                             type="month"
                             value={stage.annual_bonus_earning_start_month ?? ""}
                             onChange={(event) => updateIncomeStage(index, stageIndex, "annual_bonus_earning_start_month", event.target.value)}
                           />
                         </Field>
-                        <Field label="奖金归属结束">
+                        <Field label="奖金归属截止月">
                           <input
                             type="month"
                             value={stage.annual_bonus_earning_end_month ?? ""}
@@ -2471,13 +2650,6 @@ function IncomePage({
                       min={0}
                       step={100}
                       onChange={(value) => updateIncomeStage(index, stageIndex, "monthly_non_taxable_income", value)}
-                    />
-                    <NumberField
-                      label="额外现金支出/月"
-                      value={stage.monthly_extra_cash_expense ?? 0}
-                      min={0}
-                      step={100}
-                      onChange={(value) => updateIncomeStage(index, stageIndex, "monthly_extra_cash_expense", value)}
                     />
                     <NumberField
                       label="个人公积金比例"
@@ -2649,14 +2821,17 @@ function IncomePage({
         </div>
       </div>
       <p className="field-hint">
-        现金和投资账户按当前家庭合计填写；成员公积金、基本养老、医保和个人养老金账户在家庭画像的成员卡片里统一维护。公积金、基本养老和医保的后续缴存来自收入阶段与政策规则，个人养老金缴存作为税优储蓄策略单独配置。
+        现金和投资账户按当前家庭合计填写；成员公积金、基本养老、医保和个人养老金账户在家庭画像的成员卡片里统一维护。实际账户余额和模型不一致时，请到“记账校准”页面按月份校准账户。
       </p>
     </section>
   );
 
   return (
-    <div className="page-stack income-page-stack">
-      <SectionHeader icon={<ClipboardCheck size={20} />} title="家庭财务" />
+    <PlannerPageShell
+      icon={<ClipboardCheck size={20} />}
+      title="家庭财务"
+      summary={<p>按“家庭画像 → 成员与账户 → 收入阶段 → 支出阶段 → 已有贷款”的顺序维护基础数据；计算结果和账户校准不要混在画像字段里。</p>}
+    >
       <section className="form-panel setup-guide">
         <PanelTitle icon={<Sparkles size={18} />} title="初始化指引" />
         <p className="field-hint">
@@ -2806,6 +2981,7 @@ function IncomePage({
                       className="icon-button"
                       onClick={() => removeIncomeMember(index)}
                       disabled={incomeMembers.length <= 1}
+                      aria-label="删除成员"
                       title="删除成员"
                       type="button"
                     >
@@ -3630,6 +3806,170 @@ function IncomePage({
         </p>
       </section>
       </div>
+    </PlannerPageShell>
+  );
+}
+
+function AccountCalibrationPage({
+  household,
+  result,
+  updateHousehold
+}: {
+  household: HouseholdData;
+  result: AffordabilityResult | null;
+  updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
+}) {
+  const today = new Date();
+  const accountCalibrations = household.account_calibrations ?? [];
+  const currentMonthText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+  const updateAccountCalibration = <K extends keyof AccountCalibrationData>(
+    index: number,
+    key: K,
+    value: AccountCalibrationData[K]
+  ) => {
+    updateHousehold("account_calibrations", accountCalibrations.map((item, itemIndex) => (
+      itemIndex === index ? { ...item, [key]: value } : item
+    )));
+  };
+  const addAccountCalibration = (target: AccountCalibrationTarget = "cash") => {
+    const defaultAmountByTarget: Record<AccountCalibrationTarget, number> = {
+      cash: household.cash_account_balance ?? 0,
+      investment: household.investments ?? 0,
+      provident: household.members.reduce((sum, member) => sum + (member.provident_account_enabled ? member.provident_fund_balance ?? 0 : 0), 0),
+      pension: household.members.reduce((sum, member) => sum + (member.pension_account_enabled ? member.pension_account_balance ?? 0 : 0), 0),
+      medical: household.members.reduce((sum, member) => sum + (member.medical_account_enabled ? member.medical_account_balance ?? 0 : 0), 0),
+      property_asset: 0,
+      vehicle_asset: 0,
+      fixed_asset: household.members.reduce((sum, member) => sum + (member.initial_other_asset_value ?? 0), 0),
+      total_loan: household.phased_loans.reduce((sum, loan) => sum + (loan.principal ?? 0), 0)
+    };
+    updateHousehold("account_calibrations", [
+      ...accountCalibrations,
+      {
+        enabled: true,
+        month: currentMonthText,
+        target,
+        amount: defaultAmountByTarget[target] ?? 0,
+        member_name: "",
+        reference_name: "",
+        note: ""
+      }
+    ]);
+  };
+  const removeAccountCalibration = (index: number) => {
+    updateHousehold("account_calibrations", accountCalibrations.filter((_, itemIndex) => itemIndex !== index));
+  };
+  const updateAccountCalibrationNote = (index: number, value: string) => {
+    updateHousehold("account_calibrations", accountCalibrations.map((item, itemIndex) => (
+      itemIndex === index ? { ...item, reference_name: value, note: value } : item
+    )));
+  };
+  const enabledCount = accountCalibrations.filter((item) => item.enabled).length;
+  const latestSnapshot = result?.account_snapshots?.[result.account_snapshots.length - 1];
+  const targetSummary = ACCOUNT_CALIBRATION_TARGET_OPTIONS.map((option) => ({
+    ...option,
+    count: accountCalibrations.filter((item) => item.target === option.value).length
+  })).filter((item) => item.count > 0);
+
+  return (
+    <div className="page-stack account-calibration-page">
+      <SectionHeader icon={<ShieldCheck size={20} />} title="记账校准" />
+      <section className="form-panel setup-guide">
+        <PanelTitle icon={<Sparkles size={18} />} title="校准方式" />
+        <p className="field-hint">
+          现金流偏差最终会体现为账户余额偏差。这里按某个真实月份把现金、投资、公积金、贷款或固定资产校到实际余额，后端会从该月开始把差额延续进后续推演。
+        </p>
+        <div className="setup-steps">
+          <span className="setup-step done"><CheckCircle2 size={15} /> 不再使用收入阶段手动扣减</span>
+          <span className="setup-step done"><CheckCircle2 size={15} /> 现金流修正通过现金账户校准吸收</span>
+          <span className="setup-step done"><CheckCircle2 size={15} /> 贷款、资产、政策账户分别校准</span>
+        </div>
+      </section>
+      <section className="form-panel account-panel">
+        <div className="member-header">
+          <PanelTitle icon={<ShieldCheck size={18} />} title="校准记录" />
+          <button className="secondary-button" type="button" onClick={() => addAccountCalibration("cash")}>
+            <Plus size={16} /> 添加校准
+          </button>
+        </div>
+        <div className="metric-grid">
+          <Metric label="校准记录" value={`${accountCalibrations.length} 条`} />
+          <Metric label="启用记录" value={`${enabledCount} 条`} tone={enabledCount > 0 ? "good" : undefined} />
+          <Metric label="当前现金账户" value={money(household.cash_account_balance)} />
+          <Metric label="当前投资账户" value={money(household.investments)} />
+          <Metric label="测算末月现金" value={latestSnapshot ? money(latestSnapshot.cash_balance) : "等待计算"} />
+          <Metric label="测算末月贷款" value={latestSnapshot ? money(latestSnapshot.total_loan_balance) : "等待计算"} />
+        </div>
+        <div className="quick-action-row">
+          {ACCOUNT_CALIBRATION_TARGET_OPTIONS.slice(0, 5).map((option) => (
+            <button className="ghost-button" type="button" key={option.value} onClick={() => addAccountCalibration(option.value)}>
+              <Plus size={15} /> {option.label}
+            </button>
+          ))}
+        </div>
+        {targetSummary.length ? (
+          <div className="setup-steps">
+            {targetSummary.map((item) => (
+              <span className="setup-step done" key={item.value}>{item.label} {item.count} 条</span>
+            ))}
+          </div>
+        ) : null}
+        {accountCalibrations.length === 0 ? (
+          <div className="empty-state">
+            <strong>暂无校准记录</strong>
+            <span>当实际银行卡、券商、公积金或贷款余额和模型不一致时，添加一条对应月份的账户校准即可。</span>
+          </div>
+        ) : (
+          <div className="account-calibration-list">
+            {accountCalibrations.map((calibration, index) => (
+              <div className="calibration-row" key={`account-calibration-${index}`}>
+                <SwitchField
+                  label={calibration.enabled ? "启用" : "停用"}
+                  checked={calibration.enabled}
+                  onChange={(checked) => updateAccountCalibration(index, "enabled", checked)}
+                />
+                <Field label="校准月份">
+                  <input
+                    type="month"
+                    value={calibration.month}
+                    onChange={(event) => updateAccountCalibration(index, "month", event.target.value)}
+                  />
+                </Field>
+                <Field label="校准对象">
+                  <select
+                    value={calibration.target}
+                    onChange={(event) => updateAccountCalibration(index, "target", event.target.value as AccountCalibrationTarget)}
+                  >
+                    {ACCOUNT_CALIBRATION_TARGET_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </Field>
+                <NumberField
+                  label="真实余额/估值"
+                  value={calibration.amount}
+                  min={0}
+                  step={1000}
+                  onChange={(value) => updateAccountCalibration(index, "amount", value)}
+                />
+                <Field label="对象备注">
+                  <input
+                    value={calibration.reference_name || calibration.note}
+                    placeholder="如某张银行卡、某只基金、某笔贷款"
+                    onChange={(event) => updateAccountCalibrationNote(index, event.target.value)}
+                  />
+                </Field>
+                <button className="icon-button danger" type="button" onClick={() => removeAccountCalibration(index)} aria-label="删除校准">
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="field-hint">
+          例如某月模型现金为 8 万、真实现金为 7.2 万，不需要补一条手动支出；直接把该月现金账户校准为 7.2 万，后续现金曲线会从这个真实状态继续推演。
+        </p>
+      </section>
     </div>
   );
 }
@@ -3639,6 +3979,7 @@ function ChildPlanPage({
   childPlans,
   childPlanStrategies,
   updateChildPlan,
+  updateChildPlanPatch,
   addChildPlan,
   removeChildPlan
 }: {
@@ -3646,9 +3987,13 @@ function ChildPlanPage({
   childPlans: ChildPlanData[];
   childPlanStrategies: ChildPlanStrategyPoint[];
   updateChildPlan: <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => void;
+  updateChildPlanPatch: (index: number, patch: Partial<ChildPlanData>) => void;
   addChildPlan: () => void;
   removeChildPlan: (index: number) => void;
 }) {
+  const [selectedChildIndex, setSelectedChildIndex] = useState(0);
+  const activeChildIndex = childPlans.length ? Math.min(selectedChildIndex, childPlans.length - 1) : 0;
+  const activeChild = childPlans[activeChildIndex] ?? null;
   const today = useMemo(() => new Date(), []);
   const enabledChildren = childPlans.filter((child) => child.enabled).length;
   const plannedChildren = childPlans.filter((child) => child.timing_mode !== "not_planned").length;
@@ -3659,7 +4004,6 @@ function ChildPlanPage({
     .map((child) => resolveChildBirthMonth(child, today))
     .filter((item): item is { year: number; month: number } => Boolean(item))
     .sort(compareMonth)[0];
-  const memberOptions = incomeMembers.length ? incomeMembers : [{ name: "成员 1" } as IncomeMember];
   const strategyByName = new Map(childPlanStrategies.map((item) => [item.child_name, item]));
   const advisorText = childPlans.length === 0
     ? "当前没有子女目标。先添加计划，系统会把出生时间、教育阶段和养育支出放进家庭现金流。"
@@ -3668,8 +4012,11 @@ function ChildPlanPage({
       : `已有 ${enabledChildren} 个子女目标进入测算，当前口径下月度养育支出约 ${money(totalCurrentMonthlyCost)}。`;
 
   return (
-    <div className="page-stack strategy-workbench child-plan-page">
-      <SectionHeader icon={<Sparkles size={20} />} title="养娃计划" />
+    <PlannerPageShell
+      icon={<Sparkles size={20} />}
+      title="养娃计划"
+      summary={<p>先管理子女目标，再编辑当前选中目标的出生窗口、阶段支出和税务联动；策略说明会回答建议何时生、对买房和现金流有什么影响。</p>}
+    >
       <section className="strategy-hero child-advisor-panel">
         <div className="strategy-hero-main">
           <div className="recommend-title">
@@ -3692,23 +4039,25 @@ function ChildPlanPage({
       </section>
 
       <section className="strategy-layout child-workbench-layout">
-      <aside className="strategy-side-panel child-goal-panel">
-        <div className="member-header">
-          <PanelTitle icon={<Target size={18} />} title="子女目标" />
+      <WorkflowSection
+        icon={<Target size={18} />}
+        title="子女目标"
+        description="上方卡片用于比较和选择目标；详情区只编辑当前选中的子女目标。"
+        className="strategy-main-panel child-goal-panel"
+      >
+        <div className="member-header compact-actions">
           <button className="ghost-button" type="button" onClick={addChildPlan}>
             <Plus size={16} /> 添加子女目标
           </button>
         </div>
         {childPlans.length === 0 ? (
-          <div className="empty-state target-empty-state">
-            <strong>默认暂无养娃目标</strong>
-            <span>添加子女目标后，页面会按出生时间、教育阶段和支出口径生成现金流影响说明。</span>
-            <button className="ghost-button" type="button" onClick={addChildPlan}>
-              <Plus size={16} /> 添加子女目标
-            </button>
-          </div>
+          <EmptyState
+            title="默认暂无养娃目标"
+            description="添加子女目标后，页面会按出生时间、教育阶段和支出口径生成现金流影响说明。"
+            action={<button className="ghost-button" type="button" onClick={addChildPlan}><Plus size={16} /> 添加子女目标</button>}
+          />
         ) : (
-          <div className="child-goal-grid">
+          <div className="child-goal-grid horizontal-card-list">
             {childPlans.map((child, index) => {
               const strategy = strategyByName.get(child.name);
               const birth = resolveChildBirthMonth(child, today);
@@ -3716,15 +4065,15 @@ function ChildPlanPage({
               const stageLabel = childEducationStageLabel(child, today);
               const monthlyCost = childMonthlyCostAt(child, today);
               return (
-                <article className={child.enabled ? "planning-goal-card child-goal-card active" : "planning-goal-card child-goal-card"} key={`child-goal-${index}`}>
-                  <div className="planning-goal-select">
+                <article className={`${child.enabled ? "planning-goal-card child-goal-card" : "planning-goal-card child-goal-card"} ${index === activeChildIndex ? "active" : ""}`} key={`child-goal-${index}`}>
+                  <button className="planning-goal-select" type="button" onClick={() => setSelectedChildIndex(index)}>
                     <span className={child.enabled ? "goal-status enabled" : "goal-status paused"}>
                       {child.enabled ? "纳入规划" : "暂停测算"}
                     </span>
                     <strong>{child.name || `子女目标 ${index + 1}`}</strong>
                     <small>{childTimingLabel(child)} · {strategy?.birth_month_label || (birth ? `${birth.year}年${birth.month}月` : "出生时间待定")}</small>
                     <em>{stageLabel} · 当前月支出 {money(monthlyCost)}</em>
-                  </div>
+                  </button>
                   <div className="child-mini-metrics">
                     <span><b>{ageText}</b><small>当前年龄</small></span>
                     <span><b>{strategy?.mother_age_at_birth ? `${strategy.mother_age_at_birth.toFixed(1)} 岁` : "待判断"}</b><small>母亲生产年龄</small></span>
@@ -3741,13 +4090,19 @@ function ChildPlanPage({
             })}
           </div>
         )}
-      </aside>
+      </WorkflowSection>
 
-      {childPlans.length > 0 ? (
-        <section className="strategy-main-panel child-config-panel">
-          <PanelTitle icon={<SlidersHorizontal size={18} />} title="目标设定与支出口径" />
+      {activeChild ? (
+        <WorkflowSection
+          icon={<SlidersHorizontal size={18} />}
+          title="当前目标配置"
+          description="只展示当前选中子女目标的时间、支出和影响，避免多个完整表单纵向堆叠。"
+          className="strategy-main-panel child-config-panel"
+        >
           <div className="member-list roomy child-config-list">
-            {childPlans.map((child, index) => {
+            {(() => {
+              const index = activeChildIndex;
+              const child = activeChild;
               const strategy = strategyByName.get(child.name);
               const birth = resolveChildBirthMonth(child, today);
               const stageLabel = childEducationStageLabel(child, today);
@@ -3801,23 +4156,23 @@ function ChildPlanPage({
                             <option value="not_planned">暂不纳入规划</option>
                           </select>
                         </Field>
-                        <Field label="计划出生最早月">
+                        <Field label="出生窗口开始">
                           <input type="month" value={child.planned_birth_start_month} onChange={(event) => updateChildPlan(index, "planned_birth_start_month", event.target.value)} />
                         </Field>
-                        <Field label="计划出生最晚月">
+                        <Field label="出生窗口最晚">
                           <input type="month" value={child.planned_birth_end_month} onChange={(event) => updateChildPlan(index, "planned_birth_end_month", event.target.value)} />
                         </Field>
+                        <p className="field-hint form-grid-note">策略会在出生窗口内选择具体出生月份；不填则默认按买房后开始计划，并结合母亲年龄、现金流、税务扣除和幸福指数判断。</p>
                         <Field label="实际出生年月">
                           <input type="month" value={child.birth_month} onChange={(event) => updateChildPlan(index, "birth_month", event.target.value)} />
                         </Field>
                         <Field label="教育阶段开始">
                           <input type="month" value={child.education_start_month} onChange={(event) => updateChildPlan(index, "education_start_month", event.target.value)} />
                         </Field>
-                        <Field label="税务参考成员">
-                          <select value={child.tax_deduction_owner} onChange={(event) => updateChildPlan(index, "tax_deduction_owner", event.target.value)}>
-                            <option value="">到税务页指定</option>
-                            {memberOptions.map((member, memberIndex) => <option key={`child-owner-${memberIndex}`} value={member.name}>{member.name}</option>)}
-                          </select>
+                        <Field label="税务扣除归属">
+                          <div className="readonly-metric compact">
+                            {child.tax_deduction_owner || "到税务页指定"}
+                          </div>
                         </Field>
                       </div>
                     </div>
@@ -3828,7 +4183,13 @@ function ChildPlanPage({
                       </div>
                       <div className="form-grid compact-two">
                         <Field label="费用策略">
-                          <select value={child.expense_strategy_mode} onChange={(event) => updateChildPlan(index, "expense_strategy_mode", event.target.value as ChildPlanData["expense_strategy_mode"])}>
+                          <select
+                            value={child.expense_strategy_mode}
+                            onChange={(event) => {
+                              const mode = event.target.value as ChildPlanData["expense_strategy_mode"];
+                              updateChildPlanPatch(index, { expense_strategy_mode: mode, ...childExpensePresets[mode] });
+                            }}
+                          >
                             <option value="balanced">均衡口径</option>
                             <option value="conservative">保守低支出口径</option>
                             <option value="quality">高投入口径</option>
@@ -3876,30 +4237,34 @@ function ChildPlanPage({
                   </div>
                 </section>
               );
-            })}
+            })()}
           </div>
-        </section>
+        </WorkflowSection>
       ) : null}
       </section>
-    </div>
+    </PlannerPageShell>
   );
 }
 
 function TaxPage({
   household,
   incomeMembers,
+  childPlans,
   specialDeductions,
   result,
   updateHousehold,
+  updateChildPlan,
   updateSpecialDeduction,
   addSpecialDeduction,
   removeSpecialDeduction
 }: {
   household: HouseholdData;
   incomeMembers: IncomeMember[];
+  childPlans: ChildPlanData[];
   specialDeductions: SpecialDeductionItemData[];
   result: AffordabilityResult | null;
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
+  updateChildPlan: <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => void;
   updateSpecialDeduction: <K extends keyof SpecialDeductionItemData>(index: number, key: K, value: SpecialDeductionItemData[K]) => void;
   addSpecialDeduction: (deductionType?: SpecialDeductionItemData["deduction_type"]) => void;
   removeSpecialDeduction: (index: number) => void;
@@ -3922,8 +4287,16 @@ function TaxPage({
   const selectedYearSummary = taxYearSummaries[0];
   const taxMemberRows = selectedYearSummary?.summaries ?? result?.tax_summaries ?? [];
   const taxStrategyItems = result?.tax_strategy_items ?? [];
+  const taxStrategyTimeline = result?.tax_strategy_timeline ?? [];
   const autoTaxStrategyItems = taxStrategyItems.filter((item) => item.source !== "manual");
   const manualTaxStrategyItems = taxStrategyItems.filter((item) => item.source === "manual");
+  const childPlanIndexByName = new Map(childPlans.map((child, index) => [child.name, index]));
+  const childTaxStrategyTarget = (item: TaxStrategyItem) => {
+    if (item.deduction_type !== "infant_care" && item.deduction_type !== "child_education") return null;
+    const childName = childPlans.find((child) => item.title.startsWith(child.name))?.name ?? "";
+    const index = childName ? childPlanIndexByName.get(childName) : undefined;
+    return typeof index === "number" ? { childName, index } : null;
+  };
   const enabledMonthlyDeductions = specialDeductions.filter((item) => item.enabled && item.settlement_mode === "monthly_withholding");
   const enabledAnnualDeductions = specialDeductions.filter((item) => item.enabled && item.settlement_mode === "annual_settlement");
   const monthlyDeductionTotal = enabledMonthlyDeductions.reduce((sum, item) => sum + Math.max(0, item.monthly_amount), 0);
@@ -3933,10 +4306,31 @@ function TaxPage({
   const taxStrategyStatusLabel: Record<string, string> = {
     auto_enabled: "策略启用",
     manual_enabled: "手动覆盖",
-    available: "可切换",
+    available: "待指定",
     not_applicable: "暂不适用",
     conflict: "互斥"
   };
+  const taxTimelineCategoryLabel: Record<TaxStrategyTimelinePoint["category"], string> = {
+    deduction_assignment: "扣除归属",
+    deduction_switch: "扣除切换",
+    personal_pension: "个人养老金",
+    bonus_tax: "奖金计税",
+    investment_tax: "理财税务",
+    annual_settlement: "年度汇算",
+    manual_override: "手动覆盖"
+  };
+  const taxTimelineCategoryTone: Record<TaxStrategyTimelinePoint["category"], string> = {
+    deduction_assignment: "deduction",
+    deduction_switch: "deduction",
+    personal_pension: "pension",
+    bonus_tax: "tax",
+    investment_tax: "investment",
+    annual_settlement: "settlement",
+    manual_override: "manual"
+  };
+  const timelineSavingTotal = taxStrategyTimeline.reduce((sum, item) => sum + Math.max(0, item.estimated_tax_saving ?? 0), 0);
+  const nextTimelinePoint = taxStrategyTimeline.find((item) => item.month >= 0);
+  const investmentTaxTimeline = taxStrategyTimeline.find((item) => item.category === "investment_tax");
   const investmentTaxWeightedRate =
     profile.deposit_interest_ratio * profile.deposit_interest_tax_rate +
     profile.fund_dividend_ratio * profile.fund_dividend_tax_rate +
@@ -3952,33 +4346,68 @@ function TaxPage({
   ];
 
   return (
-    <div className="page-stack tax-page">
-      <SectionHeader icon={<CircleDollarSign size={20} />} title="税务" />
+    <PlannerPageShell
+      icon={<CircleDollarSign size={20} />}
+      title="税务"
+      summary={<p>税务页按“年度税务策略、专项附加扣除、工资年终奖口径、理财税务”组织；后端生成长期策略时间线和成员税负，前端只负责申报归属、手动覆盖和口径配置。</p>}
+    >
 
-      <section className="result-panel">
-        <div className="strategy-panel-head">
-          <PanelTitle icon={<ShieldCheck size={18} />} title="税务顾问摘要" compact />
-          <span>这里集中管理个税、专项附加扣除、个人养老金税前扣除和理财税务口径；后端负责实际计算，前端只编辑策略参数和展示结果。</span>
+      <WorkflowSection
+        icon={<ShieldCheck size={18} />}
+        title="年度税务策略"
+        description="后端会把收入阶段、购房租房、养娃、个人养老金和理财收益税统一编排成长期税务动作，而不是只看某一个月份。"
+        className="tax-timeline-panel"
+      >
+        <div className="metric-grid">
+          <Metric label="下一次策略动作" value={nextTimelinePoint ? `${nextTimelinePoint.year}-${String(nextTimelinePoint.month_of_year).padStart(2, "0")}` : "等待后端生成"} />
+          <Metric label="时间线节点" value={`${taxStrategyTimeline.length} 个`} />
+          <Metric label="已估算节税" value={money(timelineSavingTotal)} tone={timelineSavingTotal > 0 ? "good" : undefined} />
+          <Metric label="理财有效税率" value={percent(investmentTaxTimeline?.amount ?? investmentTaxWeightedRate)} />
         </div>
+        {taxStrategyTimeline.length > 0 ? (
+          <div className="tax-strategy-timeline">
+            {taxStrategyTimeline.slice(0, 16).map((item, index) => (
+              <article className="tax-timeline-item" key={`${item.category}-${item.title}-${item.year}-${item.month_of_year}-${index}`}>
+                <div className={`tax-timeline-dot ${taxTimelineCategoryTone[item.category]}`} />
+                <div className="tax-timeline-date">
+                  <strong>{item.year}-{String(item.month_of_year).padStart(2, "0")}</strong>
+                  <span>{taxTimelineCategoryLabel[item.category]}</span>
+                </div>
+                <div className="tax-timeline-main">
+                  <div className="tax-timeline-title">
+                    <strong>{item.action}</strong>
+                    <StrategyStatePill active={item.status === "auto_enabled" || item.status === "manual_enabled"} recommended={item.status === "available"} label={taxStrategyStatusLabel[item.status] ?? "策略项"} />
+                  </div>
+                  <p>{item.title}{item.member_name ? ` · ${item.member_name}` : ""}</p>
+                  <small>{item.detail}</small>
+                </div>
+                <div className="tax-timeline-value">
+                  {item.amount > 0 ? <Metric label={item.category === "investment_tax" ? "有效税率" : "金额"} value={item.category === "investment_tax" ? percent(item.amount) : money(item.amount)} /> : null}
+                  {item.estimated_tax_saving > 0 ? <Metric label="估算节税" value={money(item.estimated_tax_saving)} tone="good" /> : null}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="field-hint">等待后端生成税务策略时间线。配置收入阶段、租房/购房计划、子女计划或个人养老金后，这里会显示长期税务动作。</p>
+        )}
+        {taxStrategyTimeline.length > 16 ? (
+          <p className="field-hint">已展示最近 16 个税务动作；完整时间线仍由后端保留在计算结果中，后续可用于导出。</p>
+        ) : null}
+      </WorkflowSection>
+
+      <WorkflowSection
+        icon={<Gauge size={18} />}
+        title="工资年终奖口径"
+        description="这里说明工资薪金、年终奖和年度口径的计算方式，具体金额以后端成员明细为准。"
+        className="tax-strategy-panel"
+      >
         <div className="metric-grid">
           <Metric label="年度个税" value={money(selectedYearSummary?.total_tax ?? result?.annual_income_tax ?? 0)} />
-          <Metric label="年度税前收入" value={money(selectedYearSummary?.gross_annual_income ?? result?.household_gross_monthly_income ? (result?.household_gross_monthly_income ?? 0) * 12 : 0)} />
-          <Metric label="月度专项扣除" value={money(monthlyDeductionTotal)} />
+          <Metric label="年度税前收入" value={money(selectedYearSummary?.gross_annual_income ?? ((result?.household_gross_monthly_income ?? 0) * 12))} />
+          <Metric label="月度手动扣除" value={money(monthlyDeductionTotal)} />
           <Metric label="年度汇算扣除" value={money(annualDeductionTotal)} />
-          <Metric label="理财加权税率" value={percent(investmentTaxWeightedRate)} />
         </div>
-        <div className="advisor-note-list tax-note-list">
-          {taxStrategyNotes.map((note) => (
-            <p key={note}>{note}</p>
-          ))}
-          {rentMortgageConflict ? (
-            <p className="warning-text">已同时配置住房租金和首套房贷利息扣除。若规则包启用互斥，后端会按同月更优项处理；请确认真实申报口径。</p>
-          ) : null}
-        </div>
-      </section>
-
-      <section className="form-panel tax-strategy-panel">
-        <PanelTitle icon={<Gauge size={18} />} title="税务计算与优惠策略" />
         <div className="strategy-grid tax-strategy-grid">
           <article className="strategy-card active">
             <div className="strategy-card-head">
@@ -4002,32 +4431,57 @@ function TaxPage({
             <p>投资收益税按理财账户收益扣减，不进入工资薪金个税，也不混入家庭消费支出。策略比较时应看税后收益、买卖手续费和现金安全垫。</p>
           </article>
         </div>
-      </section>
+        {rentMortgageConflict ? (
+          <p className="warning-text">已同时配置住房租金和首套房贷利息扣除。若规则包启用互斥，后端会按同月更优项处理；请确认真实申报口径。</p>
+        ) : null}
+      </WorkflowSection>
 
-      <section className="form-panel">
-        <div className="member-header">
-          <PanelTitle icon={<CircleDollarSign size={18} />} title="专项附加扣除策略" />
-        </div>
+      <WorkflowSection
+        icon={<CircleDollarSign size={18} />}
+        title="专项附加扣除"
+        description="住房租金、首套住房贷款利息、子女相关扣除和个人养老金默认由后端根据事件生成；只在真实申报口径不同的时候添加手动覆盖。"
+      >
         <p className="field-hint">住房租金、首套住房贷款利息、子女相关扣除和个人养老金默认由后端根据租房、购房、养娃和收入事件生成税务策略；用户只在需要覆盖真实申报口径时添加手动项。</p>
         <div className="tax-auto-strategy-grid">
-          {(autoTaxStrategyItems.length ? autoTaxStrategyItems : []).map((item) => (
-            <article className={`tax-strategy-item ${item.status}`} key={`${item.deduction_type}-${item.title}-${item.start_month}`}>
-              <div className="strategy-card-head">
-                <strong>{item.title}</strong>
-                <StrategyStatePill active={item.status === "auto_enabled"} recommended={item.status === "available"} label={taxStrategyStatusLabel[item.status] ?? "策略项"} />
-              </div>
-              <div className="tax-strategy-metrics">
-                <Metric label="申报成员" value={item.member_name || "待策略分配"} />
-                <Metric label="月扣除" value={money(item.monthly_amount)} />
-                <Metric label="年度扣除" value={money(item.annual_amount)} />
-                <Metric label="生效区间" value={`${item.start_month || "待事件"}${item.end_month ? ` 至 ${item.end_month}` : ""}`} />
-              </div>
-              <p>{item.reason}</p>
-              {item.conflicts_with.length ? (
-                <span className="tax-conflict-note">与 {item.conflicts_with.map((type) => deductionLabels[type]).join("、")} 同月互斥，后端按税务策略择优。</span>
-              ) : null}
-            </article>
-          ))}
+          {(autoTaxStrategyItems.length ? autoTaxStrategyItems : []).map((item) => {
+            const childTarget = childTaxStrategyTarget(item);
+            const assignedMember = childTarget ? childPlans[childTarget.index]?.tax_deduction_owner || "" : item.member_name;
+            return (
+              <article className={`tax-strategy-item ${item.status}`} key={`${item.deduction_type}-${item.title}-${item.start_month}`}>
+                <div className="strategy-card-head">
+                  <strong>{item.title}</strong>
+                  <StrategyStatePill active={item.status === "auto_enabled"} recommended={item.status === "available"} label={taxStrategyStatusLabel[item.status] ?? "策略项"} />
+                </div>
+                <div className="tax-strategy-metrics">
+                  {childTarget ? (
+                    <Field label="申报成员">
+                      <select value={assignedMember} onChange={(event) => updateChildPlan(childTarget.index, "tax_deduction_owner", event.target.value)}>
+                        <option value="">选择成员后启用</option>
+                        {memberOptions.map((member, memberIndex) => <option key={`child-tax-owner-${childTarget.index}-${memberIndex}`} value={member.name}>{member.name}</option>)}
+                      </select>
+                    </Field>
+                  ) : (
+                    <Metric label="申报成员" value={item.member_name || "后端策略生成"} />
+                  )}
+                  <Metric label="月扣除" value={money(item.monthly_amount)} />
+                  <Metric label="年度扣除" value={money(item.annual_amount)} />
+                  {item.deduction_type === "personal_pension" ? (
+                    <>
+                      <Metric label="年度缴费" value={money(item.cash_contribution)} />
+                      <Metric label="估算节税" value={money(item.estimated_tax_saving)} />
+                      <Metric label="产品年化" value={percent(item.account_return_rate)} />
+                      <Metric label="领取税率" value={percent(item.withdrawal_tax_rate)} />
+                    </>
+                  ) : null}
+                  <Metric label="生效区间" value={`${item.start_month || "待事件"}${item.end_month ? ` 至 ${item.end_month}` : ""}`} />
+                </div>
+                <p>{childTarget && !assignedMember ? "该扣除来自养娃计划。请选择申报成员，后端会在下一次计算中启用并进入对应成员个税。" : item.reason}</p>
+                {item.conflicts_with.length ? (
+                  <span className="tax-conflict-note">与 {item.conflicts_with.map((type) => deductionLabels[type]).join("、")} 同月互斥，后端按税务策略择优。</span>
+                ) : null}
+              </article>
+            );
+          })}
         </div>
         <details className="details-panel tax-manual-panel">
           <summary>
@@ -4048,7 +4502,7 @@ function TaxPage({
               <section className="member-card" key={`tax-deduction-${index}`}>
               <div className="member-card-head">
                 <strong>{item.name || deductionLabels[item.deduction_type]}</strong>
-                <button className="icon-button" type="button" onClick={() => removeSpecialDeduction(index)} title="删除扣除项">
+                <button className="icon-button" type="button" onClick={() => removeSpecialDeduction(index)} aria-label="删除扣除项" title="删除扣除项">
                   <Trash2 size={15} />
                 </button>
               </div>
@@ -4095,11 +4549,18 @@ function TaxPage({
             )}
           </div>
         </details>
-      </section>
+      </WorkflowSection>
 
-      <section className="form-panel">
-        <PanelTitle icon={<TrendingUp size={18} />} title="理财税务口径" />
-        <p className="field-hint">这些参数用于估算投资账户收益的税后效果。默认很多公开市场产品未必需要在此扣税，所以初始值可以为 0；只有明确产品税负时再设置。</p>
+      <WorkflowSection
+        icon={<TrendingUp size={18} />}
+        title="理财税务"
+        description="理财收益税按投资账户收益扣减，不进入工资薪金个税，也不作为生活支出重复计算。"
+      >
+        <div className="advisor-note-list tax-note-list">
+          <p>{investmentTaxTimeline?.detail ?? "当前理财收益税口径由后端按理财税参数折算有效税率，并直接扣减投资账户收益。它不进入工资薪金个税，也不作为生活支出重复计算。"}</p>
+          <p>理财策略比较应使用税后收益、手续费、现金安全垫和买房买车时间的综合结果。修改理财税务参数后，后端会重新生成投资账户曲线和相关策略。</p>
+        </div>
+        <p className="field-hint">这些参数用于估算投资账户收益的税后效果。未手动填写来源占比时，后端会按当前理财策略的权益、固收、现金配置自动估算；手动填写后作为覆盖口径。</p>
         <div className="form-grid three">
           <NumberField label="存款利息占比" value={profile.deposit_interest_ratio} min={0} max={1} step={0.05} onChange={(value) => updateInvestmentTaxProfile("deposit_interest_ratio", value)} />
           <NumberField label="存款利息税率" value={profile.deposit_interest_tax_rate} min={0} max={1} step={0.01} onChange={(value) => updateInvestmentTaxProfile("deposit_interest_tax_rate", value)} />
@@ -4116,10 +4577,13 @@ function TaxPage({
           <NumberField label="简化应税收益比例" value={household.investment_taxable_return_ratio ?? 0} min={0} max={1} step={0.05} onChange={(value) => updateHousehold("investment_taxable_return_ratio", value)} />
           <NumberField label="简化理财收益税率" value={household.investment_return_tax_rate ?? 0} min={0} max={1} step={0.01} onChange={(value) => updateHousehold("investment_return_tax_rate", value)} />
         </div>
-      </section>
+      </WorkflowSection>
 
-      <section className="form-panel">
-        <PanelTitle icon={<ClipboardCheck size={18} />} title="后端税务结果" />
+      <WorkflowSection
+        icon={<ClipboardCheck size={18} />}
+        title="成员年度税负明细"
+        description="成员年度结果由后端根据收入阶段、专项扣除、年终奖和税务策略生成。"
+      >
         {taxMemberRows.length > 0 ? (
           <div className="tax-detail-table">
             <span>成员</span>
@@ -4142,8 +4606,8 @@ function TaxPage({
         ) : (
           <p className="field-hint">等待后端生成税务结果。填写收入阶段并完成计算后，这里会展示成员年度税务明细。</p>
         )}
-      </section>
-    </div>
+      </WorkflowSection>
+    </PlannerPageShell>
   );
 }
 
@@ -4266,8 +4730,11 @@ function InvestmentPlanPage({
   };
 
   return (
-    <div className="page-stack strategy-workbench investment-page">
-      <SectionHeader icon={<TrendingUp size={20} />} title="理财计划" />
+    <PlannerPageShell
+      icon={<TrendingUp size={20} />}
+      title="理财计划"
+      summary={<p>先选择理财策略方案，再编辑当前策略的现金安全垫、定投规则、资产比例、手续费税务和再平衡规则；后端会把实际定投、收益复利、手续费和税后收益纳入账户曲线。</p>}
+    >
       <section className="strategy-hero investment-dashboard">
         <div className="strategy-hero-main">
           <div className="recommend-title">
@@ -4290,153 +4757,163 @@ function InvestmentPlanPage({
       </section>
 
       <section className="strategy-layout investment-workbench-layout">
-        <aside className="strategy-side-panel investment-settings">
-          <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动参数" compact />
-          <div className="form-grid two">
-            <Field label="理财计划">
-              <select
-                value={activeInvestmentPlanName === "cash_reserve_first" ? "conservative_monthly_investment" : activeInvestmentPlanName}
-                onChange={(event) => selectInvestmentPlan(event.target.value)}
-              >
-                {investmentPlanOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="风险类型">
-              <select
-                value={household.investment_risk_level ?? "conservative"}
-                onChange={(event) => updateManualInvestmentHousehold("investment_risk_level", event.target.value)}
-              >
-                {Object.entries(investmentRiskLabels).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <NumberField label="每月定投" value={household.monthly_investment_amount ?? 0} min={0} step={100} onChange={(value) => updateManualInvestmentHousehold("monthly_investment_amount", value)} />
-            <NumberField label="现金安全垫月数" value={household.investment_cash_reserve_months ?? 6} min={0} max={36} step={1} onChange={(value) => updateManualInvestmentHousehold("investment_cash_reserve_months", value)} />
-            <NumberField label="权益比例" value={household.investment_equity_ratio ?? 0.25} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_equity_ratio", value)} />
-            <NumberField label="固收比例" value={household.investment_bond_ratio ?? 0.45} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_bond_ratio", value)} />
-            <NumberField label="现金比例" value={household.investment_cash_ratio ?? 0.3} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_cash_ratio", value)} />
-            <NumberField label="测算年化" value={scenario.annual_investment_return ?? 0.025} min={-0.5} max={0.5} step={0.001} onChange={updateManualInvestmentAnnualReturn} />
-            <NumberField label="买入手续费率" value={household.investment_buy_fee_rate ?? 0.0015} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_buy_fee_rate", value)} />
-            <NumberField label="卖出手续费率" value={household.investment_sell_fee_rate ?? 0.005} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_sell_fee_rate", value)} />
+        <WorkflowSection
+          icon={<Target size={18} />}
+          title="理财策略方案"
+          description={`${displayedRecommendations.length} 个方案。卡片负责比较和采用，下面只编辑当前采用或手动策略。`}
+          className="strategy-main-panel investment-strategy-panel"
+        >
+          <div className="metric-grid investment-side-metrics">
+            <Metric label="当前已设定投" value={money(household.monthly_investment_amount ?? 0)} />
+            <Metric label="现金安全垫目标" value={money(currentInvestmentAllocation.reserve_target)} />
+            <Metric label="追加定投" value={money(currentInvestmentAllocation.cash_sweep_investment)} tone={currentInvestmentAllocation.cash_sweep_investment > 0 ? "good" : undefined} />
+            <Metric label="测算年化" value={percent(household.investment_plan_name === "cash_only" ? 0 : scenario.annual_investment_return ?? 0)} />
           </div>
-          <SwitchField
-            label="自动再平衡"
-            checked={household.investment_auto_rebalance ?? true}
-            onChange={(checked) => updateManualInvestmentHousehold("investment_auto_rebalance", checked)}
-            description="现金垫不足时暂停定投，现金垫达标后按目标比例恢复。"
-            className="section-switch"
-          />
-          <p className="field-hint">
-            达到现金安全垫后，系统会把超过安全垫的闲置现金按节奏追加到定投；理财税务口径统一在“税务”页配置。
-          </p>
-          <div className="investment-allocation">
-            <PanelTitle icon={<Gauge size={18} />} title="目标配置" compact />
-            <ResponsiveContainer width="100%" height={210}>
-              <BarChart data={allocationData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="name" tickLine={false} axisLine={false} />
-                <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={42} />
-                <Tooltip formatter={(value) => `${Number(value).toFixed(0)}%`} />
-                <Bar dataKey="比例" fill={visualColors.cash} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-            <div className="investment-rule-list">
-              <Row label="安全垫规则" value={currentInvestmentAllocation.reserve_gap > 0 ? "先补现金" : "允许定投"} />
-              <Row label="基础定投" value={money(currentInvestmentAllocation.base_investment)} />
-              <Row label="超额现金追加" value={money(currentInvestmentAllocation.cash_sweep_investment)} />
-              <Row label="实际本月定投" value={money(currentInvestmentAllocation.total_investment)} />
-              <Row label="当前采用" value={activeRecommendation?.variant ?? "手动设置"} />
+          <div className="strategy-grid investment-plan-grid horizontal-card-list">
+            {displayedRecommendations.map((plan) => {
+              const active = activeInvestmentPlanName === plan.plan_name || activeInvestmentRecommendationName === plan.plan_name;
+              return (
+                <article className={`strategy-card investment-card ${active ? "active" : ""}`} key={plan.variant}>
+                  <div className="strategy-card-head">
+                    <strong>{plan.variant}</strong>
+                    <StrategyStatePill
+                      active={active}
+                      recommended={!active && plan.plan_name === recommendedInvestment?.plan_name}
+                      label={!active && plan.plan_name !== recommendedInvestment?.plan_name ? `${plan.score} 分` : undefined}
+                    />
+                  </div>
+                  <p>{plan.description}</p>
+                  <ul className="strategy-explain-list">
+                    {investmentStrategyDetails(plan.variant).map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                  <div className="strategy-metrics">
+                    <Metric label="月定投" value={money(plan.monthly_investment)} />
+                    <Metric label="测算年化" value={percent(plan.annual_return)} />
+                    <Metric label="风险类型" value={plan.risk_label} />
+                    <Metric label="现金垫" value={`${plan.cash_reserve_months} 个月`} />
+                  </div>
+                  <div className="investment-ratio-row">
+                    <span style={{ width: `${plan.equity_ratio * 100}%` }} />
+                    <span style={{ width: `${plan.bond_ratio * 100}%` }} />
+                    <span style={{ width: `${plan.cash_ratio * 100}%` }} />
+                  </div>
+                  <p className="strategy-note">{plan.reasons.join("；")}</p>
+                  <AdoptStrategyButton active={active} onClick={() => applyInvestmentPlan(plan)} />
+                </article>
+              );
+            })}
+          </div>
+        </WorkflowSection>
+        <WorkflowSection
+          icon={<SlidersHorizontal size={18} />}
+          title="当前策略配置"
+          description="采用方案或手动调整后会影响可视化里的资产曲线。"
+          className="strategy-main-panel investment-config-panel"
+        >
+          <div className="investment-config-grid">
+            <section className="investment-settings">
+              <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动参数" compact />
+              <div className="form-grid two">
+                <Field label="理财计划">
+                  <select
+                    value={activeInvestmentPlanName === "cash_reserve_first" ? "conservative_monthly_investment" : activeInvestmentPlanName}
+                    onChange={(event) => selectInvestmentPlan(event.target.value)}
+                  >
+                    {investmentPlanOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="风险类型">
+                  <select
+                    value={household.investment_risk_level ?? "conservative"}
+                    onChange={(event) => updateManualInvestmentHousehold("investment_risk_level", event.target.value)}
+                  >
+                    {Object.entries(investmentRiskLabels).map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <NumberField label="每月定投" value={household.monthly_investment_amount ?? 0} min={0} step={100} onChange={(value) => updateManualInvestmentHousehold("monthly_investment_amount", value)} />
+                <NumberField label="现金安全垫月数" value={household.investment_cash_reserve_months ?? 6} min={0} max={36} step={1} onChange={(value) => updateManualInvestmentHousehold("investment_cash_reserve_months", value)} />
+                <NumberField label="权益比例" value={household.investment_equity_ratio ?? 0.25} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_equity_ratio", value)} />
+                <NumberField label="固收比例" value={household.investment_bond_ratio ?? 0.45} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_bond_ratio", value)} />
+                <NumberField label="现金比例" value={household.investment_cash_ratio ?? 0.3} min={0} max={1} step={0.05} onChange={(value) => updateManualInvestmentHousehold("investment_cash_ratio", value)} />
+                <NumberField label="测算年化" value={scenario.annual_investment_return ?? 0.025} min={-0.5} max={0.5} step={0.001} onChange={updateManualInvestmentAnnualReturn} />
+                <NumberField label="买入手续费率" value={household.investment_buy_fee_rate ?? 0.0015} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_buy_fee_rate", value)} />
+                <NumberField label="卖出手续费率" value={household.investment_sell_fee_rate ?? 0.005} min={0} max={0.05} step={0.0005} onChange={(value) => updateManualInvestmentHousehold("investment_sell_fee_rate", value)} />
+              </div>
+              <SwitchField
+                label="自动再平衡"
+                checked={household.investment_auto_rebalance ?? true}
+                onChange={(checked) => updateManualInvestmentHousehold("investment_auto_rebalance", checked)}
+                description="现金垫不足时暂停定投，现金垫达标后按目标比例恢复。"
+                className="section-switch"
+              />
+              <p className="field-hint">
+                达到现金安全垫后，系统会把超过安全垫的闲置现金按节奏追加到定投；理财税务口径统一在“税务”页配置。
+              </p>
+            </section>
+            <section className="investment-allocation">
+              <PanelTitle icon={<Gauge size={18} />} title="目标配置" compact />
+              <ResponsiveContainer width="100%" height={210}>
+                <BarChart data={allocationData}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="name" tickLine={false} axisLine={false} />
+                  <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={42} />
+                  <Tooltip formatter={(value) => `${Number(value).toFixed(0)}%`} />
+                  <Bar dataKey="比例" fill={visualColors.cash} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+              <div className="investment-rule-list">
+                <Row label="安全垫规则" value={currentInvestmentAllocation.reserve_gap > 0 ? "先补现金" : "允许定投"} />
+                <Row label="基础定投" value={money(currentInvestmentAllocation.base_investment)} />
+                <Row label="超额现金追加" value={money(currentInvestmentAllocation.cash_sweep_investment)} />
+                <Row label="实际本月定投" value={money(currentInvestmentAllocation.total_investment)} />
+                <Row label="当前采用" value={activeRecommendation?.variant ?? "手动设置"} />
+              </div>
+            </section>
+          </div>
+          <div className="strategy-current-panel">
+            <div>
+              <span>当前理财策略</span>
+              <strong>{activeRecommendation?.variant ?? "手动设置"}</strong>
+              <p>
+                系统按“先保现金安全垫，再把月结余和超额现金逐步转入投资账户”的规则执行。
+                当前选中策略本月预计投入 {money(currentInvestmentAllocation.total_investment)}，其中基础定投 {money(currentInvestmentAllocation.base_investment)}、超额现金追加 {money(currentInvestmentAllocation.cash_sweep_investment)}。
+              </p>
+            </div>
+            <div>
+              <span>风险与费用口径</span>
+              <strong>{activeRecommendation?.risk_label ?? investmentRiskLabels[household.investment_risk_level ?? "conservative"]}</strong>
+              <p>
+                收益留在投资账户内复利；买入手续费从当月投入中扣除，买房变现时由后端按卖出费率扣除后进入现金账户。
+              </p>
             </div>
           </div>
-        </aside>
-        <div className="strategy-main-panel">
-          <div className="strategy-panel-head">
-            <PanelTitle icon={<Target size={18} />} title="理财策略方案" compact />
-            <span>包含手动指定和自动生成方案，采用后会影响可视化里的资产曲线</span>
+          <div className="investment-guide">
+            <article>
+              <strong>1. 先定现金安全垫</strong>
+              <span>现金安全垫按家庭月支出折算。未达标时系统会优先补现金，避免为了收益率把日常流动性压得过低。</span>
+            </article>
+            <article>
+              <strong>2. 再选风险和定投</strong>
+              <span>自动方案会给出月定投、权益/固收/现金比例；你手动改参数后会进入手动方案，并同步影响可视化资产曲线。</span>
+            </article>
+            <article>
+              <strong>3. 最后看买房前后影响</strong>
+              <span>买入手续费、卖出手续费和可配置的理财收益税都由后端进入账户推演；默认税率为 0，不臆造具体产品税负。</span>
+            </article>
           </div>
-        <div className="metric-grid">
-          <Metric label="当前已设定投" value={money(household.monthly_investment_amount ?? 0)} />
-          <Metric label="现金安全垫目标" value={money(currentInvestmentAllocation.reserve_target)} />
-          <Metric label="安全垫达标后追加定投" value={money(currentInvestmentAllocation.cash_sweep_investment)} tone={currentInvestmentAllocation.cash_sweep_investment > 0 ? "good" : undefined} />
-          <Metric label="测算年化" value={percent(household.investment_plan_name === "cash_only" ? 0 : scenario.annual_investment_return ?? 0)} />
-        </div>
-        <div className="strategy-current-panel">
-          <div>
-            <span>当前理财策略</span>
-            <strong>{activeRecommendation?.variant ?? "手动设置"}</strong>
-            <p>
-              系统按“先保现金安全垫，再把月结余和超额现金逐步转入投资账户”的规则执行。
-              当前选中策略本月预计投入 {money(currentInvestmentAllocation.total_investment)}，其中基础定投 {money(currentInvestmentAllocation.base_investment)}、超额现金追加 {money(currentInvestmentAllocation.cash_sweep_investment)}。
-            </p>
-          </div>
-          <div>
-            <span>风险与费用口径</span>
-            <strong>{activeRecommendation?.risk_label ?? investmentRiskLabels[household.investment_risk_level ?? "conservative"]}</strong>
-            <p>
-              收益留在投资账户内复利；买入手续费从当月投入中扣除，买房变现时由后端按卖出费率扣除后进入现金账户。
-            </p>
-          </div>
-        </div>
-        <div className="investment-guide">
-          <article>
-            <strong>1. 先定现金安全垫</strong>
-            <span>现金安全垫按家庭月支出折算。未达标时系统会优先补现金，避免为了收益率把日常流动性压得过低。</span>
-          </article>
-          <article>
-            <strong>2. 再选风险和定投</strong>
-            <span>自动方案会给出月定投、权益/固收/现金比例；你手动改参数后会进入手动方案，并同步影响可视化资产曲线。</span>
-          </article>
-          <article>
-            <strong>3. 最后看买房前后影响</strong>
-            <span>买入手续费、卖出手续费和可配置的理财收益税都由后端进入账户推演；默认税率为 0，不臆造具体产品税负。</span>
-          </article>
-        </div>
-        <div className="strategy-grid">
-          {displayedRecommendations.map((plan) => {
-            const active = activeInvestmentPlanName === plan.plan_name || activeInvestmentRecommendationName === plan.plan_name;
-            return (
-              <article className={`strategy-card investment-card ${active ? "active" : ""}`} key={plan.variant}>
-                <div className="strategy-card-head">
-                  <strong>{plan.variant}</strong>
-                  <StrategyStatePill
-                    active={active}
-                    recommended={!active && plan.plan_name === recommendedInvestment?.plan_name}
-                    label={!active && plan.plan_name !== recommendedInvestment?.plan_name ? `${plan.score} 分` : undefined}
-                  />
-                </div>
-                <p>{plan.description}</p>
-                <ul className="strategy-explain-list">
-                  {investmentStrategyDetails(plan.variant).map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-                <div className="strategy-metrics">
-                  <Metric label="月定投" value={money(plan.monthly_investment)} />
-                  <Metric label="测算年化" value={percent(plan.annual_return)} />
-                  <Metric label="风险类型" value={plan.risk_label} />
-                  <Metric label="现金垫" value={`${plan.cash_reserve_months} 个月`} />
-                </div>
-                <div className="investment-ratio-row">
-                  <span style={{ width: `${plan.equity_ratio * 100}%` }} />
-                  <span style={{ width: `${plan.bond_ratio * 100}%` }} />
-                  <span style={{ width: `${plan.cash_ratio * 100}%` }} />
-                </div>
-                <p className="strategy-note">{plan.reasons.join("；")}</p>
-                <AdoptStrategyButton active={active} onClick={() => applyInvestmentPlan(plan)} />
-              </article>
-            );
-          })}
-        </div>
-        </div>
+        </WorkflowSection>
       </section>
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -4988,10 +5465,18 @@ function ScenarioPage({
           </div>
           <div className="structured-settings strategy-settings-groups">
             <section className="setting-group">
-              <strong className="setting-group-title">执行时间与贷款结构</strong>
+              <strong className="setting-group-title">计划时间窗口与贷款结构</strong>
               <div className="form-grid">
+                <PlanningWindowFields
+                  startMonth={selectedScenario.data.planning_window_start_month ?? ""}
+                  endMonth={selectedScenario.data.planning_window_end_month ?? ""}
+                  onChange={(patch) => updateScenarioRecord(selectedScenario.id, patch)}
+                  startLabel="购房窗口开始"
+                  endLabel="购房窗口最晚"
+                  hint="策略会在这个窗口内寻找可买月份；不填则从现在开始按现金安全、贷款政策、车辆和养娃计划自动安排。"
+                />
                 <NumberField
-                  label="手动买入延后月数"
+                  label="最早买入距今月数"
                   value={selectedScenario.data.manual_purchase_delay_months ?? 0}
                   min={0}
                   max={360}
@@ -5100,7 +5585,7 @@ function ScenarioPage({
             </section>
           </div>
           <p className="field-hint">
-            手动买入延后月数只作用于“手动指定”策略，系统会从该月份开始校验现金安全；微量商贷手动比例填 0 时由系统在政策规则上下限内自动寻找更早可买且商贷尽量少的比例，填入比例后按该比例固定测算。理财年化、定投和手续费来自理财计划当前策略，购房页只决定交易时如何动用投资账户。商贷提前还本选择“策略自动生成”时，后端会在合同允许最早月之后比较商贷成本、理财预期净收益、现金安全和买后结余，再决定是否额外还本；选择“手动指定”时按你填写的起始月和每月金额测算。买房动用投资选择“自动优化提取”时，后端只卖出覆盖交易现金和安全垫所需的投资资产；选择“清空投资账户”才会在交易月全部变现；选择“手动保留余额”时按设定余额尽量保留长期投资。
+            计划时间窗口会约束所有购房策略的最早搜索月份，系统会在窗口内校验现金安全、政策贷款和买后压力；“最早买入距今月数”保留给需要用相对月份精确控制的情况。微量商贷手动比例填 0 时由系统在政策规则上下限内自动寻找更早可买且商贷尽量少的比例，填入比例后按该比例固定测算。理财年化、定投和手续费来自理财计划当前策略，购房页只决定交易时如何动用投资账户。商贷提前还本选择“策略自动生成”时，后端会在合同允许最早月之后比较商贷成本、理财预期净收益、现金安全和买后结余，再决定是否额外还本；选择“手动指定”时按你填写的起始月和每月金额测算。买房动用投资选择“自动优化提取”时，后端只卖出覆盖交易现金和安全垫所需的投资资产；选择“清空投资账户”才会在交易月全部变现；选择“手动保留余额”时按设定余额尽量保留长期投资。
           </p>
         </section>
       </div>
@@ -5266,7 +5751,7 @@ function StrategyNarrative({
       ? "按当前收入和资产路径，30 年内暂时无法满足买入所需现金。"
       : `预计 ${purchaseMonthText}、约 ${plan.years_to_buy} 年后可以执行买入；该日期用于同步计算届时公积金缴存年限、可贷额度和现金积累。`;
   const loanText = `执行时采用 ${money(plan.planned_down_payment)} 首付，贷款合计 ${money(plan.provident_loan_amount + plan.commercial_loan_amount)}：其中公积金贷 ${money(plan.provident_loan_amount)}，商贷 ${money(plan.commercial_loan_amount)}。首付、贷款和交易现金按 ${purchaseMonthText} 的资产路径测算。`;
-  const policyBasisText = `政策依据采用北京住房公积金官方口径：首套/二套分别读取规则包中的商贷和公积金最低首付比例，系统取更严格者；公积金贷款按“每缴存一年可贷 15 万元”随 ${purchaseMonthText} 的缴存时间增长，并受首套 ${money(1200000)}、二套 ${money(1000000)} 的基础最高额度、购房月收入还款能力和基本生活费保留约束。当前房源性质为「${propertyNatureText || "未标注"}」，符合绿色建筑、装配式建筑或超低能耗建筑时只取最高一项上浮，本方案上浮 ${money(plan.provident_policy_bonus)}，最终政策上限 ${money(plan.provident_policy_cap)}。`;
+  const policyBasisText = `政策依据采用北京住房公积金官方口径：首套/二套分别读取规则包中的商贷和公积金最低首付比例，系统取更严格者；公积金贷款按“每缴存一年可贷 15 万元”随 ${purchaseMonthText} 的缴存时间增长，并受首套 ${money(1200000)}、二套 ${money(1000000)} 的基础最高额度、购房月收入还款能力和基本生活费保留约束。当前房源性质为「${propertyNatureText || "未标注"}」，符合绿色建筑、装配式建筑或超低能耗建筑时按可叠加项目求和并受上浮封顶控制，本方案上浮 ${money(plan.provident_policy_bonus)}，最终政策上限 ${money(plan.provident_policy_cap)}。`;
   const termBasisText = `贷款年限依据同时看手动设定年限、北京公积金最长 30 年、借款申请人年龄上限，以及二手房/老旧小区房龄或土地剩余年限；本方案采用公积金 ${plan.provident_loan_years} 年，理由：${plan.provident_loan_year_limit_reasons.join("；")}。`;
   const commercialPrepaymentText = plan.commercial_prepayment_enabled
     ? ` 商贷提前还本采用「${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}」：合同按第 ${plan.commercial_prepayment_allowed_after_month} 个还款月后才允许提前还本估算，实际从第 ${plan.commercial_prepayment_start_month} 个还款月起每月额外还本金 ${money(plan.commercial_prepayment_monthly_amount)}；按合同月供不降、缩短期限估算，预计 ${plan.commercial_actual_payoff_months} 个月结清，节省商贷利息约 ${money(plan.commercial_interest_saved_by_prepayment)}。`
@@ -5500,14 +5985,39 @@ function CarPlanPage({
     new_energy_catalog_eligible: base?.new_energy_catalog_eligible ?? true,
     beijing_license_indicator_status: base?.beijing_license_indicator_status ?? "unknown",
     beijing_indicator_expected_delay_months: base?.beijing_indicator_expected_delay_months ?? 0,
+    license_plate_rental_enabled: base?.license_plate_rental_enabled ?? false,
+    license_plate_rental_upfront_fee: base?.license_plate_rental_upfront_fee ?? 20000,
+    license_plate_rental_term_months: base?.license_plate_rental_term_months ?? 36,
+    license_plate_rental_renewal_fee: base?.license_plate_rental_renewal_fee ?? 20000,
+    license_plate_rental_renewal_term_months: base?.license_plate_rental_renewal_term_months ?? 36,
+    license_plate_rental_after_term_mode: base?.license_plate_rental_after_term_mode ?? "renew_until_own_indicator",
+    beijing_family_indicator_score_enabled: base?.beijing_family_indicator_score_enabled ?? false,
+    beijing_family_indicator_application_start_month: base?.beijing_family_indicator_application_start_month ?? "",
+    beijing_family_indicator_applicants: normalizeVehicleIndicatorApplicants(base?.beijing_family_indicator_applicants),
+    beijing_family_indicator_generations: base?.beijing_family_indicator_generations ?? 1,
+    beijing_family_indicator_has_spouse: base?.beijing_family_indicator_has_spouse ?? true,
+    beijing_family_indicator_main_points: base?.beijing_family_indicator_main_points ?? 2,
+    beijing_family_indicator_spouse_points: base?.beijing_family_indicator_spouse_points ?? 1,
+    beijing_family_indicator_other_applicant_count: base?.beijing_family_indicator_other_applicant_count ?? 0,
+    beijing_family_indicator_other_points_total: base?.beijing_family_indicator_other_points_total ?? 0,
+    beijing_family_indicator_application_years: base?.beijing_family_indicator_application_years ?? 0,
+    beijing_family_indicator_current_cutoff_score: base?.beijing_family_indicator_current_cutoff_score ?? 36,
+    beijing_family_indicator_cutoff_score_annual_change: base?.beijing_family_indicator_cutoff_score_annual_change ?? 0,
+    beijing_family_indicator_last_config_year: base?.beijing_family_indicator_last_config_year ?? 2026,
+    beijing_family_indicator_annual_quota: base?.beijing_family_indicator_annual_quota ?? 119200,
     vehicle_vessel_tax_annual_override: base?.vehicle_vessel_tax_annual_override ?? null,
     purchase_tax: base?.purchase_tax ?? 0,
     purchase_tax_relief: base?.purchase_tax_relief ?? 0,
     annual_vehicle_vessel_tax: base?.annual_vehicle_vessel_tax ?? 0,
+    license_plate_rental_initial_fee: base?.license_plate_rental_initial_fee ?? 0,
+    beijing_family_indicator_score: base?.beijing_family_indicator_score ?? 0,
+    beijing_family_indicator_estimated_wait_months: base?.beijing_family_indicator_estimated_wait_months ?? null,
     planning_sequence: base?.planning_sequence ?? vehicleIndex + 1,
     purchase_timing_mode: base?.purchase_timing_mode ?? "auto_sequence",
     after_previous_event_delay_months: base?.after_previous_event_delay_months ?? 0,
     manual_purchase_delay_months: base?.manual_purchase_delay_months ?? base?.purchase_delay_months ?? 0,
+    planning_window_start_month: base?.planning_window_start_month ?? "",
+    planning_window_end_month: base?.planning_window_end_month ?? "",
     total_price: base?.total_price ?? 200000,
     down_payment_ratio: base?.down_payment_ratio ?? 0.3,
     down_payment: base?.down_payment ?? Math.round((base?.total_price ?? 200000) * (base?.down_payment_ratio ?? 0.3)),
@@ -5536,7 +6046,7 @@ function CarPlanPage({
     annual_insurance_min: base?.annual_insurance_min ?? 4500,
     annual_insurance_growth_rate: base?.annual_insurance_growth_rate ?? 0.02,
     depreciation_years: base?.depreciation_years ?? 8,
-    vehicle_service_years: base?.vehicle_service_years ?? 15,
+    vehicle_service_years: base?.vehicle_service_years ?? 10,
     vehicle_retirement_mileage_km: base?.vehicle_retirement_mileage_km ?? 600000,
     happiness_score: base?.happiness_score ?? 6.5,
     notes: base?.notes ?? ""
@@ -5645,6 +6155,41 @@ function CarPlanPage({
       return { ...vehicle, selected_strategy_variant: "target", candidate_vehicles: candidates };
     });
     updateVehiclePlans(nextVehicles);
+  };
+
+  const updateCandidateIndicatorApplicants = (
+    vehicleIndex: number,
+    candidateIndex: number,
+    updater: (applicants: VehicleIndicatorApplicantData[]) => VehicleIndicatorApplicantData[]
+  ) => {
+    const vehicle = vehiclePlans[vehicleIndex];
+    const candidate = vehicle?.candidate_vehicles?.[candidateIndex];
+    const currentApplicants = normalizeVehicleIndicatorApplicants(candidate?.beijing_family_indicator_applicants);
+    updateCandidate(vehicleIndex, candidateIndex, {
+      beijing_family_indicator_applicants: updater(currentApplicants)
+    });
+  };
+
+  const addIndicatorApplicant = (vehicleIndex: number, candidateIndex: number, patch: Partial<VehicleIndicatorApplicantData> = {}) => {
+    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) => [
+      ...applicants,
+      defaultVehicleIndicatorApplicant(applicants.length, patch)
+    ]);
+  };
+
+  const updateIndicatorApplicant = (
+    vehicleIndex: number,
+    candidateIndex: number,
+    applicantIndex: number,
+    patch: Partial<VehicleIndicatorApplicantData>
+  ) => {
+    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) =>
+      applicants.map((applicant, index) => index === applicantIndex ? defaultVehicleIndicatorApplicant(index, { ...applicant, ...patch }) : applicant)
+    );
+  };
+
+  const removeIndicatorApplicant = (vehicleIndex: number, candidateIndex: number, applicantIndex: number) => {
+    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) => applicants.filter((_, index) => index !== applicantIndex));
   };
 
   const buildFinancingOption = (index: number, base?: Partial<VehicleFinancingOptionData>): VehicleFinancingOptionData =>
@@ -5816,10 +6361,13 @@ function CarPlanPage({
     return "该策略按当前车源、金融方案和手动偏好测算，适合继续微调首付比例、购车时间或提前还本设置。";
   };
   const carStrategyFinancingText = (strategy: CarPlanAnalysis) => {
+    const plateRentalText = strategy.license_plate_rental_initial_fee > 0
+      ? `另外，上牌租牌首期现金支出为 ${money(strategy.license_plate_rental_initial_fee)}，这笔钱不计入车价、首付或贷款本金。`
+      : "";
     if (strategy.loan_principal <= 0) {
-      return `当前采用${financingTypeLabel(strategy.financing_type)}口径，但实际不形成车贷；交易当月需要覆盖 ${money(strategy.down_payment)} 现金。`;
+      return `当前采用${financingTypeLabel(strategy.financing_type)}口径，但实际不形成车贷；交易当月需要覆盖 ${money(strategy.down_payment)} 车辆首付/车款。${plateRentalText}`;
     }
-    return `采用「${strategy.financing_option_name || financingTypeLabel(strategy.financing_type)}」：合同 ${strategy.total_months} 期、年利率 ${percent(strategy.later_annual_rate)}，贴息 ${strategy.interest_free_months} 期。贴息不是贷款余额免息，而是厂家或经销商补贴部分利息；后端仍按合同等额本息推演余额。`;
+    return `采用「${strategy.financing_option_name || financingTypeLabel(strategy.financing_type)}」：合同 ${strategy.total_months} 期、年利率 ${percent(strategy.later_annual_rate)}，贴息 ${strategy.interest_free_months} 期。贴息不是贷款余额免息，而是厂家或经销商补贴部分利息；后端仍按合同等额本息推演余额。${plateRentalText}`;
   };
   const carStrategyPrepaymentText = (strategy: CarPlanAnalysis) => {
     if (!strategy.prepayment_allowed) {
@@ -5847,7 +6395,19 @@ function CarPlanPage({
       ? `经销商贴息预计覆盖 ${money(strategy.total_interest_subsidy)} 利息，但仍要确认合同是否限制提前还本或收取违约金。`
       : strategy.prepayment_allowed
         ? `当前金融方案没有明显贴息补贴，应重点比较车贷利率和理财预期收益。`
-        : `当前金融方案不允许提前还本，策略只比较首付、购车时间和现金安全。`
+        : `当前金融方案不允许提前还本，策略只比较首付、购车时间和现金安全。`,
+    strategy.beijing_family_indicator_estimated_wait_months !== null
+      ? `家庭新能源指标估算分约 ${strategy.beijing_family_indicator_score.toFixed(2)}，预计等待 ${strategy.beijing_family_indicator_estimated_wait_months} 个月；启用租牌时购车时间不再被该等待直接推迟。`
+      : "北京指标时间按手动等待月数或已获指标状态处理。",
+    ...strategy.notes
+      .filter((note) =>
+        note.includes("家庭新能源指标") ||
+        note.includes("家庭指标") ||
+        note.includes("申请人") ||
+        note.includes("每满一年") ||
+        note.includes("代计算")
+      )
+      .slice(0, 8)
   ];
 
   const carLoan = result?.car_loan;
@@ -6064,16 +6624,22 @@ function CarPlanPage({
                     step={1}
                     onChange={(value) => updateVehicle(vehicleIndex, { after_previous_event_delay_months: value })}
                   />
-                  {vehicle.purchase_timing_mode === "manual_month" ? (
-                    <NumberField
-                      label="指定购车距今月数"
-                      value={vehicle.manual_purchase_delay_months ?? vehicle.purchase_delay_months ?? 0}
-                      min={0}
-                      max={600}
-                      step={1}
-                      onChange={(value) => updateVehicle(vehicleIndex, { manual_purchase_delay_months: value, purchase_delay_months: value })}
-                    />
-                  ) : null}
+                  <PlanningWindowFields
+                    startMonth={vehicle.planning_window_start_month ?? ""}
+                    endMonth={vehicle.planning_window_end_month ?? ""}
+                    onChange={(patch) => updateVehicle(vehicleIndex, patch)}
+                    startLabel="购车窗口开始"
+                    endLabel="购车窗口最晚"
+                    hint="策略会在这个窗口内选择具体购车月份；不填则按消费顺序、指标等待、现金安全和对买房影响自动安排。"
+                  />
+                  <NumberField
+                    label="最早购车距今月数"
+                    value={vehicle.manual_purchase_delay_months ?? vehicle.purchase_delay_months ?? 0}
+                    min={0}
+                    max={600}
+                    step={1}
+                    onChange={(value) => updateVehicle(vehicleIndex, { manual_purchase_delay_months: value, purchase_delay_months: value })}
+                  />
                 </div>
                 <p className="field-hint">
                   消费事件顺序会和房源的购房顺序一起参与测算：排在当前房源之前或并行的车辆会计入购房前现金压力；排在当前房源之后的车辆会在选中购房方案成交后再进入现金流、贷款和事件时间线。
@@ -6124,10 +6690,13 @@ function CarPlanPage({
                               <NumberField label="保险费率" value={candidate.annual_insurance_rate ?? 0.018} min={0} max={0.2} step={0.001} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { annual_insurance_rate: value })} />
                               <NumberField label="年保险下限" value={candidate.annual_insurance_min ?? 0} min={0} step={500} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { annual_insurance_min: value })} />
                               <NumberField label="折旧年限" value={candidate.depreciation_years ?? 8} min={1} max={20} step={1} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { depreciation_years: value })} />
-                              <NumberField label="车辆使用年限" value={candidate.vehicle_service_years ?? 15} min={1} max={30} step={1} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { vehicle_service_years: value })} />
+                              <NumberField label="实际使用年限" value={candidate.vehicle_service_years ?? 10} min={1} max={30} step={1} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { vehicle_service_years: value })} />
                               <NumberField label="报废/更新里程" value={candidate.vehicle_retirement_mileage_km ?? 600000} min={0} max={1000000} step={10000} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { vehicle_retirement_mileage_km: value })} />
                               <NumberField label="购车幸福度" value={candidate.happiness_score ?? 6.5} min={0} max={10} step={0.5} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { happiness_score: value })} />
                             </div>
+                            <p className="field-hint">
+                              车辆没有固定强制报废年限时，后端会按实际使用年限和报废/更新里程择早估算更新月份。实际使用年限默认 10 年，可按性能衰减、维修经济性和家庭体验手动调整；到该月后，车辆资产、电费、停车费、保险、保养和车船税停止计入，若车贷未结清，贷款余额和月供仍继续进入现金流。
+                            </p>
                           </section>
 
                           <section className="setting-group">
@@ -6147,6 +6716,7 @@ function CarPlanPage({
                                   <option value="already_have">已取得指标</option>
                                   <option value="family_new_energy_pending">家庭新能源指标等待中</option>
                                   <option value="personal_new_energy_pending">个人新能源指标等待中</option>
+                                  <option value="ordinary_indicator_pending">普通小客车指标等待中</option>
                                   <option value="not_eligible">暂不具备申请资格</option>
                                 </select>
                               </Field>
@@ -6158,6 +6728,156 @@ function CarPlanPage({
                                 step={1}
                                 onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_indicator_expected_delay_months: value })}
                               />
+                              <SwitchField
+                                label={candidate.license_plate_rental_enabled ? "启用租牌过渡" : "不租牌"}
+                                checked={candidate.license_plate_rental_enabled ?? false}
+                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_enabled: checked })}
+                              />
+                              {candidate.license_plate_rental_enabled ? (
+                                <>
+                                  <NumberField
+                                    label="首期租牌费"
+                                    value={candidate.license_plate_rental_upfront_fee ?? 20000}
+                                    min={0}
+                                    step={1000}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_upfront_fee: value })}
+                                  />
+                                  <NumberField
+                                    label="首期租牌周期"
+                                    value={candidate.license_plate_rental_term_months ?? 36}
+                                    min={1}
+                                    max={120}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_term_months: value })}
+                                  />
+                                  <Field label="到期处理">
+                                    <select
+                                      value={candidate.license_plate_rental_after_term_mode ?? "renew_until_own_indicator"}
+                                      onChange={(event) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_after_term_mode: event.target.value as VehiclePlanData["license_plate_rental_after_term_mode"] })}
+                                    >
+                                      <option value="renew_until_own_indicator">继续租到取得自有指标</option>
+                                      <option value="switch_to_own_indicator">到期改用自有指标</option>
+                                    </select>
+                                  </Field>
+                                  {candidate.license_plate_rental_after_term_mode !== "switch_to_own_indicator" ? (
+                                    <>
+                                      <NumberField
+                                        label="续租费用"
+                                        value={candidate.license_plate_rental_renewal_fee ?? 20000}
+                                        min={0}
+                                        step={1000}
+                                        onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_renewal_fee: value })}
+                                      />
+                                      <NumberField
+                                        label="续租周期"
+                                        value={candidate.license_plate_rental_renewal_term_months ?? 36}
+                                        min={1}
+                                        max={120}
+                                        step={1}
+                                        onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_renewal_term_months: value })}
+                                      />
+                                    </>
+                                  ) : null}
+                                </>
+                              ) : null}
+                              <SwitchField
+                                label={candidate.beijing_family_indicator_score_enabled ? "估算家庭新能源积分" : "不估算家庭积分"}
+                                checked={candidate.beijing_family_indicator_score_enabled ?? false}
+                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_score_enabled: checked })}
+                              />
+                              {candidate.beijing_family_indicator_score_enabled ? (
+                                <>
+                                  <Field label="家庭指标开始月">
+                                    <input
+                                      type="month"
+                                      value={candidate.beijing_family_indicator_application_start_month ?? ""}
+                                      onChange={(event) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_application_start_month: event.target.value })}
+                                    />
+                                  </Field>
+                                  <NumberField
+                                    label="家庭代际数"
+                                    value={candidate.beijing_family_indicator_generations ?? 1}
+                                    min={1}
+                                    max={3}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_generations: value })}
+                                  />
+                                  <SwitchField
+                                    label={candidate.beijing_family_indicator_has_spouse ? "含配偶申请人" : "不含配偶"}
+                                    checked={candidate.beijing_family_indicator_has_spouse ?? true}
+                                    onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_has_spouse: checked })}
+                                  />
+                                  <NumberField
+                                    label="主申请人积分"
+                                    value={candidate.beijing_family_indicator_main_points ?? 2}
+                                    min={0}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_main_points: value })}
+                                  />
+                                  {candidate.beijing_family_indicator_has_spouse ? (
+                                    <NumberField
+                                      label="配偶积分"
+                                      value={candidate.beijing_family_indicator_spouse_points ?? 1}
+                                      min={0}
+                                      step={1}
+                                      onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_spouse_points: value })}
+                                    />
+                                  ) : null}
+                                  <NumberField
+                                    label="其他申请人数"
+                                    value={candidate.beijing_family_indicator_other_applicant_count ?? 0}
+                                    min={0}
+                                    max={20}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_other_applicant_count: value })}
+                                  />
+                                  <NumberField
+                                    label="其他申请人积分合计"
+                                    value={candidate.beijing_family_indicator_other_points_total ?? 0}
+                                    min={0}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_other_points_total: value })}
+                                  />
+                                  <NumberField
+                                    label="共同申请年数"
+                                    value={candidate.beijing_family_indicator_application_years ?? 0}
+                                    min={0}
+                                    max={50}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_application_years: value })}
+                                  />
+                                  <NumberField
+                                    label="最近入围分"
+                                    value={candidate.beijing_family_indicator_current_cutoff_score ?? 36}
+                                    min={0}
+                                    step={0.01}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_current_cutoff_score: value })}
+                                  />
+                                  <NumberField
+                                    label="入围分年变化"
+                                    value={candidate.beijing_family_indicator_cutoff_score_annual_change ?? 0}
+                                    min={-20}
+                                    max={20}
+                                    step={0.1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_cutoff_score_annual_change: value })}
+                                  />
+                                  <NumberField
+                                    label="公告年份"
+                                    value={candidate.beijing_family_indicator_last_config_year ?? 2026}
+                                    min={2020}
+                                    max={2100}
+                                    step={1}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_last_config_year: value })}
+                                  />
+                                  <NumberField
+                                    label="家庭新能源指标量"
+                                    value={candidate.beijing_family_indicator_annual_quota ?? 119200}
+                                    min={0}
+                                    step={100}
+                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_annual_quota: value })}
+                                  />
+                                </>
+                              ) : null}
                               <NumberField
                                 label="车船税覆盖值/年"
                                 value={candidate.vehicle_vessel_tax_annual_override ?? 0}
@@ -6168,8 +6888,99 @@ function CarPlanPage({
                               />
                             </div>
                             <p className="field-hint">
-                              后端会按购车月份计算购置税减免、北京指标等待和车船税；覆盖值只用于保险公司或税务口径与规则包不一致时手动修正。
+                              后端会按购车月份计算购置税减免、北京指标等待、租牌现金支出和车船税。纯电车优先按北京新能源指标估算；插混、增程和燃油车按普通指标口径处理。租牌费只属于上牌现金情景支出，不属于车价、首付或贷款本金，合规和合同风险需要单独复核。
                             </p>
+                            {candidate.beijing_family_indicator_score_enabled ? (
+                              <div className="indicator-applicant-panel">
+                                <div className="vehicle-source-toolbar">
+                                  <strong>家庭指标申请人明细</strong>
+                                  <div className="template-chip-row">
+                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "main", name: "主申请人", has_valid_driver_license: true })}>
+                                      <Plus size={14} /> 主申请人
+                                    </button>
+                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "spouse", name: "配偶", generation: "self_generation" })}>
+                                      <Plus size={14} /> 配偶
+                                    </button>
+                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "parent", name: "老人", generation: "parent_generation", eligibility_type: "beijing_residence_permit_social_tax", only_for_indicator_scoring: true })}>
+                                      <Plus size={14} /> 老人算分
+                                    </button>
+                                  </div>
+                                </div>
+                                <p className="field-hint">
+                                  这里的申请人只用于北京家庭指标算分，不会自动进入家庭现金流。主申请人、配偶权重按 2 计，其他家庭申请人权重按 1 计，再乘家庭代际数；个人摇号阶梯或新能源轮候历史会进入基础分。
+                                </p>
+                                <div className="indicator-applicant-grid">
+                                  {normalizeVehicleIndicatorApplicants(candidate.beijing_family_indicator_applicants).map((applicant, applicantIndex) => (
+                                    <article className="indicator-applicant-card" key={`indicator-${vehicleIndex}-${candidateIndex}-${applicantIndex}`}>
+                                      <div className="vehicle-source-head">
+                                        <Field label="申请人名称">
+                                          <input value={applicant.name} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { name: event.target.value })} />
+                                        </Field>
+                                        <SwitchField
+                                          label={applicant.enabled ? "参与算分" : "不参与算分"}
+                                          checked={applicant.enabled}
+                                          onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { enabled: checked })}
+                                        />
+                                        <button className="ghost-button small danger-action" type="button" onClick={() => removeIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex)}>
+                                          <Trash2 size={14} /> 删除
+                                        </button>
+                                      </div>
+                                      <div className="form-grid compact-fields">
+                                        <Field label="家庭关系">
+                                          <select value={applicant.relationship} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { relationship: event.target.value as VehicleIndicatorApplicantData["relationship"] })}>
+                                            <option value="main">主申请人</option>
+                                            <option value="spouse">配偶</option>
+                                            <option value="child">子女</option>
+                                            <option value="parent">父母</option>
+                                            <option value="parent_in_law">配偶父母</option>
+                                            <option value="other">其他</option>
+                                          </select>
+                                        </Field>
+                                        <Field label="所属代际">
+                                          <select value={applicant.generation} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { generation: event.target.value as VehicleIndicatorApplicantData["generation"] })}>
+                                            <option value="self_generation">本人/配偶一代</option>
+                                            <option value="child_generation">子女一代</option>
+                                            <option value="parent_generation">父母一代</option>
+                                          </select>
+                                        </Field>
+                                        <Field label="资格口径">
+                                          <select value={applicant.eligibility_type} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { eligibility_type: event.target.value as VehicleIndicatorApplicantData["eligibility_type"] })}>
+                                            <option value="unknown">待确认</option>
+                                            <option value="beijing_household">北京户籍</option>
+                                            <option value="beijing_work_residence_permit">北京工作居住证</option>
+                                            <option value="beijing_residence_permit_social_tax">北京居住证+连续社保/个税</option>
+                                            <option value="active_military_or_police">驻京现役军人/武警</option>
+                                            <option value="hongkong_macao_taiwan_foreign">港澳台/外籍按规定居留</option>
+                                          </select>
+                                        </Field>
+                                        <Field label="加入家庭指标月">
+                                          <input type="month" value={applicant.family_application_start_month} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { family_application_start_month: event.target.value })} />
+                                        </Field>
+                                        <Field label="个人指标历史">
+                                          <select value={applicant.personal_indicator_history_type} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { personal_indicator_history_type: event.target.value as VehicleIndicatorApplicantData["personal_indicator_history_type"] })}>
+                                            <option value="none">无个人历史</option>
+                                            <option value="ordinary_lottery">普通指标摇号阶梯</option>
+                                            <option value="new_energy_queue">新能源个人轮候</option>
+                                            <option value="both">普通阶梯+新能源轮候</option>
+                                          </select>
+                                        </Field>
+                                        <NumberField label="普通摇号阶梯数" value={applicant.ordinary_lottery_steps} min={0} max={200} step={1} onChange={(value) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { ordinary_lottery_steps: value })} />
+                                        <Field label="新能源轮候开始月">
+                                          <input type="month" value={applicant.new_energy_queue_start_month} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { new_energy_queue_start_month: event.target.value })} />
+                                        </Field>
+                                        <NumberField label="个人历史分覆盖" value={applicant.personal_history_points_override ?? 0} min={0} step={1} onChange={(value) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { personal_history_points_override: value > 0 ? value : null })} />
+                                        <SwitchField label="有驾驶证" checked={applicant.has_valid_driver_license} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { has_valid_driver_license: checked })} />
+                                        <SwitchField label="名下无京牌车" checked={applicant.has_no_beijing_vehicle} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { has_no_beijing_vehicle: checked })} />
+                                        <SwitchField label="仅参与指标算分" checked={applicant.only_for_indicator_scoring} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { only_for_indicator_scoring: checked })} />
+                                      </div>
+                                    </article>
+                                  ))}
+                                  {normalizeVehicleIndicatorApplicants(candidate.beijing_family_indicator_applicants).length === 0 ? (
+                                    <div className="empty-state compact-empty-state">还没有申请人明细；不添加时后端会使用上方简化积分参数估算。</div>
+                                  ) : null}
+                                </div>
+                              </div>
+                            ) : null}
                           </section>
 
                           <section className="setting-group vehicle-financing-group">
@@ -6659,7 +7470,7 @@ function RulePage({
         { kind: "number", key: "first_home_commercial_min_down_payment_ratio", label: "首套商贷最低首付", fallback: 0.15, min: 0, max: 1, step: 0.01, description: "首套住房使用商业贷款时的最低首付比例。" },
         { kind: "number", key: "second_home_commercial_min_down_payment_ratio", label: "二套商贷最低首付", fallback: 0.2, min: 0, max: 1, step: 0.01, description: "二套住房使用商业贷款时的最低首付比例。" },
         { kind: "number", key: "first_home_provident_min_down_payment_ratio", label: "首套公积金最低首付", fallback: 0.2, min: 0, max: 1, step: 0.01, description: "首套住房使用公积金贷款时的最低首付比例。" },
-        { kind: "number", key: "second_home_provident_min_down_payment_ratio", label: "二套公积金最低首付", fallback: 0.3, min: 0, max: 1, step: 0.01, description: "二套住房使用公积金贷款时的最低首付比例。" }
+        { kind: "number", key: "second_home_provident_min_down_payment_ratio", label: "二套公积金最低首付", fallback: 0.25, min: 0, max: 1, step: 0.01, description: "二套住房使用公积金贷款时的最低首付比例。" }
       ]
     },
     {
@@ -6691,7 +7502,7 @@ function RulePage({
         { kind: "number", key: "provident_prefab_aa_bonus", label: "装配式 AA 上浮", fallback: 200000, min: 0, step: 10000, description: "装配式建筑 AA 等级对应上浮。" },
         { kind: "number", key: "provident_prefab_aaa_bonus", label: "装配式 AAA 上浮", fallback: 300000, min: 0, step: 10000, description: "装配式建筑 AAA 等级对应上浮。" },
         { kind: "number", key: "provident_ultra_low_energy_bonus", label: "超低能耗建筑上浮", fallback: 400000, min: 0, step: 10000, description: "超低能耗建筑对应上浮。" },
-        { kind: "number", key: "provident_policy_bonus_cap", label: "上浮封顶", fallback: 400000, min: 0, step: 10000, description: "多项上浮同时满足时，系统只按政策封顶控制最终上浮额。" }
+        { kind: "number", key: "provident_policy_bonus_cap", label: "上浮封顶", fallback: 400000, min: 0, step: 10000, description: "多项上浮同时满足时，系统按可叠加项目求和，但最终不超过该封顶额。" }
       ]
     },
     {
@@ -6721,6 +7532,29 @@ function RulePage({
         { kind: "number", key: "deed_tax_second_home_large_rate", label: "二套大面积契税", fallback: 0.02, min: 0, max: 0.2, step: 0.001, description: "二套且面积超过阈值时使用的契税比例。" },
         { kind: "number", key: "default_broker_fee_rate", label: "默认中介费假设", fallback: 0.022, min: 0, max: 0.2, step: 0.001, description: "新建房源目标时可参考的市场交易费用假设；具体房源仍可手动覆盖。" },
         { kind: "number", key: "seller_tax_pass_through_default_rate", label: "卖方税费转嫁默认", fallback: 0, min: 0, max: 0.2, step: 0.001, description: "卖方个税、增值税等是否转嫁给买方属于成交口径假设，不等同于买方契税政策。" }
+      ]
+    },
+    {
+      title: "车辆税费与北京小客车指标",
+      description: "国家新能源购置税、北京小客车指标和车船税是三套不同口径。纯电、插混、增程、燃油车在购置税、上牌指标、限行和车船税上的规则不能混用。",
+      params: [
+        { kind: "number", key: "vehicle_purchase_tax_rate", label: "车辆购置税税率", fallback: 0.1, min: 0, max: 1, step: 0.005, description: "按不含增值税计税价格乘税率估算。当前国家口径为 10%。" },
+        { kind: "number", key: "vehicle_purchase_tax_taxable_price_ratio", label: "含税价转计税价比例", fallback: 1 / 1.13, min: 0, max: 1, step: 0.001, description: "车价通常含增值税，购置税按不含增值税价格估算；默认用 1/1.13 折算。" },
+        { kind: "text", key: "new_energy_vehicle_purchase_tax_exempt_until", label: "新能源购置税免征至", fallback: "2025-12", description: "符合目录的新能源车在该月份前按免征处理，并受单车免税额上限约束。" },
+        { kind: "number", key: "new_energy_vehicle_purchase_tax_exemption_cap", label: "免征期单车免税上限", fallback: 30000, min: 0, step: 1000, description: "2024-2025 年新能源车免征车辆购置税，每辆新能源乘用车免税额不超过该上限。" },
+        { kind: "text", key: "new_energy_vehicle_purchase_tax_half_until", label: "新能源购置税减半至", fallback: "2027-12", description: "符合目录的新能源车在该月份前按减半征收处理，并受单车减税额上限约束。" },
+        { kind: "number", key: "new_energy_vehicle_purchase_tax_half_relief_cap", label: "减半期单车减税上限", fallback: 15000, min: 0, step: 1000, description: "2026-2027 年新能源车减半征收车辆购置税，每辆新能源乘用车减税额不超过该上限。" },
+        { kind: "switch", key: "beijing_small_passenger_indicator_required", label: "北京小客车需要指标", description: "开启后，购车策略会要求明确北京小客车指标状态，并把预计等待月份纳入购车时间。" },
+        { kind: "text", key: "beijing_new_energy_indicator_vehicle_types", label: "北京新能源指标车型", fallback: "pure_electric", description: "逗号分隔。北京新能源小客车指标默认只按纯电驱动车型处理；插混和增程不要默认放进这里。" },
+        { kind: "text", key: "beijing_tail_restriction_exempt_vehicle_types", label: "北京尾号限行豁免车型", fallback: "pure_electric", description: "逗号分隔。默认只有纯电小客车按不限行便利性处理，插混、增程、燃油车应按普通小客车复核。" },
+        { kind: "text", key: "vehicle_vessel_tax_passenger_not_taxable_types", label: "乘用车不征车船税类型", fallback: "pure_electric,fuel_cell", description: "逗号分隔。纯电、燃料电池乘用车因无排量通常不进入车船税征税范围；这不同于“免征”优惠。" },
+        { kind: "text", key: "new_energy_vehicle_vessel_tax_exempt_types", label: "新能源车船税免征类型", fallback: "pure_electric,fuel_cell", description: "逗号分隔。用于政策包中仍按免征处理的新能源车船类型；插混/增程乘用车当前单独按优惠期和优惠后税额处理。" },
+        { kind: "number", key: "beijing_family_new_energy_config_month", label: "家庭新能源配置月份", fallback: 5, min: 1, max: 12, step: 1, description: "用于把家庭新能源积分达到入围线的年份换算成具体等待月份；默认按每年 5 月集中配置估算。" },
+        { kind: "number", key: "beijing_family_new_energy_reference_annual_quota", label: "家庭新能源指标量基准", fallback: 119200, min: 1, step: 100, description: "用于根据年度公告指标量粗略校正等待时间；2026 年常规配置加增发家庭新能源指标合计约 119200 个。" },
+        { kind: "number", key: "beijing_personal_new_energy_indicator_wait_risk_months", label: "个人新能源指标等待风险月", fallback: 60, min: 0, max: 240, step: 1, description: "当车辆目标没有填写预计等待月数时，可作为个人新能源指标长期等待风险的参考。" },
+        { kind: "text", key: "plug_in_hybrid_vehicle_vessel_tax_exempt_until", label: "插混/增程车船税优惠至", fallback: "2026-12", description: "插混、增程等车型在优惠期内可按 0 估算；优惠期后按下方年度车船税估算。" },
+        { kind: "number", key: "plug_in_hybrid_vehicle_vessel_tax_annual", label: "插混/增程优惠后车船税/年", fallback: 420, min: 0, step: 10, description: "优惠期结束后用于插混、增程车型的年度车船税估算。具体税额仍与车型、排量和地方执行口径有关。" },
+        { kind: "number", key: "fuel_vehicle_vessel_tax_annual_default", label: "燃油车车船税/年", fallback: 420, min: 0, step: 10, description: "燃油车年度车船税默认估算；实际金额按排量档、车型和保险代收结果复核。" }
       ]
     },
     {
@@ -7161,25 +7995,21 @@ function SelectedPlanVisualization({
           : plan.months_to_renovation === 0
             ? "买后可启动"
             : `买后 ${plan.months_to_renovation} 个月`;
-  const taxMemberPointToIncomeRow = (member: NonNullable<(typeof taxMonthlySeries)[number]["member_points"]>[number]) => {
+  const taxMemberPointToIncomeRow = (
+    member: NonNullable<(typeof taxMonthlySeries)[number]["member_points"]>[number],
+    absoluteMonth: number
+  ) => {
+    const householdMember = household.members.find((item) => item.name === member.member_name);
+    const activeStage = householdMember ? incomeStageAt(householdMember, timelineBaseDate, absoluteMonth) : null;
+    const stageKind = activeStage?.stage_kind ?? "manual";
     const taxableCash = member.gross_salary + member.bonus_income + member.other_taxable_income;
     const pensionIncome = member.pension_income ?? 0;
     const otherNonTaxableIncome = Math.max(0, member.non_taxable_income - pensionIncome);
-    const extraCashExpense = Math.max(
-      0,
-      member.gross_salary +
-        member.bonus_income +
-        member.other_taxable_income +
-        member.non_taxable_income -
-        member.personal_social -
-        member.personal_housing_fund -
-        member.total_income_tax -
-        member.net_income
-    );
     const allocTax = (amount: number) => (taxableCash > 0 ? member.total_income_tax * (amount / taxableCash) : 0);
     return {
       name: member.member_name,
       stageName: member.stage_name,
+      stageKind,
       grossMonthly: member.gross_salary,
       bonusMonthly: member.bonus_income,
       otherMonthly: member.other_taxable_income,
@@ -7193,7 +8023,7 @@ function SelectedPlanVisualization({
       otherNetMonthly: Math.max(0, member.other_taxable_income - allocTax(member.other_taxable_income)),
       nonTaxableNetMonthly: otherNonTaxableIncome,
       pensionNetMonthly: pensionIncome,
-      extraCashExpense,
+      extraCashExpense: 0,
       netMonthly: member.net_income,
       personalSocial: member.personal_social,
       personalHousingFund: member.personal_housing_fund,
@@ -7206,13 +8036,14 @@ function SelectedPlanVisualization({
     };
   };
   const getMemberIncomeRows = (absoluteMonth: number) =>
-    taxMonthlyByMonth.get(absoluteMonth)?.member_points.map(taxMemberPointToIncomeRow) ??
+    taxMonthlyByMonth.get(absoluteMonth)?.member_points.map((member) => taxMemberPointToIncomeRow(member, absoluteMonth)) ??
     (household.members.length > 0
       ? []
       : [
           {
             name: "家庭",
             stageName: "当前收入",
+            stageKind: "manual" as IncomeStageData["stage_kind"],
             grossMonthly: result.household_gross_monthly_income,
             bonusMonthly: 0,
             otherMonthly: 0,
@@ -7305,6 +8136,7 @@ function SelectedPlanVisualization({
               流动资产: Math.round(item.liquid_asset_value ?? item.cash_balance + item.investment_balance),
               流动固定资产合计: Math.round((item.liquid_asset_value ?? item.cash_balance + item.investment_balance) + item.fixed_asset_value),
               净资产: Math.round(item.net_worth),
+              happinessScore: item.happiness_score ?? plan.happiness_score,
               公积金余额: Math.round(item.provident_balance),
               安全垫: Math.round(plan.required_liquidity_reserve),
               cashIncome: item.cash_income,
@@ -7329,6 +8161,7 @@ function SelectedPlanVisualization({
               secondCarMaintenanceCost: item.second_vehicle_maintenance_cost ?? 0,
               secondCarParkingCost: item.second_vehicle_parking_cost ?? 0,
               noCarCommuteCost: item.no_car_commute_cost ?? 0,
+              vehiclePlateRentalPayment: item.vehicle_plate_rental_payment ?? 0,
               housePayment,
               houseContractPayment,
               providentHouseOffsetPayment,
@@ -7350,6 +8183,9 @@ function SelectedPlanVisualization({
               investmentTax: item.investment_tax ?? 0,
               investmentSellFee,
               investmentSellProceeds: item.investment_sell_proceeds ?? 0,
+              personalPensionContribution: item.personal_pension_contribution ?? 0,
+              personalPensionReturn: item.personal_pension_return ?? 0,
+              personalPensionBalance: item.personal_pension_balance ?? 0,
               purchaseCashOut: item.transaction_cash_out,
               purchaseCashIn: item.transaction_cash_in,
               houseTransactionCashOut: Math.max(0, item.transaction_cash_out - (item.vehicle_down_payment ?? 0)),
@@ -7438,6 +8274,9 @@ function SelectedPlanVisualization({
       investmentReturn: 0,
       investmentSellFee: 0,
       investmentSellProceeds: 0,
+      personalPensionContribution: 0,
+      personalPensionReturn: 0,
+      personalPensionBalance: 0,
       purchaseCashOut: 0,
       purchaseCashIn: 0,
       houseTransactionCashOut: 0,
@@ -7941,7 +8780,8 @@ function SelectedPlanVisualization({
   const annualSocialSecurityBalanceData = selectedAnnualFinancialSummary
     ? [
         { name: "养老保险个人账户", value: selectedAnnualFinancialSummary.pension_account_balance_end ?? 0 },
-        { name: "医保个人账户", value: selectedAnnualFinancialSummary.medical_account_balance_end ?? 0 }
+        { name: "医保个人账户", value: selectedAnnualFinancialSummary.medical_account_balance_end ?? 0 },
+        { name: "个人养老金账户", value: selectedAnnualFinancialSummary.personal_pension_balance_end ?? 0 }
       ].filter((item) => item.value > 0)
     : [];
   const socialSecurityChartData = useMemo(
@@ -7950,8 +8790,17 @@ function SelectedPlanVisualization({
         const point: Record<string, number | string> = {
           month: item.month,
           政策账户合计: Math.round(item.total_balance_end),
+          个人养老金账户: Math.round(
+            backendCashflowSeries.find((row) => row.month === item.month)?.personal_pension_balance ?? 0
+          ),
           养老当月缴入: Math.round(item.pension_contribution),
           医保当月划入: Math.round(item.medical_contribution + item.medical_retiree_transfer),
+          个人养老金缴费: Math.round(
+            backendCashflowSeries.find((row) => row.month === item.month)?.personal_pension_contribution ?? 0
+          ),
+          个人养老金收益: Math.round(
+            backendCashflowSeries.find((row) => row.month === item.month)?.personal_pension_return ?? 0
+          ),
           账户利息: Math.round(item.pension_interest + item.medical_interest)
         };
         item.member_accounts.forEach((account) => {
@@ -7960,7 +8809,7 @@ function SelectedPlanVisualization({
         });
         return point;
       }),
-    [socialSecurityVisualizationSeries]
+    [backendCashflowSeries, socialSecurityVisualizationSeries]
   );
   const socialSecurityMemberAccountKeys = useMemo(() => {
     const availableKeys = new Set(
@@ -7997,7 +8846,9 @@ function SelectedPlanVisualization({
         { name: "养老个人缴入", value: selectedSocialSecurityPoint.pension_contribution },
         { name: "医保个人划入", value: selectedSocialSecurityPoint.medical_contribution },
         { name: "退休医保划入", value: selectedSocialSecurityPoint.medical_retiree_transfer },
-        { name: "账户利息", value: selectedSocialSecurityPoint.pension_interest + selectedSocialSecurityPoint.medical_interest }
+        { name: "账户利息", value: selectedSocialSecurityPoint.pension_interest + selectedSocialSecurityPoint.medical_interest },
+        { name: "个人养老金缴费", value: selectedMonth.personalPensionContribution ?? 0 },
+        { name: "个人养老金收益", value: selectedMonth.personalPensionReturn ?? 0 }
       ].filter((item) => item.value > 0)
     : [];
   const socialSecurityInflowPieTotal = annualPieTotal(socialSecurityInflowPieData);
@@ -8186,6 +9037,7 @@ function SelectedPlanVisualization({
       Math.max(0, item.firstCarInsuranceCost) +
       Math.max(0, item.firstCarMaintenanceCost) +
       Math.max(0, item.firstCarParkingCost) +
+      Math.max(0, item.vehiclePlateRentalPayment) +
       Math.max(0, item.noCarCommuteCost),
     0
   );
@@ -8202,7 +9054,7 @@ function SelectedPlanVisualization({
       label: vehicleDemandCount > 0 ? "购房前买车现金占用" : "无车通勤现金消耗",
       value: money(vehicleCashBeforeHome),
       detail: vehicleDemandCount > 0
-        ? `其中车辆首付 ${money(vehicleDownPaymentBeforeHome)}，其余为车贷、能源、保险、保养和停车。`
+        ? `其中车辆首付 ${money(vehicleDownPaymentBeforeHome)}，其余为车贷、能源、保险、保养、停车和租牌等上牌现金支出。`
         : "未配置买车需求，购房前按无车通勤成本进入现金流。"
     },
     {
@@ -8308,14 +9160,9 @@ function SelectedPlanVisualization({
             : [])
         ])
       : []),
-    ...(selectedMonth.cashIncome > 0
-      ? selectedMemberIncomeRows.flatMap((member) =>
-          member.extraCashExpense > 0
-            ? [{ name: `${member.name}收入阶段额外现金支出`, amount: -Math.round(member.extraCashExpense), kind: "expense" }]
-            : []
-        )
-      : []),
     { name: "定投买入净额", amount: -Math.round(selectedMonth.monthlyInvestmentNet), kind: "asset" },
+    { name: "个人养老金缴费", amount: -Math.round(selectedMonth.personalPensionContribution ?? 0), kind: "asset" },
+    { name: "个人养老金账户收益", amount: Math.round(selectedMonth.personalPensionReturn ?? 0), kind: "asset" },
     { name: "理财买入手续费", amount: -Math.round(selectedMonth.monthlyInvestmentBuyFee), kind: "expense" },
     { name: "复利收益留存", amount: Math.round(selectedMonth.investmentReturn), kind: "asset" },
     { name: "投资卖出到账", amount: Math.round(selectedMonth.investmentSellProceeds), kind: "income" },
@@ -8384,9 +9231,6 @@ function SelectedPlanVisualization({
       }))
     : [{ name: "已有贷款月供", value: selectedMonth.phasedLoanPayment, color: visualColors.expense }];
   const expensePieData = [
-    ...selectedMemberIncomeRows.flatMap((member) => [
-      { name: `${member.name}收入阶段额外现金支出`, value: member.extraCashExpense }
-    ]),
     { name: "基础生活支出", value: selectedMonth.baseLivingExpense },
     ...selectedMonth.scheduledExpenseRows.map((item) => ({ name: item.name, value: item.amount })),
     { name: "养娃计划支出", value: selectedMonth.childExpense },
@@ -8399,6 +9243,7 @@ function SelectedPlanVisualization({
     { name: "车辆保险", value: selectedMonth.firstCarInsuranceCost },
     { name: "车辆保养", value: selectedMonth.firstCarMaintenanceCost },
     { name: "车辆停车", value: selectedMonth.firstCarParkingCost },
+    { name: "车辆牌照租赁", value: selectedMonth.vehiclePlateRentalPayment },
     { name: "第二辆车车贷", value: selectedMonth.secondCarLoanPayment },
     { name: "第二辆车电费", value: selectedMonth.secondCarEnergyCost },
     { name: "第二辆车保险", value: selectedMonth.secondCarInsuranceCost },
@@ -8410,6 +9255,7 @@ function SelectedPlanVisualization({
     { name: "商贷月供", value: selectedMonth.commercialHousePayment },
     { name: "商贷额外还本", value: selectedMonth.commercialExtraPrincipalPayment ?? 0 },
     { name: "理财买入净额", value: selectedMonth.monthlyInvestmentNet },
+    { name: "个人养老金缴费", value: selectedMonth.personalPensionContribution ?? 0 },
     { name: "理财收益税", value: selectedMonth.investmentTax },
     { name: "理财手续费", value: selectedMonth.monthlyInvestmentBuyFee + selectedMonth.investmentSellFee },
     { name: "购房交易现金", value: selectedMonth.houseTransactionCashOut },
@@ -8595,11 +9441,6 @@ function SelectedPlanVisualization({
     {
       title: "购房后月支出",
       rows: [
-        ...selectedMemberIncomeRows.flatMap((member): Array<[string, number]> =>
-          member.extraCashExpense > 0
-            ? [[`${member.name}收入阶段额外现金支出`, -member.extraCashExpense]]
-            : []
-        ),
         ["基础生活支出", -selectedMonth.baseLivingExpense],
         ...selectedMonth.scheduledExpenseRows.map((item): [string, number] => [item.name, -item.amount]),
         ["固定还款与已有贷款", -selectedMonth.debtPayment],
@@ -8669,6 +9510,11 @@ function SelectedPlanVisualization({
     name: item.variant,
     幸福指数: Number(item.happiness_score.toFixed(1)),
     selected: item.variant === plan.variant
+  }));
+  const happinessCurveData = monthlySeries.map((item) => ({
+    month: item.month,
+    name: item.name,
+    幸福指数: Number((item.happinessScore ?? plan.happiness_score).toFixed(2))
   }));
   const timelineItems = (result.plan_events ?? [])
     .filter((item) => item.plan_variant === plan.variant)
@@ -9610,6 +10456,7 @@ function SelectedPlanVisualization({
               <Tooltip formatter={(value) => money(Number(value))} labelFormatter={(value) => formatMonthDate(timelineBaseDate, Number(value))} />
               {selectedMonthReferenceLine()}
               <Line type="monotone" dataKey="政策账户合计" stroke={visualColors.totalAsset} strokeWidth={2.7} dot={false} />
+              <Line type="monotone" dataKey="个人养老金账户" stroke={visualColors.investment} strokeWidth={2.4} strokeDasharray="6 3" dot={false} />
               {socialSecurityMemberAccountKeys.map((key) => (
                 <Line
                   key={key}
@@ -9623,10 +10470,12 @@ function SelectedPlanVisualization({
               ))}
               <Line type="monotone" dataKey="养老当月缴入" stroke={visualColors.pension} strokeWidth={1.8} strokeDasharray="4 4" dot={false} />
               <Line type="monotone" dataKey="医保当月划入" stroke={visualColors.medical} strokeWidth={1.8} strokeDasharray="4 4" dot={false} />
+              <Line type="monotone" dataKey="个人养老金缴费" stroke={visualColors.investment} strokeWidth={1.8} strokeDasharray="2 4" dot={false} />
             </LineChart>
           </ResponsiveContainer>
           <div className="loan-legend provident-account-legend">
             <span><i style={{ background: visualColors.totalAsset }} />政策账户合计</span>
+            <span><i style={{ background: visualColors.investment }} />个人养老金账户</span>
             {socialSecurityMemberAccountKeys.map((key) => (
               <span key={`social-security-legend-${key}`}>
                 <i style={{ background: stablePieColor(key) }} />
@@ -9635,12 +10484,18 @@ function SelectedPlanVisualization({
             ))}
             <span><i style={{ background: visualColors.pension }} />养老当月缴入</span>
             <span><i style={{ background: visualColors.medical }} />医保当月划入</span>
+            <span><i style={{ background: visualColors.investment }} />个人养老金缴费</span>
           </div>
           <div className="provident-balance-summary">
             <div>
               <span>{selectedMonth.name} 养老与医保账户合计</span>
               <strong>{money(selectedSocialSecurityPoint?.total_balance_end ?? selectedMonth.socialSecurityAccountBalance ?? 0)}</strong>
               <small>养老 {money(selectedSocialSecurityPoint?.pension_balance_end ?? selectedMonth.pensionAccountBalance ?? 0)}，医保 {money(selectedSocialSecurityPoint?.medical_balance_end ?? selectedMonth.medicalAccountBalance ?? 0)}</small>
+            </div>
+            <div>
+              <span>{selectedMonth.name} 个人养老金账户</span>
+              <strong>{money(selectedMonth.personalPensionBalance ?? 0)}</strong>
+              <small>当月缴费 {money(selectedMonth.personalPensionContribution ?? 0)}，账户收益 {money(selectedMonth.personalPensionReturn ?? 0)}</small>
             </div>
             {selectedSocialSecurityMemberAccounts.map((account) => (
               <div key={`social-security-balance-${account.member_index}`}>
@@ -9687,7 +10542,7 @@ function SelectedPlanVisualization({
             </div>
           </div>
           <p className="field-hint">
-            养老保险个人账户和医保个人账户由后端逐月计算。基本养老个人账户按政策年度记账利率结息，默认在年度结息月体现；北京医保个人账户按同期居民活期存款利率、默认季度付息。它们受政策用途限制，不作为现金账户或流动资产。
+            养老保险个人账户和医保个人账户由后端逐月计算，展示位置固定在“公积金账户变化”之后。基本养老个人账户不能提前自由支取，通常只在退休计发、死亡继承、出国定居等法定情形下处理；北京医保个人账户资金也按定向医疗保障用途使用，不能当作银行卡现金随意提取。因此这里按政策账户展示，不计入现金账户或可自由动用的流动资产。
           </p>
           <div className="annual-inline-chart">
             <div className="strategy-panel-head">
@@ -9863,7 +10718,28 @@ function SelectedPlanVisualization({
       </div>
 
       <section className="chart-block happiness-chart">
-        <PanelTitle icon={<TrendingUp size={18} />} title="幸福指数对比" compact />
+        <PanelTitle icon={<TrendingUp size={18} />} title="幸福指数" compact />
+        <div className="chart-subhead">
+          <strong>当前方案逐月曲线</strong>
+          <span>后端按现金安全、月现金流、贷款压力、购房阶段和家庭事件生成</span>
+        </div>
+        <ResponsiveContainer width="100%" height={240}>
+          <LineChart data={happinessCurveData}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="month" tickFormatter={formatChartMonthTick} tickLine={false} axisLine={false} height={34} />
+            <YAxis domain={[0, 10]} tickLine={false} axisLine={false} width={36} />
+            <Tooltip
+              labelFormatter={(value) => formatChartMonthTick(value)}
+              formatter={(value) => `${Number(value).toFixed(2)} / 10`}
+            />
+            <Line type="monotone" dataKey="幸福指数" stroke={visualColors.safe} strokeWidth={2.4} dot={false} activeDot={{ r: 4 }} />
+            {selectedMonthReferenceLine()}
+          </LineChart>
+        </ResponsiveContainer>
+        <div className="chart-subhead">
+          <strong>不同购房方案对比</strong>
+          <span>横向比较最终方案评分</span>
+        </div>
         <ResponsiveContainer width="100%" height={220}>
           <BarChart data={happinessData}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} />
@@ -9926,18 +10802,52 @@ function ExportPage({
   runCalculation: () => void;
 }) {
   const availablePlans = result?.purchase_plan_analyses ?? [];
+  const exportTargets = [
+    {
+      key: "current_plan",
+      title: "当前方案",
+      description: "导出当前选中的购房方案说明、关键指标和顾问提示。",
+      ready: Boolean(result && selectedPlan),
+    },
+    {
+      key: "monthly_timeline",
+      title: "月度账户时间线",
+      description: "详细表格包含现金、投资、公积金、养老医保、固定资产、贷款和流水。",
+      ready: Boolean(result && selectedPlan),
+    },
+    {
+      key: "tax_year_detail",
+      title: "税务年度明细",
+      description: "跟随详细表格一起导出年度税务、成员税负和税务策略结果。",
+      ready: Boolean(result?.tax_year_summaries?.length),
+    },
+  ];
 
   return (
-    <div className="page-stack">
-      <SectionHeader
-        icon={<Download size={20} />}
-        title="导出方案"
-        action={
-          <button className="ghost-button" onClick={runCalculation}>
-            <RefreshCw size={16} /> 刷新结果
-          </button>
-        }
-      />
+    <PlannerPageShell
+      icon={<Download size={20} />}
+      title="导出方案"
+      action={<button className="ghost-button" onClick={runCalculation}><RefreshCw size={16} /> 刷新结果</button>}
+      summary={<p>先确认导出对象和当前选中方案，再导出文字说明或详细表格。表格列名保持中文，避免出现后端字段名。</p>}
+    >
+      <WorkflowSection
+        icon={<Target size={18} />}
+        title="导出对象"
+        description="选择要导出的内容范围；当前按钮会按所选方案导出文字或完整明细表。"
+        className="export-target-panel"
+      >
+        <div className="horizontal-card-list compact export-target-grid">
+          {exportTargets.map((target, index) => (
+            <article className={`strategy-card ${index === 0 ? "active" : ""}`} key={target.key}>
+              <div className="strategy-card-head">
+                <strong>{target.title}</strong>
+                <StrategyStatePill active={target.ready} recommended={!target.ready} label={target.ready ? "可导出" : "等待数据"} />
+              </div>
+              <p>{target.description}</p>
+            </article>
+          ))}
+        </div>
+      </WorkflowSection>
       <section className="result-panel export-panel">
         {result && selectedPlan ? (
           <>
@@ -10007,10 +10917,14 @@ function ExportPage({
             </section>
           </>
         ) : (
-          <PanelTitle icon={<Loader2 className="spin" size={18} />} title="等待计算" />
+          <EmptyState
+            title="等待计算结果"
+            description="先刷新或完成一次后端计算，然后这里会显示可导出的当前方案和详细账户时间线。"
+            action={<button className="ghost-button" onClick={runCalculation}><RefreshCw size={16} /> 刷新结果</button>}
+          />
         )}
       </section>
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -10393,6 +11307,7 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       "新增车辆保险",
       "新增车辆保养",
       "新增车辆停车",
+      "车辆牌照租赁",
       "无车通勤成本",
       "主用车首付",
       "新增车辆首付",
@@ -10448,6 +11363,7 @@ function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: Pu
       item.second_vehicle_insurance_cost,
       item.second_vehicle_maintenance_cost,
       item.second_vehicle_parking_cost,
+      item.vehicle_plate_rental_payment,
       item.no_car_commute_cost,
       item.first_vehicle_down_payment,
       item.second_vehicle_down_payment,
@@ -10712,6 +11628,72 @@ function SectionHeader({
         {icon}
         <h2>{title}</h2>
       </div>
+      {action}
+    </div>
+  );
+}
+
+function PlannerPageShell({
+  icon,
+  title,
+  summary,
+  action,
+  children
+}: {
+  icon: ReactNode;
+  title: string;
+  summary?: ReactNode;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="page-stack planner-page-shell">
+      <SectionHeader icon={icon} title={title} action={action} />
+      {summary ? <section className="planner-summary-band">{summary}</section> : null}
+      {children}
+    </div>
+  );
+}
+
+function WorkflowSection({
+  icon,
+  title,
+  description,
+  children,
+  className = ""
+}: {
+  icon: ReactNode;
+  title: string;
+  description?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <section className={`form-panel workflow-section ${className}`}>
+      <div className="workflow-section-head">
+        <PanelTitle icon={icon} title={title} compact />
+        {description ? <span className="workflow-section-description">{description}</span> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function EmptyState({
+  title,
+  description,
+  action,
+  compact = false
+}: {
+  title: string;
+  description?: ReactNode;
+  action?: ReactNode;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "empty-state compact-empty-state" : "empty-state"}>
+      <strong>{title}</strong>
+      {description ? <span>{description}</span> : null}
       {action}
     </div>
   );

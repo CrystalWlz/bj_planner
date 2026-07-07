@@ -73,7 +73,7 @@ class BeijingPolicy:
             bonuses.append(float(params.get("provident_ultra_low_energy_bonus", 0)))
 
         cap = float(params.get("provident_policy_bonus_cap", 400000))
-        return min(max(bonuses) if bonuses else 0.0, cap)
+        return min(sum(bonuses), cap)
 
     def provident_loan_years(self, household: HouseholdData, scenario: ScenarioData) -> tuple[int, list[str]]:
         params = self.params
