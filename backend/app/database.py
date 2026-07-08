@@ -610,6 +610,17 @@ def delete_scenario_record(record_id: str) -> bool:
 
 
 def get_calculation_cache(cache_key: str) -> dict[str, Any] | None:
+    payload = get_calculation_cache_payload(cache_key)
+    if payload is None:
+        return None
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def get_calculation_cache_payload(cache_key: str) -> str | None:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT result FROM calculation_cache WHERE cache_key = ?",
@@ -617,16 +628,13 @@ def get_calculation_cache(cache_key: str) -> dict[str, Any] | None:
         ).fetchone()
     if row is None:
         return None
-    try:
-        result = json.loads(row["result"])
-    except json.JSONDecodeError:
-        return None
-    return result if isinstance(result, dict) else None
+    payload = row["result"]
+    return payload if isinstance(payload, str) and payload.strip().startswith("{") else None
 
 
 def upsert_calculation_cache(cache_key: str, engine_fingerprint: str, result: dict[str, Any]) -> None:
     timestamp = now_iso()
-    payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    payload = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     with get_connection() as conn:
         conn.execute(
             """

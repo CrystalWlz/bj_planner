@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from functools import lru_cache
 from typing import Protocol
 
-from ..schemas import ExistingLoanVisualizationDetail, PhasedLoanData, PhasedLoanSummary
+from ..schemas import ExistingLoanVisualizationDetail, LoanSummary, PhasedLoanData, PhasedLoanSummary, ScenarioData
 from .time import month_after, month_distance, parse_month
 
 
@@ -70,6 +71,32 @@ def calculate_loan(principal: float, annual_rate: float, years: int, method: str
     monthly_payment = principal * monthly_rate * factor / (factor - 1)
     total_interest = monthly_payment * months - principal
     return LoanComputation(monthly_payment, monthly_payment, total_interest)
+
+
+def loan_summary(principal: float, annual_rate: float, years: int, method: str) -> LoanSummary | None:
+    if principal <= 0:
+        return None
+    computed = calculate_loan(principal, annual_rate, years, method)
+    return LoanSummary(
+        principal=round(principal, 2),
+        annual_rate=annual_rate,
+        years=years,
+        repayment_method=method,  # type: ignore[arg-type]
+        first_month_payment=round(computed.first_month_payment, 2),
+        average_month_payment=round(computed.average_month_payment, 2),
+        total_interest=round(computed.total_interest, 2),
+    )
+
+
+def commercial_repayment_method(scenario: ScenarioData) -> str:
+    return scenario.commercial_repayment_method or scenario.repayment_method
+
+
+def commercial_prepayment_mode(scenario: ScenarioData) -> str:
+    mode = getattr(scenario, "commercial_prepayment_mode", "auto") or "auto"
+    if mode in {"auto", "manual", "none"}:
+        return mode
+    return "manual" if scenario.commercial_prepayment_enabled else "auto"
 
 
 def equal_installment_monthly_payment(principal: float, annual_rate: float, months: int) -> float:
@@ -350,22 +377,59 @@ def vehicle_loan_projection(
 
 
 def vehicle_loan_point_after_payments(loan: VehicleLoanLike, elapsed_payments: int) -> tuple[float, float, float]:
+    projection = vehicle_loan_projection_for_like(loan)
+    return vehicle_loan_projection_point(projection, loan.loan_principal, elapsed_payments)
+
+
+def vehicle_loan_projection_for_like(loan: VehicleLoanLike) -> LoanProjection:
     if loan.loan_principal <= 0 or loan.total_months <= 0:
-        return 0.0, 0.0, 0.0
-    projection = vehicle_loan_projection(
+        return LoanProjection(points=(), total_interest=0.0, actual_payoff_months=0, interest_saved_by_prepayment=0.0)
+    return _cached_vehicle_loan_projection(
         loan.loan_principal,
-        loan.total_months,
-        loan.interest_free_months,
+        int(loan.total_months),
+        int(loan.interest_free_months),
         loan.later_annual_rate,
-        prepayment_monthly_amount=loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0,
-        prepayment_start_month=loan.prepayment_start_month,
-        prepayment_lump_sum_amount=loan.prepayment_lump_sum_amount if loan.prepayment_enabled else 0.0,
-        prepayment_lump_sum_month=loan.prepayment_lump_sum_month if loan.prepayment_enabled else 0,
+        loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0,
+        int(loan.prepayment_start_month),
+        loan.prepayment_lump_sum_amount if loan.prepayment_enabled else 0.0,
+        int(loan.prepayment_lump_sum_month if loan.prepayment_enabled else 0),
     )
+
+
+@lru_cache(maxsize=1024)
+def _cached_vehicle_loan_projection(
+    principal: float,
+    total_months: int,
+    interest_free_months: int,
+    later_annual_rate: float,
+    prepayment_monthly_amount: float,
+    prepayment_start_month: int,
+    prepayment_lump_sum_amount: float,
+    prepayment_lump_sum_month: int,
+) -> LoanProjection:
+    return vehicle_loan_projection(
+        principal,
+        total_months,
+        interest_free_months,
+        later_annual_rate,
+        prepayment_monthly_amount=prepayment_monthly_amount,
+        prepayment_start_month=prepayment_start_month,
+        prepayment_lump_sum_amount=prepayment_lump_sum_amount,
+        prepayment_lump_sum_month=prepayment_lump_sum_month,
+    )
+
+
+def vehicle_loan_projection_point(
+    projection: LoanProjection,
+    principal: float,
+    elapsed_payments: int,
+) -> tuple[float, float, float]:
+    if principal <= 0:
+        return 0.0, 0.0, 0.0
     paid_months = max(0, int(elapsed_payments))
     if paid_months <= 0:
         first_point = projection.points[0] if projection.points else None
-        return loan.loan_principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
+        return principal, first_point.contract_payment if first_point else 0.0, first_point.extra_principal_payment if first_point else 0.0
     if paid_months > len(projection.points):
         return 0.0, 0.0, 0.0
     previous = projection.points[paid_months - 1]
@@ -487,6 +551,131 @@ def phased_loan_state_detail_at(
         balance = max(0.0, balance - scheduled_principal - extra_principal)
         if balance <= 0:
             return 0.0, 0.0, 0.0
+
+
+def phased_loan_detail_projection(
+    loan: PhasedLoanData,
+    horizon_months: int,
+    *,
+    as_of: date | None = None,
+    annual_investment_return: float = 0.0,
+    investment_buy_fee_rate: float = 0.0,
+    investment_sell_fee_rate: float = 0.0,
+) -> list[tuple[float, float, float, str]]:
+    horizon = max(0, int(horizon_months))
+    if loan.principal <= 0:
+        return [(0.0, 0.0, 0.0, "已结清") for _ in range(horizon + 1)]
+
+    current = as_of or date.today()
+    start_month = parse_month(loan.interest_start_month)
+    interest_only_until = parse_month(loan.interest_only_until)
+    if start_month is None or interest_only_until is None:
+        return [(loan.principal, 0.0, 0.0, "配置待校验") for _ in range(horizon + 1)]
+
+    monthly_rate = loan.annual_rate / 12
+    interest_only_months = max(0, month_distance(start_month, interest_only_until))
+    amortization_months = max(1, loan.remaining_months - interest_only_months)
+    fixed_installment_payment = equal_installment_monthly_payment(loan.principal, loan.annual_rate, amortization_months)
+    balance = loan.principal
+    payment_month_index = 0
+    rows: list[tuple[float, float, float, str]] = []
+
+    for offset in range(horizon + 1):
+        month = month_after(current, offset)
+        if balance <= 0:
+            rows.append((0.0, 0.0, 0.0, "已结清"))
+            continue
+
+        if month_distance(month, start_month) > 0:
+            contract_payment = 0.0
+            scheduled_principal = 0.0
+            extra_principal = 0.0
+            phase = "未开始计息"
+        elif month_distance(month, interest_only_until) >= 0:
+            payment_month_index += 1
+            interest = balance * monthly_rate
+            contract_payment = interest
+            scheduled_principal = 0.0
+            extra_principal = phased_loan_prepayment_amount(
+                loan,
+                payment_month_index,
+                balance,
+                annual_investment_return=annual_investment_return,
+                investment_buy_fee_rate=investment_buy_fee_rate,
+                investment_sell_fee_rate=investment_sell_fee_rate,
+            )
+            phase = "只还利息"
+        else:
+            payment_month_index += 1
+            interest = balance * monthly_rate
+            if loan.repayment_method == "equal_principal":
+                scheduled_principal = min(balance, loan.principal / amortization_months)
+                contract_payment = scheduled_principal + interest
+                phase = "等额本金"
+            else:
+                contract_payment = min(balance + interest, fixed_installment_payment)
+                scheduled_principal = max(0.0, min(balance, contract_payment - interest))
+                phase = "等额本息"
+            extra_principal = phased_loan_prepayment_amount(
+                loan,
+                payment_month_index,
+                max(0.0, balance - scheduled_principal),
+                annual_investment_return=annual_investment_return,
+                investment_buy_fee_rate=investment_buy_fee_rate,
+                investment_sell_fee_rate=investment_sell_fee_rate,
+            )
+
+        rows.append((balance, contract_payment + extra_principal, extra_principal, phase))
+        balance = max(0.0, balance - scheduled_principal - extra_principal)
+
+    return rows
+
+
+def existing_loan_details_projection(
+    loans: list[PhasedLoanData],
+    horizon_months: int,
+    *,
+    as_of: date | None = None,
+    annual_investment_return: float = 0.0,
+    investment_buy_fee_rate: float = 0.0,
+    investment_sell_fee_rate: float = 0.0,
+) -> list[list[ExistingLoanVisualizationDetail]]:
+    horizon = max(0, int(horizon_months))
+    loan_projections = [
+        (
+            index,
+            loan,
+            phased_loan_detail_projection(
+                loan,
+                horizon,
+                as_of=as_of,
+                annual_investment_return=annual_investment_return,
+                investment_buy_fee_rate=investment_buy_fee_rate,
+                investment_sell_fee_rate=investment_sell_fee_rate,
+            ),
+        )
+        for index, loan in enumerate(loans, start=1)
+    ]
+    rows: list[list[ExistingLoanVisualizationDetail]] = []
+    for month in range(horizon + 1):
+        details: list[ExistingLoanVisualizationDetail] = []
+        for index, loan, projection in loan_projections:
+            balance, payment, extra_principal_payment, phase = projection[month]
+            if balance <= 0 and payment <= 0:
+                continue
+            details.append(
+                ExistingLoanVisualizationDetail(
+                    name=loan.name or f"已有贷款 {index}",
+                    borrower=loan.borrower,
+                    loan_type=loan.loan_type or "other",
+                    phase=phase,
+                    balance=round(balance, 2),
+                    monthly_payment=round(payment, 2),
+                    extra_principal_payment=round(extra_principal_payment, 2),
+                )
+            )
+        rows.append(details)
+    return rows
 
 
 def phased_loan_phase_at(

@@ -175,6 +175,41 @@ def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkey
     assert planning_goal_table is not None
 
 
+def test_affordability_cache_key_includes_stress_switch() -> None:
+    from app.cache import affordability_cache_key
+    from app.schemas import AffordabilityRequest, HouseholdData, RulePackData, ScenarioData
+
+    base_payload = {
+        "household": HouseholdData(),
+        "scenario": ScenarioData(),
+        "rule_pack": RulePackData(),
+    }
+
+    normal_key, _, _ = affordability_cache_key(AffordabilityRequest(**base_payload, include_stress_tests=False))
+    stress_key, _, _ = affordability_cache_key(AffordabilityRequest(**base_payload, include_stress_tests=True))
+
+    assert normal_key != stress_key
+
+
+def test_affordability_cache_key_exposes_layer_hashes() -> None:
+    from app.cache import affordability_cache_key
+    from app.schemas import AffordabilityRequest, HouseholdData, RulePackData, ScenarioData
+
+    _, engine_fingerprint, layers = affordability_cache_key(
+        AffordabilityRequest(
+            household=HouseholdData(),
+            scenario=ScenarioData(),
+            rule_pack=RulePackData(),
+        )
+    )
+
+    assert set(layers) == {"input", "strategy", "ledger", "visualization", "engine"}
+    assert layers["engine"] == engine_fingerprint
+    assert layers["strategy"] != layers["ledger"]
+    assert layers["ledger"] != layers["visualization"]
+    assert all(len(value) == 64 for value in layers.values())
+
+
 def test_scenario_api_is_backed_by_planning_goals(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 

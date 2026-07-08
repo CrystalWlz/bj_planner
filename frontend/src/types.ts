@@ -354,6 +354,7 @@ export interface ScheduledExpenseData {
   annual_occurrence_month: number;
   start_month: string;
   end_month: string | null;
+  medical_account_payable: boolean;
   tax_deductible_elderly_care: boolean;
   notes: string;
 }
@@ -1041,12 +1042,15 @@ export interface SocialSecurityMemberAccountPoint {
   member_name: string;
   pension_balance_start: number;
   pension_contribution: number;
+  pension_account_payout: number;
   pension_interest: number;
   pension_balance_end: number;
   medical_balance_start: number;
   medical_contribution: number;
   medical_retiree_transfer: number;
   medical_interest: number;
+  medical_healthcare_outflow: number;
+  medical_mutual_aid_outflow: number;
   medical_outflow: number;
   medical_balance_end: number;
   retired: boolean;
@@ -1057,12 +1061,15 @@ export interface SocialSecurityVisualizationPoint {
   month: number;
   pension_balance_start: number;
   pension_contribution: number;
+  pension_account_payout: number;
   pension_interest: number;
   pension_balance_end: number;
   medical_balance_start: number;
   medical_contribution: number;
   medical_retiree_transfer: number;
   medical_interest: number;
+  medical_healthcare_outflow: number;
+  medical_mutual_aid_outflow: number;
   medical_outflow: number;
   medical_balance_end: number;
   total_balance_end: number;
@@ -1090,6 +1097,7 @@ export interface AccountSnapshotPoint {
   pension_account_balance: number;
   medical_account_balance: number;
   social_security_account_balance: number;
+  personal_pension_balance: number;
   property_asset_value: number;
   vehicle_asset_value: number;
   first_vehicle_asset_value: number;
@@ -1168,6 +1176,54 @@ export interface MonthlyCashflowPoint {
   second_vehicle_asset_value: number;
   phase: string;
   ledger_entries: MonthlyLedgerEntry[];
+}
+
+export interface VisualizationBreakdownItem {
+  name: string;
+  value: number;
+  amount: number | null;
+  kind: "income" | "expense" | "asset" | "deduction" | "result" | null;
+}
+
+export interface MonthlyVisualizationDetail {
+  plan_variant: string;
+  month: number;
+  income_pie: VisualizationBreakdownItem[];
+  income_legend: VisualizationBreakdownItem[];
+  expense_pie: VisualizationBreakdownItem[];
+  loan_payment_pie: VisualizationBreakdownItem[];
+  provident_inflow_pie: VisualizationBreakdownItem[];
+  provident_outflow_pie: VisualizationBreakdownItem[];
+  social_security_inflow_pie: VisualizationBreakdownItem[];
+  social_security_outflow_pie: VisualizationBreakdownItem[];
+  cash_flow_items: VisualizationBreakdownItem[];
+  cash_flow_drivers: VisualizationBreakdownItem[];
+  advisor_text: string;
+  explanation_items: Array<{ title: string; body: string }>;
+}
+
+export interface AnnualVisualizationDetail {
+  plan_variant: string;
+  year: number;
+  cash_inflow_pie: VisualizationBreakdownItem[];
+  cash_outflow_pie: VisualizationBreakdownItem[];
+  liquid_asset_pie: VisualizationBreakdownItem[];
+  fixed_asset_pie: VisualizationBreakdownItem[];
+  loan_payment_pie: VisualizationBreakdownItem[];
+  loan_balance_pie: VisualizationBreakdownItem[];
+  provident_flow_pie: VisualizationBreakdownItem[];
+  social_security_inflow_pie: VisualizationBreakdownItem[];
+  social_security_outflow_pie: VisualizationBreakdownItem[];
+  social_security_balance_pie: VisualizationBreakdownItem[];
+}
+
+export interface TaxVisualizationDetail {
+  year: number;
+  month: number | null;
+  monthly_tax_member_pie: VisualizationBreakdownItem[];
+  monthly_deduction_pie: VisualizationBreakdownItem[];
+  annual_tax_member_pie: VisualizationBreakdownItem[];
+  annual_tax_type_pie: VisualizationBreakdownItem[];
 }
 
 export interface ChildPlanStrategyPoint {
@@ -1252,11 +1308,14 @@ export interface AnnualFinancialSummary {
   provident_deposit: number;
   provident_withdrawal: number;
   pension_account_contribution: number;
+  pension_account_payout: number;
   pension_account_interest: number;
   pension_account_balance_end: number;
   medical_account_contribution: number;
   medical_account_retiree_transfer: number;
   medical_account_interest: number;
+  medical_account_healthcare_outflow: number;
+  medical_account_mutual_aid_outflow: number;
   medical_account_outflow: number;
   medical_account_balance_end: number;
   social_security_account_balance_end: number;
@@ -1291,7 +1350,21 @@ export interface AnnualFinancialSummary {
   existing_loan_balance_end: number;
 }
 
+export interface ExportSheet {
+  plan_variant: string;
+  title: string;
+  headers: string[];
+  rows: unknown[][];
+}
+
+export interface ExportTextDocument {
+  plan_variant: string;
+  filename: string;
+  lines: string[];
+}
+
 export interface AffordabilityResult {
+  cache_layers: Record<string, string>;
   status: string;
   status_reason: string;
   eligible: boolean;
@@ -1330,6 +1403,9 @@ export interface AffordabilityResult {
   purchase_plan_analyses: PurchasePlanAnalysis[];
   yield_sensitivity: YieldSensitivityPoint[];
   monthly_cashflow_visualization: MonthlyCashflowPoint[];
+  monthly_visualization_details: MonthlyVisualizationDetail[];
+  annual_visualization_details: AnnualVisualizationDetail[];
+  tax_visualization_details: TaxVisualizationDetail[];
   account_snapshots: AccountSnapshotPoint[];
   monthly_ledger: MonthlyLedgerEntry[];
   loan_visualization: LoanVisualizationPoint[];
@@ -1338,6 +1414,8 @@ export interface AffordabilityResult {
   account_concepts: AccountConceptSummary[];
   strategy_explanations: StrategyExplanationPoint[];
   plan_events: PlanEventPoint[];
+  export_sheets: ExportSheet[];
+  export_texts: ExportTextDocument[];
   stress_tests: StressResult[];
   assumptions: string[];
 }

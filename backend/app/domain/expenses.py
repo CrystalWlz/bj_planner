@@ -1,10 +1,38 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from ..schemas import DailyExpenseStageData, HouseholdData, RentExpenseStageData, ScheduledExpenseData
+from ..schemas import DailyExpenseStageData, HouseholdData, RentExpenseStageData, RulePackData, ScheduledExpenseData
+from .career import career_shock_self_payment_at_month
+from .children import child_plan_monthly_expense_at
 from .time import month_after, month_distance, parse_month
+
+
+@dataclass(frozen=True)
+class MonthlyHouseholdExpenseBreakdown:
+    base_living_expense: float
+    rent_cash_expense: float
+    scheduled_expense: float
+    medical_account_payable_expense: float
+    child_expense: float
+    career_shock_self_payment: float
+
+    @property
+    def total(self) -> float:
+        return max(
+            0.0,
+            self.base_living_expense
+            + self.rent_cash_expense
+            + self.scheduled_expense
+            + self.child_expense
+            + self.career_shock_self_payment,
+        )
+
+    @property
+    def cash_scheduled_expense(self) -> float:
+        return max(0.0, self.scheduled_expense)
 
 
 def scheduled_expense_occurs_in_month(item: ScheduledExpenseData, target_month: tuple[int, int]) -> bool:
@@ -99,6 +127,29 @@ def rent_provident_monthly_at(household: HouseholdData, months_from_now: int = 0
     return rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
 
 
+def rent_withdrawal_before_purchase(household: HouseholdData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
+    if household.existing_home_count > 0:
+        return 0.0
+    return rent_provident_monthly_at(household, months_from_now, as_of=as_of)
+
+
+def quarterly_rent_withdrawal_before_purchase_at(
+    household: HouseholdData,
+    months_from_now: int,
+    *,
+    as_of: date | None = None,
+) -> float:
+    if household.existing_home_count > 0:
+        return 0.0
+    stage = rent_expense_stage_at(household, months_from_now, as_of=as_of)
+    if stage and stage.rent_payment_mode == "provident":
+        return rent_stage_payment_amount_at(stage, months_from_now, as_of=as_of)
+    monthly_withdrawal = rent_provident_monthly_at(household, months_from_now, as_of=as_of)
+    if monthly_withdrawal <= 0 or months_from_now <= 0 or months_from_now % 3 != 0:
+        return 0.0
+    return monthly_withdrawal * 3
+
+
 def rent_stage_payment_amount_at(stage: RentExpenseStageData, months_from_now: int = 0, *, as_of: date | None = None) -> float:
     monthly_rent = max(0.0, stage.rent_amount)
     if monthly_rent <= 0:
@@ -141,3 +192,63 @@ def rent_stage_broker_fee_at(stage: RentExpenseStageData, months_from_now: int =
     if stage.broker_fee_amount is not None:
         return max(0.0, stage.broker_fee_amount)
     return max(0.0, stage.rent_amount * stage.broker_fee_months)
+
+
+def monthly_household_expense_breakdown_at(
+    household: HouseholdData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+    rules: RulePackData | None = None,
+    home_purchase_month: int | None = None,
+) -> MonthlyHouseholdExpenseBreakdown:
+    current = as_of or date.today()
+    target_month = month_after(current, max(0, months_from_now))
+    stage = daily_expense_stage_at(household, months_from_now, as_of=current)
+    base_living_expense = stage.base_living_expense if stage else household.monthly_expense
+    rent_cash_expense = rent_cash_payment_at(household, months_from_now, as_of=current)
+    scheduled_total = 0.0
+    medical_account_payable_total = 0.0
+    for item in household.scheduled_expenses:
+        if scheduled_expense_occurs_in_month(item, target_month):
+            amount = max(0.0, float(item.monthly_amount))
+            scheduled_total += amount
+            if bool(getattr(item, "medical_account_payable", False)):
+                medical_account_payable_total += amount
+    child_expense = child_plan_monthly_expense_at(
+        household,
+        target_month,
+        as_of=current,
+        home_purchase_month=home_purchase_month,
+        rules=rules,
+    )
+    career_shock_self_payment = (
+        career_shock_self_payment_at_month(household, rules, months_from_now, as_of=current)
+        if rules is not None
+        else 0.0
+    )
+    return MonthlyHouseholdExpenseBreakdown(
+        base_living_expense=max(0.0, base_living_expense),
+        rent_cash_expense=max(0.0, rent_cash_expense),
+        scheduled_expense=max(0.0, scheduled_total),
+        medical_account_payable_expense=max(0.0, medical_account_payable_total),
+        child_expense=max(0.0, child_expense),
+        career_shock_self_payment=max(0.0, career_shock_self_payment),
+    )
+
+
+def monthly_household_expense_at(
+    household: HouseholdData,
+    months_from_now: int = 0,
+    *,
+    as_of: date | None = None,
+    rules: RulePackData | None = None,
+    home_purchase_month: int | None = None,
+) -> float:
+    return monthly_household_expense_breakdown_at(
+        household,
+        months_from_now,
+        as_of=as_of,
+        rules=rules,
+        home_purchase_month=home_purchase_month,
+    ).total

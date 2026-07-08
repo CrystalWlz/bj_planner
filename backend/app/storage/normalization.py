@@ -792,6 +792,7 @@ def normalize_household(data: dict[str, Any]) -> dict[str, Any]:
             expense["one_time_timing_mode"] = "flexible_range" if timing_mode == "flexible_range" else "fixed_month"
             default_month = safe_int(str(expense.get("start_month") or "2026-01").split("-")[-1], 1)
             expense.setdefault("annual_occurrence_month", max(1, min(12, default_month)))
+            expense.setdefault("medical_account_payable", False)
     data.setdefault("phased_loans", [])
     for loan in data["phased_loans"]:
         if isinstance(loan, dict):

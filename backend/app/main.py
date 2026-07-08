@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from contextlib import asynccontextmanager
-from functools import lru_cache
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.middleware.gzip import GZipMiddleware
 
+from .cache import affordability_cache_key
 from .calculator import calculate_affordability
 from .database import (
     delete_record,
     delete_planning_goal_record,
     delete_scenario_record,
     get_calculation_cache,
+    get_calculation_cache_payload,
     initialize_database,
     insert_household_record,
     insert_planning_goal_record,
@@ -61,32 +61,6 @@ from .schemas import (
 from .source_monitor import fetch_preview
 
 
-CALCULATION_ENGINE_FILES = ("calculator.py", "schemas.py", "policies.py")
-
-
-@lru_cache(maxsize=1)
-def calculation_engine_fingerprint() -> str:
-    digest = hashlib.sha256()
-    app_dir = Path(__file__).resolve().parent
-    for file_name in CALCULATION_ENGINE_FILES:
-        path = app_dir / file_name
-        digest.update(file_name.encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def affordability_cache_key(payload: AffordabilityRequest) -> tuple[str, str]:
-    engine_fingerprint = calculation_engine_fingerprint()
-    request_payload = {
-        "engine_fingerprint": engine_fingerprint,
-        "household": payload.household.model_dump(mode="json"),
-        "scenario": payload.scenario.model_dump(mode="json"),
-        "rule_pack": payload.rule_pack.model_dump(mode="json"),
-    }
-    canonical = json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), engine_fingerprint
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
@@ -94,6 +68,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="北京买房可行性规划计算器", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(GZipMiddleware, minimum_size=4096)
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,12 +196,11 @@ def create_market_snapshot(payload: MarketSnapshotCreate) -> dict:
 
 
 @app.post("/api/calculations/affordability", response_model=AffordabilityResult)
-def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
-    cache_key, engine_fingerprint = affordability_cache_key(payload)
-    cached = get_calculation_cache(cache_key)
-    if cached is not None:
-        upsert_generated_strategies(cache_key, engine_fingerprint, cached)
-        return AffordabilityResult.model_validate(cached)
+def calculate(payload: AffordabilityRequest) -> AffordabilityResult | Response:
+    cache_key, engine_fingerprint, cache_layers = affordability_cache_key(payload)
+    cached_payload = get_calculation_cache_payload(cache_key)
+    if cached_payload is not None:
+        return Response(content=cached_payload, media_type="application/json")
 
     result = calculate_affordability(
         payload.household,
@@ -233,6 +208,7 @@ def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
         payload.rule_pack,
         include_stress_tests=payload.include_stress_tests,
     )
+    result = result.model_copy(update={"cache_layers": cache_layers})
     result_payload = result.model_dump(mode="json")
     upsert_calculation_cache(cache_key, engine_fingerprint, result_payload)
     upsert_generated_strategies(cache_key, engine_fingerprint, result_payload)

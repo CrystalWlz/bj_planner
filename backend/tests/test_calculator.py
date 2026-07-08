@@ -11,6 +11,7 @@ from app.calculator import (
     calculate_affordability,
     build_car_plan_analyses,
     build_child_plan_strategies,
+    build_monthly_cashflow_visualization,
     build_tax_events,
     build_tax_monthly_points,
     build_social_security_visualization,
@@ -22,6 +23,7 @@ from app.calculator import (
     monthly_household_expense_at,
     summarize_phased_loans,
 )
+from app.domain.time import month_after
 from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ChildPlanData, DailyExpenseStageData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, InvestmentTaxProfileData, RentExpenseStageData, RulePackData, ScenarioData, ScheduledExpenseData, SpecialDeductionItemData, PhasedLoanData, VehicleFinancingOptionData
 
 
@@ -568,7 +570,13 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
         item
         for item in result.monthly_cashflow_visualization
         if item.plan_variant == summary.plan_variant
-        and calculator_module._month_after(base_month, item.month)[0] == summary.year
+        and month_after(base_month, item.month)[0] == summary.year
+    ]
+    ledger_entries = [
+        item
+        for item in result.monthly_ledger
+        if item.plan_variant == summary.plan_variant
+        and month_after(base_month, item.month)[0] == summary.year
     ]
     assert rows
     last_month = max(item.month for item in rows)
@@ -589,7 +597,42 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
     )
 
     assert summary.months == len(rows)
+    monthly_details = [
+        item
+        for item in result.monthly_visualization_details
+        if item.plan_variant == summary.plan_variant
+        and month_after(base_month, item.month)[0] == summary.year
+    ]
+    assert len(monthly_details) == len(rows)
+    assert any(item.cash_flow_items for item in monthly_details)
+    assert any(item.expense_pie for item in monthly_details)
+    assert all(item.loan_payment_pie is not None for item in monthly_details)
+    assert all(item.provident_inflow_pie is not None for item in monthly_details)
+    assert all(item.social_security_inflow_pie is not None for item in monthly_details)
+    annual_visual_detail = next(
+        item
+        for item in result.annual_visualization_details
+        if item.plan_variant == summary.plan_variant and item.year == summary.year
+    )
+    assert annual_visual_detail.cash_inflow_pie
+    assert annual_visual_detail.cash_outflow_pie
+    assert annual_visual_detail.liquid_asset_pie
+    assert annual_visual_detail.loan_payment_pie is not None
+    assert annual_visual_detail.social_security_inflow_pie is not None
+    assert result.tax_visualization_details
+    assert any(item.month is not None and item.monthly_tax_member_pie for item in result.tax_visualization_details)
+    assert any(item.month is None and item.annual_tax_type_pie for item in result.tax_visualization_details)
     assert summary.cash_income == pytest.approx(sum(item.cash_income for item in rows))
+    assert summary.cash_income == pytest.approx(
+        sum(item.amount for item in ledger_entries if item.category == "income")
+    )
+    assert summary.transaction_cash_out == pytest.approx(
+        sum(
+            abs(item.amount)
+            for item in ledger_entries
+            if item.category in {"home_purchase", "vehicle_down_payment", "vehicle_plate_rental"}
+        )
+    )
     assert summary.investment_contribution == pytest.approx(sum(item.investment_contribution for item in rows))
     assert summary.cash_balance_end == pytest.approx(snapshot.cash_balance)
     assert summary.investment_balance_end == pytest.approx(snapshot.investment_balance)
@@ -603,6 +646,39 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
     assert summary.provident_balance_end == pytest.approx(provident_row.balance_end)
     assert summary.commercial_loan_balance_end == pytest.approx(loan_row.commercial_loan_balance)
     assert summary.provident_loan_balance_end == pytest.approx(loan_row.provident_loan_balance)
+    export_sheet_titles = {
+        item.title
+        for item in result.export_sheets
+        if item.plan_variant in {"", plan.variant}
+    }
+    assert "账户月度快照" in export_sheet_titles
+    assert "后端月度流水" in export_sheet_titles
+    snapshot_sheet = next(
+        item
+        for item in result.export_sheets
+        if item.plan_variant == plan.variant and item.title == "账户月度快照"
+    )
+    ledger_sheet = next(
+        item
+        for item in result.export_sheets
+        if item.plan_variant == plan.variant and item.title == "后端月度流水"
+    )
+    assert snapshot_sheet.headers[:4] == ["月份序号", "真实年月", "阶段", "现金账户"]
+    assert len(snapshot_sheet.rows) == len(selected_plan_snapshot_rows := [
+        item for item in result.account_snapshots if item.plan_variant == plan.variant
+    ])
+    assert len(ledger_sheet.rows) == len([
+        item for item in result.monthly_ledger if item.plan_variant == plan.variant
+    ])
+    assert selected_plan_snapshot_rows
+    export_text = next(
+        item
+        for item in result.export_texts
+        if item.plan_variant == plan.variant
+    )
+    assert export_text.filename == f"house-plan-{plan.variant}.txt"
+    assert any("账户与贷款快照" in line for line in export_text.lines)
+    assert any("后端 export_sheets" in line for line in export_text.lines)
 
 
 def test_income_member_defaults_to_one_income_stage() -> None:
@@ -1469,6 +1545,37 @@ def test_beijing_family_indicator_applicants_can_include_elder_for_generation_sc
 
     assert loan.beijing_family_indicator_score == pytest.approx(((2 + 3) * 2 + 1) * 2)
     assert any("样例老人" in note and "不会进入家庭现金流" in "；".join(loan.policy_notes) for note in loan.policy_notes)
+
+
+def test_beijing_family_indicator_applicants_accept_runtime_dict_items() -> None:
+    plan = CarPlanData(
+        enabled=True,
+        total_price=180_000,
+        energy_type="pure_electric",
+        beijing_license_indicator_status="family_new_energy_pending",
+        beijing_family_indicator_score_enabled=True,
+        beijing_family_indicator_application_start_month="2026-07",
+        beijing_family_indicator_current_cutoff_score=36,
+    )
+    plan.beijing_family_indicator_applicants = [
+        {
+            "name": "样例主申请人",
+            "relationship": "main",
+            "generation": "self_generation",
+            "eligibility_type": "beijing_household",
+            "personal_history_points_override": 3,
+        },
+        {
+            "name": "样例老人",
+            "relationship": "parent",
+            "generation": "parent_generation",
+            "eligibility_type": "beijing_residence_permit_social_tax",
+        },
+    ]
+
+    loan = calculate_car_loan(plan, rules=RulePackData())
+
+    assert loan.beijing_family_indicator_score == pytest.approx(((2 + 3) * 2 + 1) * 2)
 
 
 def test_range_extended_vehicle_does_not_wait_for_family_new_energy_score() -> None:
@@ -5882,6 +5989,177 @@ def test_social_security_accounts_stop_salary_contribution_after_retirement_and_
     assert retired_month.medical_retiree_transfer == pytest.approx(100)
     assert retired_month.medical_outflow == pytest.approx(3)
     assert retired_month.medical_balance_end >= 0
+
+
+def test_retired_pension_account_pays_out_by_policy_months() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "pension_personal_account_annual_return": 0,
+                "medical_account_annual_interest_rate": 0,
+                "medical_account_retiree_monthly_transfer_under_70": 0,
+                "medical_account_retiree_large_mutual_aid_monthly": 0,
+                "pension_personal_account_months_by_retirement_category": {"male_60": 10},
+            }
+        }
+    )
+    household = HouseholdData(
+        members=[
+            IncomeMember(
+                name="retired_member",
+                birth_month="1963-07",
+                retirement_category="male_60",
+                pension_account_balance=1_000,
+                medical_account_balance=0,
+                income_stages=[],
+            )
+        ]
+    )
+
+    rows = build_social_security_visualization(household, rule, [_sample_purchase_plan()], None, horizon_months=3, as_of=date(2026, 7, 1))
+    first_retired_month = next(item for item in rows if item.month == 1)
+    second_retired_month = next(item for item in rows if item.month == 2)
+
+    assert first_retired_month.pension_account_payout == pytest.approx(100)
+    assert first_retired_month.pension_balance_end == pytest.approx(900)
+    assert second_retired_month.pension_account_payout == pytest.approx(100)
+    assert second_retired_month.pension_balance_end == pytest.approx(800)
+
+
+def test_retired_pension_account_stops_payout_after_balance_depleted() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "pension_personal_account_annual_return": 0,
+                "medical_account_annual_interest_rate": 0,
+                "medical_account_retiree_monthly_transfer_under_70": 0,
+                "medical_account_retiree_large_mutual_aid_monthly": 0,
+                "pension_personal_account_months_by_retirement_category": {"male_60": 2},
+            }
+        }
+    )
+    household = HouseholdData(
+        members=[
+            IncomeMember(
+                name="retired_member",
+                birth_month="1963-07",
+                retirement_category="male_60",
+                pension_account_balance=100,
+                medical_account_balance=0,
+                income_stages=[],
+            )
+        ]
+    )
+
+    rows = build_social_security_visualization(household, rule, [_sample_purchase_plan()], None, horizon_months=4, as_of=date(2026, 7, 1))
+    first_retired_month = next(item for item in rows if item.month == 1)
+    second_retired_month = next(item for item in rows if item.month == 2)
+    after_depleted_month = next(item for item in rows if item.month == 3)
+
+    assert first_retired_month.pension_account_payout == pytest.approx(50)
+    assert second_retired_month.pension_account_payout == pytest.approx(50)
+    assert second_retired_month.pension_balance_end == pytest.approx(0)
+    assert after_depleted_month.pension_account_payout == pytest.approx(0)
+    assert after_depleted_month.pension_balance_end == pytest.approx(0)
+
+
+def test_medical_account_splits_retiree_mutual_aid_and_healthcare_outflow() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "pension_personal_account_annual_return": 0,
+                "medical_account_annual_interest_rate": 0,
+                "medical_account_retiree_monthly_transfer_under_70": 100,
+                "medical_account_retiree_large_mutual_aid_monthly": 3,
+            }
+        }
+    )
+    household = HouseholdData(
+        scheduled_expenses=[
+            ScheduledExpenseData(
+                name="医疗支出",
+                monthly_amount=80,
+                start_month="2026-08",
+                medical_account_payable=True,
+            )
+        ],
+        members=[
+            IncomeMember(
+                name="retired_member",
+                birth_month="1963-07",
+                retirement_category="male_60",
+                pension_account_balance=0,
+                medical_account_balance=20,
+                income_stages=[],
+            )
+        ],
+    )
+
+    rows = build_social_security_visualization(household, rule, [_sample_purchase_plan()], None, horizon_months=1, as_of=date(2026, 7, 1))
+    retired_month = next(item for item in rows if item.month == 1)
+
+    assert retired_month.medical_retiree_transfer == pytest.approx(100)
+    assert retired_month.medical_mutual_aid_outflow == pytest.approx(3)
+    assert retired_month.medical_healthcare_outflow == pytest.approx(80)
+    assert retired_month.medical_outflow == pytest.approx(83)
+    assert retired_month.medical_balance_end == pytest.approx(37)
+
+
+def test_medical_account_payable_expense_reduces_cash_scheduled_expense() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "pension_personal_account_annual_return": 0,
+                "medical_account_annual_interest_rate": 0,
+                "medical_account_retiree_monthly_transfer_under_70": 0,
+                "medical_account_retiree_large_mutual_aid_monthly": 0,
+            }
+        }
+    )
+    household = HouseholdData(
+        cash_account_balance=10_000,
+        investments=0,
+        investment_plan_name="cash_only",
+        scheduled_expenses=[
+            ScheduledExpenseData(
+                name="医保可支付医疗支出",
+                monthly_amount=800,
+                start_month="2026-08",
+                medical_account_payable=True,
+            )
+        ],
+        members=[
+            IncomeMember(
+                name="sample_member",
+                pension_account_balance=0,
+                medical_account_balance=500,
+                income_stages=[],
+            )
+        ],
+    )
+    plan = _sample_purchase_plan()
+    social_security_rows = build_social_security_visualization(household, rule, [plan], None, horizon_months=1, as_of=date(2026, 7, 1))
+
+    cashflow_rows, _, ledger_rows = build_monthly_cashflow_visualization(
+        household,
+        ScenarioData(),
+        rule,
+        [plan],
+        calculate_car_loan(CarPlanData()),
+        [],
+        [],
+        social_security_rows,
+    )
+    month_one = next(item for item in cashflow_rows if item.month == 1)
+
+    assert social_security_rows[1].medical_healthcare_outflow == pytest.approx(500)
+    assert month_one.scheduled_expense == pytest.approx(300)
+    assert month_one.monthly_cash_delta == pytest.approx(-300)
+    assert any(item.category == "medical_healthcare_outflow" and item.amount == pytest.approx(-500) for item in ledger_rows)
 
 
 def test_member_can_have_no_income_stage_without_top_level_income_fallback() -> None:

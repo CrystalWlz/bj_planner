@@ -439,6 +439,7 @@ const defaultScheduledExpenses: ScheduledExpenseData[] = [
     annual_occurrence_month: 1,
     start_month: "2026-07",
     end_month: null,
+    medical_account_payable: false,
     tax_deductible_elderly_care: false,
     notes: ""
   }
@@ -452,6 +453,7 @@ const defaultAnnualScheduledExpense: ScheduledExpenseData = {
   annual_occurrence_month: 6,
   start_month: "2026-06",
   end_month: null,
+  medical_account_payable: false,
   tax_deductible_elderly_care: false,
   notes: "一年一次的大额家庭消费支出，只在指定月份进入现金流。"
 };
@@ -464,6 +466,7 @@ const defaultOneTimeScheduledExpense: ScheduledExpenseData = {
   annual_occurrence_month: 1,
   start_month: "2027-01",
   end_month: "2027-06",
+  medical_account_payable: false,
   tax_deductible_elderly_care: false,
   notes: "给出可接受时间范围后，后端策略会先按不挤占现金池的保守口径安排到范围内较晚月份。"
 };
@@ -771,7 +774,8 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         ...expense,
         frequency: expense.frequency ?? "monthly",
         one_time_timing_mode: expense.one_time_timing_mode ?? "fixed_month",
-        annual_occurrence_month: expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1)
+        annual_occurrence_month: expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1),
+        medical_account_payable: expense.medical_account_payable ?? false
       })),
       daily_expense_stages: (record.data.daily_expense_stages?.length
         ? record.data.daily_expense_stages
@@ -3501,11 +3505,19 @@ function IncomePage({
                     onChange={(event) => updateScheduledExpense(index, "end_month", event.target.value || null)}
                   />
                 </Field>
+                <SwitchField
+                  label={expense.medical_account_payable ? "医保账户可支付" : "现金账户支付"}
+                  checked={expense.medical_account_payable ?? false}
+                  onChange={(checked) => updateScheduledExpense(index, "medical_account_payable", checked)}
+                  description="仅对明确属于医保个人账户可支付的医疗支出生效；医保余额不足的部分仍进入现金支出。"
+                />
               </div>
               <p className="expense-note-display">
                 {expense.notes || ((expense.frequency ?? "monthly") === "one_time" && (expense.one_time_timing_mode ?? "fixed_month") === "flexible_range"
                   ? "一次性支出给出时间范围后，后端会先按保守策略安排到范围内较晚月份，减少对购房买车现金池的挤压。"
-                  : "这项支出只作为家庭现金支出，不自动认定为个税专项扣除。")}
+                  : expense.medical_account_payable
+                    ? "这项支出会先从医保个人账户余额支付，余额不足部分才进入现金账户支出；它不自动认定为个税专项扣除。"
+                    : "这项支出只作为家庭现金支出，不自动认定为个税专项扣除。")}
               </p>
             </section>
           ))}
@@ -7973,6 +7985,42 @@ function SelectedPlanVisualization({
     () => (result.monthly_cashflow_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
     [result.monthly_cashflow_visualization, plan.variant]
   );
+  const monthlyVisualizationDetailByMonth = useMemo(
+    () =>
+      new Map(
+        (result.monthly_visualization_details ?? [])
+          .filter((item) => item.plan_variant === plan.variant)
+          .map((item) => [item.month, item])
+      ),
+    [result.monthly_visualization_details, plan.variant]
+  );
+  const annualVisualizationDetailByYear = useMemo(
+    () =>
+      new Map(
+        (result.annual_visualization_details ?? [])
+          .filter((item) => item.plan_variant === plan.variant)
+          .map((item) => [item.year, item])
+      ),
+    [result.annual_visualization_details, plan.variant]
+  );
+  const taxVisualizationDetailByMonth = useMemo(
+    () =>
+      new Map(
+        (result.tax_visualization_details ?? [])
+          .filter((item) => item.month !== null)
+          .map((item) => [item.month as number, item])
+      ),
+    [result.tax_visualization_details]
+  );
+  const taxVisualizationDetailByYear = useMemo(
+    () =>
+      new Map(
+        (result.tax_visualization_details ?? [])
+          .filter((item) => item.month === null)
+          .map((item) => [item.year, item])
+      ),
+    [result.tax_visualization_details]
+  );
   const taxMonthlySeries = result.tax_monthly_points ?? [];
   const taxMonthlyByMonth = useMemo(
     () => new Map(taxMonthlySeries.map((item) => [item.month, item])),
@@ -8297,6 +8345,7 @@ function SelectedPlanVisualization({
       socialSecurityAccountBalance: 0,
       backendLedgerEntries: []
     };
+  const selectedMonthDetail = monthlyVisualizationDetailByMonth.get(selectedMonth.month);
   const plannedHomeLoanAmount = Math.max(0, plan.commercial_loan_amount + plan.provident_loan_amount);
   const plannedVehicleLoanAmount = Math.max(0, result.car_loan.loan_principal ?? 0);
   const selectedLoanPoint = loanVisualizationByMonth.get(safeSelectedMonthIndex);
@@ -8683,6 +8732,10 @@ function SelectedPlanVisualization({
   const selectedAnnualFinancialSummary = result.annual_financial_summaries?.find(
     (item) => item.plan_variant === plan.variant && item.year === selectedTaxYear
   );
+  const selectedAnnualVisualizationDetail = annualVisualizationDetailByYear.get(selectedTaxYear);
+  const selectedTaxVisualizationDetail =
+    taxVisualizationDetailByMonth.get(safeSelectedMonthIndex) ??
+    taxVisualizationDetailByYear.get(selectedTaxYear);
   const annualLoanPayment = selectedAnnualFinancialSummary
     ? selectedAnnualFinancialSummary.commercial_payment +
       selectedAnnualFinancialSummary.provident_payment +
@@ -8693,97 +8746,16 @@ function SelectedPlanVisualization({
     : 0;
   const annualPieTotal = (items: Array<{ value: number }>) =>
     items.reduce((sum, item) => sum + item.value, 0);
-  const annualCashInflowData = selectedAnnualFinancialSummary
-    ? [
-        {
-          name: "工资及其他现金收入",
-          value: Math.max(0, selectedAnnualFinancialSummary.cash_income - (selectedAnnualFinancialSummary.pension_income ?? 0))
-        },
-        { name: "养老金领取", value: selectedAnnualFinancialSummary.pension_income ?? 0 },
-        { name: "公积金现金提取", value: selectedAnnualFinancialSummary.provident_withdrawal },
-        { name: "投资卖出到账", value: selectedAnnualFinancialSummary.investment_sell_proceeds },
-        { name: "交易现金流入", value: selectedAnnualFinancialSummary.transaction_cash_in }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualCashOutflowData = selectedAnnualFinancialSummary
-    ? [
-        { name: "基础生活支出", value: selectedAnnualFinancialSummary.living_expense },
-        { name: "计划支出", value: selectedAnnualFinancialSummary.scheduled_expense },
-        { name: "养娃计划支出", value: selectedAnnualFinancialSummary.child_expense ?? 0 },
-        { name: "灵活就业自缴社保公积金", value: selectedAnnualFinancialSummary.career_shock_self_payment ?? 0 },
-        { name: "已有贷款还款", value: selectedAnnualFinancialSummary.debt_payment },
-        { name: "房贷现金还款", value: selectedAnnualFinancialSummary.house_payment },
-        { name: "车贷现金还款", value: selectedAnnualFinancialSummary.vehicle_payment },
-        { name: "养车现金支出", value: selectedAnnualFinancialSummary.vehicle_operating_cost },
-        { name: "理财买入", value: selectedAnnualFinancialSummary.investment_contribution },
-        { name: "理财收益税", value: selectedAnnualFinancialSummary.investment_tax },
-        { name: "理财手续费", value: selectedAnnualFinancialSummary.investment_fee },
-        { name: "交易现金流出", value: selectedAnnualFinancialSummary.transaction_cash_out }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualAssetCompositionData = selectedAnnualFinancialSummary
-    ? [
-        { name: "现金账户", value: selectedAnnualFinancialSummary.cash_balance_end },
-        { name: "投资账户", value: selectedAnnualFinancialSummary.investment_balance_end }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualFixedAssetCompositionData = selectedAnnualFinancialSummary
-    ? [
-        { name: "房产估值", value: selectedAnnualFinancialSummary.property_asset_value_end },
-        { name: "车辆估值", value: selectedAnnualFinancialSummary.vehicle_asset_value_end }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualLoanPaymentData = selectedAnnualFinancialSummary
-    ? [
-        { name: "商贷合同还款", value: selectedAnnualFinancialSummary.commercial_payment },
-        {
-          name: "公积金贷银行卡还款",
-          value: Math.max(
-            0,
-            selectedAnnualFinancialSummary.provident_payment -
-              selectedAnnualFinancialSummary.provident_monthly_withdrawal_payment
-          )
-        },
-        { name: "公积金按月抵月供", value: selectedAnnualFinancialSummary.provident_monthly_withdrawal_payment },
-        { name: "公积金半年度冲本金", value: selectedAnnualFinancialSummary.provident_principal_offset_payment },
-        { name: "车贷现金还款", value: selectedAnnualFinancialSummary.vehicle_loan_payment },
-        { name: "已有贷款还款", value: selectedAnnualFinancialSummary.existing_loan_payment },
-        { name: "商贷额外还本", value: selectedAnnualFinancialSummary.commercial_extra_principal_payment },
-        { name: "车贷额外还本", value: selectedAnnualFinancialSummary.vehicle_extra_principal_payment }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualLoanBalanceData = selectedAnnualFinancialSummary
-    ? [
-        { name: "商贷余额", value: selectedAnnualFinancialSummary.commercial_loan_balance_end },
-        { name: "公积金贷余额", value: selectedAnnualFinancialSummary.provident_loan_balance_end },
-        { name: "车贷余额", value: selectedAnnualFinancialSummary.vehicle_loan_balance_end },
-        { name: "已有贷款余额", value: selectedAnnualFinancialSummary.existing_loan_balance_end }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualProvidentFlowData = selectedAnnualFinancialSummary
-    ? [
-        { name: "公积金缴存", value: selectedAnnualFinancialSummary.provident_deposit },
-        { name: "现金提取到账", value: selectedAnnualFinancialSummary.provident_withdrawal },
-        { name: "按月抵月供", value: selectedAnnualFinancialSummary.provident_monthly_withdrawal_payment },
-        { name: "半年度冲本金", value: selectedAnnualFinancialSummary.provident_principal_offset_payment }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualSocialSecurityFlowData = selectedAnnualFinancialSummary
-    ? [
-        { name: "养老个人缴入", value: selectedAnnualFinancialSummary.pension_account_contribution ?? 0 },
-        { name: "养老账户利息", value: selectedAnnualFinancialSummary.pension_account_interest ?? 0 },
-        { name: "医保个人划入", value: selectedAnnualFinancialSummary.medical_account_contribution ?? 0 },
-        { name: "退休医保划入", value: selectedAnnualFinancialSummary.medical_account_retiree_transfer ?? 0 },
-        { name: "医保账户利息", value: selectedAnnualFinancialSummary.medical_account_interest ?? 0 }
-      ].filter((item) => item.value > 0)
-    : [];
-  const annualSocialSecurityBalanceData = selectedAnnualFinancialSummary
-    ? [
-        { name: "养老保险个人账户", value: selectedAnnualFinancialSummary.pension_account_balance_end ?? 0 },
-        { name: "医保个人账户", value: selectedAnnualFinancialSummary.medical_account_balance_end ?? 0 },
-        { name: "个人养老金账户", value: selectedAnnualFinancialSummary.personal_pension_balance_end ?? 0 }
-      ].filter((item) => item.value > 0)
-    : [];
+  const annualCashInflowData = selectedAnnualVisualizationDetail?.cash_inflow_pie ?? [];
+  const annualCashOutflowData = selectedAnnualVisualizationDetail?.cash_outflow_pie ?? [];
+  const annualAssetCompositionData = selectedAnnualVisualizationDetail?.liquid_asset_pie ?? [];
+  const annualFixedAssetCompositionData = selectedAnnualVisualizationDetail?.fixed_asset_pie ?? [];
+  const annualLoanPaymentData = selectedAnnualVisualizationDetail?.loan_payment_pie ?? [];
+  const annualLoanBalanceData = selectedAnnualVisualizationDetail?.loan_balance_pie ?? [];
+  const annualProvidentFlowData = selectedAnnualVisualizationDetail?.provident_flow_pie ?? [];
+  const annualSocialSecurityFlowData = selectedAnnualVisualizationDetail?.social_security_inflow_pie ?? [];
+  const annualSocialSecurityOutflowData = selectedAnnualVisualizationDetail?.social_security_outflow_pie ?? [];
+  const annualSocialSecurityBalanceData = selectedAnnualVisualizationDetail?.social_security_balance_pie ?? [];
   const socialSecurityChartData = useMemo(
     () =>
       socialSecurityVisualizationSeries.map((item) => {
@@ -8794,7 +8766,9 @@ function SelectedPlanVisualization({
             backendCashflowSeries.find((row) => row.month === item.month)?.personal_pension_balance ?? 0
           ),
           养老当月缴入: Math.round(item.pension_contribution),
+          养老计发支出: Math.round(item.pension_account_payout ?? 0),
           医保当月划入: Math.round(item.medical_contribution + item.medical_retiree_transfer),
+          医保账户支出: Math.round(item.medical_outflow ?? 0),
           个人养老金缴费: Math.round(
             backendCashflowSeries.find((row) => row.month === item.month)?.personal_pension_contribution ?? 0
           ),
@@ -8841,17 +8815,10 @@ function SelectedPlanVisualization({
       }),
     [household.members, selectedSocialSecurityPoint?.member_accounts]
   );
-  const socialSecurityInflowPieData = selectedSocialSecurityPoint
-    ? [
-        { name: "养老个人缴入", value: selectedSocialSecurityPoint.pension_contribution },
-        { name: "医保个人划入", value: selectedSocialSecurityPoint.medical_contribution },
-        { name: "退休医保划入", value: selectedSocialSecurityPoint.medical_retiree_transfer },
-        { name: "账户利息", value: selectedSocialSecurityPoint.pension_interest + selectedSocialSecurityPoint.medical_interest },
-        { name: "个人养老金缴费", value: selectedMonth.personalPensionContribution ?? 0 },
-        { name: "个人养老金收益", value: selectedMonth.personalPensionReturn ?? 0 }
-      ].filter((item) => item.value > 0)
-    : [];
+  const socialSecurityInflowPieData = selectedMonthDetail?.social_security_inflow_pie ?? [];
   const socialSecurityInflowPieTotal = annualPieTotal(socialSecurityInflowPieData);
+  const socialSecurityOutflowPieData = selectedMonthDetail?.social_security_outflow_pie ?? [];
+  const socialSecurityOutflowPieTotal = annualPieTotal(socialSecurityOutflowPieData);
   const selectedMonthGrossIncome = selectedMemberIncomeRows.reduce(
     (sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly,
     0
@@ -9142,46 +9109,11 @@ function SelectedPlanVisualization({
       ifOverflow="extendDomain"
     />
   );
-  const cashFlowData = [
-    ...(selectedMonth.cashIncome > 0
-      ? selectedMemberIncomeRows.flatMap((member) => [
-          { name: `${member.name}工资净入账`, amount: Math.round(member.salaryNetMonthly), kind: "income" },
-          ...(member.bonusMonthly > 0
-            ? [{ name: `${member.name}奖金净入账`, amount: Math.round(member.bonusNetMonthly), kind: "income" }]
-            : []),
-          ...(member.otherMonthly > 0
-            ? [{ name: `${member.name}其他净入账`, amount: Math.round(member.otherNetMonthly), kind: "income" }]
-            : []),
-          ...(member.pensionMonthly > 0
-            ? [{ name: `${member.name}养老金领取`, amount: Math.round(member.pensionNetMonthly), kind: "income" }]
-            : []),
-          ...(member.nonTaxableMonthly > 0
-            ? [{ name: `${member.name}非税收入`, amount: Math.round(member.nonTaxableNetMonthly), kind: "income" }]
-            : [])
-        ])
-      : []),
-    { name: "定投买入净额", amount: -Math.round(selectedMonth.monthlyInvestmentNet), kind: "asset" },
-    { name: "个人养老金缴费", amount: -Math.round(selectedMonth.personalPensionContribution ?? 0), kind: "asset" },
-    { name: "个人养老金账户收益", amount: Math.round(selectedMonth.personalPensionReturn ?? 0), kind: "asset" },
-    { name: "理财买入手续费", amount: -Math.round(selectedMonth.monthlyInvestmentBuyFee), kind: "expense" },
-    { name: "复利收益留存", amount: Math.round(selectedMonth.investmentReturn), kind: "asset" },
-    { name: "投资卖出到账", amount: Math.round(selectedMonth.investmentSellProceeds), kind: "income" },
-    { name: "投资卖出手续费", amount: -Math.round(selectedMonth.investmentSellFee), kind: "expense" },
-    { name: "公积金现金到账", amount: Math.round(selectedMonth.providentRentWithdrawal + selectedMonth.providentPostTransactionWithdrawal + (selectedMonth.providentAgreedWithdrawal ?? 0) + (selectedMonth.providentRetirementWithdrawal ?? 0)), kind: "income" },
-    { name: "公积金账户抵扣/冲本金", amount: Math.round(selectedMonth.providentLoanOffsetPayment ?? 0), kind: "asset" },
-    { name: "基础生活支出", amount: -Math.round(selectedMonth.baseLivingExpense), kind: "expense" },
-    ...selectedMonth.scheduledExpenseRows.map((item) => ({
-      name: item.name,
-      amount: -Math.round(item.amount),
-      kind: "expense"
-    })),
-    { name: "债务还款", amount: -Math.round(selectedMonth.debtPayment), kind: "expense" },
-    { name: "通勤/用车成本", amount: -Math.round(selectedMonth.carCost), kind: "expense" },
-    { name: "房贷现金还款", amount: -Math.round(selectedMonth.housePayment), kind: "expense" },
-    { name: "公积金账户代扣房贷", amount: Math.round(selectedMonth.providentHouseOffsetPayment ?? 0), kind: "asset" },
-    { name: "交易现金", amount: Math.round(selectedMonth.purchaseCashIn - selectedMonth.purchaseCashOut), kind: "expense" },
-    { name: "当月现金净流入", amount: Math.round(selectedMonth.monthlyCashDelta), kind: "result" }
-  ].filter((item) => item.amount !== 0 || item.kind === "result");
+  const cashFlowData = (selectedMonthDetail?.cash_flow_items ?? []).map((item) => ({
+    name: item.name,
+    amount: Math.round(item.amount ?? item.value),
+    kind: item.kind ?? "expense"
+  }));
   const cashFlowChartHeight = Math.max(360, cashFlowData.length * 28);
   const cashFlowColor = (kind: string) => {
     if (kind === "income") return visualColors.cash;
@@ -9190,132 +9122,32 @@ function SelectedPlanVisualization({
     if (kind === "result") return selectedMonth.monthlyCashDelta >= 0 ? visualColors.safe : visualColors.danger;
     return visualColors.expense;
   };
-  const selectedMonthDrivers = cashFlowData
-    .filter((item) => item.kind !== "result" && Math.abs(item.amount) > 0)
-    .sort((left, right) => Math.abs(right.amount) - Math.abs(left.amount))
-    .slice(0, 5);
+  const selectedMonthDrivers = (selectedMonthDetail?.cash_flow_drivers ?? []).map((item) => ({
+    name: item.name,
+    amount: Math.round(item.amount ?? item.value),
+    kind: item.kind ?? "expense"
+  }));
   const monthAdvisorText =
-    selectedMonth.monthlyCashDelta >= 0
-      ? `${selectedMonth.name} 现金净流入 ${money(selectedMonth.monthlyCashDelta)}，这个月现金账户在变厚。主要正向项来自工资入账、公积金现金到账、公积金账户抵扣月供、投资卖出或收益留存；主要压力项见下方归因。`
-      : `${selectedMonth.name} 现金净流出 ${money(Math.abs(selectedMonth.monthlyCashDelta))}，这个月需要确认是否是交易、定投、车贷、房贷或生活支出的阶段性压力。`;
-  const incomeMemberLegendData = selectedMemberIncomeRows
-    .flatMap((member) => [
-      { name: `${member.name}工资净入账`, value: Math.max(0, member.salaryNetMonthly) },
-      { name: `${member.name}奖金净入账`, value: Math.max(0, member.bonusNetMonthly) },
-      { name: `${member.name}其他净入账`, value: Math.max(0, member.otherNetMonthly) },
-      { name: `${member.name}养老金领取`, value: Math.max(0, member.pensionNetMonthly ?? 0) },
-      { name: `${member.name}非税收入`, value: Math.max(0, member.nonTaxableNetMonthly) },
-    ])
-    .filter((item) => item.value > 0);
-  const incomeHouseholdFlowData = [
-    { name: "复利收益", value: selectedMonth.investmentReturn },
-    { name: "租房公积金提取", value: selectedMonth.providentRentWithdrawal },
-    { name: "交易后公积金回流", value: selectedMonth.providentPostTransactionWithdrawal },
-    { name: "退休公积金销户到账", value: selectedMonth.providentRetirementWithdrawal ?? 0 },
-    { name: "投资卖出到账", value: selectedMonth.investmentSellProceeds },
-    { name: "交易现金流入", value: Math.max(0, selectedMonth.purchaseCashIn - selectedMonth.investmentSellProceeds) }
-  ];
-  const incomeLegendData = [
-    ...incomeMemberLegendData,
-    ...incomeHouseholdFlowData.filter((item) => item.value > 0)
-  ];
-  const incomePieData = [
-    ...incomeMemberLegendData,
-    ...incomeHouseholdFlowData
-  ].filter((item) => item.value > 0);
-  const existingLoanExpensePieData = selectedExistingLoanDetails.length > 0
-    ? selectedExistingLoanDetails.map((item, index) => ({
-        name: item.name,
-        value: item.monthly_payment,
-        color: stablePieColor(item.name)
-      }))
-    : [{ name: "已有贷款月供", value: selectedMonth.phasedLoanPayment, color: visualColors.expense }];
-  const expensePieData = [
-    { name: "基础生活支出", value: selectedMonth.baseLivingExpense },
-    ...selectedMonth.scheduledExpenseRows.map((item) => ({ name: item.name, value: item.amount })),
-    { name: "养娃计划支出", value: selectedMonth.childExpense },
-    { name: "灵活就业自缴社保公积金", value: selectedMonth.careerShockSelfPayment },
-    { name: "其他固定还款", value: selectedOtherFixedDebtPayment || selectedMonth.regularDebtPayment },
-    ...existingLoanExpensePieData,
-    { name: "无车通勤成本", value: selectedMonth.noCarCommuteCost },
-    { name: "车辆车贷", value: selectedMonth.firstCarLoanPayment },
-    { name: "车辆电费", value: selectedMonth.firstCarEnergyCost },
-    { name: "车辆保险", value: selectedMonth.firstCarInsuranceCost },
-    { name: "车辆保养", value: selectedMonth.firstCarMaintenanceCost },
-    { name: "车辆停车", value: selectedMonth.firstCarParkingCost },
-    { name: "车辆牌照租赁", value: selectedMonth.vehiclePlateRentalPayment },
-    { name: "第二辆车车贷", value: selectedMonth.secondCarLoanPayment },
-    { name: "第二辆车电费", value: selectedMonth.secondCarEnergyCost },
-    { name: "第二辆车保险", value: selectedMonth.secondCarInsuranceCost },
-    { name: "第二辆车保养", value: selectedMonth.secondCarMaintenanceCost },
-    { name: "第二辆车停车", value: selectedMonth.secondCarParkingCost },
-    { name: "公积金贷银行卡月扣", value: selectedMonth.providentHousePayment },
-    { name: "公积金账户按月抵月供", value: selectedMonth.providentMonthlyRepaymentWithdrawal ?? 0 },
-    { name: "公积金账户半年度冲本金", value: selectedMonth.providentPrincipalOffsetPayment ?? 0 },
-    { name: "商贷月供", value: selectedMonth.commercialHousePayment },
-    { name: "商贷额外还本", value: selectedMonth.commercialExtraPrincipalPayment ?? 0 },
-    { name: "理财买入净额", value: selectedMonth.monthlyInvestmentNet },
-    { name: "个人养老金缴费", value: selectedMonth.personalPensionContribution ?? 0 },
-    { name: "理财收益税", value: selectedMonth.investmentTax },
-    { name: "理财手续费", value: selectedMonth.monthlyInvestmentBuyFee + selectedMonth.investmentSellFee },
-    { name: "购房交易现金", value: selectedMonth.houseTransactionCashOut },
-    { name: "车辆首付", value: selectedMonth.carDownPaymentCashOut },
-    { name: "第二辆车首付", value: selectedMonth.secondCarDownPaymentCashOut }
-  ].filter((item) => item.value > 0);
-  const selectedLoanPaymentPieData = [
-    { name: "商贷合同还款", value: selectedLoanPoint?.commercial_monthly_payment ?? 0, color: visualColors.property },
-    { name: "商贷额外还本", value: selectedLoanPoint?.commercial_extra_principal_payment ?? 0, color: visualColors.baseline },
-    {
-      name: "公积金贷银行卡月扣",
-      value: Math.max(
-        0,
-        (selectedLoanPoint?.provident_monthly_payment ?? 0) -
-          (selectedLoanPoint?.provident_monthly_payment_relief ?? 0)
-      ),
-      color: visualColors.warning
-    },
-    {
-      name: "公积金账户按月抵月供",
-      value: selectedLoanPoint?.provident_monthly_withdrawal_payment ?? 0,
-      color: visualColors.provident
-    },
-    {
-      name: "公积金账户半年度冲本金",
-      value: selectedLoanPoint?.provident_principal_offset_payment ?? 0,
-      color: visualColors.provident
-    },
-    {
-      name: "车贷现金还款",
-      value: Math.max(0, (selectedLoanPoint?.vehicle_monthly_payment ?? 0) - (selectedLoanPoint?.vehicle_extra_principal_payment ?? 0)),
-      color: visualColors.vehicle
-    },
-    { name: "车贷额外还本", value: selectedLoanPoint?.vehicle_extra_principal_payment ?? 0, color: "var(--gold)" },
-    { name: "其他固定还款", value: selectedOtherFixedDebtPayment, color: visualColors.expense },
-    ...selectedExistingLoanDetails.map((item, index) => ({
-      name: item.name,
-      value: item.monthly_payment,
-      color: stablePieColor(item.name)
-    }))
-  ].filter((item) => item.value > 0);
+    selectedMonthDetail?.advisor_text ??
+    (selectedMonth.monthlyCashDelta >= 0
+      ? `${selectedMonth.name} 现金净流入 ${money(selectedMonth.monthlyCashDelta)}。`
+      : `${selectedMonth.name} 现金净流出 ${money(Math.abs(selectedMonth.monthlyCashDelta))}。`);
+  const incomeLegendData = selectedMonthDetail?.income_legend ?? [];
+  const incomePieData = selectedMonthDetail?.income_pie ?? [];
+  const expensePieData = selectedMonthDetail?.expense_pie ?? [];
+  const selectedLoanPaymentPieData = selectedMonthDetail?.loan_payment_pie ?? [];
   const sumPieValues = (items: Array<{ value: number }>) =>
     items.reduce((sum, item) => sum + Math.max(0, Number(item.value) || 0), 0);
-  const annualTaxMemberPieData = taxSummaryRows
-    .map((item) => ({ name: `${item.member_name}年度个税`, value: item.total_tax }))
-    .filter((item) => item.value > 0);
-  const annualTaxTypePieData = [
-    { name: "工资薪金个税", value: taxSummaryRows.reduce((sum, item) => sum + item.salary_tax, 0) },
-    { name: "年终奖个税", value: taxSummaryRows.reduce((sum, item) => sum + item.bonus_tax, 0) }
-  ].filter((item) => item.value > 0);
-  const currentMonthTaxPieData = selectedMemberIncomeRows
-    .map((member) => ({ name: `${member.name}当月个税`, value: member.incomeTax }))
-    .filter((item) => item.value > 0);
-  const currentMonthDeductionPieData = selectedMemberIncomeRows
-    .flatMap((member) => [
-      { name: `${member.name}个人社保`, value: member.personalSocial },
-      { name: `${member.name}个人公积金`, value: member.personalHousingFund },
-      { name: `${member.name}专项附加扣除`, value: member.elderlyCareDeduction ?? 0 }
-    ])
-    .filter((item) => item.value > 0);
+  const annualTaxMemberPieData =
+    selectedTaxVisualizationDetail?.annual_tax_member_pie ??
+    taxVisualizationDetailByYear.get(selectedTaxYear)?.annual_tax_member_pie ??
+    [];
+  const annualTaxTypePieData =
+    selectedTaxVisualizationDetail?.annual_tax_type_pie ??
+    taxVisualizationDetailByYear.get(selectedTaxYear)?.annual_tax_type_pie ??
+    [];
+  const currentMonthTaxPieData = selectedTaxVisualizationDetail?.monthly_tax_member_pie ?? [];
+  const currentMonthDeductionPieData = selectedTaxVisualizationDetail?.monthly_deduction_pie ?? [];
   const taxPieBlocks = [
     {
       title: "当月个税成员构成",
@@ -9396,24 +9228,8 @@ function SelectedPlanVisualization({
     money(Number(value)),
     item.payload?.name ?? "金额"
   ];
-  const providentInflowPieData = [
-    ...selectedProvidentMemberAccounts.flatMap((account) => [
-      { name: `${account.member_name}个人缴存`, value: account.personal_deposit },
-      { name: `${account.member_name}单位缴存`, value: account.employer_deposit },
-      { name: `${account.member_name}利息`, value: account.interest }
-    ])
-  ].filter((item) => item.value > 0);
-  const providentOutflowPieData = [
-    ...providentOutflowMemberAccounts.flatMap((account) => [
-      { name: `${account.member_name}租房提取`, value: account.rent_withdrawal },
-      { name: `${account.member_name}交易前提取`, value: account.upfront_withdrawal },
-      { name: `${account.member_name}交易后提取`, value: account.post_transaction_withdrawal },
-      { name: `${account.member_name}购后约定提取`, value: account.agreed_withdrawal },
-      { name: `${account.member_name}按月抵月供`, value: account.monthly_repayment_withdrawal ?? 0 },
-      { name: `${account.member_name}半年度冲本金`, value: account.loan_offset_payment },
-      { name: `${account.member_name}退休销户提取`, value: account.retirement_withdrawal ?? 0 }
-    ])
-  ].filter((item) => item.value > 0);
+  const providentInflowPieData = selectedMonthDetail?.provident_inflow_pie ?? [];
+  const providentOutflowPieData = selectedMonthDetail?.provident_outflow_pie ?? [];
   const incomePieTotal = sumPieValues(incomePieData);
   const expensePieTotal = sumPieValues(expensePieData);
   const selectedLoanPaymentPieTotal = sumPieValues(selectedLoanPaymentPieData);
@@ -9465,47 +9281,7 @@ function SelectedPlanVisualization({
       ]
     }
   ];
-  const selectedMonthExplanationItems = [
-    {
-      title: "收入为什么这样入账",
-      body:
-        selectedMonth.cashIncome > 0
-          ? `工资按各家庭成员当前生效的收入阶段逐月入账；年终奖会按收入阶段设置，一次性模式只在发放月进入现金流，按月均摊模式会进入每月工资薪金税基。${selectedMonth.name} 的税后现金工资已经扣除了个人社保、个人公积金和当月累计预扣个税。`
-          : `${selectedMonth.name} 没有工资现金入账，通常是收入阶段尚未开始、已进入失业/退休等自动情景，或该月是交易月只展示资产转换。`
-    },
-    {
-      title: "年度/阶段性支出为什么不是均摊",
-      body:
-        selectedMonth.firstCarInsuranceCost + selectedMonth.firstCarMaintenanceCost + selectedMonth.secondCarInsuranceCost + selectedMonth.secondCarMaintenanceCost > 0
-          ? `车辆保险和保养按实际发生月计入现金流，不做月度均摊；当前月出现 ${money(selectedMonth.firstCarInsuranceCost + selectedMonth.secondCarInsuranceCost)} 保险和 ${money(selectedMonth.firstCarMaintenanceCost + selectedMonth.secondCarMaintenanceCost)} 保养，并按设定年增长率随持有年份递增。`
-          : `车辆保险、保养这类年度支出不会平均摊到每个月；只有到车辆购入后的年度节点才进入当月现金流，并会按设定年增长率随持有年份递增。平时只保留电费、停车、通勤等更接近月度发生的项目。`
-    },
-    {
-      title: "贷款还款策略为什么这样",
-      body:
-        selectedLoanPoint && selectedLoanPoint.total_monthly_payment > 0
-          ? `房贷、车贷和已有贷款都属于贷款。当前月贷款还款 ${money(selectedLoanPoint.total_monthly_payment)}，其中房贷 ${money(selectedLoanPoint.home_monthly_payment)}、车贷 ${money(selectedLoanPoint.vehicle_monthly_payment)}、${selectedExistingLoanDescription}；商贷和车贷额外还本会作为本金支出计入当月还款。公积金按月抵月供只降低银行卡还款压力，半年度冲本金才额外压降贷款本金，两者不会在同一阶段并行。`
-          : `当前月还没有实际贷款还款进入现金流；如果计划中有房贷或车贷，它们会从买房/买车发生月起进入贷款余额与月供曲线。`
-    },
-    {
-      title: "公积金账户为什么这样流动",
-      body: `公积金账户由后端逐月计算：个人缴存和单位缴存进入账户，账户利息留在账户内；购房前租房提取按季度到账，买房后不再把租房提取当作后续来源。按月抵月供和半年度冲本金分开记账，半年度冲本金与约定提取互斥，属于账户支出，不属于自由现金收入。`
-    },
-    {
-      title: "理财定投为什么这样执行",
-      body:
-        selectedMonth.monthlyInvestment > 0
-          ? `本月定投 ${money(selectedMonth.monthlyInvestment)}，买入净额 ${money(selectedMonth.monthlyInvestmentNet)}，手续费 ${money(selectedMonth.monthlyInvestmentBuyFee)}。策略先保护现金安全垫：当月结余用于基础定投，安全垫以上的存量现金会分期追加到投资账户；若当月净流入为负，通常代表主动调仓而不是日常支出失控。`
-          : `本月没有执行定投，通常是月结余不足、现金账户低于安全垫，或理财策略选择了现金保守模式。已有投资账户的收益仍留在投资账户中复利。`
-    },
-    {
-      title: "当月净流入怎么看",
-      body:
-        selectedMonth.monthlyCashDelta >= 0
-          ? `${selectedMonth.name} 现金净流入为 ${money(selectedMonth.monthlyCashDelta)}，说明工资、到账、冲抵或投资变现足以覆盖本月支出和定投。`
-          : `${selectedMonth.name} 现金净流出为 ${money(Math.abs(selectedMonth.monthlyCashDelta))}。如果不是交易、买车首付、年度保险保养或装修等特殊时点，就应优先检查定投、用车、房贷和家庭支出是否需要调整。`
-    }
-  ];
+  const selectedMonthExplanationItems = selectedMonthDetail?.explanation_items ?? [];
   const happinessData = result.purchase_plan_analyses.map((item) => ({
     name: item.variant,
     幸福指数: Number(item.happiness_score.toFixed(1)),
@@ -10469,7 +10245,9 @@ function SelectedPlanVisualization({
                 />
               ))}
               <Line type="monotone" dataKey="养老当月缴入" stroke={visualColors.pension} strokeWidth={1.8} strokeDasharray="4 4" dot={false} />
+              <Line type="monotone" dataKey="养老计发支出" stroke={visualColors.expense} strokeWidth={1.8} strokeDasharray="5 3" dot={false} />
               <Line type="monotone" dataKey="医保当月划入" stroke={visualColors.medical} strokeWidth={1.8} strokeDasharray="4 4" dot={false} />
+              <Line type="monotone" dataKey="医保账户支出" stroke={visualColors.warning} strokeWidth={1.8} strokeDasharray="5 3" dot={false} />
               <Line type="monotone" dataKey="个人养老金缴费" stroke={visualColors.investment} strokeWidth={1.8} strokeDasharray="2 4" dot={false} />
             </LineChart>
           </ResponsiveContainer>
@@ -10483,7 +10261,9 @@ function SelectedPlanVisualization({
               </span>
             ))}
             <span><i style={{ background: visualColors.pension }} />养老当月缴入</span>
+            <span><i style={{ background: visualColors.expense }} />养老计发支出</span>
             <span><i style={{ background: visualColors.medical }} />医保当月划入</span>
+            <span><i style={{ background: visualColors.warning }} />医保账户支出</span>
             <span><i style={{ background: visualColors.investment }} />个人养老金缴费</span>
           </div>
           <div className="provident-balance-summary">
@@ -10501,7 +10281,12 @@ function SelectedPlanVisualization({
               <div key={`social-security-balance-${account.member_index}`}>
                 <span>{account.member_name}政策账户</span>
                 <strong>{money(account.pension_balance_end + account.medical_balance_end)}</strong>
-                <small>养老 {money(account.pension_balance_end)}，医保 {money(account.medical_balance_end)}{account.retired ? "，已按退休口径划入医保" : ""}</small>
+                <small>
+                  养老 {money(account.pension_balance_end)}，医保 {money(account.medical_balance_end)}
+                  {account.pension_account_payout > 0 ? `，养老计发 ${money(account.pension_account_payout)}` : ""}
+                  {account.medical_outflow > 0 ? `，医保支出 ${money(account.medical_outflow)}` : ""}
+                  {account.retired ? "，已按退休口径划入医保" : ""}
+                </small>
               </div>
             ))}
           </div>
@@ -10540,9 +10325,43 @@ function SelectedPlanVisualization({
                 <p className="field-hint">当前月份没有养老或医保个人账户流入。</p>
               )}
             </div>
+            <div className="cash-flow-pie">
+              <div className="pie-heading">
+                <strong>当月政策账户支出</strong>
+                <span>
+                  <small>{selectedMonth.name}</small>
+                  <b>{money(socialSecurityOutflowPieTotal)}</b>
+                </span>
+              </div>
+              {socialSecurityOutflowPieData.length > 0 ? (
+                <div className="pie-layout">
+                  <ResponsiveContainer width="100%" height={190}>
+                    <PieChart>
+                      <Tooltip formatter={pieTooltipFormatter} />
+                      <Pie data={socialSecurityOutflowPieData} dataKey="value" nameKey="name" innerRadius={42} outerRadius={68} paddingAngle={2}>
+                        {socialSecurityOutflowPieData.map((item) => (
+                          <Cell key={`social-security-outflow-${item.name}`} fill={stablePieColor(item.name)} />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="pie-legend">
+                    {socialSecurityOutflowPieData.map((item) => (
+                      <span key={`social-security-outflow-legend-${item.name}`}>
+                        <i style={{ background: stablePieColor(item.name) }} />
+                        <em>{item.name}</em>
+                        <strong>{money(item.value)}</strong>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="field-hint">当前月份没有养老或医保个人账户支出。</p>
+              )}
+            </div>
           </div>
           <p className="field-hint">
-            养老保险个人账户和医保个人账户由后端逐月计算，展示位置固定在“公积金账户变化”之后。基本养老个人账户不能提前自由支取，通常只在退休计发、死亡继承、出国定居等法定情形下处理；北京医保个人账户资金也按定向医疗保障用途使用，不能当作银行卡现金随意提取。因此这里按政策账户展示，不计入现金账户或可自由动用的流动资产。
+            养老保险个人账户和医保个人账户由后端逐月计算。退休后养老个人账户会按计发月数形成账户支出，养老金现金领取仍在收入侧展示；北京医保个人账户退休后会按政策定额划入，同时扣缴大额互助并优先支付明确标记为医保账户可支付的医疗支出。两类账户都不作为自由现金或流动资产。
           </p>
           <div className="annual-inline-chart">
             <div className="strategy-panel-head">
@@ -10557,6 +10376,13 @@ function SelectedPlanVisualization({
                   annualSocialSecurityFlowData,
                   "当前年份没有养老或医保个人账户流入。",
                   4
+                )}
+                {renderAnnualPieBlock(
+                  "年度政策账户支出",
+                  `${selectedTaxYear} 年度`,
+                  annualSocialSecurityOutflowData,
+                  "当前年份没有养老或医保个人账户支出。",
+                  6
                 )}
                 {renderAnnualPieBlock(
                   "年度政策账户余额",
@@ -10991,97 +10817,25 @@ function downloadFile(filename: string, content: string, type: string) {
   URL.revokeObjectURL(url);
 }
 
-function exportText(result: AffordabilityResult, scenario: ScenarioData, plan: PurchasePlanAnalysis) {
-  const planStatus = getPlanStatus(plan);
-  const monthlyRows = selectedPlanCashflowRows(result, plan);
-  const loanRows = selectedPlanLoanRows(result, plan);
-  const providentRows = selectedPlanProvidentRows(result, plan);
-  const socialSecurityRows = selectedPlanSocialSecurityRows(result, plan);
-  const eventRows = selectedPlanEventRows(result, plan);
-  const strategyRows = selectedPlanStrategyRows(result, plan);
-  const purchaseMonth = plan.months_to_buy ?? null;
-  const purchaseCashflow = purchaseMonth === null ? null : monthlyRows.find((item) => item.month === purchaseMonth) ?? null;
-  const finalCashflow = monthlyRows[monthlyRows.length - 1] ?? null;
-  const renovationText =
-    scenario.renovation_cost <= 0
-      ? "装修预算：未设置"
-      : plan.renovation_included_in_upfront_cash
-        ? `装修预算：${money(scenario.renovation_cost)}，资金方式：${renovationFundingLabels[plan.renovation_funding_mode]}，已计入交易现金需求`
-        : plan.months_to_renovation === null
-          ? `装修预算：${money(scenario.renovation_cost)}，资金方式：${renovationFundingLabels[plan.renovation_funding_mode]}，买后月结余暂不足以估算装修启动时间`
-          : `装修预算：${money(scenario.renovation_cost)}，资金方式：${renovationFundingLabels[plan.renovation_funding_mode]}，预计买后 ${plan.months_to_renovation} 个月可启动装修`;
-  const lines = [
+function exportText(result: AffordabilityResult, _scenario: ScenarioData, plan: PurchasePlanAnalysis) {
+  const document = (result.export_texts ?? []).find((item) => item.plan_variant === plan.variant);
+  const lines = document?.lines ?? [
     `当前导出方案：${plan.variant}`,
-    `方案结论：${planStatus.status}`,
-    planStatus.reason,
-    plan.description,
-    "",
-    `税后月收入：${money(result.household_net_monthly_income)}`,
-    `年度个税：${money(result.annual_income_tax)}`,
-    `已有贷款月供：${money(result.phased_loan_monthly_payment)}`,
-    "",
-    "当前方案购房路径：",
-    `预计买入时间：${plan.months_to_buy === null ? "30 年内暂不可达" : formatMonthDate(new Date(), plan.months_to_buy)}（约 ${plan.years_to_buy ?? "超过30"} 年）`,
-    `首付：${money(plan.planned_down_payment)}，本人公积金首付抵扣：${money(plan.provident_upfront_extractable)}${familySupportPhrase(plan)}，交易现金需覆盖：${money(plan.required_cash_after_pf_extract)}`,
-    `购房后预计公积金提取到账：${money(plan.provident_post_transaction_extractable)}，剩余公积金余额：${money(plan.provident_balance_after_extract)}`,
-    renovationText,
-    `公积金贷：${money(plan.provident_loan_amount)}，${plan.provident_loan_years} 年，${repaymentMethodLabels[plan.provident_repayment_method]}，政策上限 ${money(plan.provident_policy_cap)}，政策上浮 ${money(plan.provident_policy_bonus)}`,
-    `商贷：${money(plan.commercial_loan_amount)}，${plan.commercial_loan_years} 年，${repaymentMethodLabels[plan.commercial_repayment_method]}`,
-    plan.commercial_prepayment_enabled
-      ? `商贷提前还本：${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}，第 ${plan.commercial_prepayment_start_month} 个还款月起每月额外还本 ${money(plan.commercial_prepayment_monthly_amount)}，预计节省利息 ${money(plan.commercial_interest_saved_by_prepayment)}`
-      : `商贷提前还本：${commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]}，当前方案不安排额外还本`,
-    `合计月供：${money(plan.total_monthly_payment)}，交易当下现金：${money(plan.cash_after_transaction)}，购房后公积金到账后现金：${money(plan.cash_after_purchase)}`,
-    `买后自由现金月结余：${money(plan.post_purchase_cash_flow)}，贷后公积金策略：${providentStrategyLabel(plan)}，按策略折算后的现金压力：${money(plan.post_purchase_cash_flow_with_pf_withdrawal)}/月`,
-    `公积金还款方式建议：${plan.provident_repayment_advice || "无"}`,
-    `负债收入比：${percent(plan.debt_to_income_ratio)}，幸福指数：${plan.happiness_score.toFixed(1)} / 10`,
-    "幸福指数明细：",
-    ...plan.happiness_breakdown.map((item) => `- ${item.name}：${item.score.toFixed(1)} 分，权重 ${percent(item.weight)}，贡献 ${item.weighted_score.toFixed(2)} 分。${item.note}`),
-    `公积金年限依据：${plan.provident_loan_year_limit_reasons.join("；")}`,
-    "",
-    "关键事件时间线：",
-    ...(eventRows.length > 0
-      ? eventRows.map((item) => `- ${formatMonthDate(new Date(), item.month)}｜${item.title}｜${item.detail}${item.amount === null || item.amount === undefined ? "" : `｜金额 ${money(item.amount)}`}`)
-      : ["- 当前方案暂无后端事件。"]),
-    "",
-    "账户与贷款快照：",
-    purchaseCashflow
-      ? `买入月 ${formatMonthDate(new Date(), purchaseCashflow.month)}：现金账户 ${money(purchaseCashflow.cash_balance)}，投资账户 ${money(purchaseCashflow.investment_balance)}，公积金账户 ${money(purchaseCashflow.provident_balance)}，固定资产 ${money(purchaseCashflow.fixed_asset_value)}，贷款余额 ${money(purchaseCashflow.total_loan_balance)}，净资产 ${money(purchaseCashflow.net_worth)}。`
-      : "买入月：当前方案 30 年内暂不可达。",
-    finalCashflow
-      ? `测算末月 ${formatMonthDate(new Date(), finalCashflow.month)}：现金账户 ${money(finalCashflow.cash_balance)}，投资账户 ${money(finalCashflow.investment_balance)}，公积金账户 ${money(finalCashflow.provident_balance)}，固定资产 ${money(finalCashflow.fixed_asset_value)}，贷款余额 ${money(finalCashflow.total_loan_balance)}，净资产 ${money(finalCashflow.net_worth)}。`
-      : "测算末月：暂无后端账户曲线。",
-    loanRows.length > 0
-      ? `贷款曲线：共 ${loanRows.length} 个月，最高总贷款余额 ${money(Math.max(...loanRows.map((item) => item.total_loan_balance)))}。`
-      : "贷款曲线：当前方案暂无贷款曲线。",
-    providentRows.length > 0
-      ? `公积金账户曲线：共 ${providentRows.length} 个月，末月家庭公积金余额 ${money(providentRows[providentRows.length - 1].balance_end)}。`
-      : "公积金账户曲线：当前方案暂无公积金曲线。",
-    socialSecurityRows.length > 0
-      ? `养老与医保个人账户曲线：共 ${socialSecurityRows.length} 个月，末月养老个人账户 ${money(socialSecurityRows[socialSecurityRows.length - 1].pension_balance_end)}，医保个人账户 ${money(socialSecurityRows[socialSecurityRows.length - 1].medical_balance_end)}。`
-      : "养老与医保个人账户曲线：当前方案暂无账户曲线。",
-    "",
-    "策略解释：",
-    ...(strategyRows.length > 0
-      ? strategyRows.map((item) => `- ${item.title}：${item.body}`)
-      : ["- 当前方案暂无后端策略解释。"]),
-    "",
-    "详细表格提示：导出表格会包含每个月的现金账户、投资账户、公积金账户、养老与医保个人账户、固定资产、贷款余额、月现金流、成员公积金账户和后端流水明细。",
-    "",
-    `全局即时评估：${result.status}。${result.status_reason}`
+    "后端尚未返回结构化文字导出，请先重新计算。"
   ];
-  downloadFile(`house-plan-${plan.variant}.txt`, lines.join("\n"), "text/plain;charset=utf-8");
+  downloadFile(document?.filename ?? `house-plan-${plan.variant}.txt`, lines.join("\n"), "text/plain;charset=utf-8");
 }
 
-function csvCell(value: string | number | null | undefined) {
+function csvCell(value: unknown) {
   const text = value === null || value === undefined ? "" : String(value);
   return `"${text.replace(/"/g, '""')}"`;
 }
 
-function csvRow(values: Array<string | number | boolean | null | undefined>) {
+function csvRow(values: unknown[]) {
   return values.map((value) => csvCell(typeof value === "boolean" ? (value ? "是" : "否") : value)).join(",");
 }
 
-function csvSection(title: string, headers: string[], rows: Array<Array<string | number | boolean | null | undefined>>) {
+function csvSection(title: string, headers: string[], rows: unknown[][]) {
   return [
     csvRow([title]),
     csvRow(headers),
@@ -11090,526 +10844,23 @@ function csvSection(title: string, headers: string[], rows: Array<Array<string |
   ];
 }
 
-function selectedPlanCashflowRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.monthly_cashflow_visualization ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month);
-}
-
-function selectedPlanSnapshotRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.account_snapshots ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month);
-}
-
-function selectedPlanLoanRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.loan_visualization ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month);
-}
-
-function selectedPlanProvidentRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.provident_visualization ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month);
-}
-
-function selectedPlanSocialSecurityRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.social_security_visualization ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month);
-}
-
-function selectedPlanLedgerRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.monthly_ledger ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month || left.account.localeCompare(right.account) || left.label.localeCompare(right.label));
-}
-
-function selectedPlanEventRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.plan_events ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.month - right.month || left.title.localeCompare(right.title));
-}
-
-function selectedPlanStrategyRows(result: AffordabilityResult, plan: PurchasePlanAnalysis) {
-  return (result.strategy_explanations ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
-    .sort((left, right) => left.priority - right.priority || left.section.localeCompare(right.section));
-}
-
-function exportCsv(result: AffordabilityResult, scenario: ScenarioData, plan: PurchasePlanAnalysis) {
-  const planStatus = getPlanStatus(plan);
-  const baseDate = new Date();
-  const cashflowRows = selectedPlanCashflowRows(result, plan);
-  const snapshotRows = selectedPlanSnapshotRows(result, plan);
-  const loanRows = selectedPlanLoanRows(result, plan);
-  const providentRows = selectedPlanProvidentRows(result, plan);
-  const socialSecurityRows = selectedPlanSocialSecurityRows(result, plan);
-  const ledgerRows = selectedPlanLedgerRows(result, plan);
-  const eventRows = selectedPlanEventRows(result, plan);
-  const strategyRows = selectedPlanStrategyRows(result, plan);
-  const cashflowByMonth = new Map(cashflowRows.map((item) => [item.month, item]));
-  const sections = [
-    "sep=,",
-    ...csvSection("导出说明", ["项目", "内容"], [
-      ["导出时间", new Date().toLocaleString("zh-CN")],
-      ["导出方案", plan.variant],
-      ["方案结论", planStatus.status],
-      ["结论解释", planStatus.reason],
-      ["时间口径", "所有月份为从当前月份开始推演的真实年月；金额单位为元。"],
-      ["数据来源", "后端返回的已选方案、账户曲线、贷款曲线、公积金曲线、月度流水和事件时间线。"]
-    ]),
-    ...csvSection("方案摘要", ["项目", "内容"], [
-      ["房源/场景", scenario.name],
-      ["方案描述", plan.description],
-      ["预计买入时间", plan.months_to_buy === null ? "30年内暂不可达" : formatPurchaseTiming(baseDate, plan.months_to_buy, plan.years_to_buy)],
-      ["最低首付", plan.minimum_down_payment],
-      ["计划首付", plan.planned_down_payment],
-      ["交易现金总需求", plan.upfront_cash_required],
-      ["本人公积金首付抵扣", plan.provident_upfront_extractable],
-      ["亲属首付支持类型", familySupportLabel(plan)],
-      ["亲属首付支持金额", familySupportAmount(plan)],
-      ["交易现金需家庭覆盖", plan.required_cash_after_pf_extract],
-      ["交易当下现金", plan.cash_after_transaction],
-      ["购房后公积金到账后现金", plan.cash_after_purchase],
-      ["现金安全垫要求", plan.required_liquidity_reserve],
-      ["最低现金账户", plan.minimum_cash_balance ?? ""],
-      ["最低现金月份", plan.minimum_cash_balance_month === null || plan.minimum_cash_balance_month === undefined ? "" : formatMonthDate(baseDate, plan.minimum_cash_balance_month)],
-      ["压力现金缺口", plan.cash_stress_shortfall ?? 0],
-      ["买后自由现金月结余", plan.post_purchase_cash_flow],
-      ["贷后公积金策略", providentStrategyLabel(plan)],
-      ["公积金账户还贷改善/月", plan.monthly_post_purchase_pf_withdrawal],
-      ["策略后现金压力/月", plan.post_purchase_cash_flow_with_pf_withdrawal],
-      ["负债收入比", percent(plan.debt_to_income_ratio)],
-      ["幸福指数", plan.happiness_score.toFixed(1)]
-    ]),
-    ...csvSection("贷款与购房资金", ["项目", "内容"], [
-      ["公积金贷款金额", plan.provident_loan_amount],
-      ["公积金贷款政策上限", plan.provident_policy_cap],
-      ["公积金政策上浮", plan.provident_policy_bonus],
-      ["公积金贷款年限", plan.provident_loan_years],
-      ["公积金合同期数", plan.provident_contract_months],
-      ["公积金还款方式", repaymentMethodLabels[plan.provident_repayment_method]],
-      ["公积金月供", plan.provident_monthly_payment],
-      ["公积金等额本息月供", plan.provident_equal_installment_payment],
-      ["公积金等额本金首月", plan.provident_equal_principal_first_payment],
-      ["等额本金可节省利息", plan.provident_interest_saving_if_equal_principal],
-      ["公积金还款建议", plan.provident_repayment_advice],
-      ["公积金年限依据", plan.provident_loan_year_limit_reasons.join("；")],
-      ["商贷金额", plan.commercial_loan_amount],
-      ["商贷年限", plan.commercial_loan_years],
-      ["商贷还款方式", repaymentMethodLabels[plan.commercial_repayment_method]],
-      ["商贷月供", plan.commercial_monthly_payment],
-      ["商贷提前还本策略", commercialPrepaymentModeLabels[plan.commercial_prepayment_mode ?? "none"]],
-      ["商贷提前还本是否启用", plan.commercial_prepayment_enabled],
-      ["商贷提前还本起始月", plan.commercial_prepayment_start_month],
-      ["商贷每月额外还本", plan.commercial_prepayment_monthly_amount],
-      ["商贷提前还本节省利息", plan.commercial_interest_saved_by_prepayment],
-      ["合计月供", plan.total_monthly_payment],
-      ["全周期利息", plan.total_interest],
-      ["购房后预计公积金提取到账", plan.provident_post_transaction_extractable],
-      ["提取后公积金余额", plan.provident_balance_after_extract]
-    ]),
-    ...csvSection("装修与幸福指数", ["项目", "内容"], [
-      ["装修预算", plan.renovation_cost],
-      ["装修资金方式", renovationFundingLabels[plan.renovation_funding_mode]],
-      ["装修是否计入交易现金", plan.renovation_included_in_upfront_cash],
-      ["预计装修等待月数", plan.months_to_renovation ?? "暂无法估算"],
-      ["预计装修等待年数", plan.years_to_renovation ?? "暂无法估算"],
-      ["买后每月装修储蓄", plan.post_purchase_renovation_monthly_saving]
-    ]),
-    ...csvSection("幸福指数明细", ["分类", "维度", "得分", "权重", "贡献", "解释"], plan.happiness_breakdown.map((item) => [
-      item.category,
-      item.name,
-      item.score,
-      item.weight,
-      item.weighted_score,
-      item.note
-    ])),
-    ...csvSection("关键事件时间线", ["月份序号", "真实年月", "类别", "标题", "详情", "金额", "等级", "来源"], eventRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.category,
-      item.title,
-      item.detail,
-      item.amount ?? "",
-      item.severity,
-      item.source
-    ])),
-    ...csvSection("账户月度快照", [
-      "月份序号",
-      "真实年月",
-      "阶段",
-      "现金账户",
-      "投资账户",
-      "流动资产",
-      "公积金账户",
-      "养老保险个人账户",
-      "医保个人账户",
-      "养老医保账户合计",
-      "房产估值",
-      "车辆估值",
-      "主用车估值",
-      "新增车辆估值",
-      "固定资产",
-      "总资产",
-      "贷款余额",
-      "净资产"
-    ], snapshotRows.map((item) => {
-      const cashflow = cashflowByMonth.get(item.month);
-      return [
-        item.month,
-        formatMonthDate(baseDate, item.month),
-        cashflow?.phase ?? "",
-        item.cash_balance,
-        item.investment_balance,
-        item.liquid_asset_value,
-        item.provident_balance,
-        item.pension_account_balance,
-        item.medical_account_balance,
-        item.social_security_account_balance,
-        item.property_asset_value,
-        item.vehicle_asset_value,
-        item.first_vehicle_asset_value,
-        item.second_vehicle_asset_value,
-        item.fixed_asset_value,
-        item.total_asset_value,
-        item.total_loan_balance,
-        item.net_worth
-      ];
-    })),
-    ...csvSection("月现金流明细", [
-      "月份序号",
-      "真实年月",
-      "阶段",
-      "现金净流入",
-      "现金收入",
-      "养老金领取",
-      "基础生活支出",
-      "计划支出",
-      "养娃计划支出",
-      "灵活就业自缴社保公积金",
-      "普通固定还款",
-      "已有贷款还款",
-      "房贷现金还款",
-      "房贷合同还款",
-      "公积金账户代扣房贷",
-      "车贷还款",
-      "主用车贷款",
-      "新增车辆贷款",
-      "车辆运营成本",
-      "主用车能耗",
-      "主用车保险",
-      "主用车保养",
-      "主用车停车",
-      "新增车辆能耗",
-      "新增车辆保险",
-      "新增车辆保养",
-      "新增车辆停车",
-      "车辆牌照租赁",
-      "无车通勤成本",
-      "主用车首付",
-      "新增车辆首付",
-      "车辆首付合计",
-      "定投买入",
-      "基础定投",
-      "安全垫达标后追加定投",
-      "投资收益",
-      "投资收益税",
-      "投资买入手续费",
-      "投资卖出手续费",
-      "投资卖出到账",
-      "公积金缴存",
-      "公积金现金提取",
-      "交易现金支出",
-      "交易现金流入",
-      "月末现金账户",
-      "月末投资账户",
-      "月末流动资产",
-      "月末公积金账户",
-      "月末养老保险个人账户",
-      "月末医保个人账户",
-      "月末养老医保账户合计",
-      "月末固定资产",
-      "月末总资产",
-      "月末贷款余额",
-      "月末净资产"
-    ], cashflowRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.phase,
-      item.monthly_cash_delta,
-      item.cash_income,
-      item.pension_income,
-      item.living_expense,
-      item.scheduled_expense,
-      item.child_expense,
-      item.career_shock_self_payment,
-      item.regular_debt_payment,
-      item.phased_loan_payment,
-      item.house_payment,
-      item.house_contract_payment,
-      item.provident_house_offset_payment,
-      item.vehicle_payment,
-      item.first_vehicle_payment,
-      item.second_vehicle_payment,
-      item.vehicle_operating_cost,
-      item.first_vehicle_energy_cost,
-      item.first_vehicle_insurance_cost,
-      item.first_vehicle_maintenance_cost,
-      item.first_vehicle_parking_cost,
-      item.second_vehicle_energy_cost,
-      item.second_vehicle_insurance_cost,
-      item.second_vehicle_maintenance_cost,
-      item.second_vehicle_parking_cost,
-      item.vehicle_plate_rental_payment,
-      item.no_car_commute_cost,
-      item.first_vehicle_down_payment,
-      item.second_vehicle_down_payment,
-      item.vehicle_down_payment,
-      item.investment_contribution,
-      item.investment_contribution_base,
-      item.investment_contribution_cash_sweep,
-      item.investment_return,
-      item.investment_tax,
-      item.investment_buy_fee,
-      item.investment_sell_fee,
-      item.investment_sell_proceeds,
-      item.provident_deposit,
-      item.provident_withdrawal,
-      item.transaction_cash_out,
-      item.transaction_cash_in,
-      item.cash_balance,
-      item.investment_balance,
-      item.liquid_asset_value,
-      item.provident_balance,
-      item.pension_account_balance,
-      item.medical_account_balance,
-      item.social_security_account_balance,
-      item.fixed_asset_value,
-      item.total_asset_value,
-      item.total_loan_balance,
-      item.net_worth
-    ])),
-    ...csvSection("贷款余额与月供", [
-      "月份序号",
-      "真实年月",
-      "商贷余额",
-      "公积金贷余额",
-      "房贷余额",
-      "车贷余额",
-      "已有贷款余额",
-      "总贷款余额",
-      "商贷月供",
-      "公积金贷合同月供",
-      "房贷合同月供",
-      "车贷月供",
-      "已有贷款月供",
-      "贷款还款合计",
-      "现金还款",
-      "公积金按月抵月供",
-      "公积金半年度冲本金"
-    ], loanRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.commercial_loan_balance,
-      item.provident_loan_balance,
-      item.home_loan_balance,
-      item.vehicle_loan_balance,
-      item.existing_loan_balance,
-      item.total_loan_balance,
-      item.commercial_monthly_payment,
-      item.provident_monthly_payment,
-      item.home_monthly_payment,
-      item.vehicle_monthly_payment,
-      item.existing_monthly_payment,
-      item.total_monthly_payment,
-      item.cash_monthly_payment,
-      item.provident_monthly_withdrawal_payment,
-      item.provident_principal_offset_payment
-    ])),
-    ...csvSection("公积金家庭账户", [
-      "月份序号",
-      "真实年月",
-      "月初余额",
-      "个人缴存",
-      "单位缴存",
-      "缴存合计",
-      "利息",
-      "租房提取",
-      "交易前提取",
-      "交易后提取",
-      "约定提取",
-      "按月抵月供",
-      "半年度冲本金",
-      "退休销户提取",
-      "收入合计",
-      "支出合计",
-      "月末余额",
-      "策略"
-    ], providentRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.balance_start,
-      item.personal_deposit,
-      item.employer_deposit,
-      item.total_deposit,
-      item.interest,
-      item.rent_withdrawal,
-      item.upfront_withdrawal,
-      item.post_transaction_withdrawal,
-      item.agreed_withdrawal,
-      item.monthly_repayment_withdrawal,
-      item.loan_offset_payment,
-      item.retirement_withdrawal,
-      item.total_inflow,
-      item.total_outflow,
-      item.balance_end,
-      item.strategy_label
-    ])),
-    ...csvSection("公积金成员账户", [
-      "月份序号",
-      "真实年月",
-      "成员序号",
-      "成员",
-      "月初余额",
-      "个人缴存",
-      "单位缴存",
-      "缴存合计",
-      "利息",
-      "租房提取",
-      "交易前提取",
-      "交易后提取",
-      "约定提取",
-      "按月抵月供",
-      "半年度冲本金",
-      "退休销户提取",
-      "退休销户关闭",
-      "收入合计",
-      "支出合计",
-      "月末余额"
-    ], providentRows.flatMap((row) =>
-      [...(row.member_accounts ?? [])]
-        .sort((left, right) => left.member_index - right.member_index)
-        .map((account) => [
-          row.month,
-          formatMonthDate(baseDate, row.month),
-          account.member_index + 1,
-          account.member_name,
-          account.balance_start,
-          account.personal_deposit,
-          account.employer_deposit,
-          account.total_deposit,
-          account.interest,
-          account.rent_withdrawal,
-          account.upfront_withdrawal,
-          account.post_transaction_withdrawal,
-          account.agreed_withdrawal,
-          account.monthly_repayment_withdrawal,
-          account.loan_offset_payment,
-          account.retirement_withdrawal,
-          account.account_closed_by_retirement ? "是" : "否",
-          account.total_inflow,
-          account.total_outflow,
-          account.balance_end
-        ])
-    )),
-    ...csvSection("养老与医保个人账户", [
-      "月份序号",
-      "真实年月",
-      "养老月初余额",
-      "养老个人缴入",
-      "养老账户利息",
-      "养老月末余额",
-      "医保月初余额",
-      "医保个人划入",
-      "退休医保划入",
-      "医保账户利息",
-      "医保账户支出",
-      "医保月末余额",
-      "政策账户合计"
-    ], socialSecurityRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.pension_balance_start,
-      item.pension_contribution,
-      item.pension_interest,
-      item.pension_balance_end,
-      item.medical_balance_start,
-      item.medical_contribution,
-      item.medical_retiree_transfer,
-      item.medical_interest,
-      item.medical_outflow,
-      item.medical_balance_end,
-      item.total_balance_end
-    ])),
-    ...csvSection("养老与医保成员账户", [
-      "月份序号",
-      "真实年月",
-      "成员序号",
-      "成员",
-      "养老月初余额",
-      "养老个人缴入",
-      "养老账户利息",
-      "养老月末余额",
-      "医保月初余额",
-      "医保个人划入",
-      "退休医保划入",
-      "医保账户利息",
-      "医保账户支出",
-      "医保月末余额",
-      "是否退休口径"
-    ], socialSecurityRows.flatMap((row) =>
-      [...(row.member_accounts ?? [])]
-        .sort((left, right) => left.member_index - right.member_index)
-        .map((account) => [
-          row.month,
-          formatMonthDate(baseDate, row.month),
-          account.member_index + 1,
-          account.member_name,
-          account.pension_balance_start,
-          account.pension_contribution,
-          account.pension_interest,
-          account.pension_balance_end,
-          account.medical_balance_start,
-          account.medical_contribution,
-          account.medical_retiree_transfer,
-          account.medical_interest,
-          account.medical_outflow,
-          account.medical_balance_end,
-          account.retired ? "是" : "否"
-        ])
-    )),
-    ...csvSection("后端月度流水", ["月份序号", "真实年月", "账户", "类别", "项目", "金额", "方向", "来源"], ledgerRows.map((item) => [
-      item.month,
-      formatMonthDate(baseDate, item.month),
-      item.account,
-      item.category,
-      item.label,
-      item.amount,
-      item.direction,
-      item.source
-    ])),
-    ...csvSection("策略解释", ["分区", "标题", "解释", "优先级"], strategyRows.map((item) => [
-      item.section,
-      item.title,
-      item.body,
-      item.priority
-    ])),
-    ...csvSection("账户与概念说明", ["代码", "名称", "类别", "管理方", "说明"], (result.account_concepts ?? []).map((item) => [
-      item.code,
-      item.name,
-      item.category,
-      item.managed_by,
-      item.description
-    ])),
-    ...csvSection("全局提示与假设", ["类型", "内容"], [
-      ...result.eligibility_notes.map((note) => ["资格提示", note]),
-      ...result.assumptions.map((note) => ["测算假设", note]),
-      ...plan.provident_extraction_notes.map((note) => ["公积金提取提示", note])
-    ])
-  ];
+function exportCsv(result: AffordabilityResult, _scenario: ScenarioData, plan: PurchasePlanAnalysis) {
+  const exportSheets = (result.export_sheets ?? []).filter(
+    (sheet) => !sheet.plan_variant || sheet.plan_variant === plan.variant
+  );
+  const sections =
+    exportSheets.length > 0
+      ? [
+          "sep=,",
+          ...exportSheets.flatMap((sheet) => csvSection(sheet.title, sheet.headers, sheet.rows))
+        ]
+      : [
+          "sep=,",
+          ...csvSection("导出说明", ["项目", "内容"], [
+            ["导出方案", plan.variant],
+            ["状态", "后端尚未返回结构化导出表格，请先重新计算。"]
+          ])
+        ];
   downloadFile(`house-plan-${plan.variant}-detailed.csv`, `\uFEFF${sections.join("\n")}`, "text/csv;charset=utf-8");
 }
 

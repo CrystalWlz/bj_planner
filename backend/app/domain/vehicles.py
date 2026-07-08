@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date
 from math import ceil
 
-from ..schemas import CarPlanData, RulePackData
+from ..schemas import CarLoanSummary, CarPlanData, RulePackData, VehicleIndicatorApplicantData
+from .loans import vehicle_loan_projection
 from .time import add_months, month_distance, parse_year_month
 
 
@@ -51,6 +52,14 @@ def license_plate_rental_payment_at(plan: CarPlanData, month: int, purchase_mont
     return 0.0
 
 
+def vehicle_update_month(plan: CarPlanData, purchase_month: int | None) -> int | None:
+    if purchase_month is None:
+        return None
+    service_months = max(1, plan.vehicle_service_years) * 12
+    mileage_months = ceil(max(1.0, plan.vehicle_retirement_mileage_km) / max(plan.annual_mileage_km, 1) * 12)
+    return purchase_month + min(service_months, mileage_months)
+
+
 def _whole_years_between(start_month: tuple[int, int] | None, end_month: tuple[int, int]) -> int:
     if start_month is None:
         return 0
@@ -79,8 +88,23 @@ def _indicator_eligibility_label(value: str) -> str:
     }.get(value, "资格待确认")
 
 
+def _coerce_indicator_applicant(value: object) -> VehicleIndicatorApplicantData | None:
+    if isinstance(value, VehicleIndicatorApplicantData):
+        return value
+    if isinstance(value, dict):
+        try:
+            return VehicleIndicatorApplicantData.model_validate(value)
+        except Exception:
+            return None
+    return None
+
+
 def _family_indicator_from_applicants(plan: CarPlanData) -> tuple[float, float, int, list[str]] | None:
-    applicants = [item for item in plan.beijing_family_indicator_applicants if item.enabled]
+    applicants: list[VehicleIndicatorApplicantData] = []
+    for item in plan.beijing_family_indicator_applicants:
+        applicant = _coerce_indicator_applicant(item)
+        if applicant is not None and applicant.enabled:
+            applicants.append(applicant)
     if not applicants:
         return None
 
@@ -354,3 +378,178 @@ def estimate_car_operating_cost(plan: CarPlanData) -> dict[str, float]:
         "monthly_depreciation_cost": round(monthly_depreciation, 2),
         "monthly_total_ownership_cost": round(monthly_cash + monthly_depreciation, 2),
     }
+
+
+def calculate_car_loan_summary(
+    plan: CarPlanData,
+    *,
+    initial_cash: float = 0,
+    monthly_cash_savings_before_car: float = 0,
+    rules: RulePackData | None = None,
+) -> CarLoanSummary:
+    rules = rules or RulePackData()
+    purchase_policy = vehicle_purchase_policy_amounts(plan, rules, plan.purchase_delay_months)
+    down_payment = max(0, plan.total_price * plan.down_payment_ratio)
+    months_to_down: int | None
+    if not plan.enabled or down_payment <= 0:
+        months_to_down = 0
+    elif initial_cash >= down_payment:
+        months_to_down = 0
+    elif monthly_cash_savings_before_car <= 0:
+        months_to_down = None
+    else:
+        months_to_down = int((down_payment - initial_cash + monthly_cash_savings_before_car - 1) // monthly_cash_savings_before_car)
+    if months_to_down is not None:
+        months_to_down = max(plan.purchase_delay_months, months_to_down)
+
+    if not plan.enabled or plan.total_price <= 0:
+        operating_cost = estimate_car_operating_cost(plan)
+        return CarLoanSummary(
+            enabled=False,
+            total_price=round(plan.total_price, 2),
+            down_payment_ratio=plan.down_payment_ratio,
+            down_payment=round(down_payment, 2),
+            purchase_tax=round(purchase_policy["purchase_tax"], 2),
+            purchase_tax_relief=round(purchase_policy["purchase_tax_relief"], 2),
+            annual_vehicle_vessel_tax=round(purchase_policy["annual_vehicle_vessel_tax"], 2),
+            license_plate_rental_initial_fee=round(purchase_policy["license_plate_rental_initial_fee"], 2),
+            beijing_family_indicator_score=round(purchase_policy["beijing_family_indicator_score"], 2),
+            beijing_family_indicator_estimated_wait_months=purchase_policy["beijing_family_indicator_estimated_wait_months"],
+            purchase_delay_months=plan.purchase_delay_months,
+            loan_principal=0,
+            months_to_down_payment=months_to_down,
+            years_to_down_payment=round(months_to_down / 12, 1) if months_to_down is not None else None,
+            first_phase_monthly_payment=0,
+            later_phase_monthly_payment=0,
+            contract_monthly_payment=0,
+            first_phase_interest_subsidy=0,
+            total_interest_subsidy=0,
+            borrower_total_interest=0,
+            current_monthly_payment=0,
+            prepayment_allowed=plan.selected_financing_prepayment_allowed,
+            prepayment_enabled=False,
+            prepayment_start_month=max(1, plan.loan_prepayment_start_month, plan.loan_prepayment_allowed_after_month),
+            prepayment_allowed_after_month=max(1, plan.loan_prepayment_allowed_after_month),
+            prepayment_monthly_amount=0,
+            prepayment_strategy_type="none",
+            prepayment_lump_sum_month=0,
+            prepayment_lump_sum_amount=0,
+            prepayment_total_extra_principal=0,
+            prepayment_net_benefit=0,
+            prepayment_explanation="当前不形成车贷，不安排提前还本。",
+            actual_payoff_months=0,
+            interest_saved_by_prepayment=0,
+            total_interest=0,
+            total_months=plan.total_months,
+            interest_free_months=plan.interest_free_months,
+            later_annual_rate=plan.later_annual_rate,
+            policy_notes=purchase_policy["policy_notes"],
+            **operating_cost,
+        )
+
+    total_months = max(1, plan.total_months)
+    interest_free_months = max(0, min(plan.interest_free_months, total_months))
+    principal = max(0, plan.total_price - down_payment)
+
+    prepayment_monthly_amount = (
+        max(0.0, plan.loan_prepayment_monthly_amount)
+        if plan.loan_prepayment_enabled and plan.selected_financing_prepayment_allowed
+        else 0.0
+    )
+    prepayment_allowed_after_month = (
+        max(1, min(total_months, plan.loan_prepayment_allowed_after_month))
+        if plan.selected_financing_prepayment_allowed
+        else 1
+    )
+    prepayment_start_month = max(
+        prepayment_allowed_after_month,
+        max(1, min(total_months, plan.loan_prepayment_start_month)),
+    )
+    prepayment_lump_sum_amount = (
+        max(0.0, plan.loan_prepayment_lump_sum_amount)
+        if plan.loan_prepayment_enabled and plan.selected_financing_prepayment_allowed
+        else 0.0
+    )
+    prepayment_lump_sum_month = (
+        max(prepayment_allowed_after_month, min(total_months, plan.loan_prepayment_lump_sum_month))
+        if plan.loan_prepayment_enabled and prepayment_lump_sum_amount > 0 and plan.loan_prepayment_lump_sum_month > 0
+        else 0
+    )
+    loan_projection = vehicle_loan_projection(
+        principal,
+        total_months,
+        interest_free_months,
+        plan.later_annual_rate,
+        prepayment_monthly_amount=prepayment_monthly_amount,
+        prepayment_start_month=prepayment_start_month,
+        prepayment_lump_sum_amount=prepayment_lump_sum_amount,
+        prepayment_lump_sum_month=prepayment_lump_sum_month,
+    )
+    first_point = loan_projection.points[0] if loan_projection.points else None
+    first_after_subsidy_point = (
+        loan_projection.points[interest_free_months]
+        if interest_free_months < len(loan_projection.points)
+        else first_point
+    )
+    first_phase_monthly = first_point.contract_payment if first_point else 0.0
+    later_monthly = first_after_subsidy_point.contract_payment if first_after_subsidy_point else 0.0
+    contract_monthly_payment = first_point.gross_contract_payment if first_point else 0.0
+    first_phase_interest_subsidy = first_point.interest_subsidy if first_point else 0.0
+
+    current_month = max(1, min(plan.current_month_index, total_months))
+    if plan.purchase_delay_months > 0:
+        current_monthly = 0.0
+    else:
+        current_point = loan_projection.points[current_month - 1] if current_month <= len(loan_projection.points) else None
+        current_monthly = current_point.contract_payment if current_point else 0.0
+
+    operating_cost = estimate_car_operating_cost(plan)
+    return CarLoanSummary(
+        enabled=True,
+        total_price=round(plan.total_price, 2),
+        down_payment_ratio=plan.down_payment_ratio,
+        down_payment=round(down_payment, 2),
+        purchase_tax=round(purchase_policy["purchase_tax"], 2),
+        purchase_tax_relief=round(purchase_policy["purchase_tax_relief"], 2),
+        annual_vehicle_vessel_tax=round(purchase_policy["annual_vehicle_vessel_tax"], 2),
+        license_plate_rental_initial_fee=round(purchase_policy["license_plate_rental_initial_fee"], 2),
+        beijing_family_indicator_score=round(purchase_policy["beijing_family_indicator_score"], 2),
+        beijing_family_indicator_estimated_wait_months=purchase_policy["beijing_family_indicator_estimated_wait_months"],
+        purchase_delay_months=plan.purchase_delay_months,
+        loan_principal=round(principal, 2),
+        months_to_down_payment=months_to_down,
+        years_to_down_payment=round(months_to_down / 12, 1) if months_to_down is not None else None,
+        first_phase_monthly_payment=round(first_phase_monthly, 2),
+        later_phase_monthly_payment=round(later_monthly, 2),
+        contract_monthly_payment=round(contract_monthly_payment, 2),
+        first_phase_interest_subsidy=round(first_phase_interest_subsidy, 2),
+        total_interest_subsidy=round(loan_projection.total_interest_subsidy, 2),
+        borrower_total_interest=round(loan_projection.total_interest, 2),
+        current_monthly_payment=round(current_monthly, 2),
+        prepayment_allowed=plan.selected_financing_prepayment_allowed,
+        prepayment_enabled=prepayment_monthly_amount > 0 or prepayment_lump_sum_amount > 0,
+        prepayment_start_month=prepayment_start_month,
+        prepayment_allowed_after_month=prepayment_allowed_after_month,
+        prepayment_monthly_amount=round(prepayment_monthly_amount, 2),
+        prepayment_strategy_type=plan.loan_prepayment_strategy_type if prepayment_monthly_amount > 0 or prepayment_lump_sum_amount > 0 else "none",
+        prepayment_lump_sum_month=prepayment_lump_sum_month,
+        prepayment_lump_sum_amount=round(prepayment_lump_sum_amount, 2),
+        prepayment_total_extra_principal=round(
+            sum(point.extra_principal_payment for point in loan_projection.points),
+            2,
+        ),
+        prepayment_net_benefit=round(loan_projection.interest_saved_by_prepayment, 2),
+        prepayment_explanation=(
+            "按车辆需求中设置的提前还本参数推演。"
+            if plan.selected_financing_prepayment_allowed
+            else (plan.selected_financing_prepayment_policy_note or "当前金融方案不允许提前还本。")
+        ),
+        actual_payoff_months=loan_projection.actual_payoff_months,
+        interest_saved_by_prepayment=round(loan_projection.interest_saved_by_prepayment, 2),
+        total_interest=round(loan_projection.total_interest, 2),
+        total_months=total_months,
+        interest_free_months=interest_free_months,
+        later_annual_rate=plan.later_annual_rate,
+        policy_notes=purchase_policy["policy_notes"],
+        **operating_cost,
+    )

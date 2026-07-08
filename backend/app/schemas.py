@@ -472,6 +472,7 @@ class ScheduledExpenseData(BaseModel):
     annual_occurrence_month: int = Field(1, ge=1, le=12)
     start_month: str = "2026-07"
     end_month: str | None = None
+    medical_account_payable: bool = False
     tax_deductible_elderly_care: bool = False
     notes: str = ""
 
@@ -1283,12 +1284,15 @@ class SocialSecurityMemberAccountPoint(BaseModel):
     member_name: str
     pension_balance_start: float
     pension_contribution: float
+    pension_account_payout: float = 0.0
     pension_interest: float
     pension_balance_end: float
     medical_balance_start: float
     medical_contribution: float
     medical_retiree_transfer: float = 0.0
     medical_interest: float
+    medical_healthcare_outflow: float = 0.0
+    medical_mutual_aid_outflow: float = 0.0
     medical_outflow: float = 0.0
     medical_balance_end: float
     retired: bool = False
@@ -1299,12 +1303,15 @@ class SocialSecurityVisualizationPoint(BaseModel):
     month: int
     pension_balance_start: float
     pension_contribution: float
+    pension_account_payout: float = 0.0
     pension_interest: float
     pension_balance_end: float
     medical_balance_start: float
     medical_contribution: float
     medical_retiree_transfer: float = 0.0
     medical_interest: float
+    medical_healthcare_outflow: float = 0.0
+    medical_mutual_aid_outflow: float = 0.0
     medical_outflow: float = 0.0
     medical_balance_end: float
     total_balance_end: float
@@ -1353,6 +1360,7 @@ class AccountSnapshotPoint(BaseModel):
     pension_account_balance: float = 0.0
     medical_account_balance: float = 0.0
     social_security_account_balance: float = 0.0
+    personal_pension_balance: float = 0.0
     property_asset_value: float = 0.0
     vehicle_asset_value: float = 0.0
     first_vehicle_asset_value: float = 0.0
@@ -1431,6 +1439,61 @@ class MonthlyCashflowPoint(BaseModel):
     second_vehicle_asset_value: float = 0.0
     phase: str
     ledger_entries: list[MonthlyLedgerEntry] = Field(default_factory=list)
+
+
+class VisualizationBreakdownItem(BaseModel):
+    name: str
+    value: float = 0.0
+    amount: float | None = None
+    kind: Literal["income", "expense", "asset", "deduction", "result"] | None = None
+
+
+class MonthlyVisualizationDetail(BaseModel):
+    plan_variant: str
+    month: int
+    income_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    income_legend: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    expense_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    loan_payment_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    provident_inflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    provident_outflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    social_security_inflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    social_security_outflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    cash_flow_items: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    cash_flow_drivers: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    advisor_text: str = ""
+    explanation_items: list[dict[str, str]] = Field(default_factory=list)
+
+
+class VisualizationPieBlock(BaseModel):
+    title: str
+    period: str = ""
+    data: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    empty_text: str = ""
+
+
+class AnnualVisualizationDetail(BaseModel):
+    plan_variant: str
+    year: int
+    cash_inflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    cash_outflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    liquid_asset_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    fixed_asset_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    loan_payment_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    loan_balance_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    provident_flow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    social_security_inflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    social_security_outflow_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    social_security_balance_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+
+
+class TaxVisualizationDetail(BaseModel):
+    year: int
+    month: int | None = None
+    monthly_tax_member_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    monthly_deduction_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    annual_tax_member_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
+    annual_tax_type_pie: list[VisualizationBreakdownItem] = Field(default_factory=list)
 
 
 class AccountConceptSummary(BaseModel):
@@ -1684,11 +1747,14 @@ class AnnualFinancialSummary(BaseModel):
     provident_deposit: float = 0.0
     provident_withdrawal: float = 0.0
     pension_account_contribution: float = 0.0
+    pension_account_payout: float = 0.0
     pension_account_interest: float = 0.0
     pension_account_balance_end: float = 0.0
     medical_account_contribution: float = 0.0
     medical_account_retiree_transfer: float = 0.0
     medical_account_interest: float = 0.0
+    medical_account_healthcare_outflow: float = 0.0
+    medical_account_mutual_aid_outflow: float = 0.0
     medical_account_outflow: float = 0.0
     medical_account_balance_end: float = 0.0
     social_security_account_balance_end: float = 0.0
@@ -1723,6 +1789,19 @@ class AnnualFinancialSummary(BaseModel):
     existing_loan_balance_end: float = 0.0
 
 
+class ExportSheet(BaseModel):
+    plan_variant: str = ""
+    title: str
+    headers: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+
+
+class ExportTextDocument(BaseModel):
+    plan_variant: str
+    filename: str
+    lines: list[str] = Field(default_factory=list)
+
+
 class StressResult(BaseModel):
     name: str
     status: str
@@ -1740,6 +1819,7 @@ class AffordabilityRequest(BaseModel):
 
 
 class AffordabilityResult(BaseModel):
+    cache_layers: dict[str, str] = Field(default_factory=dict)
     status: str
     status_reason: str
     eligible: bool
@@ -1778,6 +1858,9 @@ class AffordabilityResult(BaseModel):
     purchase_plan_analyses: list[PurchasePlanAnalysis]
     yield_sensitivity: list[YieldSensitivityPoint]
     monthly_cashflow_visualization: list[MonthlyCashflowPoint] = []
+    monthly_visualization_details: list[MonthlyVisualizationDetail] = []
+    annual_visualization_details: list[AnnualVisualizationDetail] = []
+    tax_visualization_details: list[TaxVisualizationDetail] = []
     account_snapshots: list[AccountSnapshotPoint] = []
     monthly_ledger: list[MonthlyLedgerEntry] = []
     loan_visualization: list[LoanVisualizationPoint] = []
@@ -1786,5 +1869,7 @@ class AffordabilityResult(BaseModel):
     account_concepts: list[AccountConceptSummary] = []
     strategy_explanations: list[StrategyExplanationPoint] = []
     plan_events: list[PlanEventPoint] = []
+    export_sheets: list[ExportSheet] = []
+    export_texts: list[ExportTextDocument] = []
     stress_tests: list[StressResult]
     assumptions: list[str]
