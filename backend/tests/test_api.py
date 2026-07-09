@@ -4277,6 +4277,24 @@ def test_planning_goal_target_control_keys_match_frontend_helper() -> None:
     assert frontend_control_keys("CHILD_TARGET_CONTROL_KEYS") | {"schema_version"} == CHILD_PLANNING_TARGET_CONTROL_KEYS
 
 
+def test_frontend_new_home_goal_does_not_seed_policy_source_fields() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    function_match = re.search(
+        r"function createTargetScenarioData\(sequence: number\): ScenarioData \{(?P<body>.*?)\n\}",
+        app_source,
+        re.DOTALL,
+    )
+    assert function_match is not None
+    function_body = function_match.group("body")
+
+    assert "provident_rate:" not in function_body
+    assert "deed_tax_rate:" not in function_body
+    assert "政策公积金利率" in app_source
+    assert "政策契税比例" in app_source
+
+
 def test_child_planning_goal_normalization_strips_sequence_control_fields() -> None:
     from app.storage.normalization import normalize_planning_goal
 

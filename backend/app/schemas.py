@@ -835,7 +835,6 @@ class ScenarioData(BaseModel):
     planning_window_end_month: str = ""
     micro_commercial_loan_ratio: float = Field(0, ge=0, le=1)
     commercial_rate: float = Field(0.035, ge=0, le=0.2)
-    provident_rate: float = Field(0.026, ge=0, le=0.2)
     loan_years: int = Field(25, ge=1, le=30)
     repayment_method: RepaymentMethod = "equal_installment"
     commercial_repayment_method: RepaymentMethod = "equal_installment"
@@ -849,7 +848,6 @@ class ScenarioData(BaseModel):
     provident_account_repayment_switch_enabled: bool = False
     provident_account_repayment_switch_after_month: int = Field(12, ge=1, le=360)
     provident_account_repayment_switch_to_strategy: ProvidentAccountRepaymentSwitchTarget = "semiannual_principal_offset"
-    deed_tax_rate: float = Field(0.015, ge=0, le=0.2)
     broker_fee_rate: float = Field(0.022, ge=0, le=0.2)
     seller_tax_pass_through_enabled: bool = False
     seller_tax_pass_through_rate: float = Field(0, ge=0, le=0.2)

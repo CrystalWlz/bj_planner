@@ -3878,6 +3878,20 @@ def test_provident_rate_comes_from_policy_pack_not_scenario() -> None:
     )
 
 
+def test_scenario_policy_source_fields_are_legacy_payload_only() -> None:
+    scenario = ScenarioData(
+        provident_rate=0.19,
+        deed_tax_rate=0.19,
+    )
+
+    dumped = scenario.model_dump()
+
+    assert "provident_rate" not in ScenarioData.model_fields
+    assert "deed_tax_rate" not in ScenarioData.model_fields
+    assert "provident_rate" not in dumped
+    assert "deed_tax_rate" not in dumped
+
+
 def test_deed_tax_rate_comes_from_policy_pack_by_home_count_and_area() -> None:
     rules = RulePackData(
         params={

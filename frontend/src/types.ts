@@ -770,7 +770,7 @@ export interface ScenarioData {
   planning_window_end_month: string;
   micro_commercial_loan_ratio: number;
   commercial_rate: number;
-  provident_rate: number;
+  provident_rate?: number;
   loan_years: number;
   repayment_method: RepaymentMethod;
   commercial_repayment_method: RepaymentMethod;
@@ -784,7 +784,7 @@ export interface ScenarioData {
   provident_account_repayment_switch_enabled: boolean;
   provident_account_repayment_switch_after_month: number;
   provident_account_repayment_switch_to_strategy: ProvidentAccountRepaymentSwitchTarget;
-  deed_tax_rate: number;
+  deed_tax_rate?: number;
   broker_fee_rate: number;
   seller_tax_pass_through_enabled: boolean;
   seller_tax_pass_through_rate: number;
