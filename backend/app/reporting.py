@@ -563,8 +563,28 @@ def build_core_object_group_summaries(
 
 def build_strategy_explanations(
     purchase_plans: list[PurchasePlanAnalysis],
+    account_concepts: list[AccountConceptSummary] | None = None,
+    core_object_groups: list[CoreObjectGroupSummary] | None = None,
 ) -> list[StrategyExplanationPoint]:
     rows: list[StrategyExplanationPoint] = []
+    concept_by_code = {item.code: item for item in (account_concepts or [])}
+    group_by_code = {item.code: item for item in (core_object_groups or [])}
+
+    def concept_summary(code: str, fallback: str) -> str:
+        concept = concept_by_code.get(code)
+        if concept is None:
+            return fallback
+        return f"{concept.name} {money_text(concept.current_balance)}（{concept.core_object_count} 个核心对象）"
+
+    def group_summary(code: str, fallback: str) -> str:
+        group = group_by_code.get(code)
+        if group is None:
+            return fallback
+        return f"{group.name} {money_text(group.current_balance)}（{group.core_object_count} 个核心对象）"
+
+    liquid_assets_text = group_summary("liquid_assets", "流动资产按现金账户和投资账户合计")
+    loan_accounts_text = group_summary("loan_accounts", "贷款账户按房贷、车贷和已有贷款合计")
+    provident_account_text = concept_summary("provident_account", "公积金账户单独作为受限账户展示")
     for plan in purchase_plans:
         if plan.months_to_buy is None:
             status_body = (
@@ -593,6 +613,7 @@ def build_strategy_explanations(
                 body=(
                     f"首付 {money_text(plan.planned_down_payment)}，本人公积金可用于交易前抵扣 {money_text(plan.provident_upfront_extractable)}，"
                     f"亲属首付支持 {money_text(plan.family_down_payment_support_amount)}；后端按房源性质、政策上限和现金安全要求共同决定现金缺口。"
+                    f"核心对象口径：{liquid_assets_text}；{provident_account_text}。"
                 ),
                 priority=20,
             )
@@ -607,6 +628,7 @@ def build_strategy_explanations(
                     f"{repayment_method_label(plan.provident_repayment_method)}；商贷 {money_text(plan.commercial_loan_amount)}，"
                     f"{plan.commercial_loan_years} 年，{repayment_method_label(plan.commercial_repayment_method)}。"
                     f"公积金政策上限 {money_text(plan.provident_policy_cap)}，上浮 {money_text(plan.provident_policy_bonus)}。"
+                    f"核心对象口径：{loan_accounts_text}。"
                 ),
                 priority=30,
             )
@@ -718,6 +740,43 @@ def build_export_sheets(
                             row.description,
                         ]
                         for row in result.account_concepts
+                    ],
+                ),
+                _sheet(
+                    plan_variant=plan_variant,
+                    title="统一规划顺序",
+                    headers=[
+                        "目标ID",
+                        "目标名称",
+                        "目标类型",
+                        "启用",
+                        "解析顺序",
+                        "时间模式",
+                        "依赖目标",
+                        "最早月份偏移",
+                        "窗口开始偏移",
+                        "窗口结束偏移",
+                        "说明",
+                    ],
+                    rows=[
+                        [
+                            goal.id,
+                            goal.name,
+                            goal.goal_type,
+                            goal.enabled,
+                            goal.sequence_index,
+                            goal.normalized_timing_mode,
+                            goal.depends_on_goal_name,
+                            goal.resolved_not_before_month,
+                            goal.resolved_window_start_month,
+                            "" if goal.resolved_window_end_month is None else goal.resolved_window_end_month,
+                            goal.explanation,
+                        ]
+                        for goal in (
+                            result.calculation_context.planning_goals
+                            if result.calculation_context
+                            else []
+                        )
                     ],
                 ),
                 _sheet(
@@ -955,7 +1014,7 @@ def build_export_sheets(
                 _sheet(
                     plan_variant=plan_variant,
                     title="关键事件时间线",
-                    headers=["月份序号", "真实年月", "类别", "标题", "详情", "金额", "等级", "来源"],
+                    headers=["月份序号", "真实年月", "类别", "标题", "详情", "金额", "等级", "来源", "校准来源"],
                     rows=[
                         [
                             row.month,
@@ -966,6 +1025,7 @@ def build_export_sheets(
                             "" if row.amount is None else row.amount,
                             row.severity,
                             row.source,
+                            row.calibration_source,
                         ]
                         for row in event_rows
                     ],

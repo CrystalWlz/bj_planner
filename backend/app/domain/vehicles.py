@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from math import ceil
 
+from ..policy_explanations import market_assumption_note, policy_source_note, user_config_note
 from ..policies import get_policy
 from ..schemas import CarLoanSummary, CarPlanData, RulePackData
 from .loans import vehicle_loan_projection
@@ -79,31 +80,31 @@ def vehicle_indicator_policy_notes(plan: CarPlanData, rules: RulePackData) -> li
     tail_restriction_exempt = policy.beijing_tail_restriction_exempt(plan)
     notes: list[str] = []
     if is_new_energy_vehicle(plan, rules) and not can_use_beijing_new_energy_indicator:
-        notes.append("国家新能源购置税口径不等于北京新能源小客车指标口径；当前能源类型不按北京新能源指标车型处理。")
+        notes.append(policy_source_note("国家新能源购置税口径不等于北京新能源小客车指标口径；当前能源类型不按北京新能源指标车型处理。"))
     if not tail_restriction_exempt:
-        notes.append("当前能源类型不按北京纯电小客车尾号限行豁免口径处理，日常使用便利性和幸福指数应按普通小客车复核。")
+        notes.append(policy_source_note("当前能源类型不按北京纯电小客车尾号限行豁免口径处理，日常使用便利性和幸福指数应按普通小客车复核。"))
     if status == "already_have":
-        notes.append("已按拥有北京小客车指标处理，购车时间不再额外等待指标。")
+        notes.append(user_config_note("已按拥有北京小客车指标处理，购车时间不再额外等待指标。"))
         return notes
     if status == "family_new_energy_pending":
         if can_use_beijing_new_energy_indicator:
-            notes.append("按北京家庭新能源指标等待处理；家庭积分优先于个人轮候，策略会叠加用户设定的预计等待月份。")
+            notes.append(policy_source_note("按北京家庭新能源指标等待处理；家庭积分优先于个人轮候，策略会叠加用户设定的预计等待月份。"))
         else:
-            notes.append("当前能源类型不能按北京家庭新能源指标上牌；请改选纯电车源、改为普通指标等待，或标记为已取得指标。")
+            notes.append(policy_source_note("当前能源类型不能按北京家庭新能源指标上牌；请改选纯电车源、改为普通指标等待，或标记为已取得指标。"))
         return notes
     if status == "personal_new_energy_pending":
         if can_use_beijing_new_energy_indicator:
-            notes.append("按北京个人新能源指标轮候处理；个人轮候存在较长不确定性，策略会叠加用户设定的预计等待月份。")
+            notes.append(policy_source_note("按北京个人新能源指标轮候处理；个人轮候存在较长不确定性，策略会叠加用户设定的预计等待月份。"))
         else:
-            notes.append("当前能源类型不能按北京个人新能源指标上牌；请改选纯电车源、改为普通指标等待，或标记为已取得指标。")
+            notes.append(policy_source_note("当前能源类型不能按北京个人新能源指标上牌；请改选纯电车源、改为普通指标等待，或标记为已取得指标。"))
         return notes
     if status == "ordinary_indicator_pending":
-        notes.append("按北京普通小客车指标等待处理；策略会叠加用户设定的预计等待月份，实际取得时间仍有较大不确定性。")
+        notes.append(policy_source_note("按北京普通小客车指标等待处理；策略会叠加用户设定的预计等待月份，实际取得时间仍有较大不确定性。"))
         return notes
     if status == "not_eligible":
-        notes.append("当前标记为不具备北京小客车指标资格，购车策略应视为存在上牌前置风险。")
+        notes.append(user_config_note("当前标记为不具备北京小客车指标资格，购车策略应视为存在上牌前置风险。"))
         return notes
-    notes.append("北京小客车上牌需要指标；当前未明确指标状态，建议在车辆需求里设置新能源指标、普通指标或已获指标。")
+    notes.append(policy_source_note("北京小客车上牌需要指标；当前未明确指标状态，建议在车辆需求里设置新能源指标、普通指标或已获指标。"))
     return notes
 
 
@@ -136,33 +137,35 @@ def vehicle_purchase_policy_amounts(plan: CarPlanData, rules: RulePackData, purc
     family_score, family_wait_months, family_notes = beijing_family_indicator_projection(plan, rules)
     plate_rental_initial_fee = license_plate_rental_initial_fee(plan)
     notes = [
-        f"车辆购置税按不含增值税车价的 {get_policy(rules).vehicle_purchase_tax_rate():.0%} 估算。"
+        policy_source_note(f"车辆购置税按不含增值税车价的 {get_policy(rules).vehicle_purchase_tax_rate():.0%} 估算。")
     ]
     if relief > 0:
-        notes.append(f"当前能源类型按新能源车政策减免购置税约 {_money_text(relief)}。")
+        notes.append(policy_source_note(f"当前能源类型按新能源车政策减免购置税约 {_money_text(relief)}。"))
     if annual_vehicle_vessel_tax <= 0:
         if str(plan.energy_type) in {"plug_in_hybrid", "range_extended"}:
-            notes.append("车船税按购车月份仍处于新能源车船税优惠期估算为 0；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。")
+            notes.append(policy_source_note("车船税按购车月份仍处于新能源车船税优惠期估算为 0；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。"))
         else:
-            notes.append("车船税按当前能源类型估算为 0；纯电动乘用车通常因无排量不进入车船税征税口径。")
+            notes.append(policy_source_note("车船税按当前能源类型估算为 0；纯电动乘用车通常因无排量不进入车船税征税口径。"))
     else:
         if str(plan.energy_type) in {"plug_in_hybrid", "range_extended"}:
-            notes.append(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。")
+            notes.append(policy_source_note(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流；2027 年起插混/增程等车型需按规则包或用户覆盖值复核。"))
         else:
-            notes.append(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流。")
+            notes.append(policy_source_note(f"年度车船税按 {_money_text(annual_vehicle_vessel_tax)} 估算，并在购车周年月进入现金流。"))
     notes.extend(vehicle_indicator_policy_notes(plan, rules))
     if plate_rental_initial_fee > 0:
         notes.append(
-            f"租牌费用按上牌现金情景支出单独计入，首期 {_money_text(plate_rental_initial_fee)}、周期 {plan.license_plate_rental_term_months} 个月；该费用不计入车辆首付、贷款本金或车辆资产，合规和合同风险需单独复核。"
+            user_config_note(f"租牌费用按上牌现金情景支出单独计入，首期 {_money_text(plate_rental_initial_fee)}、周期 {plan.license_plate_rental_term_months} 个月；该费用不计入车辆首付、贷款本金或车辆资产，合规和合同风险需单独复核。")
         )
         if plan.license_plate_rental_after_term_mode == "renew_until_own_indicator":
-            notes.append(f"租牌到期后按每 {plan.license_plate_rental_renewal_term_months} 个月续租一次、每次 {_money_text(plan.license_plate_rental_renewal_fee)} 进入现金流，直到取得自有指标口径。")
+            notes.append(user_config_note(f"租牌到期后按每 {plan.license_plate_rental_renewal_term_months} 个月续租一次、每次 {_money_text(plan.license_plate_rental_renewal_fee)} 进入现金流，直到取得自有指标口径。"))
         else:
-            notes.append("租牌到期后按改用自有指标处理，后续不再自动计入续租费用。")
+            notes.append(user_config_note("租牌到期后按改用自有指标处理，后续不再自动计入续租费用。"))
     notes.append(
-        f"非营运小微型载客汽车通常没有固定强制报废年限；模型按用户设定的 {plan.vehicle_service_years} 年实际性能使用期和"
-        f" {round(plan.vehicle_retirement_mileage_km)} 公里引导报废/更新阈值择早安排更新提醒，并从该月起停止车辆资产、"
-        "电费、停车费、保险、保养和车船税测算；若贷款合同未结清，车贷仍会继续进入贷款现金流。"
+        market_assumption_note(
+            f"非营运小微型载客汽车通常没有固定强制报废年限；模型按用户设定的 {plan.vehicle_service_years} 年实际性能使用期和"
+            f" {round(plan.vehicle_retirement_mileage_km)} 公里引导报废/更新阈值择早安排更新提醒，并从该月起停止车辆资产、"
+            "电费、停车费、保险、保养和车船税测算；若贷款合同未结清，车贷仍会继续进入贷款现金流。"
+        )
     )
     notes.extend(family_notes)
     return {

@@ -20,6 +20,7 @@ from ..domain.time import (
     parse_iso_date as _parse_iso_date,
     parse_year_month as _parse_year_month,
 )
+from ..policy_explanations import market_assumption_note, policy_source_note, user_config_note
 from ..policies import get_policy
 from ..schemas import (
     HouseholdData,
@@ -33,6 +34,14 @@ from ..schemas import (
 
 
 PersonalPensionTaxSavingEstimator = Callable[[HouseholdData, IncomeMember, RulePackData, int], float]
+
+
+def _tax_source_labeled_detail(source: str, category: str, detail: str) -> str:
+    if category == "investment_tax" and source != "manual":
+        return market_assumption_note(detail)
+    if source in {"manual", "event"}:
+        return user_config_note(detail)
+    return policy_source_note(detail)
 
 
 def build_tax_events(
@@ -448,7 +457,7 @@ def build_tax_strategy_timeline(
                 status=status,  # type: ignore[arg-type]
                 amount=round(amount, 2),
                 estimated_tax_saving=round(estimated_tax_saving, 2),
-                detail=detail,
+                detail=_tax_source_labeled_detail(source, category, detail),
                 source=source,  # type: ignore[arg-type]
             )
         )

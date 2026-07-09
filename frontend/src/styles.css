@@ -1110,6 +1110,28 @@ option {
   margin-top: 12px;
 }
 
+.calibration-source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--layout-gap-sm);
+  margin-top: 12px;
+}
+
+.calibration-source-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+}
+
+.calibration-source-picker > button {
+  height: var(--control-height);
+  min-height: var(--control-height);
+  margin-top: var(--control-slot-top);
+  white-space: nowrap;
+}
+
 .calibration-row {
   display: grid;
   grid-template-columns: minmax(108px, 0.8fr) minmax(150px, 1fr) minmax(180px, 1.1fr) minmax(160px, 1fr) minmax(220px, 1.3fr) var(--control-height);
@@ -1487,6 +1509,23 @@ option {
   color: #a13d3d;
 }
 
+.warning-list {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.warning-list span {
+  display: block;
+  border: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .setup-guide {
   border-color: #cfe0f3;
   background: #f8fbff;
@@ -1800,6 +1839,22 @@ option {
 
 .vehicle-goal-grid {
   margin-top: 4px;
+}
+
+.generic-goal-grid {
+  margin-bottom: 0;
+}
+
+.generic-goal-config-grid {
+  align-items: start;
+}
+
+.generic-goal-config-grid .field:last-child {
+  grid-column: 1 / -1;
+}
+
+.generic-goal-impact-grid article {
+  min-width: 0;
 }
 
 .purchase-demand-grid {
@@ -6065,6 +6120,7 @@ button.car-strategy-comparison-row:hover {
 
   .form-grid,
   .form-grid.wide,
+  .calibration-source-grid,
   .rule-grid,
   .visual-grid,
   .plan-grid,
@@ -6169,14 +6225,21 @@ button.car-strategy-comparison-row:hover {
   }
 
   .vehicle-source-toolbar,
+  .calibration-source-picker,
   .source-comparison-row {
     align-items: stretch;
     flex-direction: column;
   }
 
+  .calibration-source-picker {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
   .form-grid > button,
   .vehicle-sequence-grid > button,
   .compact-fields > button,
+  .calibration-source-picker > button,
   .member-card-head:has(> .field) > button,
   .vehicle-source-head:has(> .field) > button,
   .stage-row .member-card-head .icon-button {

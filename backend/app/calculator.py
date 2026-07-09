@@ -62,6 +62,7 @@ from .tax_engine import (
 from .result_assembly import AffordabilityResultInputs, build_affordability_result
 from .planning_summary import affordability_status, home_loan_summaries
 from .policies import get_policy
+from .profiling import profile_span
 from .strategies.home import (
     family_down_payment_upfront_support as _strategy_family_down_payment_upfront_support,
 )
@@ -466,42 +467,47 @@ def calculate_affordability(
         _policy_minimum_down_payment_ratio(household, False, rules),
         _policy_minimum_down_payment_ratio(household, True, rules),
     )
-    household_context = prepare_household_context(
-        household,
-        scenario,
-        rules,
-        base_month=base_month,
-    )
+    with profile_span("household_context"):
+        household_context = prepare_household_context(
+            household,
+            scenario,
+            rules,
+            base_month=base_month,
+        )
     household = household_context.household
     cashflow_household = household_context.cashflow_household
-    vehicle_context = build_vehicle_planning_context(household_context, scenario, rules, calculation_context=calculation_context)
+    with profile_span("vehicle_context"):
+        vehicle_context = build_vehicle_planning_context(household_context, scenario, rules, calculation_context=calculation_context)
     cashflow_household = vehicle_context.cashflow_household
     strategy_household = vehicle_context.strategy_household
-    purchase_cash_context = build_purchase_cash_context(
-        strategy_household,
-        scenario,
-        rules,
-        min_down_payment_ratio=min_down_payment_ratio,
-        market_snapshot=market_snapshot,
-    )
-    eligible, eligibility_notes = (
-        evaluate_eligibility(strategy_household, rules)
-        if purchase_cash_context.has_purchase_target
-        else (True, ["当前未启用购房目标，购房资格和贷款策略暂不进入基线测算。"])
-    )
-    strategy_pipeline = run_strategy_pipeline(
-        strategy_household,
-        scenario,
-        rules,
-        household_context=household_context,
-        vehicle_context=vehicle_context,
-        purchase_cash_context=purchase_cash_context,
-        base_month=base_month,
-        stress_name=stress_name,
-        parallel_workers=parallel_workers,
-        calculation_context=calculation_context,
-        market_snapshot=market_snapshot,
-    )
+    with profile_span("purchase_cash_context"):
+        purchase_cash_context = build_purchase_cash_context(
+            strategy_household,
+            scenario,
+            rules,
+            min_down_payment_ratio=min_down_payment_ratio,
+            market_snapshot=market_snapshot,
+        )
+    with profile_span("eligibility"):
+        eligible, eligibility_notes = (
+            evaluate_eligibility(strategy_household, rules)
+            if purchase_cash_context.has_purchase_target
+            else (True, ["当前未启用购房目标，购房资格和贷款策略暂不进入基线测算。"])
+        )
+    with profile_span("strategy_pipeline"):
+        strategy_pipeline = run_strategy_pipeline(
+            strategy_household,
+            scenario,
+            rules,
+            household_context=household_context,
+            vehicle_context=vehicle_context,
+            purchase_cash_context=purchase_cash_context,
+            base_month=base_month,
+            stress_name=stress_name,
+            parallel_workers=parallel_workers,
+            calculation_context=calculation_context,
+            market_snapshot=market_snapshot,
+        )
     purchase_plan_analyses = strategy_pipeline.purchase_plan_analyses
     yield_sensitivity = strategy_pipeline.yield_sensitivity
     projection_pipeline = strategy_pipeline.projection
@@ -520,60 +526,64 @@ def calculate_affordability(
     plan_events = projection_pipeline.plan_events
     selected_home_purchase_month = projection_pipeline.selected_home_purchase_month
     child_plan_strategies = projection_pipeline.child_plan_strategies
-    tax_strategy_items = build_tax_strategy_items(
-        household,
-        scenario,
-        rules,
-        base_date=base_month,
-        horizon_months=household_context.tax_horizon_months,
-        selected_purchase_month=selected_home_purchase_month,
-    )
-    tax_strategy_timeline = build_tax_strategy_timeline(
-        household,
-        rules,
-        tax_strategy_items,
-        base_date=base_month,
-        horizon_months=household_context.tax_horizon_months,
-        tax_events=household_context.tax_events,
-    )
-    home_loan_context = home_loan_summaries(
-        has_purchase_target=purchase_cash_context.has_purchase_target,
-        household=strategy_household,
-        scenario=scenario,
-        rules=rules,
-        market_snapshot=market_snapshot,
-    )
+    with profile_span("tax_strategy"):
+        tax_strategy_items = build_tax_strategy_items(
+            household,
+            scenario,
+            rules,
+            base_date=base_month,
+            horizon_months=household_context.tax_horizon_months,
+            selected_purchase_month=selected_home_purchase_month,
+        )
+        tax_strategy_timeline = build_tax_strategy_timeline(
+            household,
+            rules,
+            tax_strategy_items,
+            base_date=base_month,
+            horizon_months=household_context.tax_horizon_months,
+            tax_events=household_context.tax_events,
+        )
+    with profile_span("home_loan_summary"):
+        home_loan_context = home_loan_summaries(
+            has_purchase_target=purchase_cash_context.has_purchase_target,
+            household=strategy_household,
+            scenario=scenario,
+            rules=rules,
+            market_snapshot=market_snapshot,
+        )
 
-    affordability = affordability_status(
-        has_purchase_target=purchase_cash_context.has_purchase_target,
-        eligible=eligible,
-        household=cashflow_household,
-        stated_down_payment=purchase_cash_context.stated_down_payment,
-        taxes_and_fees=purchase_cash_context.taxes_and_fees,
-        car_loan=vehicle_context.purchase_strategy_car_loan,
-        vehicle_states=vehicle_context.pre_home_vehicle_states,
-        commercial=home_loan_context.commercial,
-        provident=home_loan_context.provident,
-        net_monthly_income=household_context.net_monthly_income,
-        current_monthly_expense=household_context.current_monthly_expense,
-        recommended_emergency_months=risk_policy.recommended_emergency_months,
-        caution_dti=risk_policy.caution_dti,
-        danger_dti=risk_policy.danger_dti,
-        car_down_payment_at=lambda plan, loan, month: _car_down_payment_at(
-            plan,
-            loan,
-            month,
+    with profile_span("affordability_status"):
+        affordability = affordability_status(
+            has_purchase_target=purchase_cash_context.has_purchase_target,
+            eligible=eligible,
+            household=cashflow_household,
+            stated_down_payment=purchase_cash_context.stated_down_payment,
+            taxes_and_fees=purchase_cash_context.taxes_and_fees,
+            car_loan=vehicle_context.purchase_strategy_car_loan,
             vehicle_states=vehicle_context.pre_home_vehicle_states,
-        ),
-        car_monthly_cash_cost_at=lambda plan, loan, month: _car_monthly_cash_cost_at(
-            plan,
-            loan,
-            month,
-            vehicle_states=vehicle_context.pre_home_vehicle_states,
-        ),
-    )
+            commercial=home_loan_context.commercial,
+            provident=home_loan_context.provident,
+            net_monthly_income=household_context.net_monthly_income,
+            current_monthly_expense=household_context.current_monthly_expense,
+            recommended_emergency_months=risk_policy.recommended_emergency_months,
+            caution_dti=risk_policy.caution_dti,
+            danger_dti=risk_policy.danger_dti,
+            car_down_payment_at=lambda plan, loan, month: _car_down_payment_at(
+                plan,
+                loan,
+                month,
+                vehicle_states=vehicle_context.pre_home_vehicle_states,
+            ),
+            car_monthly_cash_cost_at=lambda plan, loan, month: _car_monthly_cash_cost_at(
+                plan,
+                loan,
+                month,
+                vehicle_states=vehicle_context.pre_home_vehicle_states,
+            ),
+        )
 
-    result = build_affordability_result(
+    with profile_span("result_assembly"):
+        result = build_affordability_result(
         AffordabilityResultInputs(
             status=affordability.status,
             status_reason=affordability.status_reason,
@@ -629,17 +639,19 @@ def calculate_affordability(
             provident_year_reasons=home_loan_context.provident_year_reasons,
             scenario=scenario,
             base_month=base_month,
+            calculation_context=calculation_context,
         )
     )
 
     if include_stress_tests and stress_name is None and purchase_cash_context.has_purchase_target:
-        result.stress_tests = build_stress_tests(
-            household,
-            scenario,
-            rules,
-            market_snapshot=market_snapshot,
-            parallel_workers=min(parallel_workers, 3),
-        )
+        with profile_span("stress_tests"):
+            result.stress_tests = build_stress_tests(
+                household,
+                scenario,
+                rules,
+                market_snapshot=market_snapshot,
+                parallel_workers=min(parallel_workers, 3),
+            )
     return result
 
 

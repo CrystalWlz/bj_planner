@@ -6,6 +6,7 @@ from typing import Protocol
 
 from ..domain.tax import income_stage_for_month
 from ..domain.time import add_months
+from ..policy_explanations import policy_source_note, user_config_note
 from ..policies import get_policy
 from ..schemas import HouseholdData, RulePackData, ScenarioData
 from ..projection.provident import beijing_pf_loan_offset_target
@@ -400,12 +401,12 @@ def post_purchase_pf_strategy_note(mode: str, *, monthly_relief: float = 0.0) ->
 
 def provident_extraction_notes(mode: str, *, monthly_relief: float = 0.0) -> list[str]:
     return [
-        "交易前仅按规则包中的可提前提取比例计入首付现金；默认 0%，避免把审核后到账资金误当作交易前现金。",
-        "交易后购房提取按购房价款额度内、账户可用余额估算，审核通过后回流到银行卡。",
-        "买房后家庭在京住房性质发生变化，租房提取不再作为后续公积金现金流来源。",
-        "买房后月度公积金缴存默认不作为工资类收入；自动策略会在现金压力偏高且存在公积金贷款时优先考虑按月抵月供或半年度冲本金。",
+        policy_source_note("交易前仅按规则包中的可提前提取比例计入首付现金；默认 0%，避免把审核后到账资金误当作交易前现金。"),
+        policy_source_note("交易后购房提取按购房价款额度内、账户可用余额估算，审核通过后回流到银行卡。"),
+        policy_source_note("买房后家庭在京住房性质发生变化，租房提取不再作为后续公积金现金流来源。"),
+        policy_source_note("买房后月度公积金缴存默认不作为工资类收入；自动策略会在现金压力偏高且存在公积金贷款时优先考虑按月抵月供或半年度冲本金。"),
         post_purchase_pf_strategy_note(mode, monthly_relief=monthly_relief),
-        f"当前购后公积金处理：{post_purchase_pf_withdrawal_label(mode)}。",
+        user_config_note(f"当前购后公积金处理：{post_purchase_pf_withdrawal_label(mode)}。"),
     ]
 
 

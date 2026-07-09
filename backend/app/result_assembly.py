@@ -14,6 +14,7 @@ from .schemas import (
     CarPlanAnalysis,
     CareerShockProjection,
     ChildPlanStrategyPoint,
+    CalculationContextSnapshot,
     CoreObjectGroupSummary,
     InvestmentAllocationSummary,
     InvestmentPlanRecommendation,
@@ -96,6 +97,7 @@ class AffordabilityResultInputs:
     provident_year_reasons: list[str]
     scenario: ScenarioData
     base_month: date
+    calculation_context: CalculationContextSnapshot | None = None
 
 
 def affordability_assumptions(
@@ -125,6 +127,7 @@ def affordability_assumptions(
 
 def build_affordability_result(inputs: AffordabilityResultInputs) -> AffordabilityResult:
     result = AffordabilityResult(
+        calculation_context=inputs.calculation_context,
         status=inputs.status,
         status_reason=inputs.status_reason,
         eligible=inputs.eligible,

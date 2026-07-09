@@ -205,6 +205,53 @@ def test_affordability_skips_stress_tests_by_default() -> None:
     assert result.stress_tests == []
 
 
+def test_disabled_home_goal_still_projects_baseline_visualization() -> None:
+    household = HouseholdData(
+        cash_account_balance=300_000,
+        investments=120_000,
+        monthly_expense=9_000,
+        monthly_debt_payment=2_000,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=35_000, annual_bonus=0)],
+    )
+    scenario = ScenarioData(name="不买房基线", enabled=False, total_price=0)
+
+    result = calculate_affordability(household, scenario, RulePackData())
+
+    assert result.purchase_plan_analyses
+    baseline_plan = result.purchase_plan_analyses[0]
+    assert baseline_plan.source == "baseline"
+    assert baseline_plan.variant == "家庭基线"
+    assert result.monthly_cashflow_visualization
+    assert result.monthly_ledger
+    assert result.account_snapshots
+    assert result.annual_financial_summaries
+    assert all(event.category != "home_purchase" for event in result.plan_events)
+    assert {row.plan_variant for row in result.monthly_cashflow_visualization} == {"家庭基线"}
+
+
+def test_no_child_or_vehicle_plan_still_projects_baseline_visualization() -> None:
+    household = HouseholdData(
+        cash_account_balance=250_000,
+        investments=80_000,
+        monthly_expense=8_000,
+        car_plan=CarPlanData(enabled=False, vehicle_plans=[]),
+        child_plans=[],
+        members=[IncomeMember(name="sample-member-a", monthly_salary_gross=30_000, annual_bonus=0)],
+    )
+    scenario = ScenarioData(name="baseline", enabled=False, total_price=0)
+
+    result = calculate_affordability(household, scenario, RulePackData())
+
+    assert result.purchase_plan_analyses[0].source == "baseline"
+    assert result.monthly_cashflow_visualization
+    assert result.monthly_ledger
+    assert result.account_snapshots
+    assert result.annual_financial_summaries
+    assert {row.plan_variant for row in result.monthly_cashflow_visualization} == {
+        result.purchase_plan_analyses[0].variant
+    }
+
+
 def test_affordability_builds_stress_tests_when_requested() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData(), include_stress_tests=True)
     assert len(result.stress_tests) == 3
@@ -2639,6 +2686,8 @@ def test_affordability_returns_backend_strategy_events_and_concepts() -> None:
     assert {"cash_account", "investment_account", "liquid_asset_account", "provident_account", "loan_account", "net_worth"}.issubset(concept_codes)
     assert explanations
     assert any(item.section == "loan" and "公积金贷" in item.body for item in explanations)
+    assert any(item.section == "funding" and "核心对象口径：" in item.body and "流动资产" in item.body and "公积金账户" in item.body for item in explanations)
+    assert any(item.section == "loan" and "核心对象口径：" in item.body and "贷款账户" in item.body for item in explanations)
     assert events
     assert any(item.category == "account" and item.month == 0 for item in events)
     assert any(item.category == "home_purchase" and item.month == plan.months_to_buy for item in events)
@@ -3467,7 +3516,11 @@ def test_disabled_purchase_target_returns_no_purchase_baseline() -> None:
     )
 
     assert result.status == "不买房基线"
-    assert result.purchase_plan_analyses == []
+    assert result.purchase_plan_analyses[0].source == "baseline"
+    assert result.purchase_plan_analyses[0].variant == "家庭基线"
+    assert result.monthly_cashflow_visualization
+    assert {row.plan_variant for row in result.monthly_cashflow_visualization} == {"家庭基线"}
+    assert all(event.category != "home_purchase" for event in result.plan_events)
     assert result.total_required_cash == 0
     assert result.minimum_down_payment == 0
     assert result.monthly_payment == 0
@@ -6922,6 +6975,53 @@ def test_cash_only_investment_tax_default_explains_zero_rate() -> None:
     assert "有效税率为 0" in investment_tax_timeline.detail
 
 
+def test_policy_explanations_label_sources_across_home_vehicle_tax_and_provident() -> None:
+    rules = RulePackData()
+    household = HouseholdData(
+        cash_account_balance=900_000,
+        investments=300_000,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=50_000, annual_bonus=0)],
+        car_plan=CarPlanData(
+            vehicle_plans=[
+                CarPlanData(
+                    enabled=True,
+                    name="示例车辆",
+                    total_price=220_000,
+                    down_payment_ratio=0.4,
+                    beijing_license_indicator_status="family_new_energy_pending",
+                    beijing_indicator_expected_delay_months=12,
+                    vehicle_service_years=8,
+                )
+            ]
+        ),
+    )
+    scenario = ScenarioData(
+        total_price=1_200_000,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        broker_fee_rate=0.02,
+        provident_account_repayment_strategy="monthly_repayment_withdrawal",
+    )
+
+    result = calculate_affordability(household, scenario, rules)
+    plan = next(item for item in result.purchase_plan_analyses if item.variant == "0商贷")
+    vehicle_strategy = next(item for item in result.car_plan_analyses if item.vehicle_name == "示例车辆")
+    tax_policy_point = next(item for item in result.tax_strategy_timeline if item.category == "annual_settlement")
+    tax_market_point = next(item for item in result.tax_strategy_timeline if item.category == "investment_tax")
+
+    assert "政策来源：" in plan.description
+    assert "用户配置：" in plan.description
+    assert "市场假设：" in plan.description
+    assert any(note.startswith("政策来源：") for note in plan.provident_extraction_notes)
+    assert any(note.startswith("用户配置：") for note in plan.provident_extraction_notes)
+    assert any(note.startswith("政策来源：") for note in vehicle_strategy.notes)
+    assert any(note.startswith("市场假设：") for note in vehicle_strategy.notes)
+    assert tax_policy_point.detail.startswith("政策来源：")
+    assert tax_market_point.detail.startswith("市场假设：")
+
+
 def _sample_purchase_plan(variant: str = "sample_plan") -> calculator_module.PurchasePlanAnalysis:
     return calculator_module.PurchasePlanAnalysis(
         variant=variant,
@@ -7528,6 +7628,20 @@ def test_account_calibration_updates_backend_projection_and_events() -> None:
         "示例重大事件" in event.title and "来源：示例重大事件" in event.detail
         for event in result.plan_events
     )
+    calibration_event = next(
+        event
+        for event in result.plan_events
+        if event.plan_variant == plan_variant and event.source == "account_calibration" and "示例重大事件" in event.title
+    )
+    assert calibration_event.calibration_source == "major_event / home_purchase / 示例重大事件"
+    event_sheet = next(
+        sheet
+        for sheet in result.export_sheets
+        if sheet.plan_variant == plan_variant and sheet.title == "关键事件时间线"
+    )
+    assert "校准来源" in event_sheet.headers
+    source_index = event_sheet.headers.index("校准来源")
+    assert any(row[source_index] == calibration_event.calibration_source for row in event_sheet.rows)
 
 
 def test_income_stage_manual_cash_adjustment_is_cleared_by_normalization() -> None:

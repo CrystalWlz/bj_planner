@@ -1506,6 +1506,7 @@ export interface PlanEventPoint {
   amount: number | null;
   severity: "info" | "success" | "warning" | "danger";
   source: string;
+  calibration_source: string;
 }
 
 export interface AnnualFinancialSummary {

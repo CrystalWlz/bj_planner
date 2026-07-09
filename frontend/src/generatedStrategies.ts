@@ -39,6 +39,16 @@ export function generatedStrategyTypeLabel(type: GeneratedStrategyType) {
   return type;
 }
 
+export function generatedStrategySearchText(record: GeneratedStrategyRecord) {
+  return [
+    generatedStrategyTypeLabel(record.strategy_type),
+    record.strategy_type,
+    record.owner_key,
+    record.strategy_key,
+    record.variant,
+  ].filter(Boolean).join(" ");
+}
+
 export function generatedStrategyTypeSummary(records: GeneratedStrategyRecord[]) {
   const counts = new Map<GeneratedStrategyType, number>();
   for (const record of records) {

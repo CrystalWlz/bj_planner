@@ -3,6 +3,7 @@ import type {
   CalculationContextGoalSnapshot,
   CarPlanAnalysis,
   ChildPlanData,
+  PlanningGoalRecord,
   PlanningGoalType,
   PlanningGoalData,
   PlanningTimingMode,
@@ -210,6 +211,71 @@ export function planningGoalTypeLabel(type: PlanningGoalType) {
   if (type === "child") return "养娃";
   if (type === "renovation") return "装修";
   return "目标";
+}
+
+export const GENERIC_PLANNING_GOAL_TIMING_OPTIONS: Array<{
+  value: PlanningGoalData["timing_mode"];
+  label: string;
+}> = [
+  { value: "auto_sequence", label: "按规划顺序排队" },
+  { value: "parallel", label: "可并行考虑" },
+  { value: "manual_month", label: "手动指定月份" },
+  { value: "after_goal", label: "排在某目标之后" },
+  { value: "not_planned", label: "暂不纳入规划" },
+];
+
+export function genericPlanningGoalDefaultData(
+  goalType: Extract<PlanningGoalType, "renovation" | "other">,
+  index: number
+): PlanningGoalData {
+  const isRenovation = goalType === "renovation";
+  const defaultBudget = isRenovation ? 250000 : 100000;
+  const name = isRenovation ? `装修目标 ${index + 1}` : `其它目标 ${index + 1}`;
+  return {
+    schema_version: 34,
+    goal_type: goalType,
+    name,
+    enabled: true,
+    priority: index + 50,
+    timing_mode: "auto_sequence",
+    earliest_purchase_month: "",
+    earliest_purchase_delay_months: 0,
+    planning_window_start_month: "",
+    planning_window_end_month: "",
+    depends_on_goal_id: "",
+    delay_after_dependency_months: 0,
+    allow_parallel: false,
+    selected_strategy_id: "",
+    target_params: {
+      name,
+      estimated_cost: defaultBudget,
+      category: isRenovation ? "renovation" : "other_major_goal"
+    },
+    financing_preferences: {
+      funding_mode: "cash_or_investment"
+    },
+    holding_cost_params: {},
+    metadata: {},
+    notes: ""
+  };
+}
+
+export function genericPlanningGoalDuplicateData(goal: PlanningGoalRecord, index: number): PlanningGoalData {
+  const nextName = `${goal.data.name || planningGoalTypeLabel(goal.goal_type)} 复制`;
+  return {
+    ...goal.data,
+    name: nextName,
+    enabled: true,
+    priority: index + 50,
+    target_params: {
+      ...goal.data.target_params,
+      name: nextName,
+    },
+    metadata: {
+      ...goal.data.metadata,
+      duplicated_from_goal_id: goal.id,
+    }
+  };
 }
 
 export type PlanningGoalOptionSource = Pick<

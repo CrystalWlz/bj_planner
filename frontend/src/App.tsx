@@ -54,6 +54,9 @@ import {
   childPlanningGoalData,
   childPlanningTimingLabel,
   childPlanningTimingPatch,
+  GENERIC_PLANNING_GOAL_TIMING_OPTIONS,
+  genericPlanningGoalDefaultData,
+  genericPlanningGoalDuplicateData,
   HOME_PLANNING_TIMING_OPTIONS,
   homeDemandIsIncludedInPlanning,
   homePlanIsIncludedInPlanning,
@@ -66,6 +69,7 @@ import {
   planningInclusionStatusLabel,
   planningGoalIsNotPlanned,
   planningGoalOrderLabel,
+  planningGoalTimingLabel,
   planningGoalTimingSummary,
   planningGoalTypeLabel,
   planningTimingModeFromScenario,
@@ -89,6 +93,7 @@ import {
   generatedChildPlanStrategies,
   generatedInvestmentRecommendations,
   generatedPurchasePlanAnalyses,
+  generatedStrategySearchText,
   generatedTaxStrategyItems,
   generatedTaxStrategyTimeline,
   generatedStrategySummaryByOwner,
@@ -106,6 +111,7 @@ import {
   coreObjectBalanceText,
   coreObjectCountText,
   coreObjectGroupMap,
+  coreObjectOwnerKey,
   coreObjectOwnerSummaryByOwner,
   coreObjectOwnerSummaryText,
   dashboardAccountConcepts
@@ -934,10 +940,17 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
   };
 }
 
-const pages = ["家庭财务", "购车计划", "购房计划", "理财计划", "养娃计划", "税务", "可视化", "记账校准", "政策规则", "导出方案"] as const;
+const pages = ["家庭财务", "规划目标", "购车计划", "购房计划", "理财计划", "养娃计划", "税务", "可视化", "记账校准", "政策规则", "导出方案"] as const;
 type PageName = (typeof pages)[number];
 type SaveState = "idle" | "dirty" | "saving" | "saved";
 type ThemeMode = "light" | "dark";
+type CollapseProfile = "core" | "advanced" | "explanation" | "longList";
+const COLLAPSE_DEFAULTS: Record<CollapseProfile, boolean> = {
+  core: true,
+  advanced: false,
+  explanation: false,
+  longList: false,
+};
 type ScenarioComparison = {
   scenario: RecordEnvelope<ScenarioData>;
   result: AffordabilityResult;
@@ -1409,6 +1422,23 @@ function parseMonthValue(value: string | null | undefined) {
   const month = Number(match[2]);
   if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) return null;
   return { year, month };
+}
+
+function formatMonthValue(year: number, month: number) {
+  return `${year}-${String(month).padStart(2, "0")}`;
+}
+
+function childStrategyBirthMonthValue(strategy: ChildPlanStrategyPoint | null | undefined) {
+  const label = strategy?.birth_month_label?.trim();
+  if (!label) return "";
+  const direct = parseMonthValue(label);
+  if (direct) return formatMonthValue(direct.year, direct.month);
+  const match = /(\d{4})\D{0,4}(\d{1,2})/.exec(label);
+  if (!match) return "";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) return "";
+  return formatMonthValue(year, month);
 }
 
 function compareMonth(left: { year: number; month: number }, right: { year: number; month: number }) {
@@ -1905,7 +1935,7 @@ export function App() {
   const selectedScenarioPurchasePlansFromEntities = selectedScenario
     ? generatedPurchasePlanAnalyses(generatedStrategies, selectedScenario)
     : [];
-  const purchasePlanSourceLabel = selectedScenarioPurchasePlansFromEntities.length ? "后端策略实体" : "计算响应";
+  const purchasePlanSourceLabel = selectedScenarioPurchasePlansFromEntities.length ? "策略库方案" : "本次计算结果";
   const planningContextGoals = result?.calculation_context?.planning_goals ?? [];
   const planningContextCoreObjects = result?.calculation_context?.core_objects ?? [];
   const incomeMembers = household?.data.members ?? [];
@@ -1918,7 +1948,7 @@ export function App() {
   const carStrategiesForPage = carStrategiesFromEntities.length
     ? carStrategiesFromEntities
     : result?.car_plan_analyses ?? [];
-  const carStrategySourceLabel = carStrategiesFromEntities.length ? "后端策略实体" : "计算响应";
+  const carStrategySourceLabel = carStrategiesFromEntities.length ? "策略库方案" : "本次计算结果";
   const phasedLoans = household?.data.phased_loans ?? [];
   const scheduledExpenses = household?.data.scheduled_expenses ?? [];
   const dailyExpenseStages = household?.data.daily_expense_stages?.length
@@ -1936,7 +1966,7 @@ export function App() {
   const childPlanStrategiesForPage = childPlanStrategiesFromEntities.length
     ? childPlanStrategiesFromEntities
     : result?.child_plan_strategies ?? [];
-  const childPlanStrategySourceLabel = childPlanStrategiesFromEntities.length ? "后端策略实体" : "计算响应";
+  const childPlanStrategySourceLabel = childPlanStrategiesFromEntities.length ? "策略库方案" : "本次计算结果";
   const investmentRecommendationsFromEntities = useMemo(
     () => generatedInvestmentRecommendations(generatedStrategies),
     [generatedStrategies]
@@ -1944,7 +1974,7 @@ export function App() {
   const investmentRecommendationsForPage = investmentRecommendationsFromEntities.length
     ? investmentRecommendationsFromEntities
     : result?.investment_plan_recommendations ?? [];
-  const investmentRecommendationSourceLabel = investmentRecommendationsFromEntities.length ? "后端策略实体" : "计算响应";
+  const investmentRecommendationSourceLabel = investmentRecommendationsFromEntities.length ? "策略库方案" : "本次计算结果";
   const taxStrategyItemsFromEntities = useMemo(
     () => generatedTaxStrategyItems(generatedStrategies),
     [generatedStrategies]
@@ -1961,8 +1991,8 @@ export function App() {
     : result?.tax_strategy_timeline ?? [];
   const taxStrategySourceLabel =
     taxStrategyTimelineFromEntities.length || taxStrategyItemsFromEntities.length
-      ? "后端策略实体"
-      : "计算响应";
+      ? "策略库方案"
+      : "本次计算结果";
   const firstHomeGoalId = useMemo(() => planningGoals.find((goal) => goal.goal_type === "home")?.id ?? "", [planningGoals]);
   const specialDeductions = household?.data.special_deductions ?? [];
   const selectedPlanVariant = selectedScenario
@@ -1971,9 +2001,11 @@ export function App() {
   const selectedScenarioPurchasePlans = selectedScenarioPurchasePlansFromEntities.length
     ? selectedScenarioPurchasePlansFromEntities
     : result?.purchase_plan_analyses ?? [];
+  const selectedScenarioHomePurchasePlans = selectedScenarioPurchasePlans.filter((plan) => plan.source !== "baseline");
+  const visualizationPlans = selectedScenarioHomePurchasePlans.length ? selectedScenarioHomePurchasePlans : selectedScenarioPurchasePlans;
   const currentRecommendation = useMemo(
-    () => recommendedPurchasePlan(selectedScenarioPurchasePlans),
-    [selectedScenarioPurchasePlans]
+    () => recommendedPurchasePlan(selectedScenarioHomePurchasePlans),
+    [selectedScenarioHomePurchasePlans]
   );
   const selectedPlan =
     selectedScenarioPurchasePlans.find((plan) => plan.variant === selectedPlanVariant) ??
@@ -1986,12 +2018,13 @@ export function App() {
       .map((scenario): ScenarioComparison | null => {
         const scenarioResult = displayScenarioResults[scenario.id];
         if (!scenarioResult) return null;
-        const recommendation = recommendedPurchasePlan(scenarioResult.purchase_plan_analyses);
+        const homePurchasePlans = scenarioResult.purchase_plan_analyses.filter((plan) => plan.source !== "baseline");
+        const recommendation = recommendedPurchasePlan(homePurchasePlans);
         const selectedVariant = scenario.data.selected_purchase_plan_variant || selectedPlanVariants[scenario.id];
         const selectedPlan =
-          scenarioResult.purchase_plan_analyses.find((plan) => plan.variant === selectedVariant) ??
+          homePurchasePlans.find((plan) => plan.variant === selectedVariant) ??
           recommendation ??
-          scenarioResult.purchase_plan_analyses[0] ??
+          homePurchasePlans[0] ??
           null;
         return { scenario, result: scenarioResult, recommendation, selectedPlan };
       })
@@ -2347,6 +2380,28 @@ export function App() {
       setSaving(false);
     }
   };
+  const duplicateChildPlan = async (index: number) => {
+    if (!household) return;
+    const source = childPlans[index];
+    if (!source) return;
+    const child: ChildPlanData = {
+      ...source,
+      planning_goal_id: "",
+      enabled: true,
+      name: `${source.name || `子女目标 ${index + 1}`} 复制`
+    };
+    setSaving(true);
+    setError(null);
+    try {
+      await createPlanningGoal(childPlanningGoalData(child, childPlans.length, firstHomeGoalId), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("复制子女目标", err));
+    } finally {
+      setSaving(false);
+    }
+  };
   const removeChildPlan = async (index: number) => {
     if (!household) return;
     const child = childPlans[index];
@@ -2422,6 +2477,67 @@ export function App() {
   const savePlanningGoalData = useCallback(async (goalId: string, goalData: PlanningGoalData): Promise<void> => {
     await savePlanningGoal(goalId, goalData, household?.id ?? null);
   }, [household?.id]);
+  const refreshGenericPlanningGoals = useCallback(() => {
+    if (household?.id) void refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+  }, [household?.id, refreshPlanningFoundation]);
+  const createGenericPlanningGoal = useCallback(async (goalType: "renovation" | "other") => {
+    if (!household) return;
+    const genericGoals = planningGoals.filter((goal) => goal.goal_type === "renovation" || goal.goal_type === "other");
+    setSaving(true);
+    setError(null);
+    try {
+      await createPlanningGoal(genericPlanningGoalDefaultData(goalType, genericGoals.length), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("添加规划目标", err));
+    } finally {
+      setSaving(false);
+    }
+  }, [household, planningGoals, refreshPlanningFoundation]);
+  const duplicateGenericPlanningGoal = useCallback(async (goal: PlanningGoalRecord) => {
+    if (!household) return;
+    const genericGoals = planningGoals.filter((item) => item.goal_type === "renovation" || item.goal_type === "other");
+    setSaving(true);
+    setError(null);
+    try {
+      await createPlanningGoal(genericPlanningGoalDuplicateData(goal, genericGoals.length), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("复制规划目标", err));
+    } finally {
+      setSaving(false);
+    }
+  }, [household, planningGoals, refreshPlanningFoundation]);
+  const saveGenericPlanningGoal = useCallback(async (goalId: string, goalData: PlanningGoalData) => {
+    if (!household) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await savePlanningGoal(goalId, goalData, household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("保存规划目标", err));
+    } finally {
+      setSaving(false);
+    }
+  }, [household, refreshPlanningFoundation]);
+  const deleteGenericPlanningGoal = useCallback(async (goalId: string) => {
+    if (!household) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await deletePlanningGoal(goalId);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("删除规划目标", err));
+    } finally {
+      setSaving(false);
+    }
+  }, [household, refreshPlanningFoundation]);
   const updateSpecialDeduction = <K extends keyof SpecialDeductionItemData>(index: number, key: K, value: SpecialDeductionItemData[K]) => updateHousehold("special_deductions", updateArrayItem(specialDeductions, index, key, value));
   const addSpecialDeduction = (deductionType: SpecialDeductionItemData["deduction_type"] = "housing_rent") => {
     const labels: Record<SpecialDeductionItemData["deduction_type"], string> = {
@@ -2452,6 +2568,8 @@ export function App() {
   const updateCarPlanPatch = (patch: Partial<CarPlanData>) => updateHousehold("car_plan", { ...carPlan, ...patch });
   const updateCarPlanSelection = (vehicleIndex: number, variant: string) => {
     markDirty(false);
+    const selectedVehicle = carPlan.vehicle_plans?.[vehicleIndex];
+    const nextVehicle = selectedVehicle ? { ...selectedVehicle, selected_strategy_variant: variant } : null;
     setHouseholds((items) => items.map((item, index) => {
       if (index !== 0) return item;
       const vehiclePlans = (item.data.car_plan.vehicle_plans ?? []).map((vehicle, currentIndex) => (
@@ -2469,6 +2587,11 @@ export function App() {
         }
       };
     }));
+    if (nextVehicle?.planning_goal_id) {
+      void savePlanningGoalData(nextVehicle.planning_goal_id, vehiclePlanningGoalData(nextVehicle, vehicleIndex))
+        .then(() => setSaveState("saved"))
+        .catch((err) => setError(userFacingError("保存车辆策略", err)));
+    }
   };
   const setSelectedPlanVariant = (variant: string) => {
     if (!selectedScenario) return;
@@ -2622,14 +2745,15 @@ export function App() {
 
   const pageContent = (() => {
     if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} dailyExpenseStages={dailyExpenseStages} rentExpenseStages={rentExpenseStages} elderlyDependents={elderlyDependents} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} addAnnualScheduledExpense={addAnnualScheduledExpense} addOneTimeScheduledExpense={addOneTimeScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateDailyExpenseStage={updateDailyExpenseStage} addDailyExpenseStage={addDailyExpenseStage} removeDailyExpenseStage={removeDailyExpenseStage} updateRentExpenseStage={updateRentExpenseStage} addRentExpenseStage={addRentExpenseStage} removeRentExpenseStage={removeRentExpenseStage} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
+    if (activePage === "规划目标") return <GenericPlanningGoalPage planningGoals={planningGoals} planningSequence={planningSequence} coreObjects={coreObjects} createGoal={createGenericPlanningGoal} duplicateGoal={duplicateGenericPlanningGoal} saveGoal={saveGenericPlanningGoal} deleteGoal={deleteGenericPlanningGoal} refreshGoals={refreshGenericPlanningGoals} saving={saving} />;
     if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} childPlans={childPlans} specialDeductions={specialDeductions} result={result} taxStrategyItems={taxStrategyItemsForPage} taxStrategyTimeline={taxStrategyTimelineForPage} taxStrategySourceLabel={taxStrategySourceLabel} updateHousehold={updateHousehold} updateChildPlan={updateChildPlan} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
-    if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} generatedStrategies={generatedStrategies} updateHousehold={updateHousehold} />;
-    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={childPlanStrategiesForPage} childPlanStrategySourceLabel={childPlanStrategySourceLabel} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} addChildPlan={addChildPlan} removeChildPlan={removeChildPlan} />;
+    if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} planningGoals={planningGoals} planningSequence={planningSequence} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} generatedStrategies={generatedStrategies} updateHousehold={updateHousehold} />;
+    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={childPlanStrategiesForPage} childPlanStrategySourceLabel={childPlanStrategySourceLabel} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} addChildPlan={addChildPlan} duplicateChildPlan={duplicateChildPlan} removeChildPlan={removeChildPlan} />;
     if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} investmentRecommendations={investmentRecommendationsForPage} investmentRecommendationSourceLabel={investmentRecommendationSourceLabel} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
-    if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} planningSequence={planningSequence} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} purchasePlanSourceLabel={purchasePlanSourceLabel} calculationPending={calculationPending} />;
+    if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} planningSequence={planningSequence} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioHomePurchasePlans} purchasePlanSourceLabel={purchasePlanSourceLabel} calculationPending={calculationPending} />;
     if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} planningSequence={planningSequence} carStrategies={carStrategiesForPage} carStrategySourceLabel={carStrategySourceLabel} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} createVehiclePlanningGoal={createVehiclePlanningGoal} saveVehiclePlanningGoal={saveVehiclePlanningGoal} deleteVehiclePlanningGoal={deleteVehiclePlanningGoal} savePlanningGoalData={savePlanningGoalData} calculationPending={calculationPending} />;
     if (activePage === "政策规则") return <RulePage activeRulePack={activeRulePack.data} ruleNumber={ruleNumber} updateRulePack={updateRulePack} updateRuleParam={updateRuleParam} sourceUrl={sourceUrl} setSourceUrl={setSourceUrl} sourcePreview={sourcePreview} previewSource={() => void previewSource()} saving={saving} />;
-    if (activePage === "可视化") return <VisualizationPage result={result} household={household.data} selectedScenario={selectedScenario} scenarioComparisons={scenarioComparisons} setSelectedScenarioId={setSelectedScenarioId} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} activeRulePack={activeRulePack.data} calculationPending={calculationPending} />;
+    if (activePage === "可视化") return <VisualizationPage result={result} household={household.data} selectedScenario={selectedScenario} scenarioComparisons={scenarioComparisons} setSelectedScenarioId={setSelectedScenarioId} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={visualizationPlans} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} activeRulePack={activeRulePack.data} calculationPending={calculationPending} />;
     return <ExportPage result={result} scenario={selectedScenario.data} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} runCalculation={runCalculation} />;
   })();
 
@@ -3970,7 +4094,10 @@ function IncomePage({
           <strong>阶段性、年度与一次性支出</strong>
         </div>
         <div className="member-list compact-list">
-          {scheduledExpenses.map((expense, index) => (
+          {scheduledExpenses.map((expense, index) => {
+            const scheduledExpenseCategory = expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general");
+            const scheduledExpenseMedicalPayable = scheduledExpenseCategory === "medical" && (expense.medical_account_payable ?? false);
+            return (
             <section className="member-card loan-card" key={`scheduled-expense-${index}`}>
               <div className="member-card-head">
                 <strong>{expense.name || "计划支出"}</strong>
@@ -4048,7 +4175,7 @@ function IncomePage({
                 </Field>
                 <Field label="支出口径">
                   <select
-                    value={expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general")}
+                    value={scheduledExpenseCategory}
                     onChange={(event) => {
                       const expenseCategory = event.target.value as ScheduledExpenseData["expense_category"];
                       updateScheduledExpensePatch(index, {
@@ -4061,15 +4188,15 @@ function IncomePage({
                     <option value="medical">医疗支出</option>
                   </select>
                 </Field>
-                {(expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general")) === "medical" ? (
+                {scheduledExpenseCategory === "medical" ? (
                   <>
                     <SwitchField
-                      label={expense.medical_account_payable ? "医保账户可支付" : "现金账户支付"}
-                      checked={expense.medical_account_payable ?? false}
+                      label="使用医保个人账户支付"
+                      checked={scheduledExpenseMedicalPayable}
                       onChange={(checked) => updateScheduledExpense(index, "medical_account_payable", checked)}
                     />
                     <p className="field-hint form-grid-note">
-                      仅对明确属于医保个人账户可支付的医疗支出生效；医保余额不足的部分仍进入现金支出。
+                      仅对明确属于医保个人账户可支付的医疗支出生效。关闭时整项医疗支出进入现金支出；开启后医保余额不足的部分仍进入现金支出。
                     </p>
                   </>
                 ) : null}
@@ -4077,12 +4204,13 @@ function IncomePage({
               <p className="expense-note-display">
                 {expense.notes || ((expense.frequency ?? "monthly") === "one_time" && (expense.one_time_timing_mode ?? "fixed_month") === "flexible_range"
                   ? "一次性支出给出时间范围后，后端会先按保守策略安排到范围内较晚月份，减少对购房买车现金池的挤压。"
-                  : expense.medical_account_payable
+                  : scheduledExpenseMedicalPayable
                     ? "这项支出会先从医保个人账户余额支付，余额不足部分才进入现金账户支出；它不自动认定为个税专项扣除。"
                     : "这项支出只作为家庭现金支出，不自动认定为个税专项扣除。")}
               </p>
             </section>
-          ))}
+            );
+          })}
         </div>
         <p className="field-hint">
           日常家庭支出和租房支出分别按阶段生效。现金付房租会进入现金家庭支出；公积金余额付房租会按租房提取口径进入公积金账户流水。其它阶段性支出、每月固定支出、年度支出和一次性大额支出统一放在计划支出里，不会错误摊平到每个月。老人专项附加扣除由下方“赡养老人专项扣除”的出生月份、归属成员和分摊方式自动判断，{elderlyPolicyStatus.detail}
@@ -4383,9 +4511,309 @@ function IncomePage({
   );
 }
 
+function GenericPlanningGoalPage({
+  planningGoals,
+  planningSequence,
+  coreObjects,
+  createGoal,
+  duplicateGoal,
+  saveGoal,
+  deleteGoal,
+  refreshGoals,
+  saving
+}: {
+  planningGoals: PlanningGoalRecord[];
+  planningSequence: PlanningSequenceResult | null;
+  coreObjects: CoreObjectRecord[];
+  createGoal: (goalType: "renovation" | "other") => void;
+  duplicateGoal: (goal: PlanningGoalRecord) => void;
+  saveGoal: (goalId: string, goalData: PlanningGoalData) => void;
+  deleteGoal: (goalId: string) => void;
+  refreshGoals: () => void;
+  saving: boolean;
+}) {
+  const genericGoals = useMemo(
+    () => planningGoals.filter((goal) => goal.goal_type === "renovation" || goal.goal_type === "other"),
+    [planningGoals]
+  );
+  const [activeGoalId, setActiveGoalId] = useState(genericGoals[0]?.id ?? "");
+  const selectedGoal = genericGoals.find((goal) => goal.id === activeGoalId) ?? genericGoals[0] ?? null;
+  const [draftGoal, setDraftGoal] = useState<PlanningGoalData | null>(selectedGoal?.data ?? null);
+
+  useEffect(() => {
+    if (!genericGoals.length) {
+      setActiveGoalId("");
+      setDraftGoal(null);
+      return;
+    }
+    if (!selectedGoal) {
+      setActiveGoalId(genericGoals[0].id);
+      return;
+    }
+    setDraftGoal(selectedGoal.data);
+  }, [genericGoals, selectedGoal]);
+
+  const resolvedGoalById = useMemo(
+    () => new Map((planningSequence?.goals ?? []).map((goal) => [goal.id, goal])),
+    [planningSequence]
+  );
+  const dependencyOptions = planningGoalDependencyOptions(
+    planningSequence?.goals ?? planningGoals.map((goal) => ({
+      id: goal.id,
+      name: goal.data.name,
+      goal_type: goal.goal_type,
+      enabled: goal.data.enabled,
+      normalized_timing_mode: goal.data.timing_mode
+    })),
+    selectedGoal ? new Set([selectedGoal.id]) : new Set()
+  );
+  const selectedResolvedGoal = selectedGoal ? resolvedGoalById.get(selectedGoal.id) : null;
+  const selectedCoreObjects = useMemo(
+    () => selectedGoal ? coreObjects.filter((object) => coreObjectOwnerKey(object) === selectedGoal.id) : [],
+    [coreObjects, selectedGoal]
+  );
+  const selectedCoreObjectSummaryByOwner = useMemo(
+    () => coreObjectOwnerSummaryByOwner(selectedCoreObjects),
+    [selectedCoreObjects]
+  );
+  const selectedCoreObjectSummaryItem = selectedCoreObjectSummaryByOwner.get(selectedGoal?.id ?? "");
+  const selectedCoreObjectSummary = selectedCoreObjects.length
+    ? coreObjectOwnerSummaryText(selectedCoreObjectSummaryItem)
+    : "保存后会进入后端核心对象索引，作为目标/资产口径参与校准、导出和可视化说明。";
+  const effectiveGoal = draftGoal ?? selectedGoal?.data ?? null;
+  const estimatedCost = Number(
+    effectiveGoal?.target_params?.estimated_cost ??
+    effectiveGoal?.target_params?.budget ??
+    effectiveGoal?.target_params?.amount ??
+    0
+  );
+  const includedGoals = genericGoals.filter((goal) => goal.data.enabled && goal.data.timing_mode !== "not_planned").length;
+  const updateDraftGoal = (patch: Partial<PlanningGoalData>) => {
+    setDraftGoal((current) => current ? { ...current, ...patch } : current);
+  };
+  const updateDraftTargetParams = (patch: Record<string, unknown>) => {
+    setDraftGoal((current) => current ? {
+      ...current,
+      target_params: { ...current.target_params, ...patch }
+    } : current);
+  };
+  const saveSelectedGoal = () => {
+    if (selectedGoal && draftGoal) saveGoal(selectedGoal.id, draftGoal);
+  };
+  const saveImmediateGoal = (goal: PlanningGoalRecord, patch: Partial<PlanningGoalData>) => {
+    saveGoal(goal.id, { ...goal.data, ...patch });
+  };
+
+  return (
+    <PlannerPageShell
+      icon={<Target size={20} />}
+      title="规划目标"
+      action={
+        <div className="topbar-actions compact-actions">
+          <button className="secondary-button" type="button" onClick={() => createGoal("renovation")} disabled={saving}>
+            <Plus size={15} /> 添加装修目标
+          </button>
+          <button className="ghost-button" type="button" onClick={() => createGoal("other")} disabled={saving}>
+            <Plus size={15} /> 添加其它目标
+          </button>
+        </div>
+      }
+      summary={
+        <div className="metric-grid">
+          <Metric label="装修/其它目标" value={`${genericGoals.length} 个`} />
+          <Metric label="纳入规划" value={`${includedGoals} 个`} tone={includedGoals > 0 ? "good" : undefined} />
+          <Metric label="顺序预览" value={selectedResolvedGoal ? planningGoalOrderLabel(selectedResolvedGoal) : "等待选择"} />
+          <Metric label="预计预算" value={money(Math.max(0, estimatedCost || 0))} />
+        </div>
+      }
+    >
+      <WorkflowSection
+        icon={<Target size={18} />}
+        title="目标列表"
+        description="装修和其它重大目标直接写入统一规划目标库；购房、购车和养娃仍在各自专业页面编辑。"
+      >
+        {genericGoals.length ? (
+          <div className="planning-goal-grid horizontal-card-list generic-goal-grid">
+            {genericGoals.map((goal) => {
+              const resolvedGoal = resolvedGoalById.get(goal.id);
+              const isIncluded = goal.data.enabled && goal.data.timing_mode !== "not_planned";
+              return (
+                <article className={goal.id === selectedGoal?.id ? "planning-goal-card active" : "planning-goal-card"} key={goal.id}>
+                  <button className="planning-goal-select compact-select" type="button" onClick={() => setActiveGoalId(goal.id)}>
+                    <small>{planningGoalTypeLabel(goal.goal_type)} · {resolvedGoal ? planningGoalOrderLabel(resolvedGoal) : "待排序"}</small>
+                    <strong>{goal.data.name}</strong>
+                    <em>{resolvedGoal ? planningGoalTimingSummary(resolvedGoal) : planningGoalTimingLabel({ normalized_timing_mode: goal.data.timing_mode })}</em>
+                  </button>
+                  <span className={`goal-status ${isIncluded ? "enabled" : "paused"}`}>
+                    {planningInclusionStatusLabel(isIncluded, goal.data.enabled)}
+                  </span>
+                  <div className="planning-goal-actions">
+                    <button className="ghost-button small" type="button" onClick={() => duplicateGoal(goal)} disabled={saving}>
+                      <Copy size={14} /> 复制
+                    </button>
+                    <button
+                      className="ghost-button small"
+                      type="button"
+                      onClick={() => saveImmediateGoal(goal, { enabled: !goal.data.enabled })}
+                      disabled={saving}
+                    >
+                      {goal.data.enabled ? "停用" : "启用"}
+                    </button>
+                    <button className="ghost-button danger small" type="button" onClick={() => deleteGoal(goal.id)} disabled={saving}>
+                      <Trash2 size={14} /> 删除
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyState
+            title="还没有装修或其它重大目标"
+            description="添加后会进入统一规划顺序、核心对象索引、记账校准和导出表；不需要目标时可保持为空。"
+            action={
+              <div className="quick-action-row">
+                <button className="secondary-button" type="button" onClick={() => createGoal("renovation")} disabled={saving}>
+                  <Plus size={15} /> 添加装修目标
+                </button>
+                <button className="ghost-button" type="button" onClick={() => createGoal("other")} disabled={saving}>
+                  <Plus size={15} /> 添加其它目标
+                </button>
+              </div>
+            }
+          />
+        )}
+      </WorkflowSection>
+
+      {selectedGoal && effectiveGoal ? (
+        <>
+          <WorkflowSection
+            icon={<SlidersHorizontal size={18} />}
+            title="当前目标配置"
+            description="这里编辑目标名称、预算、顺序和依赖；保存后由后端统一解析顺序。"
+          >
+            <div className="form-grid generic-goal-config-grid">
+              <Field label="目标名称">
+                <input
+                  type="text"
+                  value={effectiveGoal.name}
+                  onChange={(event) => updateDraftGoal({ name: event.target.value, target_params: { ...effectiveGoal.target_params, name: event.target.value } })}
+                />
+              </Field>
+              <Field label="目标类型">
+                <select
+                  value={effectiveGoal.goal_type}
+                  onChange={(event) => updateDraftGoal({
+                    goal_type: event.target.value as "renovation" | "other",
+                    target_params: {
+                      ...effectiveGoal.target_params,
+                      category: event.target.value === "renovation" ? "renovation" : "other_major_goal"
+                    }
+                  })}
+                >
+                  <option value="renovation">装修</option>
+                  <option value="other">其它重大目标</option>
+                </select>
+              </Field>
+              <NumberField label="目标预算" value={Math.max(0, estimatedCost || 0)} min={0} step={10000} onChange={(value) => updateDraftTargetParams({ estimated_cost: value, budget: value })} />
+              <NumberField label="目标优先级" value={effectiveGoal.priority} min={1} max={999} step={1} onChange={(value) => updateDraftGoal({ priority: Math.round(value) })} />
+              <Field label="时间安排">
+                <select
+                  value={effectiveGoal.timing_mode}
+                  onChange={(event) => {
+                    const timingMode = event.target.value as PlanningTimingMode;
+                    updateDraftGoal({
+                      timing_mode: timingMode,
+                      enabled: timingMode !== "not_planned",
+                      allow_parallel: timingMode === "parallel",
+                      depends_on_goal_id: timingMode === "after_goal" ? effectiveGoal.depends_on_goal_id : ""
+                    });
+                  }}
+                >
+                  {GENERIC_PLANNING_GOAL_TIMING_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </Field>
+              {effectiveGoal.timing_mode === "after_goal" ? (
+                <Field label="跟随目标">
+                  <select value={effectiveGoal.depends_on_goal_id} onChange={(event) => updateDraftGoal({ depends_on_goal_id: event.target.value })}>
+                    <option value="">{PLANNING_GOAL_AUTO_DEPENDENCY_LABEL}</option>
+                    {dependencyOptions.map((option) => (
+                      <option key={option.id} value={option.id}>{option.label}</option>
+                    ))}
+                  </select>
+                </Field>
+              ) : null}
+              <NumberField label="等待月数" value={effectiveGoal.delay_after_dependency_months} min={0} max={360} step={1} onChange={(value) => updateDraftGoal({ delay_after_dependency_months: Math.round(value), earliest_purchase_delay_months: Math.round(value) })} />
+              <Field label="手动月份">
+                <input type="month" value={effectiveGoal.earliest_purchase_month} onChange={(event) => updateDraftGoal({ earliest_purchase_month: event.target.value })} />
+              </Field>
+              <Field label="窗口开始">
+                <input type="month" value={effectiveGoal.planning_window_start_month} onChange={(event) => updateDraftGoal({ planning_window_start_month: event.target.value })} />
+              </Field>
+              <Field label="窗口结束">
+                <input type="month" value={effectiveGoal.planning_window_end_month} onChange={(event) => updateDraftGoal({ planning_window_end_month: event.target.value })} />
+              </Field>
+              <Field label="资金策略">
+                <select
+                  value={String(effectiveGoal.financing_preferences.funding_mode ?? "cash_or_investment")}
+                  onChange={(event) => updateDraftGoal({ financing_preferences: { ...effectiveGoal.financing_preferences, funding_mode: event.target.value } })}
+                >
+                  <option value="cash_or_investment">现金与投资账户统筹</option>
+                  <option value="cash_only">仅现金账户</option>
+                  <option value="after_goal_saving">目标后逐月储备</option>
+                </select>
+              </Field>
+              <Field label="目标备注">
+                <textarea value={effectiveGoal.notes} onChange={(event) => updateDraftGoal({ notes: event.target.value })} />
+              </Field>
+            </div>
+            <div className="planning-goal-actions">
+              <button className="primary-button" type="button" onClick={saveSelectedGoal} disabled={saving}>
+                <Save size={15} /> 保存目标
+              </button>
+              <button className="ghost-button" type="button" onClick={refreshGoals} disabled={saving}>
+                <RefreshCw size={15} /> 刷新目标库
+              </button>
+            </div>
+          </WorkflowSection>
+
+          <WorkflowSection
+            icon={<Sparkles size={18} />}
+            title="策略说明与影响预览"
+            description="当前阶段先展示统一目标、顺序和核心对象口径；专属策略生成后会继续落到同一目标。"
+            profile="explanation"
+          >
+            <div className="strategy-grid generic-goal-impact-grid">
+              <article>
+                <span>规划顺序</span>
+                <strong>{selectedResolvedGoal ? planningGoalTimingSummary(selectedResolvedGoal) : "等待后端解析"}</strong>
+                <p>{selectedResolvedGoal?.explanation || "保存目标后，后端会按统一顺序规则解析自动排队、并行、手动时间和跟随目标。"}</p>
+              </article>
+              <article>
+                <span>核心对象</span>
+                <strong>{selectedCoreObjects.length ? `${selectedCoreObjects.length} 个对象` : "等待索引"}</strong>
+                <p>{selectedCoreObjectSummary}</p>
+              </article>
+              <article>
+                <span>当前策略</span>
+                <strong>{effectiveGoal.selected_strategy_id || "手动目标参数"}</strong>
+                <p>装修和其它目标先按目标预算、时间和资金偏好进入统一目标库；策略实体、账本和事件线继续使用同一 `planning_goals` 主数据。</p>
+              </article>
+            </div>
+          </WorkflowSection>
+        </>
+      ) : null}
+    </PlannerPageShell>
+  );
+}
+
 function AccountCalibrationPage({
   household,
   result,
+  planningGoals,
+  planningSequence,
   accountConcepts,
   coreObjectGroups,
   generatedStrategies,
@@ -4393,6 +4821,8 @@ function AccountCalibrationPage({
 }: {
   household: HouseholdData;
   result: AffordabilityResult | null;
+  planningGoals: PlanningGoalRecord[];
+  planningSequence: PlanningSequenceResult | null;
   accountConcepts: AccountConceptSummary[];
   coreObjectGroups: CoreObjectGroupSummary[];
   generatedStrategies: GeneratedStrategyRecord[];
@@ -4401,6 +4831,12 @@ function AccountCalibrationPage({
   const today = new Date();
   const accountCalibrations = household.account_calibrations ?? [];
   const currentMonthText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+  const [selectedConceptCode, setSelectedConceptCode] = useState("");
+  const [selectedEventKey, setSelectedEventKey] = useState("");
+  const [selectedStrategyId, setSelectedStrategyId] = useState("");
+  const [conceptSourceQuery, setConceptSourceQuery] = useState("");
+  const [eventSourceQuery, setEventSourceQuery] = useState("");
+  const [strategySourceQuery, setStrategySourceQuery] = useState("");
   const coreGroupByCode = coreObjectGroupMap(coreObjectGroups);
   const liquidAssetGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.liquidAssets);
   const restrictedAccountGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.restrictedAccounts);
@@ -4427,6 +4863,12 @@ function AccountCalibrationPage({
     if (category === "renovation") return "fixed_asset";
     return "cash";
   };
+  const targetForGoalType = (goalType: PlanningGoalRecord["goal_type"]): AccountCalibrationTarget => {
+    if (goalType === "home") return "property_asset";
+    if (goalType === "vehicle") return "vehicle_asset";
+    if (goalType === "renovation") return "fixed_asset";
+    return "cash";
+  };
   const targetForConceptCode = (code: string): AccountCalibrationTarget | null => {
     if (code === ACCOUNT_CONCEPT_CODES.cash) return "cash";
     if (code === ACCOUNT_CONCEPT_CODES.investment) return "investment";
@@ -4437,12 +4879,27 @@ function AccountCalibrationPage({
     if (code === ACCOUNT_CONCEPT_CODES.loan) return "total_loan";
     return null;
   };
+  const conceptCodeForTarget = (target: AccountCalibrationTarget): string | null => {
+    if (target === "cash") return ACCOUNT_CONCEPT_CODES.cash;
+    if (target === "investment") return ACCOUNT_CONCEPT_CODES.investment;
+    if (target === "provident") return ACCOUNT_CONCEPT_CODES.provident;
+    if (target === "pension") return ACCOUNT_CONCEPT_CODES.pension;
+    if (target === "medical") return ACCOUNT_CONCEPT_CODES.medical;
+    if (target === "fixed_asset" || target === "property_asset" || target === "vehicle_asset") return ACCOUNT_CONCEPT_CODES.fixedAsset;
+    if (target === "total_loan") return ACCOUNT_CONCEPT_CODES.loan;
+    return null;
+  };
   const targetForStrategyType = (strategyType: GeneratedStrategyRecord["strategy_type"]): AccountCalibrationTarget => {
     if (strategyType === "purchase") return "property_asset";
     if (strategyType === "vehicle") return "vehicle_asset";
     if (strategyType === "investment") return "investment";
     if (strategyType === "tax" || strategyType === "career_shock") return "cash";
     return "fixed_asset";
+  };
+  const sourceMatchesQuery = (query: string, values: Array<string | number | undefined>) => {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return true;
+    return values.some((value) => String(value ?? "").toLowerCase().includes(normalizedQuery));
   };
   const updateAccountCalibration = <K extends keyof AccountCalibrationData>(
     index: number,
@@ -4472,35 +4929,50 @@ function AccountCalibrationPage({
       }
     ]);
   };
-  const addConceptCalibration = (concept: AccountConceptSummary) => {
-    const target = targetForConceptCode(concept.code);
-    if (!target) return;
-    addAccountCalibration(target, {
+  const addConceptCalibration = (concept: {
+    key: string;
+    target: AccountCalibrationTarget;
+    name: string;
+    currentBalance: number;
+    sourceId: string;
+    sourceCategory: string;
+    note: string;
+  }) => {
+    addAccountCalibration(concept.target, {
       calibration_scope: "concept",
-      amount: concept.current_balance,
-      source_id: concept.code,
-      source_category: concept.category,
+      amount: concept.currentBalance,
+      source_id: concept.sourceId,
+      source_category: concept.sourceCategory,
       source_title: concept.name,
       reference_name: concept.name,
-      note: `${concept.name}按后端账户概念摘要校准`
+      note: concept.note
     });
   };
-  const addEventCalibration = (event: NonNullable<AffordabilityResult["plan_events"]>[number]) => {
-    const target = targetForEventCategory(event.category);
+  const addMajorEventCalibration = (event: {
+    target: AccountCalibrationTarget;
+    month: number;
+    amount: number;
+    sourceId: string;
+    sourceCategory: string;
+    sourceTitle: string;
+    note: string;
+  }) => {
+    const target = event.target;
     addAccountCalibration(target, {
       calibration_scope: "major_event",
       month: monthValueFromIndex(event.month),
-      amount: Math.max(0, event.amount ?? defaultCalibrationAmount(target)),
-      source_id: `${event.plan_variant}:${event.month}:${event.title}`,
-      source_category: event.category,
-      source_title: event.title,
-      reference_name: event.title,
-      note: event.detail
+      amount: Math.max(0, event.amount),
+      source_id: event.sourceId,
+      source_category: event.sourceCategory,
+      source_title: event.sourceTitle,
+      reference_name: event.sourceTitle,
+      note: event.note
     });
   };
   const addStrategyCalibration = (strategy: GeneratedStrategyRecord) => {
     const target = targetForStrategyType(strategy.strategy_type);
-    const title = `${generatedStrategyTypeLabel(strategy.strategy_type)}策略：${strategy.variant || strategy.strategy_key}`;
+    const strategyName = strategy.variant || "自动方案";
+    const title = `${generatedStrategyTypeLabel(strategy.strategy_type)}策略：${strategyName}`;
     addAccountCalibration(target, {
       calibration_scope: "strategy_event",
       amount: defaultCalibrationAmount(target),
@@ -4508,7 +4980,7 @@ function AccountCalibrationPage({
       source_category: strategy.strategy_type,
       source_title: title,
       reference_name: title,
-      note: `策略键 ${strategy.strategy_key}${strategy.owner_key ? `，归属 ${strategy.owner_key}` : ""}`
+      note: `来自策略库中的${generatedStrategyTypeLabel(strategy.strategy_type)}方案，可用于校准该策略影响后的账户、资产或贷款余额`
     });
   };
   const removeAccountCalibration = (index: number) => {
@@ -4529,13 +5001,134 @@ function AccountCalibrationPage({
     ...option,
     count: accountCalibrations.filter((item) => item.target === option.value).length
   })).filter((item) => item.count > 0);
-  const conceptCalibrationOptions = accountConcepts
-    .filter((concept) => targetForConceptCode(concept.code))
-    .slice(0, 8);
-  const majorEventCalibrationOptions = (result?.plan_events ?? [])
+  const conceptByTarget = new Map<AccountCalibrationTarget, AccountConceptSummary>();
+  for (const concept of accountConcepts) {
+    const target = targetForConceptCode(concept.code);
+    if (target && !conceptByTarget.has(target)) conceptByTarget.set(target, concept);
+  }
+  const conceptCalibrationOptions = ACCOUNT_CALIBRATION_TARGET_OPTIONS.map((option) => {
+    const concept = conceptByTarget.get(option.value);
+    const fallbackCode = conceptCodeForTarget(option.value) ?? option.value;
+    return {
+      key: option.value,
+      target: option.value,
+      name: concept?.name ?? option.label,
+      currentBalance: concept?.current_balance ?? defaultCalibrationAmount(option.value),
+      sourceId: concept?.code ?? `calibration:${fallbackCode}`,
+      sourceCategory: concept?.category ?? option.value,
+      note: concept
+        ? `${concept.name}按账户概念摘要校准`
+        : `${option.label}按统一校准概念目录校准，金额来自核心对象分组或本页账户输入`
+    };
+  });
+  const planEventCalibrationOptions = (result?.plan_events ?? [])
     .filter((event) => event.category !== "account")
-    .slice(0, 8);
-  const strategyCalibrationOptions = generatedStrategies.slice(0, 8);
+    .map((event, index) => ({
+      key: `${event.plan_variant}:${event.month}:${event.category}:${event.title}:${index}`,
+      label: `${formatMonthDate(today, event.month)} · ${event.title}`,
+      event: {
+        target: targetForEventCategory(event.category),
+        month: event.month,
+        amount: event.amount ?? defaultCalibrationAmount(targetForEventCategory(event.category)),
+        sourceId: `${event.plan_variant}:${event.month}:${event.title}`,
+        sourceCategory: event.category,
+        sourceTitle: event.title,
+        note: event.detail
+      }
+    }));
+  const sequenceGoalById = new Map((planningSequence?.goals ?? []).map((goal) => [goal.id, goal]));
+  const planningGoalCalibrationOptions = planningGoals
+    .filter((goal) => goal.data.enabled)
+    .map((goal, index) => {
+      const sequenceGoal = sequenceGoalById.get(goal.id);
+      const target = targetForGoalType(goal.goal_type);
+      const month = sequenceGoal?.resolved_not_before_month ?? 0;
+      const title = sequenceGoal?.name || goal.data.name || `规划目标 ${index + 1}`;
+      return {
+        key: `planning_goal:${goal.id}`,
+        label: `${formatMonthDate(today, month)} · ${title}`,
+        event: {
+          target,
+          month,
+          amount: defaultCalibrationAmount(target),
+          sourceId: goal.id,
+          sourceCategory: `planning_goal:${goal.goal_type}`,
+          sourceTitle: title,
+          note: sequenceGoal?.explanation || goal.data.notes || "来自统一规划目标库，尚未形成完整事件时间线"
+        }
+      };
+    });
+  const majorEventCalibrationOptions = planEventCalibrationOptions.length
+    ? planEventCalibrationOptions
+    : planningGoalCalibrationOptions;
+  const strategyCalibrationOptions = generatedStrategies.map((strategy) => ({
+    key: strategy.id,
+    label: `${generatedStrategyTypeLabel(strategy.strategy_type)} · ${strategy.variant || "自动方案"}`,
+    searchText: generatedStrategySearchText(strategy),
+    strategy
+  }));
+  const filteredConceptCalibrationOptions = conceptCalibrationOptions.filter((concept) =>
+    sourceMatchesQuery(conceptSourceQuery, [
+      concept.name,
+      concept.sourceCategory,
+      concept.note,
+      concept.currentBalance,
+    ])
+  );
+  const filteredMajorEventCalibrationOptions = majorEventCalibrationOptions.filter((option) =>
+    sourceMatchesQuery(eventSourceQuery, [
+      option.label,
+      option.event.sourceTitle,
+      option.event.sourceCategory,
+      option.event.note,
+      option.event.amount,
+    ])
+  );
+  const filteredStrategyCalibrationOptions = strategyCalibrationOptions.filter((option) =>
+    sourceMatchesQuery(strategySourceQuery, [
+      option.label,
+      option.searchText,
+    ])
+  );
+  const selectedConcept = filteredConceptCalibrationOptions.find((concept) => concept.key === selectedConceptCode) ?? filteredConceptCalibrationOptions[0];
+  const selectedEvent = filteredMajorEventCalibrationOptions.find((option) => option.key === selectedEventKey) ?? filteredMajorEventCalibrationOptions[0];
+  const selectedStrategy = filteredStrategyCalibrationOptions.find((option) => option.key === selectedStrategyId) ?? filteredStrategyCalibrationOptions[0];
+  const calibrationWarnings = (() => {
+    const warnings: string[] = [];
+    const disabledCount = accountCalibrations.filter((item) => !item.enabled).length;
+    if (disabledCount > 0) {
+      warnings.push(`有 ${disabledCount} 条校准已停用，不会进入后端账本和事件线。`);
+    }
+    const enabledByMonthTarget = new Map<string, AccountCalibrationData[]>();
+    const enabledBySource = new Map<string, AccountCalibrationData[]>();
+    for (const calibration of accountCalibrations) {
+      if (!calibration.enabled) continue;
+      const monthTargetKey = `${calibration.month || "未设月份"}:${calibration.target}`;
+      enabledByMonthTarget.set(monthTargetKey, [...(enabledByMonthTarget.get(monthTargetKey) ?? []), calibration]);
+      const sourceKey = [
+        calibration.calibration_scope ?? "account",
+        calibration.source_id,
+        calibration.source_category,
+        calibration.source_title,
+        calibration.reference_name,
+        calibration.target,
+        calibration.month
+      ].join("|");
+      enabledBySource.set(sourceKey, [...(enabledBySource.get(sourceKey) ?? []), calibration]);
+    }
+    for (const [key, items] of enabledByMonthTarget) {
+      if (items.length <= 1) continue;
+      const [month, target] = key.split(":");
+      const targetLabel = ACCOUNT_CALIBRATION_TARGET_OPTIONS.find((option) => option.value === target)?.label ?? target;
+      warnings.push(`${month} 的${targetLabel}有 ${items.length} 条启用校准；后端会按记录顺序逐条应用，建议只保留最终确认的一条。`);
+    }
+    for (const items of enabledBySource.values()) {
+      if (items.length <= 1) continue;
+      const title = items[0].source_title || items[0].reference_name || "同一来源";
+      warnings.push(`${title} 出现 ${items.length} 条重复启用校准，请确认不是重复添加。`);
+    }
+    return Array.from(new Set(warnings));
+  })();
 
   return (
     <div className="page-stack account-calibration-page">
@@ -4580,27 +5173,109 @@ function AccountCalibrationPage({
         </div>
         {conceptCalibrationOptions.length ? (
           <div className="quick-action-row">
-            {conceptCalibrationOptions.map((concept) => (
-              <button className="ghost-button" type="button" key={concept.code} onClick={() => addConceptCalibration(concept)}>
+            {conceptCalibrationOptions.slice(0, 6).map((concept) => (
+              <button className="ghost-button" type="button" key={concept.key} onClick={() => addConceptCalibration(concept)}>
                 <Plus size={15} /> {concept.name}
               </button>
             ))}
           </div>
         ) : null}
+        <div className="calibration-source-grid">
+          {conceptCalibrationOptions.length ? (
+            <div className="calibration-source-picker">
+              <Field label="筛选账户概念">
+                <input
+                  type="search"
+                  value={conceptSourceQuery}
+                  placeholder="按概念、分类或说明搜索"
+                  onChange={(event) => setConceptSourceQuery(event.target.value)}
+                />
+              </Field>
+              <Field label="选择账户概念来源">
+                <select
+                  value={selectedConcept?.key ?? ""}
+                  onChange={(event) => setSelectedConceptCode(event.target.value)}
+                >
+                  {filteredConceptCalibrationOptions.length ? filteredConceptCalibrationOptions.map((concept) => (
+                    <option key={concept.key} value={concept.key}>
+                      {concept.name} · {money(concept.currentBalance)}
+                    </option>
+                  )) : <option value="">没有匹配来源</option>}
+                </select>
+              </Field>
+              <p className="field-hint">账户概念来源 {conceptCalibrationOptions.length} 个，当前匹配 {filteredConceptCalibrationOptions.length} 个。</p>
+              <button className="secondary-button" type="button" disabled={!selectedConcept} onClick={() => selectedConcept && addConceptCalibration(selectedConcept)}>
+                <Plus size={15} /> 添加概念校准
+              </button>
+            </div>
+          ) : null}
+          {majorEventCalibrationOptions.length ? (
+            <div className="calibration-source-picker">
+              <Field label="筛选重大事件">
+                <input
+                  type="search"
+                  value={eventSourceQuery}
+                  placeholder="按月份、标题、分类或说明搜索"
+                  onChange={(event) => setEventSourceQuery(event.target.value)}
+                />
+              </Field>
+              <Field label="选择重大事件来源">
+                <select
+                  value={selectedEvent?.key ?? ""}
+                  onChange={(event) => setSelectedEventKey(event.target.value)}
+                >
+                  {filteredMajorEventCalibrationOptions.length ? filteredMajorEventCalibrationOptions.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  )) : <option value="">没有匹配来源</option>}
+                </select>
+              </Field>
+              <p className="field-hint">重大事件来源 {majorEventCalibrationOptions.length} 个，当前匹配 {filteredMajorEventCalibrationOptions.length} 个。</p>
+              <button className="secondary-button" type="button" disabled={!selectedEvent} onClick={() => selectedEvent && addMajorEventCalibration(selectedEvent.event)}>
+                <Plus size={15} /> 添加事件校准
+              </button>
+            </div>
+          ) : null}
+          {strategyCalibrationOptions.length ? (
+            <div className="calibration-source-picker">
+              <Field label="筛选策略事件">
+                <input
+                  type="search"
+                  value={strategySourceQuery}
+                  placeholder="按类型、方案、策略键或归属目标搜索"
+                  onChange={(event) => setStrategySourceQuery(event.target.value)}
+                />
+              </Field>
+              <Field label="选择策略事件来源">
+                <select
+                  value={selectedStrategy?.key ?? ""}
+                  onChange={(event) => setSelectedStrategyId(event.target.value)}
+                >
+                  {filteredStrategyCalibrationOptions.length ? filteredStrategyCalibrationOptions.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  )) : <option value="">没有匹配来源</option>}
+                </select>
+              </Field>
+              <p className="field-hint">策略事件来源 {strategyCalibrationOptions.length} 个，当前匹配 {filteredStrategyCalibrationOptions.length} 个。</p>
+              <button className="secondary-button" type="button" disabled={!selectedStrategy} onClick={() => selectedStrategy && addStrategyCalibration(selectedStrategy.strategy)}>
+                <Plus size={15} /> 添加策略校准
+              </button>
+            </div>
+          ) : null}
+        </div>
         {majorEventCalibrationOptions.length ? (
           <div className="quick-action-row">
-            {majorEventCalibrationOptions.map((event, index) => (
-              <button className="ghost-button" type="button" key={`${event.plan_variant}-${event.month}-${event.title}-${index}`} onClick={() => addEventCalibration(event)}>
-                <Plus size={15} /> {formatMonthDate(today, event.month)} · {event.title}
+            {majorEventCalibrationOptions.slice(0, 6).map((option) => (
+              <button className="ghost-button" type="button" key={option.key} onClick={() => addMajorEventCalibration(option.event)}>
+                <Plus size={15} /> {option.label}
               </button>
             ))}
           </div>
         ) : null}
         {strategyCalibrationOptions.length ? (
           <div className="quick-action-row">
-            {strategyCalibrationOptions.map((strategy) => (
-              <button className="ghost-button" type="button" key={strategy.id} onClick={() => addStrategyCalibration(strategy)}>
-                <Plus size={15} /> {generatedStrategyTypeLabel(strategy.strategy_type)} · {strategy.variant || strategy.strategy_key}
+            {strategyCalibrationOptions.slice(0, 6).map((option) => (
+              <button className="ghost-button" type="button" key={option.key} onClick={() => addStrategyCalibration(option.strategy)}>
+                <Plus size={15} /> {option.label}
               </button>
             ))}
           </div>
@@ -4609,6 +5284,13 @@ function AccountCalibrationPage({
           <div className="setup-steps">
             {targetSummary.map((item) => (
               <span className="setup-step done" key={item.value}>{item.label} {item.count} 条</span>
+            ))}
+          </div>
+        ) : null}
+        {calibrationWarnings.length ? (
+          <div className="warning-list calibration-warning-list">
+            {calibrationWarnings.map((warning) => (
+              <span key={warning}>{warning}</span>
             ))}
           </div>
         ) : null}
@@ -4699,6 +5381,7 @@ function ChildPlanPage({
   updateChildPlan,
   updateChildPlanPatch,
   addChildPlan,
+  duplicateChildPlan,
   removeChildPlan
 }: {
   incomeMembers: IncomeMember[];
@@ -4708,6 +5391,7 @@ function ChildPlanPage({
   updateChildPlan: <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => void;
   updateChildPlanPatch: (index: number, patch: Partial<ChildPlanData>) => void;
   addChildPlan: () => void;
+  duplicateChildPlan: (index: number) => void;
   removeChildPlan: (index: number) => void;
 }) {
   const [selectedChildIndex, setSelectedChildIndex] = useState(0);
@@ -4761,8 +5445,8 @@ function ChildPlanPage({
       <section className="strategy-layout child-workbench-layout">
       <WorkflowSection
         icon={<Target size={18} />}
-        title="子女目标"
-        description="上方卡片用于比较和选择目标；详情区只编辑当前选中的子女目标。"
+        title="目标列表"
+        description="子女目标用统一目标卡片比较和选择；详情区只编辑当前选中的子女目标。"
         className="strategy-main-panel child-goal-panel"
       >
         <div className="member-header compact-actions">
@@ -4802,6 +5486,9 @@ function ChildPlanPage({
                   </div>
                   <div className="planning-goal-actions">
                     <SwitchField label="纳入测算" checked={child.enabled} onChange={(checked) => updateChildPlan(index, "enabled", checked)} />
+                    <button className="ghost-button small" type="button" onClick={() => duplicateChildPlan(index)} title="复制子女目标">
+                      <Copy size={14} /> 复制
+                    </button>
                     <button className="ghost-button small" type="button" onClick={() => removeChildPlan(index)} title="删除子女目标">
                       <Trash2 size={14} /> 删除
                     </button>
@@ -4825,6 +5512,14 @@ function ChildPlanPage({
               const index = activeChildIndex;
               const child = activeChild;
               const strategy = strategyForChild(child);
+              const strategyBirthMonth = childStrategyBirthMonthValue(strategy);
+              const strategyBirthMonthAdopted = Boolean(
+                strategyBirthMonth &&
+                child.timing_mode === "manual_month" &&
+                child.planned_birth_month === strategyBirthMonth &&
+                child.planned_birth_start_month === strategyBirthMonth &&
+                child.planned_birth_end_month === strategyBirthMonth
+              );
               const birth = resolveChildBirthMonth(child);
               const stageLabel = childEducationStageLabel(child, today);
               const currentCost = childMonthlyCostAt(child, today);
@@ -4847,6 +5542,10 @@ function ChildPlanPage({
                       </div>
                       {strategy ? (
                         <div className="child-strategy-card">
+                          <div className="subsection-title">
+                            <Sparkles size={15} />
+                            <strong>策略建议</strong>
+                          </div>
                           <div>
                             <span>策略建议出生月</span>
                             <strong>{strategy.birth_month_label || "等待购房策略或出生窗口"}</strong>
@@ -4864,6 +5563,20 @@ function ChildPlanPage({
                             <ul>
                               {strategy.warnings.map((warning) => <li key={warning}>{warning}</li>)}
                             </ul>
+                          ) : null}
+                          {strategyBirthMonth ? (
+                            <AdoptStrategyButton
+                              active={strategyBirthMonthAdopted}
+                              activeLabel="已采用策略出生月"
+                              inactiveLabel="采用策略出生月"
+                              onClick={() => updateChildPlanPatch(index, {
+                                enabled: true,
+                                timing_mode: "manual_month",
+                                planned_birth_month: strategyBirthMonth,
+                                planned_birth_start_month: strategyBirthMonth,
+                                planned_birth_end_month: strategyBirthMonth
+                              })}
+                            />
                           ) : null}
                         </div>
                       ) : null}
@@ -5086,7 +5799,7 @@ function TaxPage({
 
       <WorkflowSection
         icon={<ShieldCheck size={18} />}
-        title="年度税务策略"
+        title="自动策略"
         description="后端会把收入阶段、购房租房、养娃、个人养老金和理财收益税统一编排成长期税务动作，而不是只看某一个月份。"
         className="tax-timeline-panel"
       >
@@ -5900,16 +6613,16 @@ function ScenarioPage({
 
   if (!hasPurchaseTargets) {
     return (
-      <div className="page-stack strategy-workbench">
-        <SectionHeader
-          icon={<Target size={20} />}
-          title="购房计划"
-          action={
-            <button className="ghost-button" onClick={addPurchaseDemand}>
-              <Plus size={16} /> 添加购房需求
-            </button>
-          }
-        />
+      <PlannerPageShell
+        icon={<Target size={20} />}
+        title="购房计划"
+        action={
+          <button className="ghost-button" onClick={addPurchaseDemand}>
+            <Plus size={16} /> 添加购房需求
+          </button>
+        }
+        summary={<p>按“购房需求、候选房源、当前策略、影响预览”的顺序管理房源目标；没有目标时只展示家庭基线。</p>}
+      >
         <section className="strategy-hero">
           <div className="strategy-hero-main">
             <PanelTitle icon={<Sparkles size={18} />} title="默认不买房" compact />
@@ -5960,21 +6673,21 @@ function ScenarioPage({
             </article>
           </div>
         </section>
-      </div>
+      </PlannerPageShell>
     );
   }
 
   return (
-    <div className="page-stack strategy-workbench">
-      <SectionHeader
-        icon={<Target size={20} />}
-          title="购房计划"
-          action={
-          <button className="ghost-button" onClick={addPurchaseDemand}>
-            <Plus size={16} /> 新增购房需求
-          </button>
-        }
-      />
+    <PlannerPageShell
+      icon={<Target size={20} />}
+      title="购房计划"
+      action={
+        <button className="ghost-button" onClick={addPurchaseDemand}>
+          <Plus size={16} /> 新增购房需求
+        </button>
+      }
+      summary={<p>先选购房需求和候选房源，再确认贷款、公积金、装修与投资动用策略，最后查看现金流、贷款和幸福指数影响。</p>}
+    >
 
       <section className="strategy-hero">
         <div className="strategy-hero-main">
@@ -6045,7 +6758,7 @@ function ScenarioPage({
           <div className="strategy-panel-head">
             <PanelTitle icon={<Home size={18} />} title="购房需求与候选房源" compact collapsible />
           </div>
-          <div className="planning-goal-grid purchase-demand-grid">
+          <div className="planning-goal-grid horizontal-card-list purchase-demand-grid">
             {purchaseDemandGroups.map((group) => {
               const firstScenario = group.items[0];
               const active = group.sequence === selectedDemand.sequence;
@@ -6088,7 +6801,7 @@ function ScenarioPage({
             <p className="goal-updating-note">购房需求已更新，正在重新生成候选房源对比与贷款策略。</p>
           ) : null}
           <div className="side-form structured-settings demand-settings-panel">
-            <CollapsibleSettingGroup title="购房需求设定">
+            <CollapsibleSettingGroup title="购房需求设定" profile="core">
               <div className="form-grid two">
                 <SwitchField
                   label={selectedDemandIncludedInPlanning ? "纳入当前规划" : "暂不纳入规划"}
@@ -6380,7 +7093,7 @@ function ScenarioPage({
 
         <section className="strategy-main-panel">
           <div className="strategy-panel-head">
-            <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动调整策略参数" compact collapsible />
+            <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动参数" compact collapsible />
             <span>修改后会自动重算推荐、贷款结构和现金流</span>
           </div>
           <div className="structured-settings strategy-settings-groups">
@@ -6639,7 +7352,7 @@ function ScenarioPage({
           isRecommended={selectedPlan.is_recommended}
         />
       ) : null}
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -7395,16 +8108,16 @@ function CarPlanPage({
   const heroCarStrategy = primarySelectedStrategy;
 
   return (
-    <div className="page-stack strategy-workbench">
-      <SectionHeader
-        icon={<Car size={20} />}
-        title="购车计划"
-        action={
-          <button className="ghost-button" type="button" onClick={addVehicle}>
-            <Plus size={16} /> 添加用车需求
-          </button>
-        }
-      />
+    <PlannerPageShell
+      icon={<Car size={20} />}
+      title="购车计划"
+      action={
+        <button className="ghost-button" type="button" onClick={addVehicle}>
+          <Plus size={16} /> 添加用车需求
+        </button>
+      }
+      summary={<p>按“用车需求、候选车源、车辆参数与策略、政策与上牌、影响预览”的顺序管理购车目标。</p>}
+    >
 
       <section className="strategy-hero">
         <div className="strategy-hero-main">
@@ -7466,7 +8179,7 @@ function CarPlanPage({
           <PanelTitle icon={<CircleDollarSign size={18} />} title="用车需求与候选车源" compact collapsible />
           <span>{selectedCarStrategy}</span>
         </div>
-        <div className="planning-goal-grid vehicle-goal-grid">
+        <div className="planning-goal-grid horizontal-card-list vehicle-goal-grid">
           {vehiclePlans.map((vehicle, vehicleIndex) => {
             const firstCandidate = vehicle.candidate_vehicles?.[0] ?? vehicle;
             const resolvedGoal = resolvedVehicleGoalById.get(vehicle.planning_goal_id || "");
@@ -7665,7 +8378,7 @@ function CarPlanPage({
                           </button>
                         </div>
                         <div className="vehicle-setting-stack">
-                          <CollapsibleSettingGroup title="车辆属性">
+                          <CollapsibleSettingGroup title="车辆属性" profile="core">
                             <div className="form-grid compact-fields">
                               <NumberField label="车辆总价" value={candidate.total_price} min={0} step={10000} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { total_price: value })} />
                               <Field label="能源类型">
@@ -8418,7 +9131,7 @@ function CarPlanPage({
           </div>
         </section>
       ) : null}
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -8635,7 +9348,7 @@ function RulePage({
         { kind: "number", key: "micro_commercial_loan_ratio", label: "微量商贷默认比例", fallback: 0.05, min: 0, max: 1, step: 0.01, description: "未手动指定时，微量商贷策略的默认候选比例。" },
         { kind: "number", key: "micro_commercial_loan_ratio_min", label: "微量商贷自动下限", fallback: 0.02, min: 0, max: 1, step: 0.01, description: "后端自动寻找微量商贷比例时的下限。" },
         { kind: "number", key: "micro_commercial_loan_ratio_max", label: "微量商贷自动上限", fallback: 0.12, min: 0, max: 1, step: 0.01, description: "后端自动寻找微量商贷比例时的上限。" },
-        { kind: "number", key: "backend_parallel_workers", label: "后端并行工作数", fallback: 4, min: 1, max: 16, step: 1, description: "策略生成可并行的工作线程数；这是性能参数，不属于政策口径。" }
+        { kind: "number", key: "backend_parallel_workers", label: "策略生成并行数", fallback: 4, min: 1, max: 16, step: 1, description: "策略生成可并行的工作线程数；这是性能参数，不属于政策口径。" }
       ]
     }
   ];
@@ -8701,8 +9414,11 @@ function RulePage({
     );
   };
   return (
-    <div className="page-stack">
-      <SectionHeader icon={<Database size={20} />} title="政策规则" />
+    <PlannerPageShell
+      icon={<Database size={20} />}
+      title="政策规则"
+      summary={<p>政策页只维护规则包、城市口径和来源预览；核心规则默认展开，细分政策参数按类别收起。</p>}
+    >
       <section className="rule-panel">
         <PanelTitle icon={<Database size={18} />} title="规则包与来源" collapsible />
         <div className="rule-grid rule-meta-grid">
@@ -8726,8 +9442,8 @@ function RulePage({
           </Field>
         </div>
         <div className="rule-category-stack">
-          {ruleGroups.map((group) => (
-            <details className="rule-category-panel collapsible-rule-category" key={group.title} open>
+          {ruleGroups.map((group, groupIndex) => (
+            <details className="rule-category-panel collapsible-rule-category" key={group.title} open={groupIndex === 0}>
               <summary className="strategy-panel-head">
                 <div>
                   <strong>{group.title}</strong>
@@ -8760,7 +9476,7 @@ function RulePage({
           </div>
         ) : null}
       </section>
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -8774,6 +9490,8 @@ function VisualizationPage({
   selectedPlanVariant,
   setSelectedPlanVariant,
   availablePlans,
+  accountConcepts,
+  coreObjectGroups,
   activeRulePack,
   calculationPending
 }: {
@@ -8786,10 +9504,22 @@ function VisualizationPage({
   selectedPlanVariant: string;
   setSelectedPlanVariant: (variant: string) => void;
   availablePlans: PurchasePlanAnalysis[];
+  accountConcepts: AccountConceptSummary[];
+  coreObjectGroups: CoreObjectGroupSummary[];
   activeRulePack: RulePackData;
   calculationPending: boolean;
 }) {
   const scenario = selectedScenario.data;
+  const visualizationConceptByCode = accountConceptMap(accountConcepts);
+  const visualizationGroupByCode = coreObjectGroupMap(coreObjectGroups);
+  const visualizationCoreObjectSummary = [
+    `流动资产 ${coreObjectBalanceText(visualizationGroupByCode.get(CORE_OBJECT_GROUP_CODES.liquidAssets))}`,
+    `受限账户 ${coreObjectBalanceText(visualizationGroupByCode.get(CORE_OBJECT_GROUP_CODES.restrictedAccounts))}`,
+    `固定资产 ${coreObjectBalanceText(visualizationGroupByCode.get(CORE_OBJECT_GROUP_CODES.fixedAssets))}`,
+    `贷款账户 ${coreObjectBalanceText(visualizationGroupByCode.get(CORE_OBJECT_GROUP_CODES.loanAccounts))}`,
+    `公积金 ${coreObjectBalanceText(visualizationConceptByCode.get(ACCOUNT_CONCEPT_CODES.provident))}`
+  ].join(" · ");
+  const isBaselinePlan = selectedPlan?.source === "baseline";
   const comparisonDecision = (plan: PurchasePlanAnalysis | null) => {
     if (!plan) return { label: "待生成", tone: "muted" };
     if (plan.months_to_buy === null) return { label: "暂不可达", tone: "bad" };
@@ -8801,12 +9531,19 @@ function VisualizationPage({
   };
 
   return (
-    <div className="page-stack visualization-page">
-      <SectionHeader icon={<TrendingUp size={20} />} title="可视化" />
+    <PlannerPageShell
+      icon={<TrendingUp size={20} />}
+      title="可视化"
+      summary={<p>按“方案对比、当前策略故事线、账户曲线、月度明细、贷款与政策账户、事件时间线”的顺序查看完整推演。</p>}
+    >
       <section className="result-panel decision-board">
         <div className="strategy-panel-head">
-          <PanelTitle icon={<Home size={18} />} title="房源决策表" compact />
-          <span>先看哪套房、哪种策略更值得继续推演；点击一行后，下方故事线会切换到对应房源和策略。</span>
+          <PanelTitle icon={<Home size={18} />} title={scenarioComparisons.length ? "房源决策表" : "家庭基线"} compact />
+          <span>
+            {scenarioComparisons.length
+              ? "先看哪套房、哪种策略更值得继续推演；点击一行后，下方故事线会切换到对应房源和策略。"
+              : "当前没有启用购房目标，下方展示家庭现金流、账户、贷款、政策账户和事件时间线的基线推演。"}
+          </span>
         </div>
         {scenarioComparisons.length ? (
           <div className="comparison-table">
@@ -8855,27 +9592,32 @@ function VisualizationPage({
             })}
           </div>
         ) : (
-          <div className="empty-state">{calculationPending ? "正在计算房源对比" : "等待计算房源对比"}</div>
+          <div className="empty-state">
+            {calculationPending
+              ? "正在计算家庭基线"
+              : "未启用购房目标，因此没有房源对比表；可视化会继续展示家庭基线账本。"}
+          </div>
         )}
+        <p className="field-hint">核心对象口径：{visualizationCoreObjectSummary}。账户、资产和贷款解释与家庭财务、记账校准和导出表共用这套后端概念。</p>
       </section>
       <section className="result-panel visualization-story-panel">
         {result && selectedPlan ? (
           <>
             <div className="visual-header">
               <div>
-                <PanelTitle icon={<TrendingUp size={18} />} title="选中策略" />
+                <PanelTitle icon={<TrendingUp size={18} />} title={isBaselinePlan ? "家庭基线" : "选中策略"} />
                 <h3>{selectedPlan.variant}</h3>
                 <div className="visual-summary-strip">
                   <span>
-                    <small>可买时间</small>
-                    <strong>{formatPurchaseTiming(new Date(), selectedPlan.months_to_buy, selectedPlan.years_to_buy)}</strong>
+                    <small>{isBaselinePlan ? "测算口径" : "可买时间"}</small>
+                    <strong>{isBaselinePlan ? "不触发购房交易" : formatPurchaseTiming(new Date(), selectedPlan.months_to_buy, selectedPlan.years_to_buy)}</strong>
                   </span>
                   <span>
-                    <small>交易后现金</small>
+                    <small>{isBaselinePlan ? "当前现金账户" : "交易后现金"}</small>
                     <strong>{money(selectedPlan.cash_after_purchase)}</strong>
                   </span>
                   <span>
-                    <small>买后月结余</small>
+                    <small>{isBaselinePlan ? "当前月结余" : "买后月结余"}</small>
                     <strong>{money(selectedPlan.post_purchase_cash_flow)}</strong>
                   </span>
                   <span>
@@ -8884,16 +9626,18 @@ function VisualizationPage({
                   </span>
                 </div>
               </div>
-              <select
-                value={selectedPlanVariant}
-                onChange={(event) => setSelectedPlanVariant(event.target.value)}
-              >
-                {availablePlans.map((plan) => (
-                  <option key={plan.variant} value={plan.variant}>
-                    {plan.variant}
-                  </option>
-                ))}
-              </select>
+              {availablePlans.length > 1 || !isBaselinePlan ? (
+                <select
+                  value={selectedPlanVariant}
+                  onChange={(event) => setSelectedPlanVariant(event.target.value)}
+                >
+                  {availablePlans.map((plan) => (
+                    <option key={plan.variant} value={plan.variant}>
+                      {plan.variant}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
             </div>
 
             <SelectedPlanVisualization
@@ -8912,7 +9656,7 @@ function VisualizationPage({
           />
         )}
       </section>
-    </div>
+    </PlannerPageShell>
   );
 }
 
@@ -8960,6 +9704,7 @@ function SelectedPlanVisualization({
   const [isCompactChart, setIsCompactChart] = useState(() =>
     typeof window === "undefined" ? false : window.innerWidth < 640
   );
+  const isBaselineVisualization = plan.source === "baseline";
   const usesMonthlyProvidentRepayment = (plan.post_purchase_pf_strategy ?? "").includes("monthly_repayment_withdrawal");
   useEffect(() => {
     const syncCompactChart = () => setIsCompactChart(window.innerWidth < 640);
@@ -9230,6 +9975,7 @@ function SelectedPlanVisualization({
   const plannedVehicleLoanAmount = Math.max(0, result.car_loan.loan_principal ?? 0);
   const selectedLoanPoint = loanVisualizationByMonth.get(safeSelectedMonthIndex);
   const selectedProvidentPoint = providentVisualizationByMonth.get(safeSelectedMonthIndex);
+  const selectedTotalLoanBalance = selectedLoanPoint?.total_loan_balance ?? 0;
   const selectedExistingLoanDetails = selectedLoanPoint?.existing_loan_details ?? [];
   const selectedExistingLoanPaymentTotal = selectedExistingLoanDetails.reduce(
     (sum, item) => sum + Math.max(0, item.monthly_payment || 0),
@@ -9798,26 +10544,36 @@ function SelectedPlanVisualization({
     monthlyInvestmentSetting > 0
       ? `当前理财方案以 ${money(monthlyInvestmentSetting)}/月作为基础定投上限、${percent(annualReturn)} 年化测算；买入费率 ${percent(investmentBuyFeeRate)}，卖出费率 ${percent(investmentSellFeeRate)}。实际每月投入由后端按现金安全垫和当月结余动态执行，超过安全垫的存量现金会按滚动节奏转入投资账户，收益留在投资账户里继续复利。`
       : "当前理财方案未设置月定投或选择只放现金，因此曲线主要体现现有投资账户的收益假设。";
-  const advisorTone = cashStressOk && plan.liquidity_ok && plan.post_purchase_cash_flow >= 0
+  const advisorTone = isBaselineVisualization
+    ? (selectedMonth.monthlyCashDelta >= 0 && selectedMonth.现金池 >= plan.required_liquidity_reserve ? "good" : "warn")
+    : cashStressOk && plan.liquidity_ok && plan.post_purchase_cash_flow >= 0
     ? "good"
     : !cashStressOk || plan.post_purchase_cash_flow < 0
       ? "bad"
       : "warn";
   const advisorTitle =
-    advisorTone === "good"
+    isBaselineVisualization
+      ? "当前展示家庭财务基线"
+      : advisorTone === "good"
       ? "这套方案可以进入细化比较"
       : advisorTone === "bad"
         ? "这套方案需要先修现金安全"
         : "这套方案可执行但要留意压力点";
   const advisorSummary =
-    plan.months_to_buy === null
+    isBaselineVisualization
+      ? "当前没有启用购房目标，后端仍按统一账本推演家庭收入、支出、贷款、车辆、公积金、养老医保、理财和校准事件；这里先用于观察不买房基线下账户会怎样变化。"
+      : plan.months_to_buy === null
       ? `按当前收入、资产、理财和贷款策略，30 年内仍不能覆盖 ${scenario.name} 的交易现金要求。优先动作是降低房源总价、延后装修或提高可动用现金。`
       : advisorTone === "good"
         ? `${scenario.name} 采用「${plan.variant}」时，预计 ${formatMonthDate(timelineBaseDate, plan.months_to_buy)} 可以买入；交易后现金和买后月结余都留在安全区，适合继续比较居住体验、通勤和房源本身。`
         : advisorTone === "bad"
           ? `${scenario.name} 采用「${plan.variant}」时，时间上可能接近目标，但现金账户在压力情景下不够稳。先不要只看可买时间，应优先调整首付、商贷量、买车节奏或理财变现。`
           : `${scenario.name} 采用「${plan.variant}」时能形成方案，但交易现金、月结余或债务收入比里至少有一项偏紧，适合作为备选而不是默认执行。`;
-  const advisorActions = [
+  const advisorActions = isBaselineVisualization ? [
+    `当前查看 ${selectedMonth.name}，当月现金净变化 ${money(selectedMonth.monthlyCashDelta)}。`,
+    `月末现金账户 ${money(selectedMonth.现金池)}，投资账户 ${money(selectedMonth.投资资产)}，流动资产 ${money(selectedMonth.流动资产)}。`,
+    `贷款余额 ${money(selectedTotalLoanBalance)}，公积金账户 ${money(selectedMonth.公积金余额)}，政策账户 ${money(selectedMonth.socialSecurityAccountBalance)}。`
+  ] : [
     plan.months_to_buy === null
       ? "把候选房源总价、装修现金或首付要求往下调，先让方案进入可达区间。"
       : `把 ${formatMonthDate(timelineBaseDate, plan.months_to_buy)} 当作当前计划锚点，观察这个月的现金流和资产构成。`,
@@ -9828,7 +10584,24 @@ function SelectedPlanVisualization({
       ? `买后自由现金流为负 ${money(Math.abs(plan.post_purchase_cash_flow))}，需要减少月供、降低用车成本或提高收入阶段。`
       : `买后自由现金流结余约 ${money(plan.post_purchase_cash_flow)}，贷后公积金策略为「${providentStrategyLabel(plan)}」，可继续评估装修和车贷节奏。`
   ];
-  const advisorEvidenceItems = [
+  const advisorEvidenceItems = isBaselineVisualization ? [
+    {
+      label: "测算范围",
+      value: "未启用购房目标，不生成房贷和购房交易；家庭财务仍按统一账本生成月度现金流、账户快照和年度摘要。"
+    },
+    {
+      label: "当前月份",
+      value: `${selectedMonth.name} 现金净变化 ${money(selectedMonth.monthlyCashDelta)}，月末现金账户 ${money(selectedMonth.现金池)}。`
+    },
+    {
+      label: "资产账户",
+      value: `投资账户 ${money(selectedMonth.投资资产)}，固定资产 ${money(selectedMonth.固定资产)}，净资产 ${money(selectedMonth.净资产)}。`
+    },
+    {
+      label: "债务和政策账户",
+      value: `贷款余额 ${money(selectedTotalLoanBalance)}，公积金账户 ${money(selectedMonth.公积金余额)}，养老医保账户 ${money(selectedMonth.socialSecurityAccountBalance)}。`
+    }
+  ] : [
     {
       label: "买入时间",
       value: plan.months_to_buy === null
@@ -10151,7 +10924,8 @@ function SelectedPlanVisualization({
       month: item.month,
       label: `${formatMonthDate(timelineBaseDate, item.month)} · ${item.title}`,
       value: item.detail,
-      severity: item.severity
+      severity: item.severity,
+      calibrationSource: item.calibration_source
     }));
 
   return (
@@ -10186,29 +10960,45 @@ function SelectedPlanVisualization({
         </div>
       </section>
 
-      <div className="metric-grid visual-strategy-metrics">
-        <Metric label="计划买入月份" value={purchaseYearText} tone={plan.months_to_buy === null ? "bad" : "good"} />
-        <Metric label="买房当天自备资金" value={money(requiredCashAfterPf)} />
-        <Metric label="买房当天剩余现金" value={money(plan.cash_after_transaction)} tone={plan.liquidity_ok ? "good" : "warn"} />
-        <Metric label="现金安全垫目标" value={money(plan.required_liquidity_reserve)} />
-        <Metric label={stressCashMetricLabel} value={stressCashMetricValue} tone={cashStressOk ? "good" : "bad"} />
-        <Metric label="买后月度自由结余" value={money(plan.post_purchase_cash_flow)} tone={plan.post_purchase_cash_flow >= 0 ? "good" : "bad"} />
-        <Metric label="装修资金" value={renovationTimingText} tone={plan.months_to_renovation === null ? "warn" : "good"} />
-        <Metric label="负债收入比" value={percent(plan.debt_to_income_ratio)} tone={plan.debt_to_income_ratio > 0.5 ? "bad" : "warn"} />
-        <Metric label="幸福指数" value={`${plan.happiness_score.toFixed(1)} / 10`} tone={plan.happiness_score >= 7 ? "good" : plan.happiness_score >= 5 ? "warn" : "bad"} />
-        <Metric label="截至买房月投入本金" value={money(displayedInvestmentContribution)} />
-        <Metric label="截至买房月投资收益" value={money(displayedInvestmentReturn)} tone={displayedInvestmentReturn >= 0 ? "good" : "warn"} />
-        <Metric label="交易手续费" value={money(displayedInvestmentFees)} tone={displayedInvestmentFees > 0 ? "warn" : undefined} />
-      </div>
-      <p className={cashStressOk ? "field-hint" : "field-hint danger-text"}>
-        {stressCashSummary}
-      </p>
+      {isBaselineVisualization ? (
+        <div className="metric-grid visual-strategy-metrics">
+          <Metric label="当前查看月份" value={selectedMonth.name} />
+          <Metric label="月末现金账户" value={money(selectedMonth.现金池)} tone={selectedMonth.现金池 >= plan.required_liquidity_reserve ? "good" : "warn"} />
+          <Metric label="月末投资账户" value={money(selectedMonth.投资资产)} />
+          <Metric label="流动资产" value={money(selectedMonth.流动资产)} />
+          <Metric label="固定资产" value={money(selectedMonth.固定资产)} />
+          <Metric label="贷款余额" value={money(selectedTotalLoanBalance)} tone={selectedTotalLoanBalance > 0 ? "warn" : "good"} />
+          <Metric label="当月现金净变化" value={money(selectedMonth.monthlyCashDelta)} tone={selectedMonth.monthlyCashDelta >= 0 ? "good" : "warn"} />
+          <Metric label="现金安全垫目标" value={money(plan.required_liquidity_reserve)} />
+        </div>
+      ) : (
+        <>
+          <div className="metric-grid visual-strategy-metrics">
+            <Metric label="计划买入月份" value={purchaseYearText} tone={plan.months_to_buy === null ? "bad" : "good"} />
+            <Metric label="买房当天自备资金" value={money(requiredCashAfterPf)} />
+            <Metric label="买房当天剩余现金" value={money(plan.cash_after_transaction)} tone={plan.liquidity_ok ? "good" : "warn"} />
+            <Metric label="现金安全垫目标" value={money(plan.required_liquidity_reserve)} />
+            <Metric label={stressCashMetricLabel} value={stressCashMetricValue} tone={cashStressOk ? "good" : "bad"} />
+            <Metric label="买后月度自由结余" value={money(plan.post_purchase_cash_flow)} tone={plan.post_purchase_cash_flow >= 0 ? "good" : "bad"} />
+            <Metric label="装修资金" value={renovationTimingText} tone={plan.months_to_renovation === null ? "warn" : "good"} />
+            <Metric label="负债收入比" value={percent(plan.debt_to_income_ratio)} tone={plan.debt_to_income_ratio > 0.5 ? "bad" : "warn"} />
+            <Metric label="幸福指数" value={`${plan.happiness_score.toFixed(1)} / 10`} tone={plan.happiness_score >= 7 ? "good" : plan.happiness_score >= 5 ? "warn" : "bad"} />
+            <Metric label="截至买房月投入本金" value={money(displayedInvestmentContribution)} />
+            <Metric label="截至买房月投资收益" value={money(displayedInvestmentReturn)} tone={displayedInvestmentReturn >= 0 ? "good" : "warn"} />
+            <Metric label="交易手续费" value={money(displayedInvestmentFees)} tone={displayedInvestmentFees > 0 ? "warn" : undefined} />
+          </div>
+          <p className={cashStressOk ? "field-hint" : "field-hint danger-text"}>
+            {stressCashSummary}
+          </p>
+        </>
+      )}
       {visualizationVariantMismatch ? (
         <p className="field-hint">
-          账户曲线正在使用本次计算响应中的「{visualizationPlanVariant}」账本；当前策略实体「{plan.variant}」刷新完成后会自动对齐。
+          账户曲线正在使用本次计算生成的「{visualizationPlanVariant}」账本；当前策略方案「{plan.variant}」刷新完成后会自动对齐。
         </p>
       ) : null}
 
+      {!isBaselineVisualization ? (
       <section className="visual-story-block key-attribution-block">
         <div className="strategy-panel-head">
           <PanelTitle icon={<WalletCards size={18} />} title="关键决策因素" compact />
@@ -10312,6 +11102,7 @@ function SelectedPlanVisualization({
           </div>
         </details>
       </section>
+      ) : null}
 
       <section className="linked-month-panel">
         <div className="visual-control-header">
@@ -11425,8 +12216,12 @@ function SelectedPlanVisualization({
       <section className="chart-block happiness-chart">
         <PanelTitle icon={<TrendingUp size={18} />} title="幸福指数" compact />
         <div className="chart-subhead">
-          <strong>当前方案逐月曲线</strong>
-          <span>后端按现金安全、月现金流、贷款压力、购房阶段和家庭事件生成</span>
+          <strong>{isBaselineVisualization ? "家庭基线逐月曲线" : "当前方案逐月曲线"}</strong>
+          <span>
+            {isBaselineVisualization
+              ? "后端按现金安全、月现金流、贷款压力和家庭事件生成"
+              : "后端按现金安全、月现金流、贷款压力、购房阶段和家庭事件生成"}
+          </span>
         </div>
         <ResponsiveContainer width="100%" height={240}>
           <LineChart data={happinessCurveData}>
@@ -11441,39 +12236,47 @@ function SelectedPlanVisualization({
             {selectedMonthReferenceLine()}
           </LineChart>
         </ResponsiveContainer>
-        <div className="chart-subhead">
-          <strong>不同购房方案对比</strong>
-          <span>横向比较最终方案评分</span>
-        </div>
-        <ResponsiveContainer width="100%" height={220}>
-          <BarChart data={happinessData}>
-            <CartesianGrid strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="name" tickLine={false} axisLine={false} />
-            <YAxis domain={[0, 10]} tickLine={false} axisLine={false} width={36} />
-            <Tooltip formatter={(value) => `${Number(value).toFixed(1)} / 10`} />
-            <Bar dataKey="幸福指数" radius={[4, 4, 0, 0]}>
-              {happinessData.map((item) => (
-                <Cell key={item.name} fill={item.selected ? visualColors.safe : "var(--chart-muted-series)"} />
-              ))}
-            </Bar>
-          </BarChart>
-        </ResponsiveContainer>
-        <p className="field-hint">
-          幸福指数由后端按居住、通勤、教育、用车便利、买车对买房影响、交易现金、买后安全垫、投资连续性、月现金流、负债、月供、利息、现金缺口、等待、装修和压力韧性加权计算；流动性偏好越高，财务安全维度权重越高。
-        </p>
-        <div className="happiness-breakdown">
-          {plan.happiness_breakdown.map((item) => (
-            <div className="happiness-breakdown-item" key={item.key || item.name}>
-              <span>
-                <strong>{item.name}</strong>
-                <small>
-                  权重 {percent(item.weight)}，贡献 {item.weighted_score.toFixed(2)} 分。{item.note}
-                </small>
-              </span>
-              <b>{item.score.toFixed(1)}</b>
+        {!isBaselineVisualization ? (
+          <>
+            <div className="chart-subhead">
+              <strong>不同购房方案对比</strong>
+              <span>横向比较最终方案评分</span>
             </div>
-          ))}
-        </div>
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={happinessData}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="name" tickLine={false} axisLine={false} />
+                <YAxis domain={[0, 10]} tickLine={false} axisLine={false} width={36} />
+                <Tooltip formatter={(value) => `${Number(value).toFixed(1)} / 10`} />
+                <Bar dataKey="幸福指数" radius={[4, 4, 0, 0]}>
+                  {happinessData.map((item) => (
+                    <Cell key={item.name} fill={item.selected ? visualColors.safe : "var(--chart-muted-series)"} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </>
+        ) : null}
+        <p className="field-hint">
+          {isBaselineVisualization
+            ? "基线幸福指数不包含购房交易和房源体验，只用于观察现金安全、月现金流、贷款压力、用车、养娃和家庭事件对长期状态的影响。"
+            : "幸福指数由后端按居住、通勤、教育、用车便利、买车对买房影响、交易现金、买后安全垫、投资连续性、月现金流、负债、月供、利息、现金缺口、等待、装修和压力韧性加权计算；流动性偏好越高，财务安全维度权重越高。"}
+        </p>
+        {plan.happiness_breakdown.length > 0 ? (
+          <div className="happiness-breakdown">
+            {plan.happiness_breakdown.map((item) => (
+              <div className="happiness-breakdown-item" key={item.key || item.name}>
+                <span>
+                  <strong>{item.name}</strong>
+                  <small>
+                    权重 {percent(item.weight)}，贡献 {item.weighted_score.toFixed(2)} 分。{item.note}
+                  </small>
+                </span>
+                <b>{item.score.toFixed(1)}</b>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       <section className="timeline-panel">
@@ -11483,6 +12286,7 @@ function SelectedPlanVisualization({
             <div className="timeline-item" key={`${item.month}-${item.label}-${index}`}>
               <span>{item.label}</span>
               <strong>{item.value}</strong>
+              {item.calibrationSource ? <small>校准来源：{item.calibrationSource}</small> : null}
             </div>
           ))}
         </div>
@@ -11534,7 +12338,7 @@ function ExportPage({
       icon={<Download size={20} />}
       title="导出方案"
       action={<button className="ghost-button" onClick={runCalculation}><RefreshCw size={16} /> 刷新结果</button>}
-      summary={<p>先确认导出对象和当前选中方案，再导出文字说明或详细表格。表格列名保持中文，避免出现后端字段名。</p>}
+      summary={<p>先确认导出对象和当前选中方案，再导出文字说明或详细表格。表格列名保持中文，避免出现内部字段名。</p>}
     >
       <WorkflowSection
         icon={<Target size={18} />}
@@ -11554,7 +12358,12 @@ function ExportPage({
           ))}
         </div>
       </WorkflowSection>
-      <section className="result-panel export-panel">
+      <WorkflowSection
+        icon={<SlidersHorizontal size={18} />}
+        title="当前选中项配置"
+        description="选择本次导出的方案口径；文字和表格会跟随这里的方案切换。"
+        className="export-panel"
+      >
         {result && selectedPlan ? (
           <>
             <div className="visual-header">
@@ -11575,6 +12384,38 @@ function ExportPage({
               </select>
             </div>
             <PlanStatus plan={selectedPlan} />
+          </>
+        ) : (
+          <EmptyState
+            title="等待计算结果"
+            description="先刷新或完成一次计算，然后这里会显示可导出的当前方案和详细账户时间线。"
+            action={<button className="ghost-button" onClick={runCalculation}><RefreshCw size={16} /> 刷新结果</button>}
+          />
+        )}
+      </WorkflowSection>
+      {result && selectedPlan ? (
+        <>
+          <WorkflowSection
+            icon={<Sparkles size={18} />}
+            title="策略说明"
+            description="导出前先确认当前方案的顾问提示、资格说明和关键假设。"
+            profile="explanation"
+          >
+            <section className="notes export-notes">
+              <p>导出内容以当前选中的“{selectedPlan.variant}”为准；全局即时可行性仅作为背景参考。</p>
+              {result.eligibility_notes.map((note) => (
+                <p key={note}>{note}</p>
+              ))}
+              {result.assumptions.map((note) => (
+                <p key={note}>{note}</p>
+              ))}
+            </section>
+          </WorkflowSection>
+          <WorkflowSection
+            icon={<Gauge size={18} />}
+            title="影响预览与导出"
+            description="先扫关键指标，再下载文字说明或结构化表格。"
+          >
             <div className="metric-grid">
               <Metric
                 label="预计买入时间"
@@ -11612,24 +12453,9 @@ function ExportPage({
                 <Download size={16} /> 导出详细表格
               </button>
             </div>
-            <section className="notes">
-              <p>导出内容以当前选中的“{selectedPlan.variant}”为准；全局即时可行性仅作为背景参考。</p>
-              {result.eligibility_notes.map((note) => (
-                <p key={note}>{note}</p>
-              ))}
-              {result.assumptions.map((note) => (
-                <p key={note}>{note}</p>
-              ))}
-            </section>
-          </>
-        ) : (
-          <EmptyState
-            title="等待计算结果"
-            description="先刷新或完成一次后端计算，然后这里会显示可导出的当前方案和详细账户时间线。"
-            action={<button className="ghost-button" onClick={runCalculation}><RefreshCw size={16} /> 刷新结果</button>}
-          />
-        )}
-      </section>
+          </WorkflowSection>
+        </>
+      ) : null}
     </PlannerPageShell>
   );
 }
@@ -11701,7 +12527,7 @@ function exportText(result: AffordabilityResult, _scenario: ScenarioData, plan: 
   const document = (result.export_texts ?? []).find((item) => item.plan_variant === plan.variant);
   const lines = document?.lines ?? [
     `当前导出方案：${plan.variant}`,
-    "后端尚未返回结构化文字导出，请先重新计算。"
+    "本次计算尚未生成结构化文字导出，请先重新计算。"
   ];
   downloadFile(document?.filename ?? `house-plan-${plan.variant}.txt`, lines.join("\n"), "text/plain;charset=utf-8");
 }
@@ -11738,7 +12564,7 @@ function exportCsv(result: AffordabilityResult, _scenario: ScenarioData, plan: P
           "sep=,",
           ...csvSection("导出说明", ["项目", "内容"], [
             ["导出方案", plan.variant],
-            ["状态", "后端尚未返回结构化导出表格，请先重新计算。"]
+            ["状态", "本次计算尚未生成结构化导出表格，请先重新计算。"]
           ])
         ];
   downloadFile(`house-plan-${plan.variant}-detailed.csv`, `\uFEFF${sections.join("\n")}`, "text/csv;charset=utf-8");
@@ -11792,7 +12618,8 @@ function WorkflowSection({
   description,
   children,
   className = "",
-  defaultOpen = true
+  defaultOpen,
+  profile = "core"
 }: {
   icon: ReactNode;
   title: string;
@@ -11800,8 +12627,10 @@ function WorkflowSection({
   children: ReactNode;
   className?: string;
   defaultOpen?: boolean;
+  profile?: CollapseProfile;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const initialOpen = defaultOpen ?? COLLAPSE_DEFAULTS[profile];
+  const [open, setOpen] = useState(initialOpen);
   return (
     <section className={`form-panel workflow-section ${className}`}>
       <div className="workflow-section-head">
@@ -11821,7 +12650,8 @@ function CollapsiblePanel({
   title,
   children,
   className = "",
-  defaultOpen = true,
+  defaultOpen,
+  profile = "core",
   action,
 }: {
   icon: ReactNode;
@@ -11829,9 +12659,11 @@ function CollapsiblePanel({
   children: ReactNode;
   className?: string;
   defaultOpen?: boolean;
+  profile?: CollapseProfile;
   action?: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const initialOpen = defaultOpen ?? COLLAPSE_DEFAULTS[profile];
+  const [open, setOpen] = useState(initialOpen);
   return (
     <section className={`form-panel collapsible-panel ${className}`}>
       <div className="collapsible-panel-head">
@@ -11850,16 +12682,19 @@ function CollapsibleSettingGroup({
   title,
   children,
   className = "",
-  defaultOpen = true,
+  defaultOpen,
+  profile = "advanced",
   action,
 }: {
   title: string;
   children: ReactNode;
   className?: string;
   defaultOpen?: boolean;
+  profile?: CollapseProfile;
   action?: ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const initialOpen = defaultOpen ?? COLLAPSE_DEFAULTS[profile];
+  const [open, setOpen] = useState(initialOpen);
   return (
     <section className={`setting-group collapsible-setting-group ${className}`}>
       <div className="setting-group-head">

@@ -46,6 +46,7 @@ from ..projection.provident import (
     future_provident_value,
     future_provident_value_with_schedule,
 )
+from ..policy_explanations import market_assumption_note, policy_source_note, user_config_note
 from ..policies import get_policy
 from ..schemas import (
     CarLoanSummary,
@@ -1400,7 +1401,14 @@ def build_purchase_plan_analyses(
     analyses: list[PurchasePlanAnalysis] = []
     for variant_spec in variant_specs:
         name = variant_spec.name
-        description = variant_spec.description
+        description = "；".join(
+            [
+                policy_source_note("北京首付、公积金贷款额度、契税和贷后公积金处理由政策包计算。"),
+                user_config_note("目标总价、房源性质、装修预算、手动贷款比例和公积金还贷模式来自当前购房目标。"),
+                market_assumption_note("商贷利率、中介费率和房价交易假设来自当前市场快照或手动报价。"),
+                variant_spec.description,
+            ]
+        )
         target_commercial = variant_spec.target_commercial_loan
         use_min_down = variant_spec.use_min_down_payment
         use_manual_mix = variant_spec.use_manual_mix

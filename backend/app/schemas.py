@@ -968,6 +968,7 @@ class RulePackData(BaseModel):
             "deed_tax_second_home_standard_rate": 0.01,
             "deed_tax_second_home_large_rate": 0.02,
             "default_broker_fee_rate": 0.022,
+            "seller_tax_pass_through_default_rate": 0.0,
             "vehicle_purchase_tax_rate": 0.10,
             "vehicle_purchase_tax_taxable_price_ratio": 1 / 1.13,
             "new_energy_vehicle_purchase_tax_exempt_until": "2025-12",
@@ -1732,6 +1733,7 @@ class PlanEventPoint(BaseModel):
     amount: float | None = None
     severity: Literal["info", "success", "warning", "danger"] = "info"
     source: str = "backend"
+    calibration_source: str = ""
 
 
 class TaxMemberSummary(BaseModel):

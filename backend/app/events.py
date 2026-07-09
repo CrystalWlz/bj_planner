@@ -76,6 +76,18 @@ def account_plan_events(
         month_index = max(0, month_distance((current_month.year, current_month.month), target_month))
         target_label = CALIBRATION_TARGET_LABELS.get(calibration.target, "账户")
         source_title = calibration.source_title or calibration.reference_name
+        calibration_source_parts = [
+            value
+            for value in (
+                calibration.calibration_scope,
+                calibration.source_category,
+                source_title,
+                calibration.source_id,
+                calibration.reference_name,
+            )
+            if value
+        ]
+        calibration_source = " / ".join(dict.fromkeys(calibration_source_parts))
         source_text = f"；来源：{source_title}" if source_title else ""
         note = f"；备注：{calibration.note}" if calibration.note else ""
         events.append(
@@ -93,6 +105,8 @@ def account_plan_events(
                 ),
                 amount=round(calibration.amount, 2),
                 severity="info",
+                source="account_calibration",
+                calibration_source=calibration_source,
             )
         )
     return events
@@ -314,10 +328,12 @@ def planning_goal_constraint_events(
         if goal.normalized_timing_mode == "not_planned":
             month = 0
             severity = "info"
+            category = "risk"
             detail = f"{goal.name} 已保留在目标库中，但当前未纳入策略排程和现金流测算。"
         else:
             month = max(0, goal.resolved_window_start_month or goal.resolved_not_before_month)
             severity = "warning" if goal.dependency_warning else "info"
+            category = category_by_type.get(goal.goal_type, "risk")
             detail_parts = [goal.explanation or "该目标的时间约束来自统一规划目标表。"]
             if goal.resolved_window_end_month is not None:
                 detail_parts.append(f"规划窗口约束为第 {goal.resolved_window_start_month} 到第 {goal.resolved_window_end_month} 个月。")
@@ -330,7 +346,7 @@ def planning_goal_constraint_events(
             PlanEventPoint(
                 plan_variant=plan_variant,
                 month=month,
-                category=category_by_type.get(goal.goal_type, "risk"),
+                category=category,
                 title=f"规划目标：{goal.name}",
                 detail=detail,
                 amount=None,
@@ -419,18 +435,19 @@ def build_plan_events(
         if retirement_event is not None:
             events.append(retirement_event)
 
-        purchase_point = (
-            monthly_by_plan_month.get((plan.variant, plan.months_to_buy))
-            if plan.months_to_buy is not None
-            else None
-        )
-        events.extend(
-            purchase_plan_events(
-                plan,
-                scenario,
-                purchase_point=purchase_point,
+        if plan.source != "baseline":
+            purchase_point = (
+                monthly_by_plan_month.get((plan.variant, plan.months_to_buy))
+                if plan.months_to_buy is not None
+                else None
             )
-        )
+            events.extend(
+                purchase_plan_events(
+                    plan,
+                    scenario,
+                    purchase_point=purchase_point,
+                )
+            )
 
     category_order = {
         "account": 0,

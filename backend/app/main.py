@@ -14,6 +14,7 @@ from .database import (
     delete_record,
     delete_planning_goal_record,
     delete_scenario_record,
+    generated_strategies_exist_for_cache,
     get_calculation_cache_payload,
     initialize_database,
     insert_household_record,
@@ -46,6 +47,7 @@ from .planning_context import (
     planning_goal_records_for_request,
     planning_goal_sequence_for_request,
 )
+from .profiling import calculation_profile, profile_span
 from .reporting import build_account_concepts_from_core_object_snapshots, build_core_object_group_summaries
 from .schemas import (
     AffordabilityRequest,
@@ -83,17 +85,17 @@ from .schemas import (
 from .source_monitor import fetch_preview
 
 
-def _cached_affordability_payload_is_current(payload: str) -> bool:
+def _load_current_cached_affordability_payload(payload: str) -> dict | None:
     try:
         result = json.loads(payload)
     except json.JSONDecodeError:
-        return False
+        return None
     if not isinstance(result, dict):
-        return False
+        return None
     monthly_rows = result.get("monthly_cashflow_visualization")
     monthly_details = result.get("monthly_visualization_details")
     if isinstance(monthly_rows, list) and monthly_rows and not monthly_details:
-        return False
+        return None
     if isinstance(monthly_rows, list) and isinstance(monthly_details, list) and monthly_rows:
         has_cashflow_activity = any(
             isinstance(row, dict)
@@ -110,24 +112,25 @@ def _cached_affordability_payload_is_current(payload: str) -> bool:
             for detail in monthly_details
         )
         if has_cashflow_activity and not has_cashflow_detail_items:
-            return False
-    return True
+            return None
+    return result
 
 
 def _upgrade_cached_affordability_payload(
-    payload: str,
+    result: dict,
     cache_layers: CacheLayerHashes,
     calculation_context: CalculationContextSnapshot | None,
-) -> dict | None:
-    try:
-        result = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(result, dict):
-        return None
-    result["cache_layers"] = cache_layers.model_dump(mode="json")
-    result["calculation_context"] = calculation_context.model_dump(mode="json") if calculation_context else None
-    return result
+) -> tuple[dict, bool]:
+    changed = False
+    next_cache_layers = cache_layers.model_dump(mode="json")
+    next_calculation_context = calculation_context.model_dump(mode="json") if calculation_context else None
+    if result.get("cache_layers") != next_cache_layers:
+        result["cache_layers"] = next_cache_layers
+        changed = True
+    if result.get("calculation_context") != next_calculation_context:
+        result["calculation_context"] = next_calculation_context
+        changed = True
+    return result, changed
 
 
 @asynccontextmanager
@@ -311,34 +314,55 @@ def create_market_snapshot(payload: MarketSnapshotCreate) -> dict:
 
 @app.post("/api/calculations/affordability", response_model=AffordabilityResult)
 def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
-    cache_payload = payload_with_calculation_context(payload)
-    cache_key, engine_fingerprint, cache_layers = affordability_cache_key(cache_payload)
-    cached_payload = get_calculation_cache_payload(cache_key)
-    if cached_payload is not None and _cached_affordability_payload_is_current(cached_payload):
-        upgraded_payload = _upgrade_cached_affordability_payload(
-            cached_payload,
-            cache_layers,
-            cache_payload.calculation_context,
-        )
-        if upgraded_payload is not None:
-            upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
-            upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
+    with calculation_profile("affordability_api"):
+        with profile_span("calculation_context"):
+            cache_payload = payload_with_calculation_context(payload)
+        with profile_span("cache_key"):
+            cache_key, engine_fingerprint, cache_layers = affordability_cache_key(cache_payload)
+        with profile_span("cache_lookup"):
+            cached_payload = get_calculation_cache_payload(cache_key)
+        if cached_payload is not None:
+            with profile_span("cache_hit_load"):
+                cached_result = _load_current_cached_affordability_payload(cached_payload)
+        else:
+            cached_result = None
+        if cached_result is not None:
+            with profile_span("cache_hit_upgrade"):
+                upgrade_result = _upgrade_cached_affordability_payload(
+                    cached_result,
+                    cache_layers,
+                    cache_payload.calculation_context,
+                )
+            upgraded_payload, cache_payload_changed = upgrade_result
+            with profile_span("cache_hit_strategy_check"):
+                strategies_exist = generated_strategies_exist_for_cache(cache_key)
+            if cache_payload_changed:
+                with profile_span("cache_hit_cache_writeback"):
+                    upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
+            if not strategies_exist:
+                with profile_span("cache_hit_strategy_writeback"):
+                    upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
             return AffordabilityResult.model_validate(upgraded_payload)
 
-    payload = apply_planning_goal_constraints(cache_payload)
-    result = calculate_affordability(
-        payload.household,
-        payload.scenario,
-        payload.rule_pack,
-        market_snapshot=payload.market_snapshot,
-        include_stress_tests=payload.include_stress_tests,
-        calculation_context=payload.calculation_context,
-    )
-    result = result.model_copy(update={"cache_layers": cache_layers, "calculation_context": payload.calculation_context})
-    result_payload = result.model_dump(mode="json")
-    upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, result_payload)
-    upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, result_payload)
-    return result
+        with profile_span("planning_goal_constraints"):
+            payload = apply_planning_goal_constraints(cache_payload)
+        with profile_span("calculate_affordability"):
+            result = calculate_affordability(
+                payload.household,
+                payload.scenario,
+                payload.rule_pack,
+                market_snapshot=payload.market_snapshot,
+                include_stress_tests=payload.include_stress_tests,
+                calculation_context=payload.calculation_context,
+            )
+        with profile_span("result_payload"):
+            result = result.model_copy(update={"cache_layers": cache_layers})
+            result_payload = result.model_dump(mode="json")
+        with profile_span("calculation_cache_write"):
+            upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, result_payload)
+        with profile_span("generated_strategies_write"):
+            upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, result_payload)
+        return result
 
 
 @app.get("/api/generated-strategies")

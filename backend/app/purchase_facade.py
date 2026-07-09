@@ -99,6 +99,7 @@ def build_yield_sensitivity(
     taxes_and_fees: float,
     parallel_workers: int = 1,
     market_snapshot: MarketSnapshotData | None = None,
+    baseline_analyses: list[PurchasePlanAnalysis] | None = None,
 ) -> list[YieldSensitivityPoint]:
     return strategy_build_yield_sensitivity(
         household,
@@ -111,6 +112,7 @@ def build_yield_sensitivity(
         purchase_plan_builder=build_purchase_plan_analyses,
         parallel_workers=parallel_workers,
         market_snapshot=market_snapshot,
+        baseline_analyses=baseline_analyses,
     )
 
 

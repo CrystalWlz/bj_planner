@@ -13,6 +13,7 @@ from .projection_facade import (
     provident_visualization as build_provident_visualization,
     social_security_visualization as build_social_security_visualization,
 )
+from .profiling import profile_span
 from .reporting import (
     build_account_concepts,
     build_annual_financial_summaries_from_ledger,
@@ -99,92 +100,92 @@ def build_strategy_projection_pipeline(
     calculation_context: CalculationContextSnapshot | None = None,
     market_snapshot: MarketSnapshotData | None = None,
 ) -> StrategyProjectionPipelineResult:
-    selected_month = selected_purchase_month(scenario, purchase_plans)
-    effective_vehicle_states = (
-        vehicle_loan_states(
-            household.car_plan,
-            scenario=scenario,
-            home_purchase_month=selected_month,
+    with profile_span("selected_purchase_month"):
+        selected_month = selected_purchase_month(scenario, purchase_plans)
+    with profile_span("vehicle_states"):
+        effective_vehicle_states = (
+            vehicle_loan_states(
+                household.car_plan,
+                scenario=scenario,
+                home_purchase_month=selected_month,
+                rules=rules,
+                calculation_context=calculation_context,
+            )
+            if selected_month is not None
+            else (
+                vehicle_states
+                if vehicle_states is not None
+                else vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules, calculation_context=calculation_context)
+            )
+        )
+    with profile_span("provident_projection"):
+        provident_rows = build_provident_visualization(
+            household,
+            scenario,
+            rules,
+            purchase_plans,
+            car_loan,
+            vehicle_states=effective_vehicle_states,
+        )
+    with profile_span("social_security_projection"):
+        social_security_rows = build_social_security_visualization(
+            household,
+            rules,
+            purchase_plans,
+            car_loan,
+            vehicle_states=effective_vehicle_states,
+        )
+    with profile_span("loan_projection"):
+        loan_rows = build_loan_visualization(
+            household,
+            scenario,
+            purchase_plans,
+            car_loan,
+            base_monthly_debt_payment=base_monthly_debt_payment,
+            provident_visualization=provident_rows,
+            vehicle_states=effective_vehicle_states,
             rules=rules,
             calculation_context=calculation_context,
+            market_snapshot=market_snapshot,
         )
-        if selected_month is not None
-        else (
-            vehicle_states
-            if vehicle_states is not None
-            else vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules, calculation_context=calculation_context)
+    with profile_span("ledger_projection"):
+        ledger_result = build_monthly_ledger(
+            household,
+            scenario,
+            rules,
+            purchase_plans,
+            car_loan,
+            loan_rows,
+            provident_rows,
+            social_security_rows,
+            calculation_context=calculation_context,
         )
-    )
-    provident_rows = build_provident_visualization(
-        household,
-        scenario,
-        rules,
-        purchase_plans,
-        car_loan,
-        vehicle_states=effective_vehicle_states,
-    )
-    social_security_rows = build_social_security_visualization(
-        household,
-        rules,
-        purchase_plans,
-        car_loan,
-        vehicle_states=effective_vehicle_states,
-    )
-    loan_rows = build_loan_visualization(
-        household,
-        scenario,
-        purchase_plans,
-        car_loan,
-        base_monthly_debt_payment=base_monthly_debt_payment,
-        provident_visualization=provident_rows,
-        vehicle_states=effective_vehicle_states,
-        rules=rules,
-        calculation_context=calculation_context,
-        market_snapshot=market_snapshot,
-    )
-    ledger_result = build_monthly_ledger(
-        household,
-        scenario,
-        rules,
-        purchase_plans,
-        car_loan,
-        loan_rows,
-        provident_rows,
-        social_security_rows,
-        calculation_context=calculation_context,
-    )
-    monthly_cashflow_rows = build_monthly_cashflow_points(
-        ledger_result.projection_states,
-        ledger_result.ledger_entries,
-    )
+    with profile_span("monthly_visualization"):
+        monthly_cashflow_rows = build_monthly_cashflow_points(
+            ledger_result.projection_states,
+            ledger_result.ledger_entries,
+        )
     account_snapshots = ledger_result.account_snapshots
     monthly_ledger_entries = ledger_result.ledger_entries
-    annual_summaries = build_annual_financial_summaries_from_ledger(
-        monthly_ledger_entries,
-        account_snapshots,
-        loan_rows,
-        provident_rows,
-        social_security_rows,
-        base_date=base_month,
-    )
-    account_concepts = build_account_concepts(calculation_context)
-    return StrategyProjectionPipelineResult(
-        loan_visualization=loan_rows,
-        provident_visualization=provident_rows,
-        social_security_visualization=social_security_rows,
-        monthly_cashflow_visualization=monthly_cashflow_rows,
-        monthly_visualization_details=build_monthly_visualization_details(
-            monthly_cashflow_rows,
+    with profile_span("annual_reporting"):
+        annual_summaries = build_annual_financial_summaries_from_ledger(
+            monthly_ledger_entries,
+            account_snapshots,
+            loan_rows,
+            provident_rows,
             social_security_rows,
-        ),
-        annual_visualization_details=build_annual_visualization_details(annual_summaries),
-        account_snapshots=account_snapshots,
-        monthly_ledger=monthly_ledger_entries,
-        annual_financial_summaries=annual_summaries,
-        account_concepts=account_concepts,
-        core_object_groups=build_core_object_group_summaries(account_concepts),
-        strategy_explanations=build_strategy_explanations(purchase_plans),
-        plan_events=build_plan_events_from_context(
+            base_date=base_month,
+        )
+    with profile_span("account_concepts"):
+        account_concepts = build_account_concepts(calculation_context)
+        core_object_groups = build_core_object_group_summaries(account_concepts)
+    with profile_span("events_and_strategy_explanations"):
+        strategy_explanations = build_strategy_explanations(
+            purchase_plans,
+            account_concepts=account_concepts,
+            core_object_groups=core_object_groups,
+        )
+        plan_events = build_plan_events_from_context(
             household,
             scenario,
             rules,
@@ -206,14 +207,33 @@ def build_strategy_projection_pipeline(
             ),
             as_of=base_month,
             calculation_context=calculation_context,
-        ),
-        child_plan_strategies=build_child_plan_strategies(
+        )
+    with profile_span("child_plan_strategies"):
+        child_plan_strategies = build_child_plan_strategies(
             household,
             rules,
             home_purchase_month=selected_month,
             as_of=base_month,
             calculation_context=calculation_context,
+        )
+    return StrategyProjectionPipelineResult(
+        loan_visualization=loan_rows,
+        provident_visualization=provident_rows,
+        social_security_visualization=social_security_rows,
+        monthly_cashflow_visualization=monthly_cashflow_rows,
+        monthly_visualization_details=build_monthly_visualization_details(
+            monthly_cashflow_rows,
+            social_security_rows,
         ),
+        annual_visualization_details=build_annual_visualization_details(annual_summaries),
+        account_snapshots=account_snapshots,
+        monthly_ledger=monthly_ledger_entries,
+        annual_financial_summaries=annual_summaries,
+        account_concepts=account_concepts,
+        core_object_groups=core_object_groups,
+        strategy_explanations=strategy_explanations,
+        plan_events=plan_events,
+        child_plan_strategies=child_plan_strategies,
         selected_home_purchase_month=selected_month,
     )
 

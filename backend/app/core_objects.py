@@ -154,6 +154,11 @@ def derive_core_objects_for_household(household_id: str, household: dict[str, An
                     "target": target,
                     "target_label": calibration_target_label(target),
                     "month": month,
+                    "calibration_scope": calibration.get("calibration_scope", "account"),
+                    "source_id": calibration.get("source_id", ""),
+                    "source_category": calibration.get("source_category", ""),
+                    "source_title": calibration.get("source_title", ""),
+                    "reference_name": calibration.get("reference_name", ""),
                     "note": calibration.get("note", ""),
                 },
             )

@@ -2,6 +2,10 @@
 
 这份文档面向接手本项目的开发者，目标是解释系统整体关系、核心概念、数据流、计算边界和常见改动路径。项目不是一个简单的前端表单工具，而是一个“后端负责推演、前端负责表达和展示”的本地家庭财务规划系统。
 
+## 架构收口状态
+
+当前“数据库核心对象表、统一 `planning_goals`、多目标顺序规划、政策接口解耦、前端概念统一、缓存分层”仍按 [架构收口清单](architecture_closure_checklist.md) 跟踪。主文档描述目标架构和职责边界；收口清单负责记录每个方向的完成状态、验收条件和剩余缺口。只有清单里的完成判定全部满足，并且后端测试、前端构建、编码扫描和隐私扫描通过后，才应把这条大架构目标标记为完成。
+
 ## 一句话架构
 
 本项目由 React 前端、FastAPI 后端和 SQLite 本地数据库组成。用户在前端维护家庭数据、重大消费目标和政策假设；后端根据这些输入生成策略、账户曲线、税务、贷款、事件时间线和可视化数据；前端只展示后端结果，不重新承担核心计算。
@@ -42,13 +46,19 @@ flowchart LR
 - `backend/app/engine_config.py`
   后端计算运行时配置层。这里集中读取和校验并行 worker 数量等执行环境参数，供 `calculator.py`、策略管线和账本管线使用。它不属于城市政策包：北京市政策、税费、公积金、社保、车辆指标等业务规则仍在 `policies.py`；线程数、调度上限和类似性能参数不应散落在业务计算里直接读 `RulePackData.params`。
 
+- `backend/app/profiling.py`
+  后端性能观测层。默认关闭，不进入 API 响应，也不影响业务缓存；设置 `HOUSE_PLANNER_PROFILE=1` 后，`main.py`、`calculator.py`、`strategy_pipeline.py` 和 `planning_pipeline.py` 会在后端日志中输出计算上下文、缓存、策略生成、账本投影、可视化、响应组装和缓存写入等阶段耗时，供优化时对比冷启动、缓存命中和不同输入规模。
+
+- `scripts/perf_calculation_sample.py`
+  固定性能样例脚本。它强制使用临时 SQLite 数据库，默认开启 `HOUSE_PLANNER_PROFILE=1`，通过 FastAPI TestClient 对同一份基准输入连续执行冷启动和缓存命中两次计算，并输出总耗时、cache layer、策略数量和月度账本行数。做计算速度优化前后，应先运行这个脚本保存对比口径，再决定是否需要更完整的业务一致性回归。
+
 - `backend/app/planning_context.py`
   统一规划上下文层。这里负责读取 `planning_goals` 和 `core_objects`，生成 `PlanningFoundationSummary` 和 `CalculationContextSnapshot`，并把统一目标顺序解析结果应用到本次计算用的 `ScenarioData`、`CarPlanData.vehicle_plans` 和 `child_plans`。全局 vehicle/child 目标只在这里投影进本次 `AffordabilityRequest`，让策略和账本能消费同一套目标顺序；它们不会被写回 household JSON，避免跨家庭目标在下一次前端保存时被复制成家庭专属影子目标。上下文里的 planning/core 指纹由规范化内容生成，不读取记录 `updated_at`，让数据库派生索引重建保持缓存稳定。FastAPI 路由只调用这个模块，不直接维护目标顺序、目标指纹、核心对象分组或房/车/养娃约束回写逻辑。
 
   `planning_goals` 是买房、购车、养娃、装修和其它重大目标的统一主数据。`PlanningGoalData` 外层字段负责名称、启用状态、优先级、规划窗口、依赖关系和选中策略；`target_params` 只保存目标资产或事件本身的业务参数。旧页面里的 `planning_goal_id`、`purchase_sequence`、`planning_sequence`、`purchase_timing_mode`、`selected_*_variant`、规划窗口字段，以及公积金贷款利率、契税税率这类政策真源字段，都不应写回 `target_params`。从 household/scenario 投影到 planning goal、直接创建 planning goal、前端保存目标时都必须经过同一套清理规则，避免旧 shadow 对象继续形成第二套真源。
 
 - `backend/app/core_objects.py`
-  核心对象派生层。这里把家庭 JSON 和 `planning_goals` 转换成统一的 `CoreObjectData`：现金账户、投资账户、成员公积金/养老/医保/个人养老金账户、已有贷款、目标房产、目标车辆、养娃目标、装修/其它规划目标、目标可能形成的规划贷款和账户校准记录。目标派生对象的 `reference_id` 指向具体对象或目标子项，`owner_key` 必须指向对应 `planning_goal_id`；例如目标房产、目标车辆、养娃目标、装修/其它目标、规划商贷、规划公积金贷和规划车贷都应能直接按同一个目标 ID 聚合。核心对象派生记录 ID 必须包含 `household_id + object_type + source + reference_id + category`，不能只靠 reference/category，避免同一个输入引用同时派生账户、资产、贷款或校准记录时互相覆盖。目标贷款对象只用于让统一规划底座、导出和前端解释理解“这个目标可能带来哪类负债”，不代表今天已经发生的贷款现金流；实际贷款余额、月供、提前还本和公积金扣款仍由策略推演和贷款投影逐月生成。规划贷款对象必须写清 `rate_source`：公积金贷款利率属于政策包，核心对象只标记 `policy_pack` 且不从目标参数写入旧利率；商贷利率可作为 `market_quote`，车贷利率可作为 `dealer_financing_option`。`database.py` 只负责把这些派生对象写入 `core_objects` 表，不直接维护对象分类、名称、余额和元数据口径。账户校准记录使用 `object_type = adjustment`、`category = manual_adjustment`，用于解释某个月份后端推演状态被真实账本重置；它不是账户本体，不作为资产或负债重复并入流动资产、固定资产或贷款分组。
+  核心对象派生层。这里把家庭 JSON 和 `planning_goals` 转换成统一的 `CoreObjectData`：现金账户、投资账户、成员公积金/养老/医保/个人养老金账户、已有贷款、目标房产、目标车辆、养娃目标、装修/其它规划目标、目标可能形成的规划贷款和账户校准记录。目标派生对象的 `reference_id` 指向具体对象或目标子项，`owner_key` 必须指向对应 `planning_goal_id`；例如目标房产、目标车辆、养娃目标、装修/其它目标、规划商贷、规划公积金贷和规划车贷都应能直接按同一个目标 ID 聚合。核心对象派生记录 ID 必须包含 `household_id + object_type + source + reference_id + category`，不能只靠 reference/category，避免同一个输入引用同时派生账户、资产、贷款或校准记录时互相覆盖。目标贷款对象只用于让统一规划底座、导出和前端解释理解“这个目标可能带来哪类负债”，不代表今天已经发生的贷款现金流；实际贷款余额、月供、提前还本和公积金扣款仍由策略推演和贷款投影逐月生成。规划贷款对象必须写清 `rate_source`：公积金贷款利率属于政策包，核心对象只标记 `policy_pack` 且不从目标参数写入旧利率；商贷利率可作为 `market_quote`，车贷利率可作为 `dealer_financing_option`。`database.py` 只负责把这些派生对象写入 `core_objects` 表，不直接维护对象分类、名称、余额和元数据口径。账户校准记录使用 `object_type = adjustment`、`category = manual_adjustment`，用于解释某个月份后端推演状态被真实账本重置；它必须在 metadata 中保留 `calibration_scope`、`source_id`、`source_category`、`source_title` 和 `reference_name`，让账户概念、重大事件和策略事件校准能从核心对象表追溯来源；它不是账户本体，不作为资产或负债重复并入流动资产、固定资产或贷款分组。
   `timing_mode = not_planned` 或已禁用的目标可以继续出现在目标列表和顺序解析结果里供用户查看，但不能派生目标资产或规划贷款核心对象，避免前端固定资产、贷款和策略实体覆盖率把“暂不纳入规划”的目标当作本次推演对象。
 
 - `backend/app/core_object_concepts.py`
@@ -100,7 +110,7 @@ flowchart LR
   - `planning_goals.py`：重大消费目标顺序解析层。这里把 `planning_goals` 表里的买房、买车、装修和其他目标统一解析成 `ResolvedPlanningGoal`：按优先级排序，处理自动顺序、并行考虑、手动年月、依赖某目标之后、延迟月份和规划窗口，并输出可读解释和 warning。后续策略生成应优先消费这个解析结果，而不是在购房、购车、养娃页面各自维护一套顺序语义。
     暂不纳入规划、已禁用或并行考虑的目标不占用 `sequence_index`，也不能作为后续自动顺序目标的默认锚点；如果目标显式依赖暂不纳入规划或已禁用的目标，解析层会给出 warning，并降级为自动顺序，继续跟随前一个有效顺序目标。并行目标可以进入列表和可视化，用户显式选择“跟随该并行目标”时仍可作为依赖目标，但不会把其它自动顺序目标往后挤。
   - `children.py`：子女计划出生时间推定、阶段性养育支出、养娃策略说明和子女计划幸福指数估算；出生延迟、年龄阈值等政策口径必须显式传入 `RulePackData`。
-  - `expenses.py`：日常支出阶段、租房支出阶段、一次性或年度支出发生月份、租房中介费和服务费估算，以及 `MonthlyHouseholdExpenseBreakdown` 家庭月支出拆解。现金流、医保可支付支出、养娃支出和职业冲击自缴等支出口径应从这里进入月度账本；领域层必须显式接收 `RulePackData`，不能在缺少规则时默默按 0 处理政策相关支出，`calculator.py` 只保留兼容包装。
+  - `expenses.py`：日常支出阶段、租房支出阶段、一次性或年度支出发生月份、租房中介费和服务费估算，以及 `MonthlyHouseholdExpenseBreakdown` 家庭月支出拆解。现金流、医保可支付支出、养娃支出和职业冲击自缴等支出口径应从这里进入月度账本；`medical_account_payable` 只对 `expense_category = medical` 的计划支出生效，普通阶段性/年度/一次性支出永远按家庭现金支出处理，前端也不能把医保支付开关显示成通用“现金账户支付”选项；领域层必须显式接收 `RulePackData`，不能在缺少规则时默默按 0 处理政策相关支出，`calculator.py` 只保留兼容包装。
   - `tax.py`：个人所得税基础税率、年终奖发放/归属口径、收入阶段生效判断、社保公积金缴费明细等纯税务基础算法；社保基数、公积金上下限、缴费比例等政策口径必须通过 `policies.py` 注入。
   - `career.py`：职业冲击、失业金、灵活就业自缴、退休养老金阶段等职业生命周期算法；失业金档位、灵活就业自缴、退休年龄和养老金估算口径必须通过 `policies.py` 注入。
   - `investments.py`：理财收益税后口径、投资组合摘要、月度投资账户分配、现金/投资账户未来值滚动，以及购房交易时投资账户动用/清仓/保留余额的现金结果。
@@ -261,7 +271,7 @@ planning_goals
 
 `planning_goals` 的顺序语义必须进入策略入口，而不是只在前端列表展示。当前 home、vehicle、child 目标都会在计算前被解析成 `CalculationContextGoalSnapshot` 并投影到旧结构：`not_planned` 或 disabled 目标必须让对应房源、车辆或子女目标在本次推演中停用，并且 `sequence_index = 0`；`parallel` 目标保持可见、可策略评估，但同样 `sequence_index = 0`，不占用有效排队顺序。后续自动顺序目标只能依赖上一个有效排队目标，不能被已停用目标或并行目标推后。全局 vehicle/child 目标会作为计算期临时投影进入 `household.car_plan.vehicle_plans` 或 `household.child_plans`，但数据库读取 household 时仍只回放家庭专属 vehicle/child 目标；全局目标属于跨家庭规划上下文和核心对象索引，不应被 household 保存流程改写成家庭私有目标。车辆目标在统一目标和旧 `VehiclePlanData` 之间双向投影时，`not_planned` 必须保留为 `purchase_timing_mode = not_planned` 且 `enabled = false`，不能被旧页面模型恢复成自动顺序；它们可以保留窗口字段供用户以后重新启用，但窗口不可行不应产生当前策略 warning。`resolved_not_before_month` 和 `resolved_window_start_month` 必须成为策略搜索下限；home 目标的 `resolved_window_end_month` 已作为购房候选搜索上限，vehicle 目标的 `resolved_window_end_month` 已作为购车候选可买时间上限，窗口内找不到可行交易时应返回不可行候选而不是跑到窗口外；窗口结束和依赖警告应进入可视化事件和策略解释。投影阶段也必须按每个购房候选方案自己的 `months_to_buy` 重新展开后续车辆状态，不能复用策略生成前的静态车辆状态，也不能把当前选中购房方案的车辆状态强行套到所有候选方案上；否则“买房后 6 个月买车”这类依赖会在方案对比、贷款曲线、月度账本和事件时间线里错位。这样“默认不买房/不买车/暂不生娃”才是真正的后端规划状态，而不是页面上的临时开关。
 
-统一目标删除和类型变更也必须以 `planning_goals` 为真源回写旧页面模型。通过 `/api/planning-goals/{id}` 删除 home 目标时，数据库层会同步删除同 ID 的旧 `scenarios` 影子记录；创建或更新 home 目标时也会把目标投影写入旧 `scenarios` 表，供仍依赖场景表的存储路径保持一致；如果 home 目标改成 vehicle、child、renovation 或 other，旧 `scenarios` 影子记录必须同步删除，不能继续让 `/api/scenarios` 暴露一个已经不再是购房目标的记录。`/api/scenarios` 的读取源仍是 home `planning_goals`，旧 `scenarios` 表只作为过渡影子，不应成为第二个真源；当请求带 `household_id` 时，返回该家庭 home goals 加全局 home goals，并按同一家庭作用域解析 `purchase_sequence`，不能把其它家庭的目标混入当前家庭页面。前端新增购房目标时必须把当前 `household_id` 传给 `/api/scenarios`，只有用户明确创建跨家庭模板目标时才允许空 household。更新 `/api/planning-goals/{id}` 时，省略 `household_id` 表示保留原作用域，显式传 `household_id: null` 才表示把目标改成全局目标；家庭目标转全局或全局目标转家庭时，数据库层必须重建所有受影响家庭的 `core_objects`。通过 `/api/planning-goals/{id}` 删除 vehicle 或 child 目标时，数据库层会同步移除 household JSON 中对应 `planning_goal_id` 的车辆需求或子女计划，并重建 `core_objects`；如果 vehicle 或 child 目标被改成其它类型或迁移到其它家庭，也必须先按旧类型清理原 household JSON 里的旧投影，再按新类型重建核心对象。household 保存流程只把上一版原始 household JSON 中已经存在的 vehicle/child 影子列表视为可被空列表删除的旧入口来源；直接通过 `planning_goals` 创建的目标不会因为一个陈旧的空 `vehicle_plans` 或 `child_plans` payload 被误删，删除这类目标必须走显式目标删除接口。这样前端未来从统一目标列表删除目标、改变目标类型或切换全局/家庭作用域时，不会因为旧 `scenarios`、`car_plan.vehicle_plans` 或 `child_plans` 仍残留而在下次保存或读取时把目标重新生成出来。
+统一目标删除和类型变更也必须以 `planning_goals` 为真源回写旧页面模型。通过 `/api/planning-goals/{id}` 创建或更新 home 目标时，数据库层不再写同 ID 的旧 `scenarios` 影子记录；`/api/scenarios` 的读取源是 home `planning_goals` 的投影，旧 `scenarios` 表只保留给仍走 `/api/scenarios` 写接口的兼容入口，不能成为第二个真源。如果 home 目标改成 vehicle、child、renovation 或 other，数据库层仍会删除同 ID 的旧 `scenarios` 兼容记录，不能继续让 `/api/scenarios` 暴露一个已经不再是购房目标的记录。当请求带 `household_id` 时，`/api/scenarios` 返回该家庭 home goals 加全局 home goals，并按同一家庭作用域解析 `purchase_sequence`，不能把其它家庭的目标混入当前家庭页面。前端新增购房目标时必须把当前 `household_id` 传给 `/api/scenarios`，只有用户明确创建跨家庭模板目标时才允许空 household。更新 `/api/planning-goals/{id}` 时，省略 `household_id` 表示保留原作用域，显式传 `household_id: null` 才表示把目标改成全局目标；家庭目标转全局或全局目标转家庭时，数据库层必须重建所有受影响家庭的 `core_objects`。通过 `/api/planning-goals/{id}` 删除 vehicle 或 child 目标时，数据库层会同步移除 household JSON 中对应 `planning_goal_id` 的车辆需求或子女计划，并重建 `core_objects`；如果 vehicle 或 child 目标被改成其它类型或迁移到其它家庭，也必须先按旧类型清理原 household JSON 里的旧投影，再按新类型重建核心对象。household 保存流程只把上一版原始 household JSON 中已经存在的 vehicle/child 影子列表视为可被空列表删除的旧入口来源；直接通过 `planning_goals` 创建的目标不会因为一个陈旧的空 `vehicle_plans` 或 `child_plans` payload 被误删，删除这类目标必须走显式目标删除接口。这样前端未来从统一目标列表删除目标、改变目标类型或切换全局/家庭作用域时，不会因为旧 `scenarios`、`car_plan.vehicle_plans` 或 `child_plans` 仍残留而在下次保存或读取时把目标重新生成出来。
 
 买房、买车和养娃仍保留各自专业参数：
 
@@ -318,7 +328,7 @@ sequenceDiagram
 
 计算入口会为 `AffordabilityRequest` 补齐 `CalculationContextSnapshot`：包含当前家庭、当前房源、统一目标列表、精简后的 `planning_goals` 解析快照、精简后的 `core_objects` 快照、核心对象表指纹，并纳入 input hash。该快照和 `/api/planning-foundation` 都复用 `planning_context.planning_foundation_for_request(...)` 读取同一批目标、顺序、核心对象、账户概念和对象分组，避免“前端底座预览”和“实际计算上下文”各自拼装；当传入 `household_id` 时，目标范围是全局目标加本家庭目标，核心对象也必须通过 `core_object_records_for_request(...)` 使用同一家庭范围，让全局目标能在本家庭底座中拥有对应目标资产对象，不能出现“目标序列可见、核心对象不可见”的断层。如果请求没有 `household_id`、`scenario_id` 或 `ScenarioData.planning_goal_id` 能解析出家庭作用域，计算上下文必须保持空的 planning/core 快照，不能因为 `/api/planning-foundation` 支持无筛选预览就把全库其它家庭的目标和核心对象读入一次临时测算。当前目标识别优先使用 `scenario_id`，也接受 `ScenarioData.planning_goal_id`，因此旧调用、局部刷新或目标级计算即使没有传 `scenario_id`，也能把统一目标标记为 `current_goal_id` 并应用同一套窗口和依赖约束。`planning_goals` 快照不携带完整业务参数，只保留目标 ID、类型、名称、优先级、顺序、依赖、解析后的最早月份、窗口和解释，供缓存、前端响应、目标约束和事件时间线消费。`core_objects` 快照不携带完整 metadata，只保留对象 ID、类型、分类、名称、来源、归属目标 `owner_key`、引用 ID、成员名、当前余额和月流量，用于让计算结果本身说明本次推演采用了哪些账户、资产、贷款和重大目标；前端规划底座必须优先用 `owner_key` 把目标资产、规划贷款和策略实体聚合回同一个目标卡片，不能只按 `reference_id` 或数组下标猜测归属。其中目标贷款对象来自目标参数或用户配置的贷款偏好，只作为“规划负债结构”索引；公积金规划贷款利率不从目标参数写入，必须等策略推演时由政策包返回；实际某个月有没有贷款、余额是多少、月供从现金还是公积金账户扣，仍必须以 `loan_visualization`、月度 ledger 和专项账户序列为准。当前购房策略生成已经能直接从当前 home goal 快照或 `ScenarioData.planning_goal_id` 对应的 home goal 快照读取最早购买月份和规划窗口，并在 `PurchasePlanAnalysis.source` 标记为 `planning_goals`；当请求明确带有 `scenario_id` 或 `ScenarioData.planning_goal_id` 指向 home goal 时，计算入口会先把该目标的 `target_params` 投影成最新 `ScenarioData`，旧请求里的房源总价、首付、目标窗口和选中策略只能作为过渡投影，不能反向覆盖数据库里的统一目标真源；同时仍会把 `resolved_not_before_month` 应用到 `ScenarioData.manual_purchase_delay_months`，确保旧调用路径不会绕过统一目标约束。购车策略生成、车贷聚合和车辆状态展开已经能直接从 vehicle goal 快照读取启用状态、手动/并行/自动顺序、规划窗口和目标来源，并在 `CarPlanAnalysis.source` 标记为 `planning_goals`；当判断车辆在购房前、购房后还是并行发生时，策略层、贷款可视化和月度账本都优先比较 `planning_goals.sequence_index`，多车辆展开排序和回写到车辆计划的顺序也使用解析后的 `sequence_index`，旧的 `purchase_sequence` / `planning_sequence` 只作为没有统一上下文时的兼容口径。即使请求里的旧 `household.car_plan.vehicle_plans` 为空，只要本家庭数据库里存在 vehicle 类型 `planning_goals`，计算入口也会先把目标投影为 `VehiclePlanData` 再进入购车策略和车贷推演，避免旧 shadow payload 成为是否参与计算的第二套真源。`GET /api/households` 和 `GET /api/scenarios` 为旧页面模型投影 `planning_sequence` / `purchase_sequence` 时，也必须按同一家庭的全量 `planning_goals` 解析 `sequence_index`，不能把单个目标的 `priority` 直接当成实际规划顺序。养娃策略生成已经能直接从 child goal 快照读取启用状态、出生时间窗口和目标来源，并在 `ChildPlanStrategyPoint.source` 标记为 `planning_goals`；多个子女目标的候选策略输出顺序也优先按 `planning_goals.sequence_index` 排列，不能退回到 `child_plans` 数组顺序。即使请求里的旧 `household.child_plans` 为空，只要本家庭数据库里存在 child 类型 `planning_goals`，计算入口也会先把目标投影为 `ChildPlanData` 再进入策略，避免旧 shadow payload 成为是否参与计算的第二套真源。投影管线会把同一快照传入事件生成层，生成 `source = planning_goals` 的规划目标事件。数据库里的目标记录仍作为房源、车源、子女目标专业参数、选中策略和 target params 的来源，没有目标记录时也能用上下文快照应用基础顺序、启用状态和最早时间约束。这个快照和约束仍只是策略主流程迁移的第一步；后续应让理财等策略继续直接消费 `planning_goals` 的顺序解析结果和核心对象，而不是继续从页面专属结构各自推演。
 
-前端顶部已经提供“规划底座”入口，把重大目标顺序、账户、目标资产、贷款、市场假设和后端策略实体放在同一条概念带里展示。已有有效计算结果时，规划底座优先使用 `AffordabilityResult.calculation_context.planning_goals`、`calculation_context.core_objects`、后端 `account_concepts` 和 `core_object_groups` 的动态对象摘要，让用户看到的是已经进入本次策略推演的目标顺序和账户/资产/贷款口径；未完成计算或无计算结果时，前端使用 `/api/planning-foundation` 一次性读取 `planning_goals`、`planning_sequence`、`core_objects`、`account_concepts` 和 `core_object_groups` 作为目标库与对象库预览，避免在页面启动、保存和目标增删后分别拉多个接口造成局部状态不同步。前端初始化会同时读取 `/api/market-snapshots`，默认使用第一条市场快照作为本次市场假设输入，并在每次 `calculateAffordability(...)` 请求中带入 `market_snapshot`；因此商贷市场报价、中介费市场假设、卖方税费转嫁成交口径和 cache input hash 由同一份前端状态驱动，不再只是后端孤立支持。计算完成后，前端会把本次计算响应中的多组完整 `CacheLayerHashes` 按 `engine + input + strategy + ledger + visualization` 去重后提交给 `POST /api/generated-strategies/by-cache-layers`，由后端按五层 hash、当前 engine 指纹、策略类型和 `owner_key` 精确取回策略实体；前端不能退回到单独拼 `input_hash`、`strategy_hash`、`ledger_hash` 或 `visualization_hash` 调旧 `GET /api/generated-strategies`，也不能只按策略层 hash 混用其它输入或旧 engine 下的历史策略。规划底座应按 `generated_strategies.owner_key` 把策略实体覆盖情况绑定回具体目标卡片，而不是只展示全局数量。前端的 `generatedStrategies` 状态是“上一批成功落库的后端策略实体”，普通配置变更或普通 `/api/planning-foundation` 刷新只把计算标记为过期，不应立即清空它；新计算完成且 batch 查询成功后再整体替换，避免理财、购车或购房策略列表在重算间隙塌缩成旧响应或手动兜底。只有添加、删除目标这类结构性操作才应显式清空相关实体。税务页已经优先从 `strategy_type = tax` 的实体恢复策略项和时间线，养娃页已经优先从 `strategy_type = child_plan` 的实体恢复子女目标策略，理财页已经优先从 `strategy_type = investment` 的实体恢复推荐方案，购车页已经优先从 `strategy_type = vehicle` 的实体恢复车源候选策略，购房页已经优先从 `strategy_type = purchase` 的实体恢复房源候选策略；实体尚未返回时才临时回退到 `AffordabilityResult.tax_strategy_*`、`child_plan_strategies`、`investment_plan_recommendations`、`car_plan_analyses` 或 `purchase_plan_analyses`。家庭财务页里的“账户与安全垫”和记账校准页已经通过 `frontend/src/coreObjects.ts` 复用同一套 `account_concepts` / `core_object_groups` code、展示顺序和格式化规则，只保留真实账户输入框，不再在页面内部维护另一套资产、受限账户、固定资产和贷款汇总口径。它是前端概念统一的入口层；各业务页面内部仍需继续向同一页面骨架和同一目标/对象模型收敛。
+前端顶部已经提供“规划底座”入口，把重大目标顺序、账户、目标资产、贷款、市场假设和后端策略实体放在同一条概念带里展示。已有有效计算结果时，规划底座优先使用 `AffordabilityResult.calculation_context.planning_goals`、`calculation_context.core_objects`、后端 `account_concepts` 和 `core_object_groups` 的动态对象摘要，让用户看到的是已经进入本次策略推演的目标顺序和账户/资产/贷款口径；未完成计算或无计算结果时，前端使用 `/api/planning-foundation` 一次性读取 `planning_goals`、`planning_sequence`、`core_objects`、`account_concepts` 和 `core_object_groups` 作为目标库与对象库预览，避免在页面启动、保存和目标增删后分别拉多个接口造成局部状态不同步。前端初始化会同时读取 `/api/market-snapshots`，默认使用第一条市场快照作为本次市场假设输入，并在每次 `calculateAffordability(...)` 请求中带入 `market_snapshot`；因此商贷市场报价、中介费市场假设、卖方税费转嫁成交口径和 cache input hash 由同一份前端状态驱动，不再只是后端孤立支持。计算完成后，前端会把本次计算响应中的多组完整 `CacheLayerHashes` 按 `engine + input + strategy + ledger + visualization` 去重后提交给 `POST /api/generated-strategies/by-cache-layers`，由后端按五层 hash、当前 engine 指纹、策略类型和 `owner_key` 精确取回策略实体；前端不能退回到单独拼 `input_hash`、`strategy_hash`、`ledger_hash` 或 `visualization_hash` 调旧 `GET /api/generated-strategies`，也不能只按策略层 hash 混用其它输入或旧 engine 下的历史策略。规划底座应按 `generated_strategies.owner_key` 把策略实体覆盖情况绑定回具体目标卡片，而不是只展示全局数量。前端的 `generatedStrategies` 状态是“上一批成功落库的后端策略实体”，普通配置变更或普通 `/api/planning-foundation` 刷新只把计算标记为过期，不应立即清空它；新计算完成且 batch 查询成功后再整体替换，避免理财、购车或购房策略列表在重算间隙塌缩成旧响应或手动兜底。只有添加、删除目标这类结构性操作才应显式清空相关实体。税务页已经优先从 `strategy_type = tax` 的实体恢复策略项和时间线，养娃页已经优先从 `strategy_type = child_plan` 的实体恢复子女目标策略，理财页已经优先从 `strategy_type = investment` 的实体恢复推荐方案，购车页已经优先从 `strategy_type = vehicle` 的实体恢复车源候选策略，购房页已经优先从 `strategy_type = purchase` 的实体恢复房源候选策略；实体尚未返回时才临时回退到 `AffordabilityResult.tax_strategy_*`、`child_plan_strategies`、`investment_plan_recommendations`、`car_plan_analyses` 或 `purchase_plan_analyses`。家庭财务页里的“账户与安全垫”和记账校准页已经通过 `frontend/src/coreObjects.ts` 复用同一套 `account_concepts` / `core_object_groups` code、展示顺序和格式化规则，只保留真实账户输入框，不再在页面内部维护另一套资产、受限账户、固定资产和贷款汇总口径；记账校准页的来源选择器必须覆盖完整统一校准概念目录、完整重大事件时间线和完整 `generated_strategies` 策略实体，后端 `account_concepts` 摘要可覆盖概念金额和来源说明，但不能成为重要概念是否可选的前置条件，`plan_events` 尚未生成时重大事件来源必须回退到统一 `planning_goals` 目标库和解析后的 `planning_sequence`；快捷按钮只能作为前几项入口，不能成为可校准对象上限。它是前端概念统一的入口层；各业务页面内部仍需继续向同一页面骨架和同一目标/对象模型收敛。
 
 购房页和购车页可以继续保留旧模型中的 `purchase_sequence` / `planning_sequence` 作为编辑线索和兼容字段，但目标卡片摘要、顺序标签和时间说明必须优先读取 `PlanningSequenceResult` 或 `CalculationContextSnapshot.planning_goals` 的解析结果，并通过 `frontend/src/planningGoals.ts` 的 helper 展示。尤其是 `parallel` 目标，旧字段仍可能是正数，展示时必须显示“并行”而不是“第 N 项”。
 
@@ -527,13 +537,25 @@ sequenceDiagram
 
 ## 测试与验证
 
-常用命令：
+后端测试按层运行。`pytest.ini` 声明 marker，`backend/tests/conftest.py` 会按测试内容自动标记现有大测试文件；日常开发优先跑局部层，跨模块或发布前再跑全量。
 
 ```powershell
-$Env:PYTHONPATH = "backend"
-$Env:PYTHONIOENCODING = "utf-8"
-python -m pytest backend/tests/test_api.py backend/tests/test_calculator.py -q -n auto
+.\scripts\test_layers.ps1 quick
+.\scripts\test_layers.ps1 api
+.\scripts\test_layers.ps1 contracts
+.\scripts\test_layers.ps1 slow
+.\scripts\test_layers.ps1 full
 ```
+
+各层含义：
+
+- `quick`：排除 slow、API 集成、前端静态契约和架构守卫，适合小的后端逻辑修改后快速回归。
+- `api`：只跑非 slow 的 FastAPI/TestClient/SQLite 边界测试，适合接口、数据库存取和 normalization 修改。
+- `contracts`：跑前后端静态契约、架构边界和收口清单守卫，适合 schema、前端 helper、模块职责或文档结构修改。
+- `slow`：跑完整计算、投影、缓存、策略生成和重型端到端用例，适合影响现金流、贷款、税务、策略或可视化主链路的修改。
+- `full`：跑 `test_api.py` 和 `test_calculator.py` 全量并行测试，适合大重构、阶段性收口和发布前验证。
+
+前端和扫描仍单独运行：
 
 ```powershell
 Push-Location frontend
@@ -548,11 +570,12 @@ python scripts/privacy_scan.py
 
 什么时候至少跑什么：
 
-- 改 `schemas.py`、数据库、API：跑后端测试。
-- 改 `calculator.py`、`policies.py`、`domain/`：跑后端测试，必要时补政策或策略测试。
-- 改前端类型、页面、图表：跑前端构建。
+- 改 `schemas.py`、数据库、API：跑 `api`，涉及前端类型再跑 `contracts`。
+- 改 `calculator.py`、`policies.py`、`domain/`、`strategies/`、`projection/`：小改跑 `quick`，影响主链路再跑 `slow` 或 `full`。
+- 改前端类型、页面、图表：跑前端构建；涉及前后端字段契约再跑 `contracts`。
+- 改架构文档、核心模型、缓存分层、模块职责：跑 `contracts`。
 - 改中文文案或文档：跑编码扫描。
-- 准备提交或推送：跑隐私扫描。
+- 准备提交或推送：跑隐私扫描；发布前使用 `.\scripts\push_public.ps1`。
 
 ## 编码和隐私注意事项
 

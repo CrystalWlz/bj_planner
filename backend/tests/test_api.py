@@ -1,6 +1,8 @@
+import ast
 from copy import deepcopy
 from datetime import date
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -280,6 +282,102 @@ def test_affordability_cache_key_exposes_layer_hashes() -> None:
     assert "core_object_concepts.py" in LAYER_CODE_PATHS["visualization"]
     assert "cache.py" in ENGINE_CODE_PATHS
     assert "generated_strategies.py" in ENGINE_CODE_PATHS
+
+
+def test_cache_layer_code_paths_are_declared_and_resolvable() -> None:
+    from app.cache import ENGINE_CODE_PATHS, LAYER_CODE_PATHS
+
+    app_dir = Path("backend/app")
+    assert set(LAYER_CODE_PATHS) == {"input", "strategy", "ledger", "visualization"}
+    for layer, entries in LAYER_CODE_PATHS.items():
+        assert entries, layer
+        for entry in entries:
+            assert (app_dir / entry).exists(), f"{layer}:{entry}"
+    for entry in ENGINE_CODE_PATHS:
+        assert (app_dir / entry).exists(), f"engine:{entry}"
+
+    assert "planning_context.py" in LAYER_CODE_PATHS["input"]
+    assert "strategies" in LAYER_CODE_PATHS["strategy"]
+    assert "projection" in LAYER_CODE_PATHS["ledger"]
+    assert "visualization.py" in LAYER_CODE_PATHS["visualization"]
+
+
+def test_calculation_profiling_is_env_gated_and_records_spans(monkeypatch, caplog) -> None:
+    from app.profiling import calculation_profile, profile_span, profiling_enabled
+
+    monkeypatch.delenv("HOUSE_PLANNER_PROFILE", raising=False)
+    assert not profiling_enabled()
+    with caplog.at_level(logging.INFO, logger="app.profiling"):
+        with calculation_profile("disabled_sample"):
+            with profile_span("disabled_stage"):
+                pass
+    assert "disabled_stage" not in caplog.text
+
+    caplog.clear()
+    monkeypatch.setenv("HOUSE_PLANNER_PROFILE", "1")
+    assert profiling_enabled()
+    with caplog.at_level(logging.INFO, logger="app.profiling"):
+        with calculation_profile("enabled_sample"):
+            with profile_span("enabled_stage"):
+                pass
+
+    assert "calculation_profile" in caplog.text
+    assert "enabled_sample" in caplog.text
+    assert "enabled_stage" in caplog.text
+
+
+def test_affordability_pipeline_declares_profile_spans() -> None:
+    expected_spans = {
+        "calculation_context": Path("backend/app/main.py"),
+        "cache_lookup": Path("backend/app/main.py"),
+        "calculate_affordability": Path("backend/app/main.py"),
+        "household_context": Path("backend/app/calculator.py"),
+        "strategy_pipeline": Path("backend/app/calculator.py"),
+        "tax_strategy": Path("backend/app/calculator.py"),
+        "result_assembly": Path("backend/app/calculator.py"),
+        "purchase_strategy_generation": Path("backend/app/strategy_pipeline.py"),
+        "yield_sensitivity": Path("backend/app/strategy_pipeline.py"),
+        "projection_pipeline": Path("backend/app/strategy_pipeline.py"),
+        "ledger_projection": Path("backend/app/planning_pipeline.py"),
+        "monthly_visualization": Path("backend/app/planning_pipeline.py"),
+        "annual_reporting": Path("backend/app/planning_pipeline.py"),
+    }
+    for span_name, path in expected_spans.items():
+        assert f'profile_span("{span_name}")' in path.read_text(encoding="utf-8")
+
+
+def test_performance_sample_uses_temp_database_and_cache_hit_run() -> None:
+    source = Path("scripts/perf_calculation_sample.py").read_text(encoding="utf-8")
+
+    assert "HOUSE_PLANNER_DB" in source
+    assert "tempfile.gettempdir()" in source
+    assert "HOUSE_PLANNER_PROFILE" in source
+    assert '"/api/calculations/affordability"' in source
+    assert '"cold"' in source
+    assert '"cache_hit"' in source
+    assert "result_hash" in source
+    assert "_assert_consistent_runs" in source
+    assert "cache_layers" in source
+    assert "monthly_ledger_count" in source
+
+
+def test_architecture_closure_checklist_tracks_major_goal_areas() -> None:
+    architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
+    checklist = Path("docs/architecture_closure_checklist.md").read_text(encoding="utf-8")
+
+    assert "architecture_closure_checklist.md" in architecture
+    assert "总体结论" in checklist
+    assert "## 完成判定" in checklist
+    for heading in (
+        "## 1. 数据库核心对象表",
+        "## 2. 统一 planning_goals",
+        "## 3. 多目标顺序规划",
+        "## 4. 政策接口继续解耦",
+        "## 5. 缓存分层",
+        "## 7. 前端概念统一",
+        "## 11. 发布与验证",
+    ):
+        assert heading in checklist
 
 
 def test_cache_layer_hashes_propagate_input_changes_downstream() -> None:
@@ -733,6 +831,64 @@ def test_affordability_api_attaches_database_calculation_context(tmp_path: Path,
     ]
     assert planning_goal_events
     assert planning_goal_events[0]["category"] == "home_purchase"
+
+
+def test_affordability_api_projects_baseline_visualization_without_child_or_vehicle_plans(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        rule_pack = client.get("/api/rule-packs").json()[0]
+        household_payload = deepcopy(household["data"])
+        household_payload["members"] = []
+        household_payload["monthly_income"] = 30_000
+        household_payload["monthly_expense"] = 8_000
+        household_payload["cash_account_balance"] = 250_000
+        household_payload["investments"] = 80_000
+        household_payload["child_count"] = 0
+        household_payload["child_plans"] = []
+        household_payload["car_plan"] = {
+            **household_payload.get("car_plan", {}),
+            "enabled": False,
+            "vehicle_plans": [],
+        }
+        scenario_payload = {
+            "name": "baseline",
+            "enabled": False,
+            "total_price": 0,
+        }
+
+        response = client.post(
+            "/api/calculations/affordability",
+            json={
+                "household": household_payload,
+                "scenario": scenario_payload,
+                "rule_pack": rule_pack["data"],
+                "include_stress_tests": False,
+            },
+        )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["car_plan_analyses"] == []
+    assert result["child_plan_strategies"] == []
+    assert result["purchase_plan_analyses"][0]["source"] == "baseline"
+    assert result["purchase_plan_analyses"][0]["variant"] == "家庭基线"
+    assert result["monthly_cashflow_visualization"]
+    assert result["monthly_visualization_details"]
+    assert result["monthly_ledger"]
+    assert result["account_snapshots"]
+    assert result["annual_financial_summaries"]
+    assert {item["plan_variant"] for item in result["monthly_cashflow_visualization"]} == {"家庭基线"}
+    assert any(item["plan_variant"] == "家庭基线" for item in result["monthly_visualization_details"])
 
 
 def test_calculation_context_fingerprints_ignore_record_timestamps(tmp_path: Path, monkeypatch) -> None:
@@ -1384,7 +1540,11 @@ def test_affordability_api_respects_not_planned_home_goal(tmp_path: Path, monkey
     assert goal_snapshot["normalized_timing_mode"] == "not_planned"
     assert goal_snapshot["enabled"] is False
     assert projected_scenario["data"]["enabled"] is False
-    assert result["purchase_plan_analyses"] == []
+    assert result["purchase_plan_analyses"][0]["source"] == "baseline"
+    assert result["purchase_plan_analyses"][0]["variant"] == "家庭基线"
+    assert result["monthly_cashflow_visualization"]
+    assert {item["plan_variant"] for item in result["monthly_cashflow_visualization"]} == {"家庭基线"}
+    assert all(event["category"] != "home_purchase" for event in result["plan_events"])
 
 
 def test_affordability_api_respects_home_planning_window_end(tmp_path: Path, monkeypatch) -> None:
@@ -1947,6 +2107,125 @@ def test_planning_goal_api_filters_by_household_scope_with_global_goals(tmp_path
     }
 
 
+def test_planning_goal_list_e2e_preserves_scope_order_and_shadow_sources(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        first_household = client.get("/api/households").json()[0]
+        second_household = client.post("/api/households", json={"data": first_household["data"]}).json()
+        home_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": first_household["id"],
+                "data": {
+                    "goal_type": "home",
+                    "name": "示例列表验收买房",
+                    "enabled": True,
+                    "priority": 1,
+                    "timing_mode": "auto_sequence",
+                    "earliest_purchase_delay_months": 6,
+                    "target_params": {"total_price": 3_200_000},
+                },
+            },
+        ).json()
+        vehicle_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": first_household["id"],
+                "data": {
+                    "goal_type": "vehicle",
+                    "name": "示例列表验收买车",
+                    "enabled": True,
+                    "priority": 2,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": home_goal["id"],
+                    "delay_after_dependency_months": 4,
+                    "target_params": {"name": "示例列表验收买车", "total_price": 180_000},
+                },
+            },
+        ).json()
+        child_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": first_household["id"],
+                "data": {
+                    "goal_type": "child",
+                    "name": "示例列表验收养娃",
+                    "enabled": True,
+                    "priority": 3,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": vehicle_goal["id"],
+                    "delay_after_dependency_months": 8,
+                    "target_params": {"name": "示例列表验收养娃"},
+                },
+            },
+        ).json()
+        second_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": second_household["id"],
+                "data": {
+                    "goal_type": "vehicle",
+                    "name": "示例第二家庭隔离目标",
+                    "priority": 1,
+                    "target_params": {"name": "示例第二家庭隔离目标", "total_price": 220_000},
+                },
+            },
+        ).json()
+
+        updated_vehicle_data = deepcopy(vehicle_goal["data"])
+        updated_vehicle_data["priority"] = 5
+        updated_vehicle_data["target_params"] = {
+            **updated_vehicle_data["target_params"],
+            "total_price": 190_000,
+        }
+        client.put(
+            f"/api/planning-goals/{vehicle_goal['id']}",
+            json={"household_id": first_household["id"], "data": updated_vehicle_data},
+        )
+
+        goals = client.get("/api/planning-goals", params={"household_id": first_household["id"]}).json()
+        sequence = client.get("/api/planning-goals/sequence", params={"household_id": first_household["id"]}).json()
+        foundation = client.get("/api/planning-foundation", params={"household_id": first_household["id"]}).json()
+        projected_household = client.get("/api/households").json()[0]
+        raw_household = database.get_record("households", first_household["id"])
+        second_goals = client.get("/api/planning-goals", params={"household_id": second_household["id"]}).json()
+
+    first_ids = {home_goal["id"], vehicle_goal["id"], child_goal["id"]}
+    assert {item["id"] for item in goals} == first_ids
+    assert second_goal["id"] not in {item["id"] for item in goals}
+    assert second_goal["id"] in {item["id"] for item in second_goals}
+    assert foundation["planning_goals"] == goals
+    assert {item["id"] for item in foundation["planning_sequence"]["goals"]} == first_ids
+    assert {item["id"] for item in sequence["goals"]} == first_ids
+
+    sequence_by_id = {item["id"]: item for item in sequence["goals"]}
+    assert sequence_by_id[home_goal["id"]]["sequence_index"] == 1
+    assert sequence_by_id[vehicle_goal["id"]]["depends_on_goal_id"] == home_goal["id"]
+    assert sequence_by_id[child_goal["id"]]["depends_on_goal_id"] == vehicle_goal["id"]
+    assert sequence_by_id[vehicle_goal["id"]]["resolved_not_before_month"] == 10
+    assert sequence_by_id[child_goal["id"]]["resolved_not_before_month"] == 18
+    assert not sequence["warnings"]
+
+    projected_vehicle_ids = {
+        item["planning_goal_id"]
+        for item in projected_household["data"]["car_plan"]["vehicle_plans"]
+    }
+    projected_child_ids = {
+        item["planning_goal_id"]
+        for item in projected_household["data"]["child_plans"]
+    }
+    assert vehicle_goal["id"] in projected_vehicle_ids
+    assert child_goal["id"] in projected_child_ids
+    assert raw_household["data"]["car_plan"]["vehicle_plans"] == []
+    assert raw_household["data"]["child_plans"] == []
+
+
 def test_update_scenario_preserves_household_scope_when_payload_omits_household_id(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
@@ -1996,7 +2275,7 @@ def test_update_scenario_preserves_household_scope_when_payload_omits_household_
     assert created["id"] in {item["id"] for item in unscoped}
 
 
-def test_home_planning_goal_crud_keeps_scenario_shadow_clean(tmp_path: Path, monkeypatch) -> None:
+def test_home_planning_goal_crud_does_not_write_scenario_shadow(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
     from app import database
@@ -2050,17 +2329,46 @@ def test_home_planning_goal_crud_keeps_scenario_shadow_clean(tmp_path: Path, mon
     assert projected_after_create["data"]["planning_goal_id"] == created["id"]
     assert projected_after_create["data"]["total_price"] == 3_100_000
     assert "depends_on_goal_id" not in created["data"]["target_params"]
-    assert shadow_after_create is not None
-    assert shadow_after_create["id"] == created["id"]
+    assert shadow_after_create is None
     assert updated["data"]["name"] == "示例直接目标房源调整"
     assert projected_after_update["data"]["name"] == "示例直接目标房源调整"
     assert projected_after_update["data"]["planning_goal_id"] == created["id"]
     assert projected_after_update["data"]["total_price"] == 3_300_000
-    assert shadow_after_update is not None
-    assert shadow_after_update["data"]["name"] == "示例直接目标房源调整"
+    assert shadow_after_update is None
     assert delete_response.status_code == 200
     assert all(item["id"] != created["id"] for item in scenarios_after_delete)
     assert shadow_after_delete is None
+
+
+def test_planning_goal_crud_does_not_upsert_scenario_shadow() -> None:
+    import re
+
+    database_source = Path("backend/app/database.py").read_text(encoding="utf-8")
+    insert_match = re.search(
+        r"def insert_planning_goal_record\((?P<body>.*?)\n\ndef update_planning_goal_record",
+        database_source,
+        re.DOTALL,
+    )
+    update_match = re.search(
+        r"def update_planning_goal_record\((?P<body>.*?)\n\ndef delete_planning_goal_record",
+        database_source,
+        re.DOTALL,
+    )
+    scenario_insert_match = re.search(
+        r"def insert_scenario_record\((?P<body>.*?)\n\ndef update_scenario_record",
+        database_source,
+        re.DOTALL,
+    )
+    assert insert_match is not None
+    assert update_match is not None
+    assert scenario_insert_match is not None
+
+    assert "INSERT INTO scenarios" not in insert_match.group("body")
+    assert "INSERT OR REPLACE INTO scenarios" not in insert_match.group("body")
+    assert "INSERT INTO scenarios" not in update_match.group("body")
+    assert "INSERT OR REPLACE INTO scenarios" not in update_match.group("body")
+    assert "DELETE FROM scenarios" in update_match.group("body")
+    assert "INSERT OR REPLACE INTO scenarios" in scenario_insert_match.group("body")
 
 
 def test_changing_vehicle_planning_goal_to_home_cleans_old_household_projection(tmp_path: Path, monkeypatch) -> None:
@@ -2133,7 +2441,7 @@ def test_changing_vehicle_planning_goal_to_home_cleans_old_household_projection(
     assert property_objects[0]["data"]["metadata"]["goal_type"] == "home"
 
 
-def test_changing_home_planning_goal_to_vehicle_removes_scenario_shadow(tmp_path: Path, monkeypatch) -> None:
+def test_changing_home_planning_goal_to_vehicle_does_not_depend_on_scenario_shadow(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
     from app import database
@@ -2158,7 +2466,7 @@ def test_changing_home_planning_goal_to_vehicle_removes_scenario_shadow(tmp_path
                 },
             },
         ).json()
-        assert database.get_record("scenarios", home_goal["id"]) is not None
+        assert database.get_record("scenarios", home_goal["id"]) is None
 
         updated_response = client.put(
             f"/api/planning-goals/{home_goal['id']}",
@@ -3194,6 +3502,72 @@ def test_after_goal_dependency_ignores_not_planned_anchor(tmp_path: Path, monkey
     assert any("暂不纳入规划" in warning for warning in sequence["warnings"])
 
 
+def test_after_goal_dependency_can_anchor_to_parallel_goal(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "home",
+                    "name": "示例顺序买房",
+                    "priority": 1,
+                    "timing_mode": "auto_sequence",
+                    "earliest_purchase_delay_months": 12,
+                },
+            },
+        )
+        parallel_vehicle = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "vehicle",
+                    "name": "示例并行购车",
+                    "priority": 2,
+                    "timing_mode": "parallel",
+                    "allow_parallel": True,
+                    "earliest_purchase_delay_months": 8,
+                },
+            },
+        ).json()
+        client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "renovation",
+                    "name": "示例跟随并行目标装修",
+                    "priority": 3,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": parallel_vehicle["id"],
+                    "delay_after_dependency_months": 5,
+                },
+            },
+        )
+        sequence = client.get("/api/planning-goals/sequence", params={"household_id": household["id"]}).json()
+
+    goals = {item["name"]: item for item in sequence["goals"]}
+    assert goals["示例顺序买房"]["sequence_index"] == 1
+    assert goals["示例并行购车"]["normalized_timing_mode"] == "parallel"
+    assert goals["示例并行购车"]["sequence_index"] == 0
+    dependent = goals["示例跟随并行目标装修"]
+    assert dependent["sequence_index"] == 2
+    assert dependent["normalized_timing_mode"] == "after_goal"
+    assert dependent["depends_on_goal_name"] == "示例并行购车"
+    assert dependent["resolved_not_before_month"] == 13
+    assert not dependent["dependency_warning"]
+    assert not sequence["warnings"]
+
+
 def test_planning_goal_after_goal_dependency_reorders_priority(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
@@ -4169,7 +4543,7 @@ def test_account_calibration_labels_share_core_object_concepts() -> None:
         f"{CALIBRATION_TARGET_LABELS['pension']}手动校准"
     )
     assert any(
-        event.title == f"手动校准：{CALIBRATION_TARGET_LABELS['property_asset']}"
+        event.title == "手动校准：示例房源"
         for event in events
     )
 
@@ -4200,6 +4574,27 @@ def test_frontend_readonly_account_fallbacks_stay_in_core_object_helper() -> Non
     assert "money(household.investments)" not in app_source
 
 
+def test_frontend_visualization_and_strategy_explanations_share_core_object_concepts() -> None:
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    reporting_source = Path("backend/app/reporting.py").read_text(encoding="utf-8")
+    pipeline_source = Path("backend/app/planning_pipeline.py").read_text(encoding="utf-8")
+
+    assert "accountConcepts={result?.account_concepts ?? accountConcepts}" in app_source
+    assert "coreObjectGroups={result?.core_object_groups ?? coreObjectGroups}" in app_source
+    assert "visualizationCoreObjectSummary" in app_source
+    assert "核心对象口径：{visualizationCoreObjectSummary}" in app_source
+    assert "accountConceptMap(accountConcepts)" in app_source
+    assert "coreObjectGroupMap(coreObjectGroups)" in app_source
+
+    assert "def build_strategy_explanations(" in reporting_source
+    assert "account_concepts: list[AccountConceptSummary] | None = None" in reporting_source
+    assert "core_object_groups: list[CoreObjectGroupSummary] | None = None" in reporting_source
+    assert "核心对象口径：" in reporting_source
+    assert "build_strategy_explanations(" in pipeline_source
+    assert "account_concepts=account_concepts" in pipeline_source
+    assert "core_object_groups=core_object_groups" in pipeline_source
+
+
 def test_monthly_visualization_mapping_stays_in_frontend_helper() -> None:
     app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
     helper_source = Path("frontend/src/visualizationSeries.ts").read_text(encoding="utf-8")
@@ -4215,6 +4610,34 @@ def test_monthly_visualization_mapping_stays_in_frontend_helper() -> None:
     assert "const loanPoint = loanVisualizationByMonth.get(item.month)" in helper_source
     assert "const providentPoint = providentVisualizationByMonth.get(item.month)" in helper_source
     assert "const socialSecurityPoint = socialSecurityVisualizationByMonth.get(item.month)" in helper_source
+    assert "return backendCashflowSeries\n    .filter((item) => item.month <= horizonMonths)\n    .map((item) => {" in helper_source
+    for forbidden in (
+        "for (let month",
+        "for (let i = 0",
+        "while (",
+        "cashBalance +=",
+        "investmentBalance +=",
+        "loanBalance -=",
+        "Array.from({ length",
+    ):
+        assert forbidden not in helper_source
+    for forbidden in (
+        "calculatedMonthlySeries",
+        "localMonthlyProjection",
+        "buildLocalProjection",
+        "simulateMonthly",
+        "projectMonthly",
+    ):
+        assert forbidden not in app_source
+
+
+def test_visualization_timeline_displays_structured_calibration_source() -> None:
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    frontend_types = Path("frontend/src/types.ts").read_text(encoding="utf-8")
+
+    assert "calibration_source: string;" in frontend_types
+    assert "calibrationSource: item.calibration_source" in app_source
+    assert "校准来源：{item.calibrationSource}" in app_source
 
 
 def test_vehicle_prepayment_labels_stay_in_planning_goal_helper() -> None:
@@ -4293,6 +4716,526 @@ def test_frontend_new_home_goal_does_not_seed_policy_source_fields() -> None:
     assert "deed_tax_rate:" not in function_body
     assert "政策公积金利率" in app_source
     assert "政策契税比例" in app_source
+
+
+def test_account_calibration_page_uses_full_source_catalogs() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function AccountCalibrationPage\((?P<body>.*?)\nfunction ChildPlanPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+
+    assert "选择账户概念来源" in page_body
+    assert "选择重大事件来源" in page_body
+    assert "选择策略事件来源" in page_body
+    assert "筛选账户概念" in page_body
+    assert "筛选重大事件" in page_body
+    assert "筛选策略事件" in page_body
+    assert "当前匹配" in page_body
+    assert "filteredConceptCalibrationOptions" in page_body
+    assert "filteredMajorEventCalibrationOptions" in page_body
+    assert "filteredStrategyCalibrationOptions" in page_body
+    assert "sourceMatchesQuery" in page_body
+    assert "来自策略库中的" in page_body
+    assert "按账户概念摘要校准" in page_body
+    assert "金额来自核心对象分组或本页账户输入" in page_body
+    assert "来自后端生成的" not in page_body
+    assert "按后端账户概念摘要校准" not in page_body
+    assert "note: `策略键" not in page_body
+    assert "strategy.variant || \"自动方案\"" in page_body
+    assert "ACCOUNT_CALIBRATION_TARGET_OPTIONS.map" in page_body
+    assert "calibration:" in page_body
+    assert "planningGoalCalibrationOptions" in page_body
+    assert "planning_goal:" in page_body
+    assert "planEventCalibrationOptions.length" in page_body
+    assert "const calibrationWarnings = (() => {" in page_body
+    assert "已停用，不会进入后端账本和事件线" in page_body
+    assert "后端会按记录顺序逐条应用" in page_body
+    assert "重复启用校准" in page_body
+    assert "calibration-warning-list" in page_body
+
+    for const_name in ("conceptCalibrationOptions", "majorEventCalibrationOptions", "strategyCalibrationOptions"):
+        source_match = re.search(rf"const {const_name} = (?P<body>.*?);", page_body, re.DOTALL)
+        assert source_match is not None
+        assert ".slice(" not in source_match.group("body")
+
+
+def test_business_pages_prefer_generated_strategy_entities() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    expected_patterns = (
+        r"const carStrategiesForPage = carStrategiesFromEntities\.length\s*\?\s*carStrategiesFromEntities\s*:\s*result\?\.car_plan_analyses \?\? \[\];",
+        r"const childPlanStrategiesForPage = childPlanStrategiesFromEntities\.length\s*\?\s*childPlanStrategiesFromEntities\s*:\s*result\?\.child_plan_strategies \?\? \[\];",
+        r"const investmentRecommendationsForPage = investmentRecommendationsFromEntities\.length\s*\?\s*investmentRecommendationsFromEntities\s*:\s*result\?\.investment_plan_recommendations \?\? \[\];",
+        r"const taxStrategyItemsForPage = taxStrategyItemsFromEntities\.length\s*\?\s*taxStrategyItemsFromEntities\s*:\s*result\?\.tax_strategy_items \?\? \[\];",
+        r"const taxStrategyTimelineForPage = taxStrategyTimelineFromEntities\.length\s*\?\s*taxStrategyTimelineFromEntities\s*:\s*result\?\.tax_strategy_timeline \?\? \[\];",
+        r"const selectedScenarioPurchasePlans = selectedScenarioPurchasePlansFromEntities\.length\s*\?\s*selectedScenarioPurchasePlansFromEntities\s*:\s*result\?\.purchase_plan_analyses \?\? \[\];",
+    )
+    for pattern in expected_patterns:
+        assert re.search(pattern, app_source) is not None
+
+    assert 'purchasePlanSourceLabel = selectedScenarioPurchasePlansFromEntities.length ? "策略库方案" : "本次计算结果"' in app_source
+    assert 'carStrategySourceLabel = carStrategiesFromEntities.length ? "策略库方案" : "本次计算结果"' in app_source
+    assert 'childPlanStrategySourceLabel = childPlanStrategiesFromEntities.length ? "策略库方案" : "本次计算结果"' in app_source
+    assert 'investmentRecommendationSourceLabel = investmentRecommendationsFromEntities.length ? "策略库方案" : "本次计算结果"' in app_source
+    assert '"后端策略实体"' not in app_source
+
+
+def test_generated_strategy_owner_matching_prefers_planning_goal_ids() -> None:
+    source = Path("frontend/src/generatedStrategies.ts").read_text(encoding="utf-8")
+
+    assert "if (child.planning_goal_id)" in source
+    assert "goalOwnerKeys.add(child.planning_goal_id)" in source
+    assert "} else if (child.name)" in source
+    assert "if (vehicle.planning_goal_id)" in source
+    assert "ownerKeys.add(vehicle.planning_goal_id)" in source
+    assert "if (scenario?.data.planning_goal_id) return new Set([scenario.data.planning_goal_id]);" in source
+
+
+def test_vehicle_strategy_selection_persists_to_planning_goal() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    function_match = re.search(
+        r"const updateCarPlanSelection = \(vehicleIndex: number, variant: string\) => \{(?P<body>.*?)\n  \};",
+        app_source,
+        re.DOTALL,
+    )
+    assert function_match is not None
+    function_body = function_match.group("body")
+
+    assert "selected_strategy_variant: variant" in function_body
+    assert "nextVehicle?.planning_goal_id" in function_body
+    assert "savePlanningGoalData(nextVehicle.planning_goal_id, vehiclePlanningGoalData(nextVehicle, vehicleIndex))" in function_body
+    assert 'userFacingError("保存车辆策略", err)' in function_body
+
+
+def test_child_strategy_birth_month_adoption_updates_child_goal_config() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function ChildPlanPage\((?P<body>.*?)\nfunction TaxPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+
+    assert "childStrategyBirthMonthValue(strategy)" in page_body
+    assert 'inactiveLabel="采用策略出生月"' in page_body
+    assert 'activeLabel="已采用策略出生月"' in page_body
+    assert 'timing_mode: "manual_month"' in page_body
+    assert "planned_birth_month: strategyBirthMonth" in page_body
+    assert "planned_birth_start_month: strategyBirthMonth" in page_body
+    assert "planned_birth_end_month: strategyBirthMonth" in page_body
+    assert re.search(r"(?<!planned_)birth_month:\s*strategyBirthMonth", page_body) is None
+    assert "updateChildPlanPatch(index, {" in page_body
+
+
+def test_child_goal_duplicate_uses_planning_goal_api() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    function_match = re.search(
+        r"const duplicateChildPlan = async \(index: number\) => \{(?P<body>.*?)\n  \};",
+        app_source,
+        re.DOTALL,
+    )
+    assert function_match is not None
+    function_body = function_match.group("body")
+
+    assert 'planning_goal_id: ""' in function_body
+    assert "createPlanningGoal(childPlanningGoalData(child, childPlans.length, firstHomeGoalId), household.id)" in function_body
+    assert "refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true })" in function_body
+    assert 'userFacingError("复制子女目标", err)' in function_body
+    assert "duplicateChildPlan={duplicateChildPlan}" in app_source
+    assert "onClick={() => duplicateChildPlan(index)}" in app_source
+
+
+def test_generic_planning_goal_page_manages_renovation_and_other_goals() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    helper_source = Path("frontend/src/planningGoals.ts").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function GenericPlanningGoalPage\((?P<body>.*?)\nfunction AccountCalibrationPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+
+    assert '"规划目标"' in app_source
+    assert "genericPlanningGoalDefaultData(goalType, genericGoals.length)" in app_source
+    assert "genericPlanningGoalDuplicateData(goal, genericGoals.length)" in app_source
+    assert "createPlanningGoal(genericPlanningGoalDefaultData" in app_source
+    assert "createPlanningGoal(genericPlanningGoalDuplicateData" in app_source
+    assert "savePlanningGoal(goalId, goalData, household.id)" in app_source
+    assert "deletePlanningGoal(goalId)" in app_source
+    assert 'planningGoals={planningGoals}' in app_source
+    assert 'createGoal={createGenericPlanningGoal}' in app_source
+    assert 'duplicateGoal={duplicateGenericPlanningGoal}' in app_source
+    assert 'saveGoal={saveGenericPlanningGoal}' in app_source
+    assert 'deleteGoal={deleteGenericPlanningGoal}' in app_source
+    assert 'planning-goal-grid horizontal-card-list generic-goal-grid' in page_body
+    assert '添加装修目标' in page_body
+    assert '添加其它目标' in page_body
+    assert '停用' in page_body
+    assert '启用' in page_body
+    assert '删除' in page_body
+    assert '保存目标' in page_body
+    assert 'target_params: {' in helper_source
+    assert 'estimated_cost: defaultBudget' in helper_source
+    assert 'goal_type: goalType' in helper_source
+    assert 'duplicated_from_goal_id: goal.id' in helper_source
+
+
+def test_export_page_uses_unified_workflow_and_business_copy() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function ExportPage\((?P<body>.*?)\nfunction getPlanStatus",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+
+    for title in (
+        'title="导出对象"',
+        'title="当前选中项配置"',
+        'title="策略说明"',
+        'title="影响预览与导出"',
+    ):
+        assert title in page_body
+    assert 'horizontal-card-list compact export-target-grid' in page_body
+    assert 'profile="explanation"' in page_body
+    assert "表格列名保持中文，避免出现内部字段名" in page_body
+    assert "先刷新或完成一次计算" in page_body
+    assert "本次计算尚未生成结构化文字导出" in app_source
+    assert "本次计算尚未生成结构化导出表格" in app_source
+    assert "后端字段名" not in page_body
+    assert "后端尚未返回结构化" not in app_source
+
+
+def test_business_pages_use_planner_page_shell() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_ranges = {
+        "IncomePage": "GenericPlanningGoalPage",
+        "GenericPlanningGoalPage": "AccountCalibrationPage",
+        "ChildPlanPage": "TaxPage",
+        "TaxPage": "InvestmentPlanPage",
+        "InvestmentPlanPage": "ScenarioPage",
+        "ScenarioPage": "CarPlanPage",
+        "CarPlanPage": "RulePage",
+        "RulePage": "VisualizationPage",
+        "VisualizationPage": "SelectedPlanVisualization",
+        "ExportPage": "getPlanStatus",
+    }
+    for page_name, next_page_name in page_ranges.items():
+        page_match = re.search(
+            rf"function {page_name}\((?P<body>.*?)\nfunction {next_page_name}",
+            app_source,
+            re.DOTALL,
+        )
+        assert page_match is not None, page_name
+        page_body = page_match.group("body")
+        assert "<PlannerPageShell" in page_body, page_name
+        assert "summary={<p>" in page_body or "summary={" in page_body, page_name
+
+    assert 'title="购房计划"' in app_source
+    assert 'title="购车计划"' in app_source
+    assert 'title="政策规则"' in app_source
+    assert 'title="可视化"' in app_source
+
+
+def test_business_pages_use_horizontal_selection_cards_and_business_copy() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_ranges = {
+        "ChildPlanPage": "TaxPage",
+        "InvestmentPlanPage": "ScenarioPage",
+        "ScenarioPage": "CarPlanPage",
+        "CarPlanPage": "RulePage",
+        "ExportPage": "getPlanStatus",
+    }
+    expected_card_classes = {
+        "ChildPlanPage": "child-goal-grid horizontal-card-list",
+        "InvestmentPlanPage": "investment-plan-grid horizontal-card-list",
+        "ScenarioPage": "planning-goal-grid horizontal-card-list purchase-demand-grid",
+        "CarPlanPage": "planning-goal-grid horizontal-card-list vehicle-goal-grid",
+        "ExportPage": "horizontal-card-list compact export-target-grid",
+    }
+    for page_name, next_page_name in page_ranges.items():
+        page_match = re.search(
+            rf"function {page_name}\((?P<body>.*?)\nfunction {next_page_name}",
+            app_source,
+            re.DOTALL,
+        )
+        assert page_match is not None, page_name
+        assert expected_card_classes[page_name] in page_match.group("body"), page_name
+
+    forbidden_copy = (
+        "后端策略实体",
+        "计算响应",
+        "后端字段名",
+        "后端尚未返回结构化",
+        "后端并行工作数",
+        "当前策略实体",
+    )
+    for text in forbidden_copy:
+        assert text not in app_source
+
+
+def test_business_pages_expose_unified_workflow_sections() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_ranges = {
+        "IncomePage": "GenericPlanningGoalPage",
+        "GenericPlanningGoalPage": "AccountCalibrationPage",
+        "ChildPlanPage": "TaxPage",
+        "TaxPage": "InvestmentPlanPage",
+        "InvestmentPlanPage": "ScenarioPage",
+        "ScenarioPage": "CarPlanPage",
+        "CarPlanPage": "RulePage",
+        "RulePage": "VisualizationPage",
+        "VisualizationPage": "SelectedPlanVisualization",
+    }
+    expected_sections = {
+        "IncomePage": ("家庭画像", "成员工资与收入阶段", "家庭支出", "已有贷款"),
+        "GenericPlanningGoalPage": ("目标列表", "当前目标配置", "策略说明与影响预览"),
+        "ChildPlanPage": ("目标列表", "当前目标配置", "策略建议"),
+        "TaxPage": ("自动策略", "专项附加扣除", "手动覆盖"),
+        "InvestmentPlanPage": ("自动方案", "手动参数", "目标配置"),
+        "ScenarioPage": ("购房需求与候选房源", "手动参数", "候选策略", "当前策略说明"),
+        "CarPlanPage": ("用车需求与候选车源", "车辆参数与手动策略", "政策与上牌", "车源对比", "当前购车策略说明"),
+        "RulePage": ("规则包与来源", "rule-category-stack", "source-row"),
+        "VisualizationPage": ("房源决策表", "选中策略", "事件时间线"),
+    }
+    for page_name, next_page_name in page_ranges.items():
+        page_match = re.search(
+            rf"function {page_name}\((?P<body>.*?)\nfunction {next_page_name}",
+            app_source,
+            re.DOTALL,
+        )
+        assert page_match is not None, page_name
+        page_body = page_match.group("body")
+        for section_name in expected_sections[page_name]:
+            assert section_name in page_body, f"{page_name}:{section_name}"
+
+
+def test_investment_strategy_adoption_updates_manual_strategy_config() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function InvestmentPlanPage\((?P<body>.*?)\nfunction CarPlanPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+    function_match = re.search(
+        r"const applyInvestmentPlan = \(plan: InvestmentPlanRecommendation\) => \{(?P<body>.*?)\n  \};",
+        page_body,
+        re.DOTALL,
+    )
+    assert function_match is not None
+    function_body = function_match.group("body")
+
+    assert "updateHouseholdPatch({" in function_body
+    for field in (
+        "investment_plan_name: plan.plan_name",
+        "investment_risk_level: plan.risk_level",
+        "monthly_investment_amount: plan.monthly_investment",
+        "investment_cash_reserve_months: plan.cash_reserve_months",
+        "investment_equity_ratio: plan.equity_ratio",
+        "investment_bond_ratio: plan.bond_ratio",
+        "investment_cash_ratio: plan.cash_ratio",
+        "investment_auto_rebalance: true",
+    ):
+        assert field in function_body
+    assert "updateInvestmentAnnualReturn(plan.annual_return)" in function_body
+    assert "<AdoptStrategyButton active={active} onClick={() => applyInvestmentPlan(plan)} />" in page_body
+    assert 'updateHouseholdPatch({ investment_plan_name: "manual_investment"' in page_body
+
+
+def test_tax_strategy_controls_write_to_unified_manual_configs() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(
+        r"function TaxPage\((?P<body>.*?)\nfunction InvestmentPlanPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert page_match is not None
+    page_body = page_match.group("body")
+
+    assert 'updateChildPlan(childTarget.index, "tax_deduction_owner", event.target.value)' in page_body
+    assert "updateSpecialDeduction(index, \"enabled\", checked)" in page_body
+    assert "updateSpecialDeduction(index, \"member_name\", event.target.value)" in page_body
+    assert "updateSpecialDeduction(index, \"settlement_mode\"" in page_body
+    assert "updateSpecialDeduction(index, \"monthly_amount\", value)" in page_body
+    assert "updateSpecialDeduction(index, \"annual_amount\", value)" in page_body
+    assert "updateHousehold(\"investment_tax_profile\", { ...profile, [key]: value })" in page_body
+    assert "updateHousehold(\"investment_taxable_return_ratio\", value)" in page_body
+    assert "updateHousehold(\"investment_return_tax_rate\", value)" in page_body
+    assert 'onClick={() => addSpecialDeduction(type)}' in page_body
+
+
+def test_rule_page_keeps_detailed_rule_categories_collapsed_by_default() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(r"function RulePage\(.*?\nfunction VisualizationPage", app_source, re.DOTALL)
+    assert page_match is not None
+    page_body = page_match.group(0)
+
+    assert "ruleGroups.map((group, groupIndex)" in page_body
+    assert 'open={groupIndex === 0}' in page_body
+    assert 'key={group.title} open>' not in page_body
+
+
+def test_collapsible_sections_keep_accessible_state_and_visualization_details_collapsed() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    for component_name in ("WorkflowSection", "CollapsiblePanel", "CollapsibleSettingGroup"):
+        component_match = re.search(
+            rf"function {component_name}\((?P<body>.*?)\nfunction ",
+            app_source,
+            re.DOTALL,
+        )
+        assert component_match is not None
+        component_body = component_match.group("body")
+        assert "COLLAPSE_DEFAULTS[profile]" in component_body
+        assert "useState(initialOpen)" in component_body
+        assert "aria-expanded={open}" in component_body
+        assert "setOpen((value) => !value)" in component_body
+        assert "{open ? children : null}" in component_body
+
+    visualization_match = re.search(
+        r"function SelectedPlanVisualization\((?P<body>.*?)\nfunction ExportPage",
+        app_source,
+        re.DOTALL,
+    )
+    assert visualization_match is not None
+    visualization_body = visualization_match.group("body")
+    for details_class in (
+        "advisor-details",
+        "attribution-details",
+        "tax-detail-panel",
+        "month-detail-panel",
+    ):
+        assert re.search(rf"<details[^>]+className=\"[^\"]*{details_class}[^\"]*\"", visualization_body)
+    assert "<details" in visualization_body
+    assert "查看年度税务明细" in visualization_body
+    assert "查看本月财务解释" in visualization_body
+
+
+def test_collapsible_default_profiles_are_centralized() -> None:
+    import re
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    defaults_match = re.search(
+        r"const COLLAPSE_DEFAULTS: Record<CollapseProfile, boolean> = \{(?P<body>.*?)\};",
+        app_source,
+        re.DOTALL,
+    )
+    assert defaults_match is not None
+    defaults_body = defaults_match.group("body")
+
+    assert "core: true" in defaults_body
+    assert "advanced: false" in defaults_body
+    assert "explanation: false" in defaults_body
+    assert "longList: false" in defaults_body
+    assert 'profile = "core"' in app_source
+    assert 'profile = "advanced"' in app_source
+    assert 'title="购房需求设定" profile="core"' in app_source
+    assert 'title="车辆属性" profile="core"' in app_source
+    assert 'title="策略说明与影响预览"' in app_source
+    assert 'profile="explanation"' in app_source
+
+
+def test_scheduled_expense_medical_payment_toggle_is_medical_only() -> None:
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert "现金账户支付" not in app_source
+    assert 'label="使用医保个人账户支付"' in app_source
+    assert 'scheduledExpenseCategory === "medical"' in app_source
+    assert 'medical_account_payable: expenseCategory === "medical"' in app_source
+
+
+def test_policy_params_are_only_read_through_policy_or_engine_interfaces() -> None:
+    allowed_files = {
+        Path("backend/app/policies.py"),
+        Path("backend/app/engine_config.py"),
+    }
+    forbidden_patterns = ("rules.params", "rule_pack.params", ".params.get(")
+    offenders: list[str] = []
+
+    for path in Path("backend/app").rglob("*.py"):
+        if "__pycache__" in path.parts or path in allowed_files:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for pattern in forbidden_patterns:
+            if pattern in source:
+                offenders.append(f"{path}:{pattern}")
+
+    assert offenders == []
+
+
+def test_rule_page_only_edits_declared_rule_pack_params() -> None:
+    import re
+
+    schemas_source = Path("backend/app/schemas.py").read_text(encoding="utf-8")
+    schemas_tree = ast.parse(schemas_source)
+    declared_params: set[str] = set()
+    rule_pack_class = next(
+        node
+        for node in schemas_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RulePackData"
+    )
+    for node in rule_pack_class.body:
+        if not isinstance(node, ast.AnnAssign) or not isinstance(node.target, ast.Name):
+            continue
+        if node.target.id != "params" or not isinstance(node.value, ast.Call):
+            continue
+        default_factory = next(
+            (keyword.value for keyword in node.value.keywords if keyword.arg == "default_factory"),
+            None,
+        )
+        assert isinstance(default_factory, ast.Lambda)
+        assert isinstance(default_factory.body, ast.Dict)
+        declared_params = {
+            key.value
+            for key in default_factory.body.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        break
+
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    page_match = re.search(r"function RulePage\(.*?\nfunction VisualizationPage", app_source, re.DOTALL)
+    assert page_match is not None
+    frontend_rule_keys = set(re.findall(r'key: "([^"]+)"', page_match.group(0)))
+
+    assert frontend_rule_keys
+    assert frontend_rule_keys <= declared_params
 
 
 def test_child_planning_goal_normalization_strips_sequence_control_fields() -> None:
@@ -4659,9 +5602,13 @@ def test_core_objects_include_enabled_account_calibrations(tmp_path: Path, monke
             {
                 "enabled": True,
                 "month": "2026-08",
+                "calibration_scope": "strategy_event",
                 "target": "cash",
                 "amount": 72_000,
                 "reference_name": "样例现金账户",
+                "source_id": "strategy-entity-1",
+                "source_category": "investment",
+                "source_title": "理财策略：稳健定投",
                 "note": "示例校准",
             },
             {
@@ -4687,6 +5634,11 @@ def test_core_objects_include_enabled_account_calibrations(tmp_path: Path, monke
     assert calibration_data["name"] == "样例现金账户校准"
     assert calibration_data["current_balance"] == 72_000
     assert calibration_data["metadata"]["target"] == "cash"
+    assert calibration_data["metadata"]["calibration_scope"] == "strategy_event"
+    assert calibration_data["metadata"]["source_id"] == "strategy-entity-1"
+    assert calibration_data["metadata"]["source_category"] == "investment"
+    assert calibration_data["metadata"]["source_title"] == "理财策略：稳健定投"
+    assert calibration_data["metadata"]["reference_name"] == "样例现金账户"
     account_calibration_concept = next(item for item in concepts if item["code"] == "account_calibration")
     assert account_calibration_concept["core_object_count"] == 1
     assert account_calibration_concept["current_balance"] == 72_000
@@ -4831,6 +5783,110 @@ def test_planning_foundation_api_returns_consistent_backend_concepts(tmp_path: P
     group_by_code = {item["code"]: item for item in foundation["core_object_groups"]}
     assert group_by_code["liquid_assets"]["current_balance"] >= 110_000
     assert group_by_code["fixed_assets"]["current_balance"] >= 150_000
+
+
+def test_planning_foundation_covers_mixed_goal_sequence_and_core_objects(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        home_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "home",
+                    "name": "示例混合买房",
+                    "enabled": True,
+                    "priority": 1,
+                    "timing_mode": "auto_sequence",
+                    "earliest_purchase_delay_months": 6,
+                    "target_params": {
+                        "total_price": 3_000_000,
+                        "commercial_loan_amount": 1_200_000,
+                        "provident_loan_amount": 600_000,
+                    },
+                },
+            },
+        ).json()
+        vehicle_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "vehicle",
+                    "name": "示例并行购车",
+                    "enabled": True,
+                    "priority": 2,
+                    "timing_mode": "parallel",
+                    "allow_parallel": True,
+                    "earliest_purchase_delay_months": 4,
+                    "target_params": {"price": 220_000},
+                },
+            },
+        ).json()
+        child_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "child",
+                    "name": "示例养娃目标",
+                    "enabled": True,
+                    "priority": 3,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": home_goal["id"],
+                    "delay_after_dependency_months": 18,
+                    "target_params": {"name": "示例子女", "planned_birth_month": "2030-06"},
+                },
+            },
+        ).json()
+        renovation_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "renovation",
+                    "name": "示例跟随并行目标装修",
+                    "enabled": True,
+                    "priority": 4,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": vehicle_goal["id"],
+                    "delay_after_dependency_months": 5,
+                    "target_params": {"estimated_cost": 90_000},
+                },
+            },
+        ).json()
+        foundation = client.get("/api/planning-foundation", params={"household_id": household["id"]}).json()
+
+    sequence_by_name = {item["name"]: item for item in foundation["planning_sequence"]["goals"]}
+    assert sequence_by_name["示例混合买房"]["sequence_index"] == 1
+    assert sequence_by_name["示例并行购车"]["normalized_timing_mode"] == "parallel"
+    assert sequence_by_name["示例并行购车"]["sequence_index"] == 0
+    assert sequence_by_name["示例养娃目标"]["depends_on_goal_name"] == "示例混合买房"
+    assert sequence_by_name["示例跟随并行目标装修"]["depends_on_goal_name"] == "示例并行购车"
+    assert sequence_by_name["示例跟随并行目标装修"]["resolved_not_before_month"] == 9
+    assert not foundation["planning_sequence"]["warnings"]
+
+    visible_goal_ids = {item["id"] for item in foundation["planning_goals"]}
+    assert {home_goal["id"], vehicle_goal["id"], child_goal["id"], renovation_goal["id"]} <= visible_goal_ids
+
+    object_owner_keys = {item["data"].get("owner_key") for item in foundation["core_objects"]}
+    assert {home_goal["id"], vehicle_goal["id"], child_goal["id"], renovation_goal["id"]} <= object_owner_keys
+    categories_by_owner: dict[str, set[str]] = {}
+    for item in foundation["core_objects"]:
+        owner_key = item["data"].get("owner_key")
+        if owner_key:
+            categories_by_owner.setdefault(owner_key, set()).add(item["category"])
+    assert "property_asset" in categories_by_owner[home_goal["id"]]
+    assert "vehicle_asset" in categories_by_owner[vehicle_goal["id"]]
+    assert "child_goal" in categories_by_owner[child_goal["id"]]
+    assert "planning_goal" in categories_by_owner[renovation_goal["id"]]
 
 
 def test_core_objects_include_planning_goal_assets(tmp_path: Path, monkeypatch) -> None:
@@ -5413,6 +6469,134 @@ def test_affordability_api_applies_vehicle_planning_goal_window_to_strategy(tmp_
     assert {item["owner_key"] for item in vehicle_strategy_entities} == {vehicle_goal["id"]}
 
 
+def test_affordability_outputs_consume_resolved_planning_sequence(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        payload = deepcopy(household["data"])
+        payload["cash_account_balance"] = 600_000
+        payload["monthly_expense"] = 6_000
+        payload["members"] = [
+            {
+                **payload["members"][0],
+                "name": "样例成员A",
+                "monthly_salary_gross": 45_000,
+                "income_stages": [
+                    {
+                        **payload["members"][0]["income_stages"][0],
+                        "monthly_salary_gross": 45_000,
+                    }
+                ],
+            }
+        ]
+        household = client.put(f"/api/households/{household['id']}", json={"data": payload}).json()
+        home_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "home",
+                    "name": "示例先购房目标",
+                    "enabled": False,
+                    "priority": 1,
+                    "timing_mode": "not_planned",
+                    "target_params": {"total_price": 2_000_000},
+                },
+            },
+        ).json()
+        vehicle_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "vehicle",
+                    "name": "示例顺序车辆",
+                    "enabled": True,
+                    "priority": 2,
+                    "timing_mode": "manual_month",
+                    "earliest_purchase_delay_months": 14,
+                    "target_params": {
+                        "name": "示例顺序车辆",
+                        "total_price": 160_000,
+                        "down_payment_ratio": 0.4,
+                        "selected_strategy_variant": "target",
+                    },
+                },
+            },
+        ).json()
+        child_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "child",
+                    "name": "示例顺序养娃",
+                    "enabled": True,
+                    "priority": 3,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": vehicle_goal["id"],
+                    "delay_after_dependency_months": 8,
+                    "target_params": {
+                        "name": "示例顺序子女",
+                        "planned_birth_month": "",
+                        "tax_deduction_owner": "样例成员A",
+                    },
+                },
+            },
+        ).json()
+        rule_pack = client.get("/api/rule-packs").json()[0]
+        response = client.post(
+            "/api/calculations/affordability",
+            json={
+                "household_id": household["id"],
+                "scenario_id": home_goal["id"],
+                "household": household["data"],
+                "scenario": {
+                    **home_goal["data"]["target_params"],
+                    "name": home_goal["data"]["name"],
+                    "enabled": False,
+                    "planning_goal_id": home_goal["id"],
+                },
+                "rule_pack": rule_pack["data"],
+                "include_stress_tests": False,
+            },
+        )
+
+    assert response.status_code == 200
+    result = response.json()
+    sequence_by_id = {item["id"]: item for item in result["calculation_context"]["planning_goals"]}
+    assert sequence_by_id[vehicle_goal["id"]]["resolved_not_before_month"] == 14
+    assert sequence_by_id[child_goal["id"]]["depends_on_goal_name"] == "示例顺序车辆"
+    assert sequence_by_id[child_goal["id"]]["resolved_not_before_month"] == 22
+
+    vehicle_analyses = [item for item in result["car_plan_analyses"] if item["planning_goal_id"] == vehicle_goal["id"]]
+    assert vehicle_analyses
+    assert min(item["purchase_delay_months"] for item in vehicle_analyses) >= 14
+
+    child_strategy = next(item for item in result["child_plan_strategies"] if item["planning_goal_id"] == child_goal["id"])
+    assert child_strategy["birth_month_index"] is None or child_strategy["birth_month_index"] >= 22
+    assert result["monthly_cashflow_visualization"]
+    assert result["monthly_ledger"]
+
+    sequence_sheet = next(
+        sheet
+        for sheet in result["export_sheets"]
+        if sheet["title"] == "统一规划顺序"
+    )
+    headers = sequence_sheet["headers"]
+    id_index = headers.index("目标ID")
+    not_before_index = headers.index("最早月份偏移")
+    rows_by_id = {row[id_index]: row for row in sequence_sheet["rows"]}
+    assert rows_by_id[vehicle_goal["id"]][not_before_index] == 14
+    assert rows_by_id[child_goal["id"]][not_before_index] == 22
+
+
 def test_affordability_api_respects_vehicle_planning_window_end(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
@@ -5669,6 +6853,56 @@ def test_affordability_calculation_is_cached_until_inputs_change(tmp_path: Path,
     assert changed.status_code == 200
     assert first.json() == second.json()
     assert calls["count"] == 2
+
+
+def test_affordability_cache_hit_does_not_rewrite_existing_cache_rows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database, main
+
+    database.DB_PATH = database.default_db_path()
+
+    cache_writes = {"count": 0}
+    strategy_writes = {"count": 0}
+    original_cache_upsert = main.upsert_calculation_cache
+    original_strategy_upsert = main.upsert_generated_strategies
+
+    def counted_cache_upsert(*args, **kwargs):
+        cache_writes["count"] += 1
+        return original_cache_upsert(*args, **kwargs)
+
+    def counted_strategy_upsert(*args, **kwargs):
+        strategy_writes["count"] += 1
+        return original_strategy_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(main, "upsert_calculation_cache", counted_cache_upsert)
+    monkeypatch.setattr(main, "upsert_generated_strategies", counted_strategy_upsert)
+
+    with TestClient(main.app) as client:
+        household = client.get("/api/households").json()[0]
+        scenario = client.post(
+            "/api/scenarios",
+            json={"household_id": household["id"], "data": {"total_price": 3_000_000}},
+        ).json()
+        rule_pack = client.get("/api/rule-packs").json()[0]
+        payload = {
+            "household_id": household["id"],
+            "scenario_id": scenario["id"],
+            "household": household["data"],
+            "scenario": scenario["data"],
+            "rule_pack": rule_pack["data"],
+        }
+
+        first = client.post("/api/calculations/affordability", json=payload)
+        assert first.status_code == 200
+        cache_writes["count"] = 0
+        strategy_writes["count"] = 0
+        second = client.post("/api/calculations/affordability", json=payload)
+
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert cache_writes["count"] == 0
+    assert strategy_writes["count"] == 0
 
 
 def test_calculation_persists_generated_strategy_entities(tmp_path: Path, monkeypatch) -> None:

@@ -404,36 +404,6 @@ def _insert_or_replace_planning_goal(
     )
 
 
-def _upsert_scenario_shadow_from_home_goal(
-    conn: sqlite3.Connection,
-    *,
-    goal_id: str,
-    household_id: str | None,
-    goal_data: dict[str, Any],
-    created_at: str | None = None,
-    updated_at: str | None = None,
-) -> None:
-    timestamp = now_iso()
-    scenario = _scenario_from_home_goal(goal_id, goal_data)
-    conn.execute(
-        """
-        INSERT INTO scenarios (id, household_id, data, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            household_id = excluded.household_id,
-            data = excluded.data,
-            updated_at = excluded.updated_at
-        """,
-        (
-            goal_id,
-            household_id,
-            json.dumps(_normalize_scenario(scenario), ensure_ascii=False),
-            created_at or timestamp,
-            updated_at or timestamp,
-        ),
-    )
-
-
 def _planning_goal_records_for_core_objects(conn: sqlite3.Connection, household_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
@@ -674,15 +644,6 @@ def insert_planning_goal_record(data: dict[str, Any], household_id: str | None =
             created_at=timestamp,
             updated_at=timestamp,
         )
-        if str(normalized.get("goal_type") or "home") == "home":
-            _upsert_scenario_shadow_from_home_goal(
-                conn,
-                goal_id=record_id,
-                household_id=household_id,
-                goal_data=normalized,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
         _sync_core_objects_for_households_affected_by_goal(conn, household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
@@ -728,16 +689,7 @@ def update_planning_goal_record(
             created_at=row["created_at"],
             updated_at=timestamp,
         )
-        if next_goal_type == "home":
-            _upsert_scenario_shadow_from_home_goal(
-                conn,
-                goal_id=record_id,
-                household_id=effective_household_id,
-                goal_data=normalized,
-                created_at=row["created_at"],
-                updated_at=timestamp,
-            )
-        elif previous_goal_type == "home":
+        if previous_goal_type == "home" and next_goal_type != "home":
             conn.execute("DELETE FROM scenarios WHERE id = ?", (record_id,))
         affected_household_ids = {previous_household_id, effective_household_id}
         for affected_household_id in affected_household_ids:
@@ -1180,6 +1132,15 @@ def get_calculation_cache_payload(cache_key: str) -> str | None:
     return payload if isinstance(payload, str) and payload.strip().startswith("{") else None
 
 
+def generated_strategies_exist_for_cache(cache_key: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM generated_strategies WHERE cache_key = ? LIMIT 1",
+            (cache_key,),
+        ).fetchone()
+    return row is not None
+
+
 def upsert_calculation_cache(
     cache_key: str,
     engine_fingerprint: str,
@@ -1187,7 +1148,7 @@ def upsert_calculation_cache(
     result: dict[str, Any],
 ) -> None:
     timestamp = now_iso()
-    payload = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     with get_connection() as conn:
         conn.execute(
             """
