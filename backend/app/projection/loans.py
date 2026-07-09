@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Sequence
 
+from ..domain.housing import commercial_loan_rate
 from ..domain.loans import (
     existing_loan_details_projection,
     loan_balance_after_payments,
@@ -14,6 +15,7 @@ from ..schemas import (
     CarPlanData,
     HouseholdData,
     LoanVisualizationPoint,
+    MarketSnapshotData,
     ProvidentVisualizationPoint,
     PurchasePlanAnalysis,
     ScenarioData,
@@ -33,6 +35,7 @@ def build_loan_projection(
     provident_projection: list[ProvidentVisualizationPoint] | None = None,
     base_vehicle_states: Sequence[VehicleLoanState] | None = None,
     vehicle_states_by_plan: dict[str, Sequence[VehicleLoanState]] | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[LoanVisualizationPoint]:
     base_existing_payment = max(
         0.0,
@@ -102,7 +105,7 @@ def build_loan_projection(
                     commercial_extra_principal_payment,
                 ) = loan_projection_point_after_payments(
                     plan.commercial_loan_amount,
-                    scenario.commercial_rate,
+                    commercial_loan_rate(scenario, market_snapshot),
                     plan.commercial_loan_years * 12,
                     plan.commercial_repayment_method,
                     home_elapsed,
@@ -188,17 +191,15 @@ def build_loan_projection_from_strategy_context(
     provident_projection: list[ProvidentVisualizationPoint] | None = None,
     selected_vehicle_states: Sequence[VehicleLoanState] | None = None,
     vehicle_states_provider: VehicleStatesProvider,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[LoanVisualizationPoint]:
     base_vehicle_states = tuple(
         selected_vehicle_states if selected_vehicle_states is not None else vehicle_states_provider(None)
     )
-    if selected_vehicle_states is not None:
-        vehicle_states_by_plan = {plan.variant: base_vehicle_states for plan in purchase_plans}
-    else:
-        vehicle_states_by_plan = {
-            plan.variant: tuple(vehicle_states_provider(plan))
-            for plan in purchase_plans
-        }
+    vehicle_states_by_plan = {
+        plan.variant: tuple(vehicle_states_provider(plan))
+        for plan in purchase_plans
+    }
     return build_loan_projection(
         household,
         scenario,
@@ -208,4 +209,5 @@ def build_loan_projection_from_strategy_context(
         provident_projection=provident_projection,
         base_vehicle_states=base_vehicle_states,
         vehicle_states_by_plan=vehicle_states_by_plan,
+        market_snapshot=market_snapshot,
     )

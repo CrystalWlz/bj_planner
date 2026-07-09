@@ -6,6 +6,7 @@ from datetime import date
 from typing import Protocol
 
 from ..domain.time import month_after, month_distance, parse_year_month
+from ..policies import get_policy
 from ..schemas import (
     HouseholdData,
     ProvidentMemberAccountPoint,
@@ -250,8 +251,9 @@ def build_provident_projection(
     strategy_active_mode: StrategyModeResolver,
     as_of: date | None = None,
 ) -> list[ProvidentVisualizationPoint]:
-    pf_interest_rate = max(0.0, float(rules.params.get("provident_balance_annual_interest_rate", 0.015))) / 12
-    retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
+    policy = get_policy(rules)
+    pf_interest_rate = policy.provident_account_balance_annual_interest_rate() / 12
+    retained_balance = policy.provident_loan_offset_retained_balance()
     base = as_of or date.today()
     base_month = date(base.year, base.month, 1)
     rows: list[ProvidentVisualizationPoint] = []

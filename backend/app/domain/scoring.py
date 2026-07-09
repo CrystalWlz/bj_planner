@@ -1,26 +1,8 @@
 from __future__ import annotations
 
+from ..policies import get_policy
 from ..schemas import PurchasePlanAnalysis, RulePackData
 
-
-DEFAULT_PURCHASE_HAPPINESS_WEIGHTS = {
-    "living_quality": 0.10,
-    "commute": 0.08,
-    "education": 0.07,
-    "vehicle_convenience": 0.04,
-    "vehicle_home_tradeoff": 0.04,
-    "transaction_liquidity": 0.09,
-    "post_purchase_liquidity": 0.08,
-    "investment_continuity": 0.05,
-    "monthly_cashflow": 0.12,
-    "debt_to_income": 0.08,
-    "monthly_payment_pressure": 0.08,
-    "loan_interest_pressure": 0.06,
-    "cash_shortfall": 0.06,
-    "waiting_time": 0.04,
-    "renovation_readiness": 0.04,
-    "stress_resilience": 0.07,
-}
 
 PURCHASE_HAPPINESS_FINANCIAL_KEYS = {
     "transaction_liquidity",
@@ -116,14 +98,7 @@ def wait_score(months: int | None, max_comfort_months: int) -> float:
 
 
 def purchase_happiness_weights(rules: RulePackData, liquidity_priority_score: float) -> dict[str, float]:
-    raw_weights = rules.params.get("purchase_happiness_weights", {})
-    weights: dict[str, float] = {}
-    for key, default in DEFAULT_PURCHASE_HAPPINESS_WEIGHTS.items():
-        raw_value = raw_weights.get(key, default) if isinstance(raw_weights, dict) else default
-        try:
-            weights[key] = max(0.0, float(raw_value))
-        except (TypeError, ValueError):
-            weights[key] = default
+    weights = dict(get_policy(rules).purchase_happiness_weights())
 
     priority = (clamp_score(liquidity_priority_score) - 5.0) / 5.0
     for key in list(weights):
@@ -134,7 +109,7 @@ def purchase_happiness_weights(rules: RulePackData, liquidity_priority_score: fl
 
     total = sum(weights.values())
     if total <= 0:
-        return DEFAULT_PURCHASE_HAPPINESS_WEIGHTS.copy()
+        return {}
     return {key: value / total for key, value in weights.items()}
 
 

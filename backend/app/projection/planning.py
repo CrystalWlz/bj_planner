@@ -18,8 +18,10 @@ from ..domain.vehicles import calculate_car_loan_summary
 from ..schemas import (
     CarLoanSummary,
     CarPlanData,
+    CalculationContextSnapshot,
     HouseholdData,
     LoanVisualizationPoint,
+    MarketSnapshotData,
     ProvidentVisualizationPoint,
     PurchasePlanAnalysis,
     RulePackData,
@@ -57,7 +59,7 @@ from .vehicles import build_vehicle_month_projection
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
 
-def calculate_car_loan(plan: CarPlanData, *, initial_cash: float = 0, monthly_cash_savings_before_car: float = 0, rules: RulePackData | None = None) -> CarLoanSummary:
+def calculate_car_loan(plan: CarPlanData, *, initial_cash: float = 0, monthly_cash_savings_before_car: float = 0, rules: RulePackData) -> CarLoanSummary:
     return calculate_car_loan_summary(
         plan,
         initial_cash=initial_cash,
@@ -72,7 +74,8 @@ def build_vehicle_loan_states(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[VehicleLoanState]:
     return vehicle_loan_states(
         plan,
@@ -81,6 +84,7 @@ def build_vehicle_loan_states(
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
         rules=rules,
+        calculation_context=calculation_context,
     )
 
 
@@ -91,14 +95,19 @@ def build_visualization_horizon(
     *,
     second_loan: CarLoanSummary | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
+    rules: RulePackData,
 ) -> int:
-    effective_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(household.car_plan)
+    effective_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(
+        household.car_plan,
+        rules=rules,
+    )
     return visualization_horizon_months(
         household,
         purchase_plans,
         car_loan,
         second_loan=second_loan,
         vehicle_states=effective_vehicle_states,
+        rules=rules,
     )
 
 
@@ -111,15 +120,22 @@ def build_loan_projection(
     base_monthly_debt_payment: float | None = None,
     provident_projection: list[ProvidentVisualizationPoint] | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[LoanVisualizationPoint]:
-    rules = rules or RulePackData()
-    base_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules)
+    base_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(
+        household.car_plan,
+        scenario=scenario,
+        rules=rules,
+        calculation_context=calculation_context,
+    )
     horizon = build_visualization_horizon(
         household,
         purchase_plans,
         car_loan,
         vehicle_states=base_vehicle_states,
+        rules=rules,
     )
     return build_loan_projection_from_strategy_context(
         household,
@@ -129,11 +145,13 @@ def build_loan_projection(
         base_monthly_debt_payment=base_monthly_debt_payment,
         provident_projection=provident_projection,
         selected_vehicle_states=vehicle_states,
+        market_snapshot=market_snapshot,
         vehicle_states_provider=lambda plan: build_vehicle_loan_states(
             household.car_plan,
             scenario=scenario,
             home_purchase_month=plan.months_to_buy if plan is not None else None,
             rules=rules,
+            calculation_context=calculation_context,
         ),
     )
 
@@ -170,8 +188,9 @@ def build_social_security_projection(
         else build_visualization_horizon(
             household,
             purchase_plans,
-            car_loan or calculate_car_loan(CarPlanData()),
+            car_loan or calculate_car_loan(CarPlanData(), rules=rules),
             vehicle_states=vehicle_states,
+            rules=rules,
         )
     )
     return build_social_security_account_projection(
@@ -198,6 +217,7 @@ def build_provident_projection(
         purchase_plans,
         car_loan,
         vehicle_states=vehicle_states,
+        rules=rules,
     )
     return build_provident_account_projection(
         household,
@@ -205,7 +225,7 @@ def build_provident_projection(
         purchase_plans,
         horizon_months=horizon,
         income_rows_provider=member_monthly_income_profiles_at,
-        retirement_months_by_member=member_retirement_months_by_index(household),
+        retirement_months_by_member=member_retirement_months_by_index(household, rules=rules),
         rent_withdrawal_at_month=quarterly_rent_withdrawal_before_purchase_at,
         is_offset_month=is_beijing_pf_offset_month,
         strategy_active_mode=lambda mode, purchase_month, current_month: pf_strategy_active_mode(
@@ -227,15 +247,22 @@ def build_monthly_ledger_projection(
     social_security_projection: list[SocialSecurityVisualizationPoint] | None = None,
     *,
     vehicle_states: list[VehicleLoanState] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> MonthlyLedgerResult:
     today = date.today()
     base_month = date(today.year, today.month, 1)
-    base_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules)
+    base_vehicle_states = vehicle_states if vehicle_states is not None else build_vehicle_loan_states(
+        household.car_plan,
+        scenario=scenario,
+        rules=rules,
+        calculation_context=calculation_context,
+    )
     horizon = build_visualization_horizon(
         household,
         purchase_plans,
         car_loan,
         vehicle_states=base_vehicle_states,
+        rules=rules,
     )
     return build_projected_monthly_ledger_from_context(
         household,
@@ -261,6 +288,7 @@ def build_monthly_ledger_projection(
             scenario=scenario,
             home_purchase_month=plan.months_to_buy,
             rules=rules,
+            calculation_context=calculation_context,
         ),
         vehicle_month_projection_provider=lambda plan_vehicle_states, month: build_vehicle_month_projection(
             household.car_plan,

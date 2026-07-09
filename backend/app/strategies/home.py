@@ -6,6 +6,7 @@ from math import ceil
 from typing import Protocol
 
 from ..domain.housing import (
+    commercial_loan_rate,
     housing_transaction_rate_amounts,
     minimum_down_payment_ratio,
     provident_loan_rate as policy_provident_loan_rate,
@@ -45,11 +46,15 @@ from ..projection.provident import (
     future_provident_value,
     future_provident_value_with_schedule,
 )
+from ..policies import get_policy
 from ..schemas import (
     CarLoanSummary,
     CarPlanData,
+    CalculationContextGoalSnapshot,
+    CalculationContextSnapshot,
     HouseholdData,
     LoanSummary,
+    MarketSnapshotData,
     PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
@@ -143,6 +148,7 @@ class PurchasePlanningContext:
     household: HouseholdData
     scenario: ScenarioData
     rules: RulePackData
+    market_snapshot: MarketSnapshotData | None
     tax_summaries: Sequence[TaxSummaryLike]
     income_profile_provider: Callable[[int], MonthlyIncomeProfileLike]
     expense_provider: Callable[[int, int | None], float]
@@ -289,6 +295,7 @@ class PurchasePlanningContext:
             car_monthly_cash_cost_at=self.car_monthly_cash_cost_at,
             car_down_payment_at=self.car_down_payment_at,
             strategy_preference=strategy_preference,
+            market_snapshot=self.market_snapshot,
         )
 
     def find_candidate(
@@ -297,6 +304,7 @@ class PurchasePlanningContext:
         variant_spec: PurchaseVariantSpec,
         micro_ratio_candidates: list[float],
         search_start_month: int,
+        search_end_month: int | None,
         target_commercial_loan: float,
         taxes_and_fees: float,
         effective_provident_rate: float,
@@ -341,6 +349,7 @@ class PurchasePlanningContext:
             variant_spec=variant_spec,
             micro_ratio_candidates=micro_ratio_candidates,
             search_start_month=search_start_month,
+            search_end_month=search_end_month,
             price=self.scenario.total_price,
             target_commercial_loan=target_commercial_loan,
             compute_mix_at=compute_mix_at,
@@ -355,17 +364,10 @@ def _clamp(value: float, floor: float, ceiling: float) -> float:
 
 
 def micro_commercial_ratio_candidates(scenario: ScenarioData, rules: RulePackData) -> list[float]:
-    micro_default_ratio = _clamp(float(rules.params.get("micro_commercial_loan_ratio", 0.05)), 0, 1)
-    micro_min_ratio = _clamp(
-        float(rules.params.get("micro_commercial_loan_ratio_min", min(0.02, micro_default_ratio))),
-        0,
-        1,
-    )
-    micro_max_ratio = _clamp(
-        float(rules.params.get("micro_commercial_loan_ratio_max", max(0.12, micro_default_ratio))),
-        micro_min_ratio,
-        1,
-    )
+    policy = get_policy(rules).home_strategy_policy()
+    micro_default_ratio = policy.micro_commercial_loan_ratio
+    micro_min_ratio = policy.micro_commercial_loan_ratio_min
+    micro_max_ratio = policy.micro_commercial_loan_ratio_max
     manual_micro_ratio = _clamp(scenario.micro_commercial_loan_ratio, 0, 1)
     if manual_micro_ratio > 0:
         return [manual_micro_ratio]
@@ -380,7 +382,7 @@ def micro_commercial_ratio_candidates(scenario: ScenarioData, rules: RulePackDat
 
 
 def purchase_variant_specs(scenario: ScenarioData, rules: RulePackData) -> list[PurchaseVariantSpec]:
-    micro_default_ratio = _clamp(float(rules.params.get("micro_commercial_loan_ratio", 0.05)), 0, 1)
+    micro_default_ratio = get_policy(rules).home_strategy_policy().micro_commercial_loan_ratio
     price = scenario.total_price
     return [
         PurchaseVariantSpec(
@@ -434,7 +436,7 @@ def build_purchase_funding_projection(
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
     sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
     monthly_return = scenario.annual_investment_return / 12
-    pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
+    pf_interest_rate = get_policy(rules).provident_account_balance_annual_interest_rate()
     pf_monthly_return = max(0.0, pf_interest_rate) / 12
     cash_value_by_month = [max(0.0, initial_cash)]
     investment_value_by_month = [max(0.0, initial_investment)]
@@ -496,11 +498,13 @@ def build_purchase_planning_context(
     car_down_payment_provider: Callable[[list[VehicleLoanState], int], float],
     family_down_payment_upfront_support: Callable[[int, float], float],
     initial_provident_balance: float,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> PurchasePlanningContext:
     context = PurchasePlanningContext(
         household=household,
         scenario=scenario,
         rules=rules,
+        market_snapshot=market_snapshot,
         tax_summaries=tax_summaries,
         income_profile_provider=income_profile_provider,
         expense_provider=expense_provider,
@@ -614,10 +618,11 @@ def cash_stress_for_financing_mix(
     car_monthly_cash_cost_at: Callable[[int], float],
     car_down_payment_at: Callable[[int], float],
     strategy_preference: str,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> tuple[float, int | None, bool]:
     commercial_payment = calculate_loan(
         financing_mix[4],
-        scenario.commercial_rate,
+        commercial_loan_rate(scenario, market_snapshot),
         scenario.loan_years,
         commercial_repayment_method,
     )
@@ -1015,6 +1020,7 @@ def find_purchase_candidate(
     variant_spec: PurchaseVariantSpec,
     micro_ratio_candidates: list[float],
     search_start_month: int,
+    search_end_month: int | None,
     price: float,
     target_commercial_loan: float,
     compute_mix_at: Callable[[int, float], tuple[float, float, float, float, float, float, float]],
@@ -1032,8 +1038,10 @@ def find_purchase_candidate(
     best_failed_result: PurchaseCandidate | None = None
     best_failed_rank: tuple[float, int, float] | None = None
     selected_candidate: PurchaseCandidate | None = None
+    effective_horizon_months = min(horizon_months, max(0, search_end_month)) if search_end_month is not None else horizon_months
+    fallback_month = max(0, min(max(search_start_month, 0), effective_horizon_months))
 
-    for candidate_month in range(search_start_month, horizon_months + 1):
+    for candidate_month in range(search_start_month, effective_horizon_months + 1):
         required_liquidity_reserve = max(
             0.0,
             expense_at_month(candidate_month) * household.required_liquidity_months,
@@ -1122,7 +1130,7 @@ def find_purchase_candidate(
         )
 
     fallback_target = price * micro_ratio_candidates[-1] if variant_spec.use_micro_strategy else target_commercial_loan
-    fallback_mix = compute_mix_at(horizon_months, fallback_target)
+    fallback_mix = compute_mix_at(fallback_month, fallback_target)
     (
         pf_upfront_extractable,
         family_pf_upfront_extractable,
@@ -1135,13 +1143,13 @@ def find_purchase_candidate(
         cash_after_transaction,
         cash_after_purchase,
         pf_after_extract,
-    ) = purchase_state_for_mix(horizon_months, fallback_mix)
+    ) = purchase_state_for_mix(fallback_month, fallback_mix)
     required_liquidity_reserve = max(
         0.0,
-        expense_at_month(horizon_months) * household.required_liquidity_months,
+        expense_at_month(fallback_month) * household.required_liquidity_months,
     )
     minimum_cash_balance, minimum_cash_balance_month, _ = cash_stress_for_mix(
-        horizon_months,
+        fallback_month,
         fallback_mix,
         cash_after_purchase,
         pf_after_extract,
@@ -1150,7 +1158,7 @@ def find_purchase_candidate(
         months=None,
         required_liquidity_reserve=required_liquidity_reserve,
         candidate=PurchaseCandidate(
-            purchase_month=horizon_months,
+            purchase_month=fallback_month,
             mix=fallback_mix,
             pf_upfront_extractable=pf_upfront_extractable,
             family_pf_upfront_extractable=family_pf_upfront_extractable,
@@ -1259,7 +1267,7 @@ def purchase_cash_state_at_month(
     if pf_value_by_month is not None and month < len(pf_value_by_month):
         pf_available = pf_value_by_month[month]
     else:
-        pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
+        pf_interest_rate = get_policy(rules).provident_account_balance_annual_interest_rate()
         pf_available = (
             future_provident_value_with_schedule(
                 initial_provident_balance,
@@ -1275,24 +1283,9 @@ def purchase_cash_state_at_month(
                 month,
             )
         )
-    default_upfront_ratio = float(rules.params.get("provident_upfront_purchase_extract_ratio", 0.0))
-    if is_second_hand_property(scenario):
-        upfront_ratio_key = "provident_upfront_purchase_extract_ratio_second_hand"
-        ratio_fallback = 0.0
-    elif is_new_home_property(scenario):
-        upfront_ratio_key = "provident_upfront_purchase_extract_ratio_new_home"
-        ratio_fallback = 1.0
-    else:
-        upfront_ratio_key = "provident_upfront_purchase_extract_ratio"
-        ratio_fallback = default_upfront_ratio
-    upfront_extract_ratio = max(
-        0,
-        min(1, float(rules.params.get(upfront_ratio_key, ratio_fallback))),
-    )
-    post_transaction_extract_ratio = max(
-        0,
-        min(1, float(rules.params.get("provident_post_transaction_extract_ratio", 1.0))),
-    )
+    policy = get_policy(rules)
+    upfront_extract_ratio = policy.provident_upfront_purchase_extract_ratio(scenario)
+    post_transaction_extract_ratio = policy.provident_post_transaction_extract_ratio(scenario)
     pf_upfront_extractable = min(pf_available, planned_down_payment * upfront_extract_ratio)
     family_pf_upfront_extractable = family_down_payment_upfront_support(
         month,
@@ -1326,6 +1319,24 @@ def purchase_cash_state_at_month(
     )
 
 
+def _home_goal_snapshot_for_scenario(
+    scenario: ScenarioData,
+    calculation_context: CalculationContextSnapshot | None,
+) -> CalculationContextGoalSnapshot | None:
+    if calculation_context is None:
+        return None
+    if calculation_context.current_goal_id:
+        current = next((goal for goal in calculation_context.planning_goals if goal.id == calculation_context.current_goal_id), None)
+        if current is not None and current.goal_type == "home":
+            return current
+    scenario_goal_id = str(getattr(scenario, "planning_goal_id", "") or "")
+    if scenario_goal_id:
+        current = next((goal for goal in calculation_context.planning_goals if goal.id == scenario_goal_id), None)
+        if current is not None and current.goal_type == "home":
+            return current
+    return next((goal for goal in calculation_context.planning_goals if goal.goal_type == "home"), None)
+
+
 def build_purchase_plan_analyses(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -1344,6 +1355,8 @@ def build_purchase_plan_analyses(
     family_down_payment_upfront_support_provider: Callable[[int, float], float],
     initial_provident_balance: float,
     planning_window_delay_provider: Callable[[str], int | None] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[PurchasePlanAnalysis]:
     price = scenario.total_price
     pf_account_strategy_preference = effective_pf_account_strategy(scenario, rules, household)
@@ -1353,12 +1366,14 @@ def build_purchase_plan_analyses(
         household,
         scenario,
         rules,
+        market_snapshot,
     )
     micro_ratio_candidates = micro_commercial_ratio_candidates(scenario, rules)
     planning_context = build_purchase_planning_context(
         household=household,
         scenario=scenario,
         rules=rules,
+        market_snapshot=market_snapshot,
         tax_summaries=tax_summaries,
         income_profile_provider=income_profile_provider,
         expense_provider=expense_provider,
@@ -1378,6 +1393,7 @@ def build_purchase_plan_analyses(
     car_down_payment_at = planning_context.car_down_payment_at
 
     variant_specs = purchase_variant_specs(scenario, rules)
+    home_goal = _home_goal_snapshot_for_scenario(scenario, calculation_context)
 
     scenario_prepayment_mode = scenario_commercial_prepayment_mode(scenario)
 
@@ -1415,11 +1431,33 @@ def build_purchase_plan_analyses(
         pf_after_extract = 0.0
 
         scenario_window_start_delay = (planning_window_delay_provider(scenario.planning_window_start_month) if planning_window_delay_provider else None) or 0
-        search_start_month = min(360, max(0, scenario.manual_purchase_delay_months, scenario_window_start_delay))
+        scenario_window_end_delay = planning_window_delay_provider(scenario.planning_window_end_month) if planning_window_delay_provider else None
+        goal_window_start_delay = home_goal.resolved_window_start_month if home_goal else 0
+        goal_not_before_delay = home_goal.resolved_not_before_month if home_goal else 0
+        window_end_candidates = [
+            value
+            for value in [
+                scenario_window_end_delay,
+                home_goal.resolved_window_end_month if home_goal else None,
+            ]
+            if value is not None
+        ]
+        search_end_month = min(window_end_candidates) if window_end_candidates else None
+        search_start_month = min(
+            360,
+            max(
+                0,
+                scenario.manual_purchase_delay_months,
+                scenario_window_start_delay,
+                goal_window_start_delay,
+                goal_not_before_delay,
+            ),
+        )
         candidate_search = planning_context.find_candidate(
             variant_spec=variant_spec,
             micro_ratio_candidates=micro_ratio_candidates,
             search_start_month=search_start_month,
+            search_end_month=search_end_month,
             target_commercial_loan=target_commercial,
             taxes_and_fees=taxes_and_fees,
             effective_provident_rate=effective_provident_rate,
@@ -1464,6 +1502,7 @@ def build_purchase_plan_analyses(
             commercial_loan=commercial_loan,
             commercial_repayment_method=scenario_commercial_repayment_method(scenario),
             commercial_prepayment_mode=selected_commercial_prepayment_mode,
+            market_snapshot=market_snapshot,
         )
         commercial_payment = commercial_prepayment_plan.regular_payment
         commercial_prepayment_allowed_after_month = commercial_prepayment_plan.allowed_after_month
@@ -1538,6 +1577,7 @@ def build_purchase_plan_analyses(
                 commercial_repayment_method=scenario_commercial_repayment_method(scenario),
                 investment_buy_fee_rate=household.investment_buy_fee_rate,
                 investment_sell_fee_rate=household.investment_sell_fee_rate,
+                market_snapshot=market_snapshot,
             )
             if not commercial_auto_prepayment_enabled:
                 commercial_prepayment_monthly = 0.0
@@ -1549,6 +1589,7 @@ def build_purchase_plan_analyses(
                 prepayment_monthly_amount=commercial_prepayment_monthly,
                 prepayment_start_month=commercial_prepayment_start_month,
                 prepayment_allowed_after_month=commercial_prepayment_allowed_after_month,
+                market_snapshot=market_snapshot,
             )
             commercial_prepayment_allowed_after_month = commercial_prepayment_plan.allowed_after_month
             commercial_prepayment_start_month = commercial_prepayment_plan.start_month
@@ -1652,6 +1693,8 @@ def build_purchase_plan_analyses(
             PurchasePlanAnalysis(
                 variant=name,
                 description=description,
+                planning_goal_id=home_goal.id if home_goal else str(getattr(scenario, "planning_goal_id", "") or ""),
+                source="planning_goals" if home_goal else "scenario",
                 months_to_buy=months,
                 years_to_buy=round(months / 12, 1) if months is not None else None,
                 minimum_down_payment=round(min_down_payment, 2),
@@ -1677,7 +1720,7 @@ def build_purchase_plan_analyses(
                 provident_loan_amount=round(provident_loan, 2),
                 provident_policy_bonus=round(provident_policy_bonus, 2),
                 provident_policy_cap=round(provident_cap, 2),
-                commercial_rate=round(scenario.commercial_rate, 6),
+                commercial_rate=round(commercial_loan_rate(scenario, market_snapshot), 6),
                 provident_rate=round(effective_provident_rate, 6),
                 deed_tax_rate=round(deed_tax_rate, 6),
                 broker_fee_rate=round(broker_fee_rate, 6),

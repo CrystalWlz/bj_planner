@@ -14,6 +14,9 @@ export type ProvidentAccountRepaymentStrategy =
   | "monthly_repayment_withdrawal"
   | "semiannual_principal_offset"
   | "keep_in_account";
+export type ProvidentAccountRepaymentSwitchTarget =
+  | "monthly_repayment_withdrawal"
+  | "semiannual_principal_offset";
 export type PersonalPensionContributionMode = "none" | "auto_tax_optimal" | "fixed_monthly" | "fixed_annual";
 export type PersonalPensionOpenMode = "auto_tax_optimal" | "manual" | "none";
 
@@ -240,8 +243,10 @@ export interface VehiclePlanData {
   beijing_family_indicator_last_config_year: number;
   beijing_family_indicator_annual_quota: number;
   vehicle_vessel_tax_annual_override: number | null;
+  planning_goal_id: string;
   planning_sequence: number;
-  purchase_timing_mode: "auto_sequence" | "parallel" | "manual_month";
+  purchase_timing_mode: VehiclePurchaseTimingMode;
+  depends_on_goal_id: string;
   after_previous_event_delay_months: number;
   manual_purchase_delay_months: number;
   planning_window_start_month: string;
@@ -313,6 +318,7 @@ export interface PropertyPurchaseGoalData {
   enabled: boolean;
   intended_use: "self_use" | "improvement" | "investment" | "other";
   planning_mode: "after_previous_purchase" | "parallel";
+  depends_on_goal_id: string;
   after_previous_purchase_delay_months: number;
   earliest_purchase_delay_months: number;
   planning_window_start_month: string;
@@ -354,6 +360,7 @@ export interface ScheduledExpenseData {
   annual_occurrence_month: number;
   start_month: string;
   end_month: string | null;
+  expense_category: "general" | "medical";
   medical_account_payable: boolean;
   tax_deductible_elderly_care: boolean;
   notes: string;
@@ -388,9 +395,10 @@ export interface ElderlyDependentData {
 }
 
 export interface ChildPlanData {
+  planning_goal_id: string;
   name: string;
   enabled: boolean;
-  timing_mode: "after_first_home" | "manual_month" | "not_planned";
+  timing_mode: ChildPlanTimingMode;
   expense_strategy_mode: "balanced" | "conservative" | "quality" | "manual";
   planned_birth_month: string;
   planned_birth_start_month: string;
@@ -498,14 +506,19 @@ export type AccountCalibrationTarget =
   | "vehicle_asset"
   | "fixed_asset"
   | "total_loan";
+export type AccountCalibrationScope = "account" | "concept" | "major_event" | "strategy_event";
 
 export interface AccountCalibrationData {
   enabled: boolean;
   month: string;
+  calibration_scope: AccountCalibrationScope;
   target: AccountCalibrationTarget;
   amount: number;
   member_name: string;
   reference_name: string;
+  source_id: string;
+  source_category: string;
+  source_title: string;
   note: string;
 }
 
@@ -565,11 +578,177 @@ export interface HouseholdData {
   notes: string;
 }
 
+export type PlanningGoalType = "home" | "vehicle" | "child" | "renovation" | "other";
+export type PlanningTimingMode = "auto_sequence" | "parallel" | "manual_month" | "after_goal" | "not_planned";
+export type VehiclePurchaseTimingMode = "auto_sequence" | "parallel" | "manual_month" | "not_planned";
+export type ChildPlanTimingMode = "after_first_home" | "manual_month" | "not_planned";
+export type CoreObjectType = "account" | "loan" | "asset" | "adjustment";
+export type CoreObjectCategory =
+  | "cash"
+  | "investment"
+  | "provident"
+  | "pension"
+  | "medical"
+  | "personal_pension"
+  | "property_asset"
+  | "vehicle_asset"
+  | "child_goal"
+  | "planning_goal"
+  | "fixed_asset"
+  | "mortgage"
+  | "car_loan"
+  | "education"
+  | "consumer"
+  | "manual_adjustment"
+  | "other";
+export type CoreObjectSource = "household" | "member" | "loan" | "goal" | "manual";
+
+export interface CoreObjectData {
+  schema_version: number;
+  object_type: CoreObjectType;
+  category: CoreObjectCategory;
+  name: string;
+  enabled: boolean;
+  member_name: string;
+  owner_key: string;
+  reference_id: string;
+  source: CoreObjectSource;
+  current_balance: number;
+  monthly_flow: number;
+  annual_rate: number;
+  start_month: string;
+  end_month: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface CoreObjectRecord {
+  id: string;
+  household_id: string | null;
+  object_type: CoreObjectType;
+  category: CoreObjectCategory;
+  data: CoreObjectData;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlanningGoalData {
+  schema_version: number;
+  goal_type: PlanningGoalType;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  timing_mode: PlanningTimingMode;
+  earliest_purchase_month: string;
+  earliest_purchase_delay_months: number;
+  planning_window_start_month: string;
+  planning_window_end_month: string;
+  depends_on_goal_id: string;
+  delay_after_dependency_months: number;
+  allow_parallel: boolean;
+  selected_strategy_id: string;
+  target_params: Record<string, unknown>;
+  financing_preferences: Record<string, unknown>;
+  holding_cost_params: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  notes: string;
+}
+
+export interface PlanningGoalRecord {
+  id: string;
+  household_id: string | null;
+  goal_type: PlanningGoalType;
+  data: PlanningGoalData;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ResolvedPlanningGoal {
+  id: string;
+  household_id: string | null;
+  goal_type: PlanningGoalType;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  sequence_index: number;
+  timing_mode: PlanningTimingMode;
+  normalized_timing_mode: PlanningTimingMode;
+  depends_on_goal_id: string;
+  depends_on_goal_name: string;
+  delay_after_dependency_months: number;
+  allow_parallel: boolean;
+  earliest_purchase_month: string;
+  earliest_purchase_delay_months: number;
+  planning_window_start_month: string;
+  planning_window_end_month: string;
+  resolved_not_before_month: number;
+  resolved_window_start_month: number;
+  resolved_window_end_month: number | null;
+  dependency_warning: string;
+  explanation: string;
+}
+
+export interface PlanningSequenceResult {
+  base_month: string;
+  goals: ResolvedPlanningGoal[];
+  warnings: string[];
+}
+
+export interface CalculationContextGoalSnapshot {
+  id: string;
+  goal_type: PlanningGoalType;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  sequence_index: number;
+  normalized_timing_mode: PlanningTimingMode;
+  depends_on_goal_id: string;
+  depends_on_goal_name: string;
+  resolved_not_before_month: number;
+  resolved_window_start_month: number;
+  resolved_window_end_month: number | null;
+  explanation: string;
+  dependency_warning: string;
+}
+
+export interface CalculationContextCoreObjectSnapshot {
+  id: string;
+  object_type: CoreObjectType;
+  category: CoreObjectCategory;
+  name: string;
+  source: CoreObjectSource | "";
+  owner_key: string;
+  reference_id: string;
+  member_name: string;
+  current_balance: number;
+  monthly_flow: number;
+}
+
+export interface CalculationContextSnapshot {
+  base_month: string;
+  household_id: string;
+  scenario_id: string;
+  current_goal_id: string;
+  current_goal_name: string;
+  current_goal_resolved_not_before_month: number;
+  current_goal_normalized_timing_mode: PlanningTimingMode | "";
+  planning_goal_ids: string[];
+  planning_goals: CalculationContextGoalSnapshot[];
+  core_object_ids: string[];
+  core_objects: CalculationContextCoreObjectSnapshot[];
+  planning_goal_fingerprint: string;
+  core_object_fingerprint: string;
+  resolved_goal_count: number;
+  core_object_count: number;
+  warnings: string[];
+}
+
 export interface ScenarioData {
+  planning_goal_id: string;
   name: string;
   enabled: boolean;
   purchase_sequence: number;
   purchase_planning_mode: "after_previous_purchase" | "parallel";
+  depends_on_goal_id: string;
   after_previous_purchase_delay_months: number;
   district: string;
   ring_area: string;
@@ -602,6 +781,9 @@ export interface ScenarioData {
   commercial_prepayment_allowed_after_month: number;
   commercial_prepayment_monthly_amount: number;
   provident_account_repayment_strategy: ProvidentAccountRepaymentStrategy;
+  provident_account_repayment_switch_enabled: boolean;
+  provident_account_repayment_switch_after_month: number;
+  provident_account_repayment_switch_to_strategy: ProvidentAccountRepaymentSwitchTarget;
   deed_tax_rate: number;
   broker_fee_rate: number;
   seller_tax_pass_through_enabled: boolean;
@@ -630,6 +812,21 @@ export interface RulePackData {
   status: RuleStatus;
   notes: string;
   params: Record<string, number | string | boolean | Array<Record<string, number>>>;
+}
+
+export interface MarketSnapshotData {
+  schema_version: number;
+  region: string;
+  snapshot_date: string;
+  source_name: string;
+  source_url: string;
+  commercial_loan_rate: number | null;
+  default_broker_fee_rate: number | null;
+  seller_tax_pass_through_rate: number | null;
+  avg_unit_price: number | null;
+  transaction_count: number | null;
+  listing_count: number | null;
+  notes: string;
 }
 
 export interface RecordEnvelope<T> {
@@ -696,6 +893,8 @@ export interface CarLoanSummary {
 export interface CarPlanAnalysis {
   variant: string;
   description: string;
+  planning_goal_id: string;
+  source: string;
   vehicle_index: number;
   vehicle_name: string;
   vehicle_candidate_index: number | null;
@@ -874,6 +1073,8 @@ export interface TaxEventPoint {
 export interface PurchasePlanAnalysis {
   variant: string;
   description: string;
+  planning_goal_id: string;
+  source: string;
   months_to_buy: number | null;
   years_to_buy: number | null;
   minimum_down_payment: number;
@@ -1227,9 +1428,11 @@ export interface TaxVisualizationDetail {
 }
 
 export interface ChildPlanStrategyPoint {
+  planning_goal_id: string;
+  source: string;
   child_name: string;
   enabled: boolean;
-  timing_mode: "after_first_home" | "manual_month" | "not_planned";
+  timing_mode: ChildPlanTimingMode;
   expense_strategy_mode: "balanced" | "conservative" | "quality" | "manual";
   birth_month_index: number | null;
   birth_month_label: string;
@@ -1253,6 +1456,28 @@ export interface AccountConceptSummary {
   category: "account" | "cash" | "investment" | "provident" | "social_security" | "fixed_asset" | "loan" | "policy";
   description: string;
   managed_by: "backend" | "user_input" | "policy";
+  core_object_count: number;
+  current_balance: number;
+  monthly_flow: number;
+}
+
+export interface CoreObjectGroupSummary {
+  code: string;
+  name: string;
+  category: "liquid_asset" | "restricted_account" | "fixed_asset" | "loan" | "policy";
+  description: string;
+  concept_codes: string[];
+  core_object_count: number;
+  current_balance: number;
+  monthly_flow: number;
+}
+
+export interface PlanningFoundationSummary {
+  planning_goals: PlanningGoalRecord[];
+  planning_sequence: PlanningSequenceResult | null;
+  core_objects: CoreObjectRecord[];
+  account_concepts: AccountConceptSummary[];
+  core_object_groups: CoreObjectGroupSummary[];
 }
 
 export interface StrategyExplanationPoint {
@@ -1363,8 +1588,43 @@ export interface ExportTextDocument {
   lines: string[];
 }
 
+export interface CacheLayerHashes {
+  input: string;
+  strategy: string;
+  ledger: string;
+  visualization: string;
+  engine: string;
+}
+
+export interface GeneratedStrategyBatchRequest {
+  cache_layers: CacheLayerHashes[];
+  strategy_type?: GeneratedStrategyType | null;
+  owner_key?: string | null;
+  current_only?: boolean;
+}
+
+export type GeneratedStrategyType = "purchase" | "vehicle" | "investment" | "child_plan" | "tax" | "career_shock";
+
+export interface GeneratedStrategyRecord<TData = Record<string, unknown>> {
+  id: string;
+  cache_key: string;
+  engine_fingerprint: string;
+  input_hash: string;
+  strategy_hash: string;
+  ledger_hash: string;
+  visualization_hash: string;
+  strategy_type: GeneratedStrategyType;
+  owner_key: string;
+  strategy_key: string;
+  variant: string;
+  data: TData;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AffordabilityResult {
-  cache_layers: Record<string, string>;
+  cache_layers: CacheLayerHashes;
+  calculation_context: CalculationContextSnapshot | null;
   status: string;
   status_reason: string;
   eligible: boolean;
@@ -1412,6 +1672,7 @@ export interface AffordabilityResult {
   provident_visualization: ProvidentVisualizationPoint[];
   social_security_visualization: SocialSecurityVisualizationPoint[];
   account_concepts: AccountConceptSummary[];
+  core_object_groups: CoreObjectGroupSummary[];
   strategy_explanations: StrategyExplanationPoint[];
   plan_events: PlanEventPoint[];
   export_sheets: ExportSheet[];

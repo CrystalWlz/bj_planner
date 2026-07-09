@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from ..schemas import ChildPlanStrategyPoint, HouseholdData, IncomeMember, RulePackData
+from ..policies import get_policy
+from ..schemas import CalculationContextGoalSnapshot, CalculationContextSnapshot, ChildPlanStrategyPoint, HouseholdData, IncomeMember, RulePackData
 from .time import (
     format_year_month_tuple,
     month_after,
@@ -17,12 +18,16 @@ def _money_text(amount: float) -> str:
     return f"{round(amount):,} 元".replace(",", "")
 
 
+def _child_policy(rules: RulePackData):
+    return get_policy(rules).child_planning_policy()
+
+
 def child_plan_birth_month_for_strategy(
     child: object,
     *,
     as_of: date,
     home_purchase_month: int | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
 ) -> tuple[int, int] | None:
     actual = parse_year_month(getattr(child, "birth_month", ""))
     if actual is not None:
@@ -44,7 +49,7 @@ def child_plan_birth_month_for_strategy(
             start, end = end, start
         earliest = start
         if getattr(child, "timing_mode", "") == "after_first_home" and home_purchase_month is not None:
-            delay = int((rules.params if rules else {}).get("child_plan_birth_after_home_delay_months", 12))
+            delay = _child_policy(rules).birth_after_home_delay_months
             after_home = month_after(as_of, max(0, home_purchase_month + delay))
             if month_distance(earliest, after_home) > 0:
                 earliest = after_home
@@ -52,7 +57,7 @@ def child_plan_birth_month_for_strategy(
     if getattr(child, "timing_mode", "") == "after_first_home":
         if home_purchase_month is None:
             return None
-        delay = int((rules.params if rules else {}).get("child_plan_birth_after_home_delay_months", 12))
+        delay = _child_policy(rules).birth_after_home_delay_months
         return month_after(as_of, max(0, home_purchase_month + delay))
     return None
 
@@ -63,7 +68,7 @@ def child_plan_stage_expense_at(
     *,
     as_of: date,
     home_purchase_month: int | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
 ) -> tuple[float, list[tuple[str, float]]]:
     birth_month = child_plan_birth_month_for_strategy(
         child,
@@ -147,7 +152,7 @@ def child_plan_monthly_expense_at(
     *,
     as_of: date | None = None,
     home_purchase_month: int | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
 ) -> float:
     total = 0.0
     current = as_of or date.today()
@@ -184,7 +189,8 @@ def _child_plan_happiness_score(
     mother_age: float | None,
     rules: RulePackData,
 ) -> float:
-    advanced_age = float(rules.params.get("child_plan_advanced_maternal_age", 35))
+    policy = get_policy(rules).child_planning_policy()
+    advanced_age = policy.advanced_maternal_age
     cashflow_score = 10.0 if first_year_cash_need <= 80000 else max(0.0, 10 - (first_year_cash_need - 80000) / 30000)
     long_term_score = 10.0 if total_to_age_18 <= 900000 else max(0.0, 10 - (total_to_age_18 - 900000) / 200000)
     age_score = 8.0
@@ -195,9 +201,7 @@ def _child_plan_happiness_score(
             age_score = 9.0
         else:
             age_score = max(3.0, 9.0 - (mother_age - advanced_age) * 0.8)
-    weights = rules.params.get("child_happiness_weights", {})
-    if not isinstance(weights, dict):
-        weights = {}
+    weights = policy.happiness_weights
     score = (
         8.0 * float(weights.get("timing", 0.22))
         + cashflow_score * float(weights.get("cashflow", 0.26))
@@ -208,24 +212,90 @@ def _child_plan_happiness_score(
     return round(max(0.0, min(10.0, score)), 2)
 
 
+def _child_goal_snapshots_by_key(
+    calculation_context: CalculationContextSnapshot | None,
+) -> tuple[dict[str, CalculationContextGoalSnapshot], dict[str, CalculationContextGoalSnapshot], dict[int, CalculationContextGoalSnapshot]]:
+    if calculation_context is None:
+        return {}, {}, {}
+    goals = [goal for goal in calculation_context.planning_goals if goal.goal_type == "child"]
+    return (
+        {goal.id: goal for goal in goals if goal.id},
+        {goal.name: goal for goal in goals if goal.name},
+        {goal.priority: goal for goal in goals},
+    )
+
+
+def _child_goal_snapshot_for_plan(
+    child: object,
+    index: int,
+    *,
+    by_id: dict[str, CalculationContextGoalSnapshot],
+    by_name: dict[str, CalculationContextGoalSnapshot],
+    by_priority: dict[int, CalculationContextGoalSnapshot],
+) -> CalculationContextGoalSnapshot | None:
+    goal_id = str(getattr(child, "planning_goal_id", "") or "")
+    return by_id.get(goal_id) or by_name.get(str(getattr(child, "name", "") or "")) or by_priority.get(30 + index)
+
+
+def _birth_month_from_goal_snapshot(
+    goal: CalculationContextGoalSnapshot | None,
+    *,
+    as_of: date,
+) -> tuple[int, int] | None:
+    if goal is None:
+        return None
+    if goal.normalized_timing_mode == "not_planned":
+        return None
+    month_index = goal.resolved_window_start_month or goal.resolved_not_before_month
+    return month_after(as_of, max(0, month_index))
+
+
 def build_child_plan_strategies(
     household: HouseholdData,
     rules: RulePackData,
     *,
     home_purchase_month: int | None = None,
     as_of: date | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[ChildPlanStrategyPoint]:
     current = date((as_of or date.today()).year, (as_of or date.today()).month, 1)
     mother = _child_mother_member(household)
-    advanced_age = float(rules.params.get("child_plan_advanced_maternal_age", 35))
+    advanced_age = get_policy(rules).child_planning_policy().advanced_maternal_age
     points: list[ChildPlanStrategyPoint] = []
-    for child in household.child_plans:
-        birth_month = child_plan_birth_month_for_strategy(
+    child_goals_by_id, child_goals_by_name, child_goals_by_priority = _child_goal_snapshots_by_key(calculation_context)
+    child_plans_with_goal = [
+        (
+            child_index,
+            child,
+            _child_goal_snapshot_for_plan(
+                child,
+                child_index,
+                by_id=child_goals_by_id,
+                by_name=child_goals_by_name,
+                by_priority=child_goals_by_priority,
+            ),
+        )
+        for child_index, child in enumerate(household.child_plans)
+    ]
+    ordered_child_plans = sorted(
+        child_plans_with_goal,
+        key=lambda item: (max(1, item[2].sequence_index) if item[2] is not None else 10_000 + item[0], item[0]),
+    )
+    for child_index, child, goal in ordered_child_plans:
+        goal_birth_month = _birth_month_from_goal_snapshot(goal, as_of=current)
+        birth_month = goal_birth_month or child_plan_birth_month_for_strategy(
             child,
             as_of=current,
             home_purchase_month=home_purchase_month,
             rules=rules,
         )
+        effective_enabled = child.enabled if goal is None else goal.enabled and goal.normalized_timing_mode != "not_planned"
+        effective_timing_mode = child.timing_mode
+        if goal is not None:
+            if goal.normalized_timing_mode == "manual_month":
+                effective_timing_mode = "manual_month"
+            elif goal.normalized_timing_mode == "not_planned":
+                effective_timing_mode = "not_planned"
         birth_index = month_distance((current.year, current.month), birth_month) if birth_month else None
         prep_index = None
         pregnancy_index = None
@@ -241,7 +311,7 @@ def build_child_plan_strategies(
                 home_purchase_month=home_purchase_month,
                 rules=rules,
             )[0]
-            if child.enabled
+            if effective_enabled
             else 0.0
         )
         if birth_month is not None:
@@ -294,8 +364,13 @@ def build_child_plan_strategies(
             ]
         mother_age = _age_years_from_birth_month_at(mother.birth_month, birth_month) if mother and birth_month else None
         warnings: list[str] = []
-        if not child.enabled:
+        if not effective_enabled:
             warnings.append("该子女目标未纳入当前现金流测算。")
+        if goal is not None:
+            if goal.dependency_warning:
+                warnings.append(goal.dependency_warning)
+            if goal.explanation:
+                warnings.append(f"时间安排来自统一规划目标：{goal.explanation}")
         if birth_month is None:
             warnings.append("尚未形成具体出生月；未设置时间范围时会等选中购房方案后按买房后开始计划推定。")
         if mother is None:
@@ -319,9 +394,11 @@ def build_child_plan_strategies(
         )
         points.append(
             ChildPlanStrategyPoint(
+                planning_goal_id=goal.id if goal else getattr(child, "planning_goal_id", ""),
+                source="planning_goals" if goal else "child_plans",
                 child_name=child.name,
-                enabled=child.enabled,
-                timing_mode=child.timing_mode,
+                enabled=effective_enabled,
+                timing_mode=effective_timing_mode,
                 expense_strategy_mode=child.expense_strategy_mode,
                 birth_month_index=birth_index,
                 birth_month_label=format_year_month_tuple(birth_month),

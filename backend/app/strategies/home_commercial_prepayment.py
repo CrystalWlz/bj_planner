@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..domain.housing import commercial_loan_rate
 from ..domain.loans import (
     LoanComputation,
     LoanProjection,
@@ -10,7 +11,7 @@ from ..domain.loans import (
     prepayment_investment_hurdle_rate,
 )
 from ..domain.scoring import cash_flow_score, clamp_score, prepayment_rate_spread_score, ratio_score
-from ..schemas import LoanSummary, ScenarioData
+from ..schemas import LoanSummary, MarketSnapshotData, ScenarioData
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ def choose_auto_commercial_prepayment(
     commercial_repayment_method: str,
     investment_buy_fee_rate: float = 0.0,
     investment_sell_fee_rate: float = 0.0,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> tuple[bool, int, int, float]:
     total_months = max(1, scenario.loan_years * 12)
     allowed_after = max(1, min(total_months, scenario.commercial_prepayment_allowed_after_month))
@@ -58,7 +60,8 @@ def choose_auto_commercial_prepayment(
         buy_fee_rate=investment_buy_fee_rate,
         sell_fee_rate=investment_sell_fee_rate,
     )
-    if scenario.commercial_rate <= hurdle_rate:
+    effective_commercial_rate = commercial_loan_rate(scenario, market_snapshot)
+    if effective_commercial_rate <= hurdle_rate:
         return False, preferred_start, allowed_after, 0.0
 
     cashflow_buffer = max(1000.0, post_purchase_monthly_expense * 0.12)
@@ -87,7 +90,7 @@ def choose_auto_commercial_prepayment(
         for start_month in starts:
             projection = loan_projection_with_prepayment(
                 commercial_loan,
-                scenario.commercial_rate,
+                effective_commercial_rate,
                 total_months,
                 commercial_repayment_method,
                 prepayment_monthly_amount=amount,
@@ -95,7 +98,7 @@ def choose_auto_commercial_prepayment(
             )
             monthly_after_extra = post_purchase_cash_flow_with_pf - amount
             interest_score = clamp_score(projection.interest_saved_by_prepayment / max(regular_payment.total_interest, 1.0) * 10)
-            opportunity_score = prepayment_rate_spread_score(scenario.commercial_rate, hurdle_rate)
+            opportunity_score = prepayment_rate_spread_score(effective_commercial_rate, hurdle_rate)
             payoff_score = clamp_score((total_months - projection.actual_payoff_months) / max(total_months, 1) * 10)
             cashflow_score = cash_flow_score(monthly_after_extra, post_purchase_monthly_expense)
             liquidity_score = ratio_score(min(cash_after_purchase, minimum_cash_balance), required_liquidity_reserve)
@@ -121,10 +124,11 @@ def build_commercial_prepayment_plan(
     prepayment_monthly_amount: float | None = None,
     prepayment_start_month: int | None = None,
     prepayment_allowed_after_month: int | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> CommercialPrepaymentPlan:
     regular_payment = calculate_loan(
         commercial_loan,
-        scenario.commercial_rate,
+        commercial_loan_rate(scenario, market_snapshot),
         scenario.loan_years,
         commercial_repayment_method,
     )
@@ -149,7 +153,7 @@ def build_commercial_prepayment_plan(
         )
     projection = loan_projection_with_prepayment(
         commercial_loan,
-        scenario.commercial_rate,
+        commercial_loan_rate(scenario, market_snapshot),
         total_months,
         commercial_repayment_method,
         prepayment_monthly_amount=monthly_amount,

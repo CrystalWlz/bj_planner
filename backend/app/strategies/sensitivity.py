@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..schemas import (
     CarLoanSummary,
     HouseholdData,
+    MarketSnapshotData,
     PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
@@ -28,6 +29,7 @@ def build_yield_sensitivity(
     taxes_and_fees: float,
     purchase_plan_builder: PurchasePlanBuilder,
     parallel_workers: int = 1,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[YieldSensitivityPoint]:
     annual_returns = [0.015, 0.025, 0.035]
 
@@ -41,6 +43,7 @@ def build_yield_sensitivity(
             net_monthly_income=net_monthly_income,
             car_loan=car_loan,
             taxes_and_fees=taxes_and_fees,
+            market_snapshot=market_snapshot,
         )
         fastest = min(
             analyses,

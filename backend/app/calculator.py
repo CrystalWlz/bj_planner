@@ -35,6 +35,9 @@ from .domain.household import (
     household_with_property_goal as _domain_household_with_property_goal,
     property_goal_for_scenario as _domain_property_goal_for_scenario,
 )
+from .domain.housing import (
+    minimum_down_payment_ratio as _policy_minimum_down_payment_ratio,
+)
 from .domain.investments import (
     InvestmentWithdrawalResult,
     investment_tax_estimate as _investment_tax_estimate,
@@ -46,6 +49,7 @@ from .domain.scoring import (
     clamp_score as _clamp_score,
 )
 from .events import build_plan_events_from_context
+from .engine_config import parallel_worker_count as _parallel_worker_count
 from .tax_engine import (
     build_tax_events,
     build_tax_monthly_points,
@@ -57,6 +61,7 @@ from .tax_engine import (
 )
 from .result_assembly import AffordabilityResultInputs, build_affordability_result
 from .planning_summary import affordability_status, home_loan_summaries
+from .policies import get_policy
 from .strategies.home import (
     family_down_payment_upfront_support as _strategy_family_down_payment_upfront_support,
 )
@@ -78,12 +83,14 @@ from .calculation_context import (
 )
 from .schemas import (
     AffordabilityResult,
+    CalculationContextSnapshot,
     CarLoanSummary,
     CarPlanAnalysis,
     CarPlanData,
     HouseholdData,
     IncomeMember,
     LoanSummary,
+    MarketSnapshotData,
     MonthlyCashflowPoint,
     PlanEventPoint,
     ProvidentVisualizationPoint,
@@ -99,17 +106,6 @@ from .schemas import (
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
 
-def _parallel_worker_count(rules: RulePackData, task_count: int) -> int:
-    if task_count <= 1:
-        return 1
-    raw_value = rules.params.get("backend_parallel_workers", min(4, task_count))
-    try:
-        configured = int(raw_value)
-    except (TypeError, ValueError):
-        configured = min(4, task_count)
-    return max(1, min(configured, task_count, 8))
-
-
 _visualization_horizon_months = _projection_facade.visualization_horizon_months
 
 
@@ -121,11 +117,12 @@ def monthly_household_expense_at(
     rules: RulePackData | None = None,
     home_purchase_month: int | None = None,
 ) -> float:
+    active_rules = rules or RulePackData()
     return _domain_monthly_household_expense_at(
         household,
         months_from_now,
         as_of=as_of,
-        rules=rules,
+        rules=active_rules,
         home_purchase_month=home_purchase_month,
     )
 
@@ -138,11 +135,12 @@ def monthly_household_expense_breakdown_at(
     rules: RulePackData | None = None,
     home_purchase_month: int | None = None,
 ) -> MonthlyHouseholdExpenseBreakdown:
+    active_rules = rules or RulePackData()
     return _domain_monthly_household_expense_breakdown_at(
         household,
         months_from_now,
         as_of=as_of,
-        rules=rules,
+        rules=active_rules,
         home_purchase_month=home_purchase_month,
     )
 
@@ -173,6 +171,7 @@ def _vehicle_loan_states(
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[VehicleLoanState]:
     return _vehicle_facade.vehicle_loan_states(
         plan,
@@ -180,6 +179,7 @@ def _vehicle_loan_states(
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
         rules=rules,
+        calculation_context=calculation_context,
     )
 
 
@@ -192,6 +192,7 @@ def _aggregate_car_loan(
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> CarLoanSummary:
     return _vehicle_facade.aggregate_car_loan(
         plan,
@@ -202,6 +203,7 @@ def _aggregate_car_loan(
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
         rules=rules,
+        calculation_context=calculation_context,
     )
 
 
@@ -423,11 +425,13 @@ def build_plan_events(
         retirement_window_end_provider=lambda target_household, current_month: _retirement_tail_months(
             target_household,
             as_of=current_month,
+            rules=rules,
         ),
         vehicle_loan_states_for_plan=lambda plan: _vehicle_loan_states(
             household.car_plan,
             scenario=scenario,
             home_purchase_month=plan.months_to_buy,
+            rules=rules,
         ),
     )
 
@@ -449,17 +453,19 @@ def calculate_affordability(
     scenario: ScenarioData,
     rules: RulePackData,
     *,
+    market_snapshot: MarketSnapshotData | None = None,
     stress_name: str | None = None,
     include_stress_tests: bool = False,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> AffordabilityResult:
     base_date = date.today()
     base_month = date(base_date.year, base_date.month, 1)
     parallel_workers = 1 if stress_name else _parallel_worker_count(rules, 4)
-    params = rules.params
-    min_down_payment_ratio = float(params.get("minimum_down_payment_ratio", 0.30))
-    recommended_emergency_months = float(params.get("recommended_emergency_months", 6))
-    caution_dti = float(params.get("caution_dti", 0.40))
-    danger_dti = float(params.get("danger_dti", 0.50))
+    risk_policy = get_policy(rules).affordability_risk_policy()
+    min_down_payment_ratio = max(
+        _policy_minimum_down_payment_ratio(household, False, rules),
+        _policy_minimum_down_payment_ratio(household, True, rules),
+    )
     household_context = prepare_household_context(
         household,
         scenario,
@@ -468,7 +474,7 @@ def calculate_affordability(
     )
     household = household_context.household
     cashflow_household = household_context.cashflow_household
-    vehicle_context = build_vehicle_planning_context(household_context, scenario, rules)
+    vehicle_context = build_vehicle_planning_context(household_context, scenario, rules, calculation_context=calculation_context)
     cashflow_household = vehicle_context.cashflow_household
     strategy_household = vehicle_context.strategy_household
     purchase_cash_context = build_purchase_cash_context(
@@ -476,6 +482,7 @@ def calculate_affordability(
         scenario,
         rules,
         min_down_payment_ratio=min_down_payment_ratio,
+        market_snapshot=market_snapshot,
     )
     eligible, eligibility_notes = (
         evaluate_eligibility(strategy_household, rules)
@@ -492,6 +499,8 @@ def calculate_affordability(
         base_month=base_month,
         stress_name=stress_name,
         parallel_workers=parallel_workers,
+        calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )
     purchase_plan_analyses = strategy_pipeline.purchase_plan_analyses
     yield_sensitivity = strategy_pipeline.yield_sensitivity
@@ -506,6 +515,7 @@ def calculate_affordability(
     annual_financial_summaries = projection_pipeline.annual_financial_summaries
     annual_visualization_details = projection_pipeline.annual_visualization_details
     account_concepts = projection_pipeline.account_concepts
+    core_object_groups = projection_pipeline.core_object_groups
     strategy_explanations = projection_pipeline.strategy_explanations
     plan_events = projection_pipeline.plan_events
     selected_home_purchase_month = projection_pipeline.selected_home_purchase_month
@@ -531,6 +541,7 @@ def calculate_affordability(
         household=strategy_household,
         scenario=scenario,
         rules=rules,
+        market_snapshot=market_snapshot,
     )
 
     affordability = affordability_status(
@@ -545,9 +556,9 @@ def calculate_affordability(
         provident=home_loan_context.provident,
         net_monthly_income=household_context.net_monthly_income,
         current_monthly_expense=household_context.current_monthly_expense,
-        recommended_emergency_months=recommended_emergency_months,
-        caution_dti=caution_dti,
-        danger_dti=danger_dti,
+        recommended_emergency_months=risk_policy.recommended_emergency_months,
+        caution_dti=risk_policy.caution_dti,
+        danger_dti=risk_policy.danger_dti,
         car_down_payment_at=lambda plan, loan, month: _car_down_payment_at(
             plan,
             loan,
@@ -611,6 +622,7 @@ def calculate_affordability(
             provident_visualization=provident_visualization,
             social_security_visualization=social_security_visualization,
             account_concepts=account_concepts,
+            core_object_groups=core_object_groups,
             strategy_explanations=strategy_explanations,
             plan_events=plan_events,
             property_goal_assumption=vehicle_context.property_goal_assumption,
@@ -621,7 +633,13 @@ def calculate_affordability(
     )
 
     if include_stress_tests and stress_name is None and purchase_cash_context.has_purchase_target:
-        result.stress_tests = build_stress_tests(household, scenario, rules, parallel_workers=min(parallel_workers, 3))
+        result.stress_tests = build_stress_tests(
+            household,
+            scenario,
+            rules,
+            market_snapshot=market_snapshot,
+            parallel_workers=min(parallel_workers, 3),
+        )
     return result
 
 
@@ -630,6 +648,7 @@ def build_stress_tests(
     scenario: ScenarioData,
     rules: RulePackData,
     *,
+    market_snapshot: MarketSnapshotData | None = None,
     parallel_workers: int = 1,
 ) -> list[StressResult]:
     return _strategy_build_stress_tests(
@@ -640,7 +659,9 @@ def build_stress_tests(
             stress_household,
             stress_scenario,
             stress_rules,
+            market_snapshot=market_snapshot,
             stress_name=name,
         ),
         parallel_workers=parallel_workers,
+        market_snapshot=market_snapshot,
     )

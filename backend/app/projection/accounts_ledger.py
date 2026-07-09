@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from ..core_object_concepts import CALIBRATION_TARGET_LABELS
 from ..domain.time import month_distance, parse_year_month
 from ..schemas import (
     AccountCalibrationData,
@@ -21,18 +22,6 @@ from .ledger_models import (
 )
 
 
-ACCOUNT_CALIBRATION_TARGET_LABELS: dict[str, str] = {
-    "cash": "现金账户",
-    "investment": "投资账户",
-    "provident": "公积金账户",
-    "pension": "养老个人账户",
-    "medical": "医保个人账户",
-    "property_asset": "房产估值",
-    "vehicle_asset": "车辆估值",
-    "fixed_asset": "固定资产",
-    "total_loan": "贷款余额",
-}
-
 def account_calibrations_by_month(
     household: HouseholdData,
     base_month: date,
@@ -51,10 +40,10 @@ def account_calibrations_by_month(
 
 
 def account_calibration_label(calibration: AccountCalibrationData) -> str:
-    target_label = ACCOUNT_CALIBRATION_TARGET_LABELS.get(calibration.target, "账户")
+    target_label = CALIBRATION_TARGET_LABELS.get(calibration.target, "账户")
     suffix_parts = [
         value
-        for value in (calibration.member_name, calibration.reference_name)
+        for value in (calibration.member_name, calibration.source_title, calibration.reference_name)
         if value
     ]
     suffix = f"（{' / '.join(suffix_parts)}）" if suffix_parts else ""

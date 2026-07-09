@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from datetime import date
 
-from ..domain.career import career_shock_settings_by_member, policy_retirement_age_for_member
+from ..domain.career import career_shock_settings_by_member, policy_retirement_age_for_member_with_rules
 from ..domain.time import month_start_for_birth_month_or_age, months_between_months
 from ..domain.vehicles import vehicle_update_month
-from ..schemas import CarLoanSummary, CarPlanData, HouseholdData, PurchasePlanAnalysis
+from ..schemas import CarLoanSummary, CarPlanData, HouseholdData, PurchasePlanAnalysis, RulePackData
 
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
 
-def retirement_tail_months(household: HouseholdData, *, as_of: date | None = None) -> int:
+def retirement_tail_months(
+    household: HouseholdData,
+    *,
+    rules: RulePackData,
+    as_of: date | None = None,
+) -> int:
     current = as_of or date.today()
     current_month = date(current.year, current.month, 1)
     targets: list[int] = []
@@ -19,7 +24,7 @@ def retirement_tail_months(household: HouseholdData, *, as_of: date | None = Non
         setting = settings.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = setting.retirement_age if setting else policy_retirement_age_for_member(member, index)
+        retirement_age = setting.retirement_age if setting else policy_retirement_age_for_member_with_rules(member, index, rules)
         retirement_month = month_start_for_birth_month_or_age(
             current_month,
             effective_birth_month,
@@ -38,6 +43,7 @@ def visualization_horizon_months(
     second_loan: CarLoanSummary | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
     as_of: date | None = None,
+    rules: RulePackData,
 ) -> int:
     plan_horizons = [
         (plan.months_to_buy or 0)
@@ -62,4 +68,4 @@ def visualization_horizon_months(
     if second_loan and second_loan.enabled:
         second_vehicle_start = second_loan.months_to_down_payment if second_loan.months_to_down_payment is not None else second_loan.purchase_delay_months
         vehicle_horizons.append(second_vehicle_start + second_loan.total_months + 24)
-    return min(840, max(180, retirement_tail_months(household, as_of=as_of), *plan_horizons, *vehicle_horizons))
+    return min(840, max(180, retirement_tail_months(household, rules=rules, as_of=as_of), *plan_horizons, *vehicle_horizons))

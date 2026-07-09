@@ -4,13 +4,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .domain.housing import (
+    commercial_loan_rate,
     provident_loan_rate,
     provident_loan_years,
     provident_repayment_method,
 )
 from .domain.loans import commercial_repayment_method, loan_summary
 from .schemas import CarLoanSummary, CarPlanData, HouseholdData, LoanSummary
-from .schemas import RulePackData, ScenarioData
+from .schemas import MarketSnapshotData, RulePackData, ScenarioData
 
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
@@ -41,6 +42,7 @@ def home_loan_summaries(
     household: HouseholdData,
     scenario: ScenarioData,
     rules: RulePackData,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> HomeLoanSummaryContext:
     if not has_purchase_target:
         return HomeLoanSummaryContext(
@@ -51,7 +53,7 @@ def home_loan_summaries(
 
     commercial = loan_summary(
         scenario.commercial_loan_amount,
-        scenario.commercial_rate,
+        commercial_loan_rate(scenario, market_snapshot),
         scenario.loan_years,
         commercial_repayment_method(scenario),
     )

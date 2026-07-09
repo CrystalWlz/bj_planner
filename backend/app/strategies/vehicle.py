@@ -16,7 +16,7 @@ from ..domain.scoring import (
     wait_score,
 )
 from ..domain.tax import clamp
-from ..domain.time import month_distance, parse_year_month
+from ..domain.time import format_year_month_tuple, month_after, month_distance, parse_year_month
 from ..domain.vehicles import vehicle_update_month
 from ..domain.vehicles import (
     estimate_car_operating_cost,
@@ -27,6 +27,8 @@ from ..schemas import (
     CarLoanSummary,
     CarPlanAnalysis,
     CarPlanData,
+    CalculationContextGoalSnapshot,
+    CalculationContextSnapshot,
     HouseholdData,
     PlanEventPoint,
     RulePackData,
@@ -37,6 +39,34 @@ from ..schemas import (
 
 CarLoanCalculator = Callable[..., CarLoanSummary]
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
+VEHICLE_POLICY_FIELD_NAMES = (
+    "beijing_license_indicator_status",
+    "beijing_indicator_expected_delay_months",
+    "license_plate_rental_enabled",
+    "license_plate_rental_upfront_fee",
+    "license_plate_rental_term_months",
+    "license_plate_rental_renewal_fee",
+    "license_plate_rental_renewal_term_months",
+    "license_plate_rental_after_term_mode",
+    "beijing_family_indicator_score_enabled",
+    "beijing_family_indicator_application_start_month",
+    "beijing_family_indicator_applicants",
+    "beijing_family_indicator_generations",
+    "beijing_family_indicator_has_spouse",
+    "beijing_family_indicator_main_points",
+    "beijing_family_indicator_spouse_points",
+    "beijing_family_indicator_other_applicant_count",
+    "beijing_family_indicator_other_points_total",
+    "beijing_family_indicator_application_years",
+    "beijing_family_indicator_current_cutoff_score",
+    "beijing_family_indicator_cutoff_score_annual_change",
+    "beijing_family_indicator_last_config_year",
+    "beijing_family_indicator_annual_quota",
+)
+
+
+def vehicle_policy_field_values(vehicle: VehiclePlanData) -> dict[str, object]:
+    return {field: getattr(vehicle, field) for field in VEHICLE_POLICY_FIELD_NAMES}
 
 
 @dataclass(frozen=True)
@@ -125,9 +155,9 @@ def vehicle_loan_states(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[VehicleLoanState]:
-    rules = rules or RulePackData()
     states: list[VehicleLoanState] = []
     for index, vehicle_plan in enumerate(
         vehicle_plans(
@@ -135,6 +165,7 @@ def vehicle_loan_states(
             scenario=scenario,
             home_purchase_month=home_purchase_month,
             include_after_home=include_after_home,
+            calculation_context=calculation_context,
         )
     ):
         loan = calculate_car_loan(vehicle_plan, rules=rules)
@@ -156,14 +187,15 @@ def aggregate_car_loan(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> CarLoanSummary:
-    rules = rules or RulePackData()
     active_vehicle_plans = vehicle_plans(
         plan,
         scenario=scenario,
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
+        calculation_context=calculation_context,
     )
     if not active_vehicle_plans:
         return calculate_car_loan(
@@ -223,6 +255,42 @@ def scenario_purchase_sequence(scenario: ScenarioData | None) -> int:
     return max(1, scenario.purchase_sequence if scenario else 1)
 
 
+def _current_home_goal(
+    calculation_context: CalculationContextSnapshot | None,
+) -> CalculationContextGoalSnapshot | None:
+    if calculation_context is None:
+        return None
+    if calculation_context.current_goal_id:
+        current = next(
+            (goal for goal in calculation_context.planning_goals if goal.id == calculation_context.current_goal_id),
+            None,
+        )
+        if current is not None and current.goal_type == "home":
+            return current
+    return next((goal for goal in calculation_context.planning_goals if goal.goal_type == "home"), None)
+
+
+def _vehicle_goal_for_plan(
+    vehicle: CarPlanData,
+    calculation_context: CalculationContextSnapshot | None,
+) -> CalculationContextGoalSnapshot | None:
+    if calculation_context is None:
+        return None
+    goal_id = str(getattr(vehicle, "planning_goal_id", "") or "")
+    if goal_id:
+        matched = next((goal for goal in calculation_context.planning_goals if goal.id == goal_id), None)
+        if matched is not None and matched.goal_type == "vehicle":
+            return matched
+    return next(
+        (
+            goal
+            for goal in calculation_context.planning_goals
+            if goal.goal_type == "vehicle" and (goal.name == vehicle.name or goal.priority == vehicle.planning_sequence)
+        ),
+        None,
+    )
+
+
 def planning_window_delay_months(window_month: str, *, as_of: date | None = None) -> int | None:
     parsed = parse_year_month(window_month)
     if parsed is None:
@@ -231,9 +299,18 @@ def planning_window_delay_months(window_month: str, *, as_of: date | None = None
     return max(0, month_distance((current.year, current.month), parsed))
 
 
-def vehicle_is_before_or_parallel_home(vehicle: CarPlanData, scenario: ScenarioData | None) -> bool:
+def vehicle_is_before_or_parallel_home(
+    vehicle: CarPlanData,
+    scenario: ScenarioData | None,
+    *,
+    calculation_context: CalculationContextSnapshot | None = None,
+) -> bool:
     if scenario is None or vehicle.purchase_timing_mode in {"parallel", "manual_month"}:
         return True
+    home_goal = _current_home_goal(calculation_context)
+    vehicle_goal = _vehicle_goal_for_plan(vehicle, calculation_context)
+    if home_goal is not None and vehicle_goal is not None:
+        return vehicle_goal.sequence_index <= home_goal.sequence_index
     return max(1, vehicle.planning_sequence) <= scenario_purchase_sequence(scenario)
 
 
@@ -242,19 +319,86 @@ def vehicle_base_purchase_month(
     *,
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> int:
     window_start_delay = planning_window_delay_months(vehicle.planning_window_start_month)
     if vehicle.purchase_timing_mode == "manual_month":
         return max(0, window_start_delay if window_start_delay is not None else vehicle.manual_purchase_delay_months)
+    home_goal = _current_home_goal(calculation_context)
+    vehicle_goal = _vehicle_goal_for_plan(vehicle, calculation_context)
+    vehicle_after_home_by_context = (
+        home_goal is not None
+        and vehicle_goal is not None
+        and vehicle_goal.sequence_index > home_goal.sequence_index
+    )
     if (
-        scenario is not None
+        (scenario is not None or vehicle_after_home_by_context)
         and home_purchase_month is not None
         and vehicle.purchase_timing_mode == "auto_sequence"
-        and vehicle.planning_sequence > scenario_purchase_sequence(scenario)
+        and (
+            vehicle_after_home_by_context
+            or (scenario is not None and vehicle.planning_sequence > scenario_purchase_sequence(scenario))
+        )
     ):
         sequenced_month = max(0, home_purchase_month + vehicle.after_previous_event_delay_months)
         return max(sequenced_month, window_start_delay or 0)
     return max(0, vehicle.purchase_delay_months, window_start_delay or 0)
+
+
+def _vehicle_goal_snapshots_by_key(
+    calculation_context: CalculationContextSnapshot | None,
+) -> tuple[dict[str, CalculationContextGoalSnapshot], dict[str, CalculationContextGoalSnapshot], dict[int, CalculationContextGoalSnapshot]]:
+    if calculation_context is None:
+        return {}, {}, {}
+    goals = [goal for goal in calculation_context.planning_goals if goal.goal_type == "vehicle"]
+    return (
+        {goal.id: goal for goal in goals if goal.id},
+        {goal.name: goal for goal in goals if goal.name},
+        {goal.priority: goal for goal in goals},
+    )
+
+
+def _vehicle_goal_snapshot_for_plan(
+    vehicle: CarPlanData,
+    index: int,
+    *,
+    by_id: dict[str, CalculationContextGoalSnapshot],
+    by_name: dict[str, CalculationContextGoalSnapshot],
+    by_priority: dict[int, CalculationContextGoalSnapshot],
+) -> CalculationContextGoalSnapshot | None:
+    goal_id = str(getattr(vehicle, "planning_goal_id", "") or "")
+    return by_id.get(goal_id) or by_name.get(vehicle.name) or by_priority.get(vehicle.planning_sequence) or by_priority.get(index + 1)
+
+
+def _vehicle_with_goal_snapshot(vehicle: CarPlanData, goal: CalculationContextGoalSnapshot | None) -> CarPlanData:
+    if goal is None:
+        return vehicle
+    update: dict[str, object] = {
+        "planning_goal_id": goal.id,
+        "planning_sequence": max(1, goal.sequence_index),
+    }
+    if goal.normalized_timing_mode == "not_planned":
+        update["enabled"] = False
+        update["purchase_timing_mode"] = "not_planned"
+    elif goal.normalized_timing_mode == "parallel":
+        update["purchase_timing_mode"] = "parallel"
+    elif goal.normalized_timing_mode == "manual_month":
+        update["purchase_timing_mode"] = "manual_month"
+    else:
+        update["purchase_timing_mode"] = "auto_sequence"
+    earliest_delay = max(
+        vehicle.purchase_delay_months,
+        vehicle.manual_purchase_delay_months,
+        goal.resolved_not_before_month,
+        goal.resolved_window_start_month,
+    )
+    update["purchase_delay_months"] = min(120, earliest_delay)
+    update["manual_purchase_delay_months"] = earliest_delay
+    if goal.resolved_window_end_month is not None:
+        update["planning_window_end_month"] = format_year_month_tuple(
+            month_after(date.today(), max(0, goal.resolved_window_end_month))
+        )
+    return vehicle.model_copy(update=update)
 
 
 def vehicle_plans(
@@ -263,22 +407,40 @@ def vehicle_plans(
     scenario: ScenarioData | None = None,
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[CarPlanData]:
     plans: list[CarPlanData] = []
+    goals_by_id, goals_by_name, goals_by_priority = _vehicle_goal_snapshots_by_key(calculation_context)
+    raw_vehicle_plans_with_goal = [
+        (
+            index,
+            vehicle,
+            _vehicle_goal_snapshot_for_plan(
+                vehicle,
+                index,
+                by_id=goals_by_id,
+                by_name=goals_by_name,
+                by_priority=goals_by_priority,
+            ),
+        )
+        for index, vehicle in enumerate(plan.vehicle_plans)
+    ]
     raw_vehicle_plans = sorted(
-        enumerate(plan.vehicle_plans),
-        key=lambda item: (max(1, item[1].planning_sequence), item[0]),
+        raw_vehicle_plans_with_goal,
+        key=lambda item: (max(1, item[2].sequence_index) if item[2] is not None else max(1, item[1].planning_sequence), item[0]),
     )
     previous_sequence_month: int | None = None
-    for index, vehicle in raw_vehicle_plans:
+    for index, vehicle, goal in raw_vehicle_plans:
+        vehicle = _vehicle_with_goal_snapshot(vehicle, goal)
         if not vehicle.enabled or vehicle.total_price <= 0:
             continue
-        if not include_after_home and not vehicle_is_before_or_parallel_home(vehicle, scenario):
+        if not include_after_home and not vehicle_is_before_or_parallel_home(vehicle, scenario, calculation_context=calculation_context):
             continue
         base_purchase_month = vehicle_base_purchase_month(
             vehicle,
             scenario=scenario,
             home_purchase_month=home_purchase_month,
+            calculation_context=calculation_context,
         )
         effective_purchase_month = base_purchase_month
         if vehicle.purchase_timing_mode == "auto_sequence" and previous_sequence_month is not None:
@@ -300,7 +462,17 @@ def vehicle_plans(
         previous_sequence_month = effective_purchase_month
     if plans:
         return plans
-    if plan.enabled and plan.total_price > 0 and (include_after_home or vehicle_is_before_or_parallel_home(plan, scenario)):
+    fallback_goal = _vehicle_goal_snapshot_for_plan(
+        plan,
+        0,
+        by_id=goals_by_id,
+        by_name=goals_by_name,
+        by_priority=goals_by_priority,
+    )
+    plan = _vehicle_with_goal_snapshot(plan, fallback_goal)
+    if plan.enabled and plan.total_price > 0 and (
+        include_after_home or vehicle_is_before_or_parallel_home(plan, scenario, calculation_context=calculation_context)
+    ):
         plans.append(plan.model_copy(update={"vehicle_plans": []}))
     return plans
 
@@ -397,6 +569,7 @@ def vehicle_candidate_plans(plan: CarPlanData) -> list[tuple[int | None, CarPlan
     for index, candidate in enumerate(candidates):
         for financing in vehicle_financing_options(candidate):
             candidate_data = candidate.model_dump()
+            candidate_data.update(vehicle_policy_field_values(plan))
             candidate_data["candidate_vehicles"] = []
             candidate_data["planning_sequence"] = plan.planning_sequence
             candidate_data["purchase_timing_mode"] = plan.purchase_timing_mode
@@ -713,10 +886,10 @@ def build_car_plan_analyses(
     current_monthly_expense: float,
     calculate_car_loan: CarLoanCalculator,
     annual_investment_return: float = 0.0,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[CarPlanAnalysis]:
-    rules = rules or RulePackData()
-    active_vehicle_plans = vehicle_plans(household.car_plan)
+    active_vehicle_plans = vehicle_plans(household.car_plan, calculation_context=calculation_context)
     if not active_vehicle_plans:
         return []
 
@@ -881,6 +1054,14 @@ def build_car_plan_analyses(
                         - loan.purchase_tax
                         - loan.license_plate_rental_initial_fee
                     )
+                planning_window_end_delay = planning_window_delay_months(plan.planning_window_end_month)
+                window_end_blocked = (
+                    planning_window_end_delay is not None
+                    and months_to_buy is not None
+                    and months_to_buy > planning_window_end_delay
+                )
+                if window_end_blocked:
+                    months_to_buy = None
                 expected_payment = max(loan.first_phase_monthly_payment, loan.later_phase_monthly_payment)
                 expected_total_payment = expected_payment + (loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0)
                 monthly_after_car = monthly_savings_before_transport - expected_total_payment - loan.monthly_cash_operating_cost
@@ -925,6 +1106,8 @@ def build_car_plan_analyses(
                     else "no_extra_principal",
                     "manual_target" if strategy_key == "target" else "preserve_home_purchase_cash" if strategy_key in {"low_down_keep_cash", "delay_purchase"} else "reduce_long_term_auto_debt_pressure",
                 ]
+                if window_end_blocked and planning_window_end_delay is not None:
+                    notes.append(f"planning_window_exceeded:{planning_window_end_delay}")
                 notes.extend(loan.policy_notes)
                 analyses.append(
                     CarPlanAnalysis(
@@ -934,6 +1117,8 @@ def build_car_plan_analyses(
                             if part
                         ),
                         description=description,
+                        planning_goal_id=vehicle_plan.planning_goal_id,
+                        source="planning_goals" if vehicle_plan.planning_goal_id else "car_plan",
                         vehicle_index=vehicle_index,
                         vehicle_name=vehicle_plan.name,
                         vehicle_candidate_index=candidate_index,
@@ -1165,6 +1350,7 @@ def vehicle_plan_with_selected_strategy(
             "name": strategy.vehicle_candidate_name or strategy.vehicle_name or source.name,
             "selected_strategy_variant": strategy.variant,
             "candidate_vehicles": [],
+            **vehicle_policy_field_values(vehicle),
             "planning_sequence": vehicle.planning_sequence,
             "purchase_timing_mode": vehicle.purchase_timing_mode,
             "after_previous_event_delay_months": vehicle.after_previous_event_delay_months,

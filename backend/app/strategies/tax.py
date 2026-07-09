@@ -20,6 +20,7 @@ from ..domain.time import (
     parse_iso_date as _parse_iso_date,
     parse_year_month as _parse_year_month,
 )
+from ..policies import get_policy
 from ..schemas import (
     HouseholdData,
     IncomeMember,
@@ -170,11 +171,11 @@ def build_tax_strategy_items(
 ) -> list[TaxStrategyItem]:
     current = base_date or date.today()
     current_month = date(current.year, current.month, 1)
-    params = rules.params
+    tax_benefit = get_policy(rules).tax_benefit_policy()
     member_name = household.members[0].name if household.members else ""
-    rent_monthly = float(params.get("beijing_housing_rent_deduction_monthly", 1500))
-    mortgage_monthly = float(params.get("first_home_mortgage_interest_deduction_monthly", 1000))
-    max_mortgage_months = int(params.get("first_home_mortgage_interest_max_months", 240))
+    rent_monthly = tax_benefit.housing_rent_monthly
+    mortgage_monthly = tax_benefit.first_home_mortgage_interest_monthly
+    max_mortgage_months = tax_benefit.first_home_mortgage_interest_max_months
     rent_window = _active_rent_deduction_window(household, base_date=current_month, horizon_months=horizon_months)
 
     items: list[TaxStrategyItem] = []
@@ -246,8 +247,8 @@ def build_tax_strategy_items(
             )
         )
 
-    child_monthly = float(params.get("child_education_deduction_monthly", 2000))
-    infant_monthly = float(params.get("infant_care_deduction_monthly", 2000))
+    child_monthly = tax_benefit.child_education_monthly
+    infant_monthly = tax_benefit.infant_care_monthly
     for child in household.child_plans:
         if not child.enabled:
             continue
@@ -293,8 +294,8 @@ def build_tax_strategy_items(
         if bool(getattr(member, "personal_pension_account_enabled", False)):
             open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
             contribution_mode = str(getattr(member, "personal_pension_contribution_mode", "auto_tax_optimal") or "auto_tax_optimal")
-            annual_cap = float(params.get("personal_pension_deduction_annual_cap", 12000))
-            withdrawal_tax_rate = float(params.get("personal_pension_withdrawal_tax_rate", 0.03))
+            annual_cap = tax_benefit.personal_pension_deduction_annual_cap
+            withdrawal_tax_rate = tax_benefit.personal_pension_withdrawal_tax_rate
             recommended_start = _first_personal_pension_tax_optimal_month(
                 member,
                 base_date=current_month,
@@ -558,7 +559,7 @@ def build_tax_strategy_timeline(
             source=investment_estimate.source,
         )
 
-    annual_settlement_month = int(rules.params.get("annual_tax_settlement_month", 3) or 3)
+    annual_settlement_month = get_policy(rules).tax_benefit_policy().annual_tax_settlement_month
     for year in range(current_month.year + 1, min(end_date.year + 1, current_month.year + 6)):
         add_point(
             month_text=f"{year:04d}-{annual_settlement_month:02d}",

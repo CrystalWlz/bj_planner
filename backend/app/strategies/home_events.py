@@ -12,6 +12,11 @@ def _money_text(amount: float) -> str:
 
 
 def _pf_strategy_switch_month(mode: str) -> int:
+    if ":" in mode:
+        try:
+            return max(1, int(mode.rsplit(":", 1)[1]))
+        except ValueError:
+            return 12
     if mode.startswith("monthly_then_semiannual_offset_after_"):
         try:
             return int(mode.rsplit("_", 1)[-1])
@@ -131,6 +136,24 @@ def purchase_plan_events(
                     f"前 {switch_month} 个还款月采用按月约定提取偿还公积金贷款，"
                     "本月起切换为北京半年度冲还贷：账户余额在每年 1 月/7 月合同约定日集中冲抵公积金贷款本金。"
                     "两种模式互斥，切换后按月约定提取终止，后续账户曲线按冲还贷规则推演。"
+                ),
+                amount=None,
+                severity="success",
+            )
+        )
+    elif plan.post_purchase_pf_strategy.startswith("semiannual_offset_then_monthly"):
+        switch_month = _pf_strategy_switch_month(plan.post_purchase_pf_strategy)
+        events.append(
+            PlanEventPoint(
+                plan_variant=plan.variant,
+                month=purchase_month + switch_month + 1,
+                category="provident",
+                title="公积金还贷方式切换",
+                detail=(
+                    f"前 {switch_month} 个还款月采用北京半年度冲还贷，"
+                    "账户余额在每年 1 月/7 月合同约定日集中冲抵公积金贷款本金；"
+                    "本月起切换为按月约定提取偿还公积金贷款月供。"
+                    "两种模式互斥，切换后后续账户曲线按按月约定提取规则推演。"
                 ),
                 amount=None,
                 severity="success",

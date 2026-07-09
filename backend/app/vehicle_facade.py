@@ -14,6 +14,7 @@ from .schemas import (
     CarLoanSummary,
     CarPlanAnalysis,
     CarPlanData,
+    CalculationContextSnapshot,
     HouseholdData,
     RulePackData,
     ScenarioData,
@@ -34,11 +35,12 @@ def calculate_car_loan(
     monthly_cash_savings_before_car: float = 0,
     rules: RulePackData | None = None,
 ) -> CarLoanSummary:
+    effective_rules = rules or RulePackData()
     return projection_calculate_car_loan(
         plan,
         initial_cash=initial_cash,
         monthly_cash_savings_before_car=monthly_cash_savings_before_car,
-        rules=rules,
+        rules=effective_rules,
     )
 
 
@@ -49,13 +51,16 @@ def vehicle_loan_states(
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[VehicleLoanState]:
+    effective_rules = rules or RulePackData()
     return build_vehicle_loan_states(
         plan,
         scenario=scenario,
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
-        rules=rules,
+        rules=effective_rules,
+        calculation_context=calculation_context,
     )
 
 
@@ -69,7 +74,9 @@ def aggregate_car_loan(
     home_purchase_month: int | None = None,
     include_after_home: bool = True,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> CarLoanSummary:
+    effective_rules = rules or RulePackData()
     return strategy_aggregate_car_loan(
         plan,
         calculate_car_loan=car_loan_calculator,
@@ -78,7 +85,8 @@ def aggregate_car_loan(
         scenario=scenario,
         home_purchase_month=home_purchase_month,
         include_after_home=include_after_home,
-        rules=rules,
+        rules=effective_rules,
+        calculation_context=calculation_context,
     )
 
 
@@ -109,6 +117,7 @@ def build_car_plan_analyses(
     car_loan_calculator=calculate_car_loan,
     annual_investment_return: float = 0.0,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[CarPlanAnalysis]:
     effective_rules = rules or RulePackData()
     effective_monthly_expense = (
@@ -123,4 +132,5 @@ def build_car_plan_analyses(
         calculate_car_loan=car_loan_calculator,
         annual_investment_return=annual_investment_return,
         rules=effective_rules,
+        calculation_context=calculation_context,
     )

@@ -39,6 +39,7 @@ ACCOUNT_CALIBRATION_TARGETS = {
     "fixed_asset",
     "total_loan",
 }
+ACCOUNT_CALIBRATION_SCOPES = {"account", "concept", "major_event", "strategy_event"}
 CHILD_EXPENSE_DEFAULTS = {
     "preparation_months_before_birth": 6,
     "pregnancy_months_before_birth": 9,
@@ -55,6 +56,55 @@ CHILD_EXPENSE_DEFAULTS = {
     "primary_school_entry_cost": 15000,
     "higher_education_entry_cost": 50000,
 }
+HOME_PLANNING_TARGET_CONTROL_KEYS = {
+    "schema_version",
+    "planning_goal_id",
+    "purchase_sequence",
+    "purchase_planning_mode",
+    "depends_on_goal_id",
+    "after_previous_purchase_delay_months",
+    "manual_purchase_delay_months",
+    "planning_window_start_month",
+    "planning_window_end_month",
+    "selected_purchase_plan_variant",
+    "provident_rate",
+    "deed_tax_rate",
+    "provident_account_repayment_strategy",
+    "provident_account_repayment_switch_enabled",
+    "provident_account_repayment_switch_after_month",
+    "provident_account_repayment_switch_to_strategy",
+}
+VEHICLE_PLANNING_TARGET_CONTROL_KEYS = {
+    "schema_version",
+    "planning_goal_id",
+    "planning_sequence",
+    "purchase_timing_mode",
+    "depends_on_goal_id",
+    "after_previous_event_delay_months",
+    "manual_purchase_delay_months",
+    "planning_window_start_month",
+    "planning_window_end_month",
+    "selected_strategy_variant",
+}
+CHILD_PLANNING_TARGET_CONTROL_KEYS = {
+    "schema_version",
+    "planning_goal_id",
+    "planning_sequence",
+    "timing_mode",
+    "planned_birth_month",
+    "planned_birth_start_month",
+    "planned_birth_end_month",
+}
+PLANNING_TARGET_CONTROL_KEYS_BY_TYPE = {
+    "home": HOME_PLANNING_TARGET_CONTROL_KEYS,
+    "vehicle": VEHICLE_PLANNING_TARGET_CONTROL_KEYS,
+    "child": CHILD_PLANNING_TARGET_CONTROL_KEYS,
+}
+
+
+def planning_goal_target_params(goal_type: str, params: dict[str, Any]) -> dict[str, Any]:
+    control_keys = PLANNING_TARGET_CONTROL_KEYS_BY_TYPE.get(goal_type, set())
+    return {key: deepcopy(value) for key, value in params.items() if key not in control_keys}
 
 
 def normalize_year_month(value: Any, fallback: str = "2026-07") -> str:
@@ -85,14 +135,21 @@ def normalize_account_calibrations(data: dict[str, Any]) -> None:
         target = str(item.get("target") or "cash")
         if target not in ACCOUNT_CALIBRATION_TARGETS:
             target = "cash"
+        calibration_scope = str(item.get("calibration_scope") or "account")
+        if calibration_scope not in ACCOUNT_CALIBRATION_SCOPES:
+            calibration_scope = "account"
         normalized.append(
             {
                 "enabled": bool(item.get("enabled", True)),
                 "month": normalize_year_month(item.get("month"), "2026-07"),
+                "calibration_scope": calibration_scope,
                 "target": target,
                 "amount": max(0.0, safe_float(item.get("amount"), 0.0)),
                 "member_name": str(item.get("member_name") or ""),
                 "reference_name": str(item.get("reference_name") or ""),
+                "source_id": str(item.get("source_id") or ""),
+                "source_category": str(item.get("source_category") or ""),
+                "source_title": str(item.get("source_title") or ""),
                 "note": str(item.get("note") or ""),
             }
         )
@@ -114,7 +171,9 @@ def clear_income_stage_manual_cash_adjustments(data: dict[str, Any]) -> None:
 
 def planning_timing_from_scenario(scenario: dict[str, Any]) -> str:
     mode = str(scenario.get("purchase_planning_mode") or "after_previous_purchase")
-    return "parallel" if mode == "parallel" else "auto_sequence"
+    if mode == "parallel":
+        return "parallel"
+    return "after_goal" if str(scenario.get("depends_on_goal_id") or "").strip() else "auto_sequence"
 
 
 def scenario_mode_from_goal(goal: dict[str, Any]) -> str:
@@ -124,14 +183,39 @@ def scenario_mode_from_goal(goal: dict[str, Any]) -> str:
 
 def planning_timing_from_vehicle(vehicle: dict[str, Any]) -> str:
     mode = str(vehicle.get("purchase_timing_mode") or "auto_sequence")
-    return mode if mode in {"auto_sequence", "parallel", "manual_month"} else "auto_sequence"
+    if not bool(vehicle.get("enabled", True)) or mode == "not_planned":
+        return "not_planned"
+    if mode in {"parallel", "manual_month"}:
+        return mode
+    return "after_goal" if str(vehicle.get("depends_on_goal_id") or "").strip() else "auto_sequence"
 
 
 def vehicle_timing_from_goal(goal: dict[str, Any]) -> str:
     timing_mode = str(goal.get("timing_mode") or "auto_sequence")
+    if not bool(goal.get("enabled", True)) or timing_mode == "not_planned":
+        return "not_planned"
     if timing_mode in {"parallel", "manual_month"}:
         return timing_mode
     return "auto_sequence"
+
+
+def planning_timing_from_child(child: dict[str, Any]) -> str:
+    mode = str(child.get("timing_mode") or "after_first_home")
+    if mode == "manual_month":
+        return "manual_month"
+    if mode == "not_planned":
+        return "not_planned"
+    return "auto_sequence"
+
+
+def child_timing_from_goal(goal: dict[str, Any]) -> str:
+    timing_mode = str(goal.get("timing_mode") or "auto_sequence")
+    if timing_mode == "manual_month":
+        return "manual_month"
+    if timing_mode == "not_planned":
+        return "not_planned"
+    metadata = goal.get("metadata") if isinstance(goal.get("metadata"), dict) else {}
+    return str(metadata.get("child_timing_mode") or "after_first_home")
 
 
 def home_goal_from_scenario(
@@ -141,6 +225,7 @@ def home_goal_from_scenario(
     household_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_scenario = normalize_scenario(deepcopy(scenario))
+    timing_mode = planning_timing_from_scenario(normalized_scenario)
     return normalize_planning_goal(
         {
             "schema_version": CURRENT_SCHEMA_VERSION,
@@ -148,19 +233,29 @@ def home_goal_from_scenario(
             "name": normalized_scenario.get("name") or "购房目标",
             "enabled": bool(normalized_scenario.get("enabled", True)),
             "priority": max(1, safe_int(normalized_scenario.get("purchase_sequence"), 1)),
-            "timing_mode": planning_timing_from_scenario(normalized_scenario),
+            "timing_mode": timing_mode,
             "earliest_purchase_delay_months": max(0, safe_int(normalized_scenario.get("manual_purchase_delay_months"), 0)),
             "planning_window_start_month": normalize_optional_year_month(normalized_scenario.get("planning_window_start_month")),
             "planning_window_end_month": normalize_optional_year_month(normalized_scenario.get("planning_window_end_month")),
+            "depends_on_goal_id": str(normalized_scenario.get("depends_on_goal_id") or "") if timing_mode == "after_goal" else "",
             "delay_after_dependency_months": max(0, safe_int(normalized_scenario.get("after_previous_purchase_delay_months"), 0)),
             "allow_parallel": str(normalized_scenario.get("purchase_planning_mode") or "") == "parallel",
             "selected_strategy_id": str(normalized_scenario.get("selected_purchase_plan_variant") or ""),
-            "target_params": normalized_scenario,
+            "target_params": planning_goal_target_params("home", normalized_scenario),
             "financing_preferences": {
                 "commercial_repayment_method": normalized_scenario.get("commercial_repayment_method"),
                 "provident_repayment_method": normalized_scenario.get("provident_repayment_method"),
                 "commercial_prepayment_mode": normalized_scenario.get("commercial_prepayment_mode"),
                 "provident_account_repayment_strategy": normalized_scenario.get("provident_account_repayment_strategy"),
+                "provident_account_repayment_switch_enabled": normalized_scenario.get(
+                    "provident_account_repayment_switch_enabled"
+                ),
+                "provident_account_repayment_switch_after_month": normalized_scenario.get(
+                    "provident_account_repayment_switch_after_month"
+                ),
+                "provident_account_repayment_switch_to_strategy": normalized_scenario.get(
+                    "provident_account_repayment_switch_to_strategy"
+                ),
                 "investment_withdrawal_mode": normalized_scenario.get("investment_withdrawal_mode"),
             },
             "metadata": {"household_id": household_id or ""},
@@ -168,12 +263,21 @@ def home_goal_from_scenario(
     )
 
 
-def scenario_from_home_goal(goal_id: str, goal: dict[str, Any]) -> dict[str, Any]:
+def scenario_from_home_goal(goal_id: str, goal: dict[str, Any], *, sequence_index: int | None = None) -> dict[str, Any]:
     scenario = deepcopy(goal.get("target_params") if isinstance(goal.get("target_params"), dict) else {})
+    financing_preferences = goal.get("financing_preferences") if isinstance(goal.get("financing_preferences"), dict) else {}
+    scenario.update(deepcopy(financing_preferences))
     scenario["name"] = goal.get("name") or scenario.get("name") or "购房目标"
-    scenario["enabled"] = bool(goal.get("enabled", True))
-    scenario["purchase_sequence"] = max(1, safe_int(goal.get("priority"), safe_int(scenario.get("purchase_sequence"), 1)))
+    scenario["enabled"] = bool(goal.get("enabled", True)) and str(goal.get("timing_mode") or "") != "not_planned"
+    scenario["purchase_sequence"] = min(
+        20,
+        max(
+            1,
+            safe_int(sequence_index, safe_int(goal.get("priority"), safe_int(scenario.get("purchase_sequence"), 1))),
+        ),
+    )
     scenario["purchase_planning_mode"] = scenario_mode_from_goal(goal)
+    scenario["depends_on_goal_id"] = str(goal.get("depends_on_goal_id") or "")
     scenario["after_previous_purchase_delay_months"] = max(
         0,
         safe_int(goal.get("delay_after_dependency_months"), safe_int(scenario.get("after_previous_purchase_delay_months"), 0)),
@@ -220,10 +324,11 @@ def vehicle_goal_from_plan(
                 0,
                 safe_int(vehicle_data.get("manual_purchase_delay_months"), safe_int(vehicle_data.get("purchase_delay_months"), 0)),
             ),
+            "depends_on_goal_id": str(vehicle_data.get("depends_on_goal_id") or "") if timing_mode == "after_goal" else "",
             "delay_after_dependency_months": max(0, safe_int(vehicle_data.get("after_previous_event_delay_months"), 0)),
             "allow_parallel": timing_mode == "parallel",
             "selected_strategy_id": str(vehicle_data.get("selected_strategy_variant") or "target"),
-            "target_params": vehicle_data,
+            "target_params": planning_goal_target_params("vehicle", vehicle_data),
             "financing_preferences": {
                 "financing_options": vehicle_data.get("financing_options", []),
                 "loan_prepayment_enabled": vehicle_data.get("loan_prepayment_enabled", False),
@@ -240,12 +345,14 @@ def vehicle_goal_from_plan(
     )
 
 
-def vehicle_plan_from_goal(goal: dict[str, Any], index: int) -> dict[str, Any]:
+def vehicle_plan_from_goal(goal_id: str, goal: dict[str, Any], index: int, *, sequence_index: int | None = None) -> dict[str, Any]:
     vehicle = deepcopy(goal.get("target_params") if isinstance(goal.get("target_params"), dict) else {})
     vehicle["name"] = goal.get("name") or vehicle.get("name") or f"用车需求 {index + 1}"
-    vehicle["enabled"] = bool(goal.get("enabled", True))
-    vehicle["planning_sequence"] = max(1, safe_int(goal.get("priority"), index + 1))
+    vehicle["enabled"] = bool(goal.get("enabled", True)) and str(goal.get("timing_mode") or "") != "not_planned"
+    vehicle["planning_goal_id"] = goal_id
+    vehicle["planning_sequence"] = max(1, safe_int(sequence_index, safe_int(goal.get("priority"), index + 1)))
     vehicle["purchase_timing_mode"] = vehicle_timing_from_goal(goal)
+    vehicle["depends_on_goal_id"] = str(goal.get("depends_on_goal_id") or "")
     vehicle["manual_purchase_delay_months"] = max(
         0,
         safe_int(goal.get("earliest_purchase_delay_months"), safe_int(vehicle.get("manual_purchase_delay_months"), 0)),
@@ -268,11 +375,79 @@ def vehicle_plan_from_goal(goal: dict[str, Any], index: int) -> dict[str, Any]:
     return vehicle
 
 
+def child_goal_from_plan(
+    child: dict[str, Any],
+    *,
+    household_id: str,
+    index: int,
+    goal_id: str,
+    first_home_goal_id: str = "",
+) -> dict[str, Any]:
+    child_data = deepcopy(child)
+    timing_mode = planning_timing_from_child(child_data)
+    planned_month = normalize_optional_year_month(
+        child_data.get("planned_birth_month") or child_data.get("planned_birth_start_month")
+    )
+    depends_on_goal_id = first_home_goal_id if str(child_data.get("timing_mode") or "") == "after_first_home" else ""
+    priority = max(1, safe_int(child_data.get("planning_sequence"), 30 + index))
+    return normalize_planning_goal(
+        {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "goal_type": "child",
+            "name": child_data.get("name") or f"子女计划 {index + 1}",
+            "enabled": bool(child_data.get("enabled", True)),
+            "priority": priority,
+            "timing_mode": "after_goal" if depends_on_goal_id else timing_mode,
+            "earliest_purchase_month": planned_month if timing_mode == "manual_month" else "",
+            "planning_window_start_month": normalize_optional_year_month(child_data.get("planned_birth_start_month")),
+            "planning_window_end_month": normalize_optional_year_month(child_data.get("planned_birth_end_month")),
+            "depends_on_goal_id": depends_on_goal_id,
+            "delay_after_dependency_months": 0,
+            "allow_parallel": False,
+            "target_params": planning_goal_target_params("child", child_data),
+            "holding_cost_params": {
+                "expense_strategy_mode": child_data.get("expense_strategy_mode", "balanced"),
+                "monthly_childcare_cost_before_kindergarten": child_data.get("monthly_childcare_cost_before_kindergarten", 0),
+                "monthly_kindergarten_cost": child_data.get("monthly_kindergarten_cost", 0),
+                "monthly_primary_secondary_cost": child_data.get("monthly_primary_secondary_cost", 0),
+                "monthly_higher_education_cost": child_data.get("monthly_higher_education_cost", 0),
+            },
+            "metadata": {
+                "household_id": household_id,
+                "child_timing_mode": child_data.get("timing_mode") or "after_first_home",
+                "planned_birth_month": child_data.get("planned_birth_month") or "",
+            },
+        }
+    )
+
+
+def child_plan_from_goal(goal_id: str, goal: dict[str, Any], index: int) -> dict[str, Any]:
+    child = deepcopy(goal.get("target_params") if isinstance(goal.get("target_params"), dict) else {})
+    child["planning_goal_id"] = goal_id
+    child["name"] = goal.get("name") or child.get("name") or f"子女计划 {index + 1}"
+    child["enabled"] = bool(goal.get("enabled", True)) and str(goal.get("timing_mode") or "") != "not_planned"
+    child["timing_mode"] = child_timing_from_goal(goal)
+    if goal.get("earliest_purchase_month") and child["timing_mode"] == "manual_month":
+        child["planned_birth_month"] = normalize_optional_year_month(goal.get("earliest_purchase_month"))
+    child["planned_birth_start_month"] = normalize_optional_year_month(
+        goal.get("planning_window_start_month") or child.get("planned_birth_start_month")
+    )
+    child["planned_birth_end_month"] = normalize_optional_year_month(
+        goal.get("planning_window_end_month") or child.get("planned_birth_end_month")
+    )
+    manual_child_expense = str(child.get("expense_strategy_mode") or "balanced") == "manual"
+    for key, fallback in CHILD_EXPENSE_DEFAULTS.items():
+        if key not in child or (not manual_child_expense and safe_float(child.get(key), 0.0) <= 0):
+            child[key] = fallback
+    return child
+
+
 def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data.get("target_params"), dict):
         data["target_params"] = {}
     data.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
     data.setdefault("goal_type", "home")
+    data["target_params"] = planning_goal_target_params(str(data.get("goal_type") or "home"), data["target_params"])
     data.setdefault("name", "规划目标")
     data.setdefault("enabled", True)
     data.setdefault("priority", 1)
@@ -282,6 +457,11 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
     data["planning_window_start_month"] = normalize_optional_year_month(data.get("planning_window_start_month"))
     data["planning_window_end_month"] = normalize_optional_year_month(data.get("planning_window_end_month"))
     data.setdefault("depends_on_goal_id", "")
+    timing_mode = str(data.get("timing_mode") or "auto_sequence")
+    if timing_mode in {"parallel", "manual_month", "not_planned"}:
+        data["depends_on_goal_id"] = ""
+    elif str(data.get("depends_on_goal_id") or "").strip():
+        data["timing_mode"] = "after_goal"
     data.setdefault("delay_after_dependency_months", 0)
     data.setdefault("allow_parallel", False)
     data.setdefault("selected_strategy_id", "")
@@ -293,6 +473,7 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
     if goal_type == "home":
         data["target_params"] = normalize_scenario(data.get("target_params") if isinstance(data.get("target_params"), dict) else {})
         data["priority"] = max(1, safe_int(data.get("priority"), safe_int(data["target_params"].get("purchase_sequence"), 1)))
+        data["target_params"] = planning_goal_target_params(goal_type, data["target_params"])
     elif goal_type == "vehicle":
         target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
         fill_vehicle_timing_defaults(target, max(0, safe_int(data.get("priority"), 1) - 1))
@@ -306,8 +487,28 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
                 fill_vehicle_prepayment_defaults(candidate)
                 normalize_vehicle_financing_options(candidate)
         normalize_vehicle_financing_options(target)
-        data["target_params"] = target
         data["priority"] = max(1, safe_int(data.get("priority"), safe_int(target.get("planning_sequence"), 1)))
+        data["target_params"] = planning_goal_target_params(goal_type, target)
+    elif goal_type == "child":
+        target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
+        target.setdefault("name", data.get("name") or "子女计划")
+        target.setdefault("enabled", bool(data.get("enabled", True)))
+        target.setdefault("timing_mode", child_timing_from_goal(data))
+        target.setdefault("expense_strategy_mode", "balanced")
+        target["planned_birth_month"] = normalize_optional_year_month(
+            target.get("planned_birth_month") or data.get("earliest_purchase_month")
+        )
+        target["planned_birth_start_month"] = normalize_optional_year_month(
+            target.get("planned_birth_start_month") or data.get("planning_window_start_month")
+        )
+        target["planned_birth_end_month"] = normalize_optional_year_month(
+            target.get("planned_birth_end_month") or data.get("planning_window_end_month")
+        )
+        manual_child_expense = str(target.get("expense_strategy_mode") or "balanced") == "manual"
+        for key, fallback in CHILD_EXPENSE_DEFAULTS.items():
+            if key not in target or (not manual_child_expense and safe_float(target.get(key), 0.0) <= 0):
+                target[key] = fallback
+        data["target_params"] = planning_goal_target_params(goal_type, target)
     normalized = PlanningGoalData.model_validate(data).model_dump(mode="json")
     normalized["schema_version"] = CURRENT_SCHEMA_VERSION
     return normalized
@@ -391,6 +592,7 @@ def strip_nested_vehicle_candidates(vehicle: dict[str, Any]) -> dict[str, Any]:
 def fill_vehicle_timing_defaults(vehicle: dict[str, Any], index: int) -> None:
     vehicle.setdefault("planning_sequence", index + 1)
     vehicle.setdefault("purchase_timing_mode", "auto_sequence")
+    vehicle.setdefault("depends_on_goal_id", "")
     vehicle.setdefault("after_previous_event_delay_months", 0)
     vehicle.setdefault("manual_purchase_delay_months", max(0, safe_int(vehicle.get("purchase_delay_months"), 0)))
     vehicle["planning_window_start_month"] = normalize_optional_year_month(vehicle.get("planning_window_start_month"))
@@ -403,6 +605,7 @@ def fill_vehicle_timing_defaults(vehicle: dict[str, Any], index: int) -> None:
                 continue
             candidate.setdefault("planning_sequence", safe_int(vehicle.get("planning_sequence"), index + 1))
             candidate.setdefault("purchase_timing_mode", vehicle.get("purchase_timing_mode") or "auto_sequence")
+            candidate.setdefault("depends_on_goal_id", vehicle.get("depends_on_goal_id") or "")
             candidate.setdefault("after_previous_event_delay_months", safe_int(vehicle.get("after_previous_event_delay_months"), 0))
             candidate["planning_window_start_month"] = normalize_optional_year_month(
                 candidate.get("planning_window_start_month") or vehicle.get("planning_window_start_month")
@@ -792,6 +995,12 @@ def normalize_household(data: dict[str, Any]) -> dict[str, Any]:
             expense["one_time_timing_mode"] = "flexible_range" if timing_mode == "flexible_range" else "fixed_month"
             default_month = safe_int(str(expense.get("start_month") or "2026-01").split("-")[-1], 1)
             expense.setdefault("annual_occurrence_month", max(1, min(12, default_month)))
+            category = str(expense.get("expense_category") or "")
+            if category not in {"general", "medical"}:
+                category = "medical" if bool(expense.get("medical_account_payable", False)) else "general"
+            expense["expense_category"] = category
+            if category != "medical":
+                expense["medical_account_payable"] = False
             expense.setdefault("medical_account_payable", False)
     data.setdefault("phased_loans", [])
     for loan in data["phased_loans"]:
@@ -829,6 +1038,7 @@ def normalize_scenario(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("enabled", True)
     data.setdefault("purchase_sequence", 1)
     data.setdefault("purchase_planning_mode", "after_previous_purchase")
+    data.setdefault("depends_on_goal_id", "")
     data.setdefault("after_previous_purchase_delay_months", 0)
     data["planning_window_start_month"] = normalize_optional_year_month(data.get("planning_window_start_month"))
     data["planning_window_end_month"] = normalize_optional_year_month(data.get("planning_window_end_month"))
@@ -848,6 +1058,9 @@ def normalize_scenario(data: dict[str, Any]) -> dict[str, Any]:
     if commercial_prepayment_mode == "none":
         data["commercial_prepayment_monthly_amount"] = 0
     data.setdefault("provident_account_repayment_strategy", "auto")
+    data.setdefault("provident_account_repayment_switch_enabled", False)
+    data.setdefault("provident_account_repayment_switch_after_month", 12)
+    data.setdefault("provident_account_repayment_switch_to_strategy", "semiannual_principal_offset")
     data.setdefault("seller_tax_pass_through_enabled", False)
     data.setdefault("seller_tax_pass_through_rate", 0)
     data.setdefault("seller_tax_pass_through_amount", 0)

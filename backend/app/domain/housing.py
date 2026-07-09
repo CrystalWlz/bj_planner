@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from math import ceil
-
 from ..policies import get_policy
-from ..schemas import HouseholdData, RulePackData, ScenarioData
+from ..schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData
 from .loans import loan_principal_for_payment_cap
 from .tax import clamp
 
@@ -29,9 +27,37 @@ def deed_tax_rate(household: HouseholdData, scenario: ScenarioData, rules: RuleP
     return get_policy(rules).deed_tax_rate(household, scenario)
 
 
-def broker_fee_rate(scenario: ScenarioData, rules: RulePackData) -> float:
+def _is_default_or_blank(value: object, default_value: float) -> bool:
+    if value is None:
+        return True
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return True
+    return numeric <= 0 or abs(numeric - default_value) < 1e-12
+
+
+def commercial_loan_rate(scenario: ScenarioData, market_snapshot: MarketSnapshotData | None = None) -> float:
+    default_rate = float(ScenarioData.model_fields["commercial_rate"].default or 0.035)
+    configured = getattr(scenario, "commercial_rate", None)
+    if market_snapshot and market_snapshot.commercial_loan_rate is not None and _is_default_or_blank(configured, default_rate):
+        return clamp(float(market_snapshot.commercial_loan_rate), 0.0, 0.2)
+    return clamp(float(configured if configured is not None else default_rate), 0.0, 0.2)
+
+
+def broker_fee_rate(
+    scenario: ScenarioData,
+    rules: RulePackData,
+    market_snapshot: MarketSnapshotData | None = None,
+) -> float:
+    configured = getattr(scenario, "broker_fee_rate", None)
+    default_rate = float(ScenarioData.model_fields["broker_fee_rate"].default or 0.022)
+    if market_snapshot and market_snapshot.default_broker_fee_rate is not None and _is_default_or_blank(configured, default_rate):
+        configured = market_snapshot.default_broker_fee_rate
+    elif _is_default_or_blank(configured, default_rate):
+        configured = get_policy(rules).default_broker_fee_rate()
     return clamp(
-        float(getattr(scenario, "broker_fee_rate", rules.params.get("default_broker_fee_rate", 0.022))),
+        float(configured),
         0.0,
         0.2,
     )
@@ -41,19 +67,29 @@ def housing_transaction_rate_amounts(
     household: HouseholdData,
     scenario: ScenarioData,
     rules: RulePackData,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> tuple[float, float, float, float]:
     deed_rate = deed_tax_rate(household, scenario, rules)
-    broker_rate = broker_fee_rate(scenario, rules)
+    broker_rate = broker_fee_rate(scenario, rules, market_snapshot)
     return deed_rate, broker_rate, scenario.total_price * deed_rate, scenario.total_price * broker_rate
 
 
-def seller_tax_pass_through_amount(scenario: ScenarioData) -> float:
+def seller_tax_pass_through_amount(
+    scenario: ScenarioData,
+    rules: RulePackData,
+    market_snapshot: MarketSnapshotData | None = None,
+) -> float:
     if not scenario.seller_tax_pass_through_enabled:
         return 0.0
     configured = max(0.0, scenario.seller_tax_pass_through_amount)
     if configured > 0:
         return configured
-    return max(0.0, scenario.total_price * scenario.seller_tax_pass_through_rate)
+    rate = scenario.seller_tax_pass_through_rate
+    if rate <= 0 and market_snapshot and market_snapshot.seller_tax_pass_through_rate is not None:
+        rate = market_snapshot.seller_tax_pass_through_rate
+    if rate <= 0:
+        rate = get_policy(rules).seller_tax_pass_through_default_rate()
+    return max(0.0, scenario.total_price * clamp(float(rate), 0.0, 0.2))
 
 
 def is_second_hand_property(scenario: ScenarioData) -> bool:
@@ -81,24 +117,13 @@ def provident_loan_cap(
     monthly_income_for_capacity: float = 0.0,
     borrower_count: int = 1,
 ) -> tuple[float, float]:
-    amount_per_year = float(rules.params.get("provident_loan_amount_per_deposit_year", 150_000))
-    effective_deposit_months = household.social_security_months + max(0, purchase_months)
-    deposit_years = ceil(effective_deposit_months / 12) if effective_deposit_months > 0 else 0
-    policy_year_cap = amount_per_year * deposit_years
-    if household.existing_home_count == 0:
-        base_maximum_cap = float(rules.params.get("provident_first_home_loan_cap", 1_200_000))
-    else:
-        base_maximum_cap = float(rules.params.get("provident_second_home_loan_cap", 1_000_000))
-    bonus = provident_policy_bonus(scenario, rules)
-    cap = min(base_maximum_cap + bonus, policy_year_cap + bonus)
-    if bool(rules.params.get("provident_repayment_capacity_enabled", True)) and monthly_income_for_capacity > 0:
-        income_ratio = clamp(float(rules.params.get("provident_repayment_income_ratio", 0.60)), 0.0, 1.0)
-        basic_living_cost = max(0.0, float(rules.params.get("provident_basic_living_cost_per_person", 1778)))
-        family_living_floor = basic_living_cost * max(1, borrower_count)
-        payment_cap = min(
-            monthly_income_for_capacity * income_ratio,
-            max(0.0, monthly_income_for_capacity - family_living_floor),
-        )
+    policy = get_policy(rules)
+    cap, bonus = policy.provident_loan_policy_cap(household, scenario, purchase_months=purchase_months)
+    payment_cap = policy.provident_repayment_capacity_payment_cap(
+        monthly_income=monthly_income_for_capacity,
+        borrower_count=borrower_count,
+    )
+    if payment_cap is not None:
         policy_loan_years = provident_loan_years(household, scenario, rules)[0]
         capacity_cap = loan_principal_for_payment_cap(
             payment_cap,

@@ -5,6 +5,8 @@ import {
   Banknote,
   CalendarClock,
   Car,
+  ChevronDown,
+  ChevronUp,
   CheckCircle2,
   CircleDollarSign,
   ClipboardCheck,
@@ -44,11 +46,87 @@ import {
   YAxis
 } from "recharts";
 import {
+  CHILD_PLANNING_TIMING_OPTIONS,
+  childEducationStageLabel,
+  childMonthlyCostAt,
+  childPlanHasPlanningTiming,
+  childPlanIsIncludedInPlanning,
+  childPlanningGoalData,
+  childPlanningTimingLabel,
+  childPlanningTimingPatch,
+  HOME_PLANNING_TIMING_OPTIONS,
+  homeDemandIsIncludedInPlanning,
+  homePlanIsIncludedInPlanning,
+  homePlanningTimingPatch,
+  homePurchasePlanningModeForSequence,
+  PLANNING_GOAL_AUTO_DEPENDENCY_LABEL,
+  homePlanningGoalData,
+  planningGoalDependencyLabel,
+  planningGoalDependencyOptions,
+  planningInclusionStatusLabel,
+  planningGoalIsNotPlanned,
+  planningGoalOrderLabel,
+  planningGoalTimingSummary,
+  planningGoalTypeLabel,
+  planningTimingModeFromScenario,
+  resolveChildBirthMonth,
+  scenarioPlanningTimingSummary,
+  useDebouncedPlanningGoalSave,
+  VEHICLE_PLANNING_TIMING_OPTIONS,
+  vehiclePlanningControlDefaults,
+  vehiclePlanningEnabledPatch,
+  vehiclePlanningTimingPatch,
+  vehiclePlanUsesDependencySelector,
+  vehiclePlanningTimingModeValue,
+  vehiclePlanIsIncludedInPlanning,
+  vehiclePrepaymentModeLabel,
+  vehiclePlanningTimingSummary,
+  vehiclePlanningGoalData
+} from "./planningGoals";
+import {
+  childPlanStrategyForChild,
+  generatedCarPlanAnalyses,
+  generatedChildPlanStrategies,
+  generatedInvestmentRecommendations,
+  generatedPurchasePlanAnalyses,
+  generatedTaxStrategyItems,
+  generatedTaxStrategyTimeline,
+  generatedStrategySummaryByOwner,
+  generatedStrategyTypeLabel,
+  generatedStrategyTypeSummary,
+} from "./generatedStrategies";
+import {
+  ACCOUNT_CALIBRATION_TARGET_OPTIONS,
+  ACCOUNT_CONCEPT_CODES,
+  CORE_OBJECT_GROUP_CODES,
+  accountConceptBalanceTextWithHouseholdFallback,
+  accountConceptMap,
+  calibrationDefaultAmountFromConcepts,
+  calibrationFallbackAmountFromHousehold,
+  coreObjectBalanceText,
+  coreObjectCountText,
+  coreObjectGroupMap,
+  coreObjectOwnerSummaryByOwner,
+  coreObjectOwnerSummaryText,
+  dashboardAccountConcepts
+} from "./coreObjects";
+import {
+  buildMonthlyChartSeries,
+  emptyMonthlyChartPoint
+} from "./visualizationSeries";
+import {
   calculateAffordability,
+  createPlanningGoal,
   createScenario,
+  deletePlanningGoal,
   deleteScenario,
+  fetchGeneratedStrategiesByCacheLayers,
+  fetchHouseholds,
+  fetchPlanningFoundation,
+  fetchScenarios,
   fetchSourcePreview,
   loadInitialData,
+  savePlanningGoal,
   saveHousehold,
   saveRulePack,
   saveScenario
@@ -56,7 +134,9 @@ import {
 import { money, numberInput, percent } from "./format";
 import type {
   AccountCalibrationData,
+  AccountCalibrationScope,
   AccountCalibrationTarget,
+  AccountConceptSummary,
   AffordabilityResult,
   BonusTaxMethod,
   CarPlanAnalysis,
@@ -64,21 +144,33 @@ import type {
   CareerShockData,
   ChildPlanData,
   ChildPlanStrategyPoint,
+  CacheLayerHashes,
   CommercialPrepaymentMode,
+  CoreObjectGroupSummary,
+  CoreObjectRecord,
   DailyExpenseStageData,
   ElderlyDependentData,
+  GeneratedStrategyRecord,
   HouseholdData,
   IncomeMember,
   IncomeStageData,
   InvestmentTaxProfileData,
   InvestmentPlanRecommendation,
+  CalculationContextCoreObjectSnapshot,
+  CalculationContextGoalSnapshot,
+  MarketSnapshotData,
   ProvidentAccountRepaymentStrategy,
+  ProvidentAccountRepaymentSwitchTarget,
   ProvidentMemberAccountPoint,
   PurchasePlanAnalysis,
   RecordEnvelope,
   RepaymentMethod,
   RenovationFundingMode,
   RentExpenseStageData,
+  PlanningGoalData,
+  PlanningGoalRecord,
+  PlanningSequenceResult,
+  PlanningTimingMode,
   RulePackData,
   ScenarioData,
   ScheduledExpenseData,
@@ -89,20 +181,9 @@ import type {
   TaxStrategyTimelinePoint,
   VehicleIndicatorApplicantData,
   VehicleFinancingOptionData,
-  VehiclePlanData
+  VehiclePlanData,
+  VisualizationBreakdownItem
 } from "./types";
-
-const ACCOUNT_CALIBRATION_TARGET_OPTIONS: Array<{ value: AccountCalibrationTarget; label: string }> = [
-  { value: "cash", label: "现金账户" },
-  { value: "investment", label: "投资账户" },
-  { value: "provident", label: "公积金账户合计" },
-  { value: "pension", label: "养老个人账户合计" },
-  { value: "medical", label: "医保个人账户合计" },
-  { value: "property_asset", label: "房产估值" },
-  { value: "vehicle_asset", label: "车辆估值" },
-  { value: "fixed_asset", label: "固定资产合计" },
-  { value: "total_loan", label: "贷款余额合计" }
-];
 
 const visualColors = {
   cash: "var(--chart-cash)",
@@ -364,12 +445,7 @@ const defaultCarPlan: CarPlanData = {
   beijing_family_indicator_score: 0,
   beijing_family_indicator_estimated_wait_months: null,
   vehicle_plans: [],
-  planning_sequence: 1,
-  purchase_timing_mode: "auto_sequence",
-  after_previous_event_delay_months: 0,
-  manual_purchase_delay_months: 0,
-  planning_window_start_month: "",
-  planning_window_end_month: "",
+  ...vehiclePlanningControlDefaults(0),
   total_price: 0,
   down_payment_ratio: 0.5,
   down_payment: 0,
@@ -439,6 +515,7 @@ const defaultScheduledExpenses: ScheduledExpenseData[] = [
     annual_occurrence_month: 1,
     start_month: "2026-07",
     end_month: null,
+    expense_category: "general",
     medical_account_payable: false,
     tax_deductible_elderly_care: false,
     notes: ""
@@ -453,6 +530,7 @@ const defaultAnnualScheduledExpense: ScheduledExpenseData = {
   annual_occurrence_month: 6,
   start_month: "2026-06",
   end_month: null,
+  expense_category: "general",
   medical_account_payable: false,
   tax_deductible_elderly_care: false,
   notes: "一年一次的大额家庭消费支出，只在指定月份进入现金流。"
@@ -466,6 +544,7 @@ const defaultOneTimeScheduledExpense: ScheduledExpenseData = {
   annual_occurrence_month: 1,
   start_month: "2027-01",
   end_month: "2027-06",
+  expense_category: "general",
   medical_account_payable: false,
   tax_deductible_elderly_care: false,
   notes: "给出可接受时间范围后，后端策略会先按不挤占现金池的保守口径安排到范围内较晚月份。"
@@ -507,6 +586,7 @@ const defaultInvestmentTaxProfile: InvestmentTaxProfileData = {
 };
 
 const defaultChildPlan: ChildPlanData = {
+  planning_goal_id: "",
   name: "子女计划",
   enabled: true,
   timing_mode: "after_first_home",
@@ -684,6 +764,7 @@ function normalizeVehiclePlanData(vehicle: VehiclePlanData): VehiclePlanData {
     selected_financing_max_down_payment_ratio: vehicle.selected_financing_max_down_payment_ratio ?? 1,
     selected_financing_prepayment_allowed: vehicle.selected_financing_prepayment_allowed ?? true,
     selected_financing_prepayment_policy_note: vehicle.selected_financing_prepayment_policy_note ?? "",
+    depends_on_goal_id: vehicle.depends_on_goal_id ?? "",
     planning_window_start_month: vehicle.planning_window_start_month ?? "",
     planning_window_end_month: vehicle.planning_window_end_month ?? "",
     loan_prepayment_enabled: vehicle.loan_prepayment_enabled ?? false,
@@ -761,6 +842,7 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         ...goal,
         priority: goal.priority ?? index + 1,
         planning_mode: goal.planning_mode ?? "after_previous_purchase",
+        depends_on_goal_id: goal.depends_on_goal_id ?? "",
         after_previous_purchase_delay_months: goal.after_previous_purchase_delay_months ?? 0
       })),
       phased_loans: (record.data.phased_loans ?? []).map((loan) => ({
@@ -770,13 +852,17 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
         prepayment_allowed_after_month: loan.prepayment_allowed_after_month ?? 1,
         prepayment_monthly_amount: loan.prepayment_monthly_amount ?? 0
       })),
-      scheduled_expenses: (record.data.scheduled_expenses ?? []).map((expense) => ({
-        ...expense,
-        frequency: expense.frequency ?? "monthly",
-        one_time_timing_mode: expense.one_time_timing_mode ?? "fixed_month",
-        annual_occurrence_month: expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1),
-        medical_account_payable: expense.medical_account_payable ?? false
-      })),
+      scheduled_expenses: (record.data.scheduled_expenses ?? []).map((expense) => {
+        const expenseCategory = expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general");
+        return {
+          ...expense,
+          frequency: expense.frequency ?? "monthly",
+          one_time_timing_mode: expense.one_time_timing_mode ?? "fixed_month",
+          annual_occurrence_month: expense.annual_occurrence_month ?? Number(expense.start_month?.slice(5, 7) || 1),
+          expense_category: expenseCategory,
+          medical_account_payable: expenseCategory === "medical" ? expense.medical_account_payable ?? false : false
+        };
+      }),
       daily_expense_stages: (record.data.daily_expense_stages?.length
         ? record.data.daily_expense_stages
         : [{
@@ -818,10 +904,14 @@ function completeHouseholdDefaults(record: RecordEnvelope<HouseholdData>): Recor
       account_calibrations: (record.data.account_calibrations ?? []).map((item) => ({
         enabled: item.enabled ?? true,
         month: item.month || "2026-07",
+        calibration_scope: item.calibration_scope ?? "account",
         target: item.target ?? "cash",
         amount: item.amount ?? 0,
         member_name: item.member_name ?? "",
         reference_name: item.reference_name ?? "",
+        source_id: item.source_id ?? "",
+        source_category: item.source_category ?? "",
+        source_title: item.source_title ?? "",
         note: item.note ?? ""
       })),
       borrower_member_index: record.data.borrower_member_index ?? 0,
@@ -859,10 +949,12 @@ const noPurchaseScenarioId = "__no_purchase_baseline__";
 
 function createTargetScenarioData(sequence: number): ScenarioData {
   return {
+    planning_goal_id: "",
     name: sequence <= 1 ? "第一套购房需求 · 候选房源 1" : `第 ${sequence} 套购房需求 · 候选房源 1`,
     enabled: true,
     purchase_sequence: Math.max(1, sequence),
-    purchase_planning_mode: sequence <= 1 ? "parallel" : "after_previous_purchase",
+    purchase_planning_mode: homePurchasePlanningModeForSequence(sequence),
+    depends_on_goal_id: "",
     after_previous_purchase_delay_months: 0,
     district: "未设置",
     ring_area: "未设置",
@@ -895,6 +987,9 @@ function createTargetScenarioData(sequence: number): ScenarioData {
     commercial_prepayment_allowed_after_month: 12,
     commercial_prepayment_monthly_amount: 0,
     provident_account_repayment_strategy: "auto",
+    provident_account_repayment_switch_enabled: false,
+    provident_account_repayment_switch_after_month: 12,
+    provident_account_repayment_switch_to_strategy: "semiannual_principal_offset",
     deed_tax_rate: 0.015,
     broker_fee_rate: 0.022,
     seller_tax_pass_through_enabled: false,
@@ -925,7 +1020,8 @@ function completeScenarioDefaults(record: RecordEnvelope<ScenarioData>, index: n
       ...record.data,
       enabled: record.data.enabled ?? true,
       purchase_sequence: record.data.purchase_sequence ?? index + 1,
-      purchase_planning_mode: record.data.purchase_planning_mode ?? (index === 0 ? "parallel" : "after_previous_purchase"),
+      purchase_planning_mode: record.data.purchase_planning_mode ?? homePurchasePlanningModeForSequence(index + 1),
+      depends_on_goal_id: record.data.depends_on_goal_id ?? "",
       after_previous_purchase_delay_months: record.data.after_previous_purchase_delay_months ?? 0,
       investment_withdrawal_mode: record.data.investment_withdrawal_mode ?? "auto",
       investment_min_balance_after_purchase: record.data.investment_min_balance_after_purchase ?? 0,
@@ -934,7 +1030,11 @@ function completeScenarioDefaults(record: RecordEnvelope<ScenarioData>, index: n
       commercial_prepayment_start_month: record.data.commercial_prepayment_start_month ?? 1,
       commercial_prepayment_allowed_after_month: record.data.commercial_prepayment_allowed_after_month ?? 12,
       commercial_prepayment_monthly_amount: commercialPrepaymentMode === "none" ? 0 : record.data.commercial_prepayment_monthly_amount ?? 0,
-      provident_account_repayment_strategy: record.data.provident_account_repayment_strategy ?? "auto"
+      provident_account_repayment_strategy: record.data.provident_account_repayment_strategy ?? "auto",
+      provident_account_repayment_switch_enabled: record.data.provident_account_repayment_switch_enabled ?? false,
+      provident_account_repayment_switch_after_month: record.data.provident_account_repayment_switch_after_month ?? 12,
+      provident_account_repayment_switch_to_strategy:
+        record.data.provident_account_repayment_switch_to_strategy ?? "semiannual_principal_offset"
     }
   };
 }
@@ -1099,7 +1199,8 @@ const parameterExplanations: Record<string, string> = {
   贷款年限: "贷款总年限。公积金贷款还会额外受年龄、房龄、土地年限等政策约束。",
   商贷还款: "商业贷款还款方式。等额本息稳定，等额本金前高后低。",
   公积金还款: "公积金贷款还款方式。会影响首月月供、平均月供和现金流压力。",
-  公积金账户还贷策略: "买房后如何使用公积金账户余额。按月约定提取用于抵扣当期公积金贷月供；半年度冲本金在约定月集中冲抵本金，不能与约定提取同时启用。",
+  公积金账户还贷策略: "买房后如何使用公积金账户余额。按月约定提取用于抵扣当期公积金贷月供；半年度冲还贷在每年 1 月和 7 月约定日集中冲抵本金，不能与约定提取同时启用。",
+  公积金还贷切换: "只在手动选择按月约定提取或半年度冲还贷时生效。切换前后仍保持同一时间只有一种公积金还贷模式。",
   商贷提前还本策略: "选择是否让后端自动生成商贷额外还本。自动模式会比较商贷利率、理财预期净收益、买卖手续费和现金安全垫：只有提前还本的确定性收益更划算时才安排；手动指定则按下方参数固定测算。",
   商贷提前还本上限: "自动模式下作为每月额外还本上限，填 0 表示由系统按商贷本金和现金流自动设定；手动模式下表示每月额外还本金额。",
   希望起始还本月: "从第几个商贷还款月开始额外还本金；若早于合同允许月份，后端会自动顺延。",
@@ -1199,6 +1300,18 @@ const providentAccountRepaymentStrategyLabels: Record<ProvidentAccountRepaymentS
   monthly_repayment_withdrawal: "按月约定提取抵月供",
   semiannual_principal_offset: "半年度冲本金缩期",
   keep_in_account: "留存在公积金账户"
+};
+
+const providentAccountRepaymentSwitchTargetLabels: Record<ProvidentAccountRepaymentSwitchTarget, string> = {
+  monthly_repayment_withdrawal: "按月约定提取抵月供",
+  semiannual_principal_offset: "半年度冲还贷"
+};
+
+const accountCalibrationScopeLabels: Record<AccountCalibrationScope, string> = {
+  account: "账户余额",
+  concept: "重要概念",
+  major_event: "重大事件",
+  strategy_event: "策略事件"
 };
 
 const existingLoanTypeLabels: Record<NonNullable<PhasedLoanData["loan_type"]>, string> = {
@@ -1315,47 +1428,6 @@ function formatAgeFromBirthMonth(value: string | null | undefined, today = new D
   const years = Math.floor(ageInMonths / 12);
   const months = ageInMonths % 12;
   return months > 0 ? `${years}岁${months}个月` : `${years}岁`;
-}
-
-function resolveChildBirthMonth(child: ChildPlanData, today = new Date()) {
-  if (child.birth_month) return parseMonthValue(child.birth_month);
-  if (child.planned_birth_start_month) return parseMonthValue(child.planned_birth_start_month);
-  if (child.planned_birth_end_month) return parseMonthValue(child.planned_birth_end_month);
-  if (child.timing_mode === "manual_month" && child.planned_birth_month) return parseMonthValue(child.planned_birth_month);
-  if (child.timing_mode === "after_first_home" && child.planned_birth_month) return parseMonthValue(child.planned_birth_month);
-  if (child.timing_mode === "after_first_home") return null;
-  return parseMonthValue(child.planned_birth_month);
-}
-
-function childTimingLabel(child: ChildPlanData) {
-  if (child.timing_mode === "after_first_home") return "买房后开始";
-  if (child.timing_mode === "manual_month") return "指定年月";
-  return "暂不纳入";
-}
-
-function childEducationStageLabel(child: ChildPlanData, today = new Date()) {
-  const birth = resolveChildBirthMonth(child, today);
-  if (!birth) return child.timing_mode === "not_planned" ? "暂不规划" : "出生时间待定";
-  const current = { year: today.getFullYear(), month: today.getMonth() + 1 };
-  const ageMonths = compareMonth(current, birth);
-  if (ageMonths < 0) return "未出生";
-  const educationStart = parseMonthValue(child.education_start_month);
-  if (educationStart && compareMonth(current, educationStart) >= 0) {
-    if (ageMonths < 15 * 12) return "中小学阶段";
-    return "高等教育阶段";
-  }
-  if (ageMonths < 36) return "婴幼儿阶段";
-  return "幼儿园阶段";
-}
-
-function childMonthlyCostAt(child: ChildPlanData, today = new Date()) {
-  if (!child.enabled) return 0;
-  const stage = childEducationStageLabel(child, today);
-  if (stage === "婴幼儿阶段") return child.monthly_childcare_cost_before_kindergarten;
-  if (stage === "幼儿园阶段") return child.monthly_kindergarten_cost;
-  if (stage === "中小学阶段") return child.monthly_primary_secondary_cost;
-  if (stage === "高等教育阶段") return child.monthly_higher_education_cost;
-  return 0;
 }
 
 function ageYearsFromBirthMonth(value: string | null | undefined, today = new Date()) {
@@ -1634,11 +1706,162 @@ function userFacingError(action: string, err: unknown) {
   return `${action}失败：${message || "未知错误"}`;
 }
 
+function PlanningFoundationStrip({
+  sequence,
+  contextGoals,
+  contextCoreObjects,
+  planningGoals,
+  accountConcepts,
+  coreObjectGroups,
+  cacheLayers,
+  coreObjects,
+  generatedStrategies,
+  marketSnapshot
+}: {
+  sequence: PlanningSequenceResult | null;
+  contextGoals?: CalculationContextGoalSnapshot[];
+  contextCoreObjects?: CalculationContextCoreObjectSnapshot[];
+  planningGoals?: PlanningGoalRecord[];
+  accountConcepts?: AccountConceptSummary[];
+  coreObjectGroups?: CoreObjectGroupSummary[];
+  cacheLayers?: CacheLayerHashes | null;
+  coreObjects: CoreObjectRecord[];
+  generatedStrategies?: GeneratedStrategyRecord[];
+  marketSnapshot?: RecordEnvelope<MarketSnapshotData> | null;
+}) {
+  const contextGoalItems = contextGoals?.map((goal) => ({
+    id: goal.id,
+    goal_type: goal.goal_type,
+    name: goal.name,
+    sequence_index: goal.sequence_index,
+    normalized_timing_mode: goal.normalized_timing_mode,
+    depends_on_goal_name: goal.depends_on_goal_name,
+    resolved_not_before_month: goal.resolved_not_before_month,
+    explanation: goal.explanation,
+    source: "calculation" as const
+  })) ?? [];
+  const planningGoalItems = planningGoals?.map((goal, index) => ({
+    id: goal.id,
+    goal_type: goal.goal_type,
+    name: goal.data.name,
+    sequence_index: index + 1,
+    normalized_timing_mode: goal.data.timing_mode,
+    depends_on_goal_name: "",
+    resolved_not_before_month: 0,
+    explanation: goal.data.notes,
+    source: "record" as const
+  })) ?? [];
+  const sequenceGoalItems = sequence?.goals.map((goal) => ({
+    id: goal.id,
+    goal_type: goal.goal_type,
+    name: goal.name,
+    sequence_index: goal.sequence_index,
+    normalized_timing_mode: goal.normalized_timing_mode,
+    depends_on_goal_name: goal.depends_on_goal_name,
+    resolved_not_before_month: goal.resolved_not_before_month,
+    explanation: goal.explanation,
+    source: "library" as const
+  })) ?? [];
+  const goalSource = contextGoalItems.length ? "calculation" : sequenceGoalItems.length ? "library" : "record";
+  const goals = (contextGoalItems.length ? contextGoalItems : sequenceGoalItems.length ? sequenceGoalItems : planningGoalItems)
+    .slice(0, 6);
+  const contextObjectItems = contextCoreObjects ?? [];
+  const coreItems = contextObjectItems.length ? contextObjectItems : coreObjects;
+  const groupByCode = coreObjectGroupMap(coreObjectGroups ?? []);
+  const liquidGroup = groupByCode.get(CORE_OBJECT_GROUP_CODES.liquidAssets);
+  const fixedAssetGroup = groupByCode.get(CORE_OBJECT_GROUP_CODES.fixedAssets);
+  const loanGroup = groupByCode.get(CORE_OBJECT_GROUP_CODES.loanAccounts);
+  const restrictedGroup = groupByCode.get(CORE_OBJECT_GROUP_CODES.restrictedAccounts);
+  const foundationGroupCount = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectCountText(group);
+  const foundationGroupBalance = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectBalanceText(group, "后端分组生成后显示");
+  if (!goals.length && !coreItems.length && !(accountConcepts?.length) && !(coreObjectGroups?.length)) return null;
+  const shortHash = (value?: string) => value ? value.slice(0, 7) : "";
+  const cacheLayerLabel = cacheLayers?.input
+    ? `输入 ${shortHash(cacheLayers.input)} · 策略 ${shortHash(cacheLayers.strategy)} · 账本 ${shortHash(cacheLayers.ledger)} · 展示 ${shortHash(cacheLayers.visualization)}`
+    : "";
+  const generatedStrategySummary = generatedStrategyTypeSummary(generatedStrategies ?? []);
+  const generatedStrategySummaryByGoal = generatedStrategySummaryByOwner(generatedStrategies ?? []);
+  const generatedStrategySummaryForGoal = (goalId: string) => generatedStrategySummaryByGoal.get(goalId) ?? "";
+  const coreObjectSummaryByGoal = coreObjectOwnerSummaryByOwner(coreItems);
+  const coreObjectSummaryForGoal = (goalId: string) => coreObjectOwnerSummaryText(coreObjectSummaryByGoal.get(goalId));
+  return (
+    <section className="planning-foundation-strip">
+      <div className="planning-foundation-heading">
+        <Target size={16} />
+        <strong>规划底座</strong>
+        {sequence?.warnings.length ? <span>{sequence.warnings.length} 个顺序提示</span> : <span>{goalSource === "calculation" ? "当前计算上下文" : "目标、账户、资产、贷款统一索引"}</span>}
+        {cacheLayerLabel ? <span className="cache-layer-label">{cacheLayerLabel}</span> : null}
+        {generatedStrategySummary ? <span className="cache-layer-label">策略实体 {generatedStrategySummary}</span> : null}
+      </div>
+      <div className="planning-foundation-content">
+        <div className="foundation-summary-list">
+          <article className="foundation-summary-card">
+            <small>流动资产</small>
+            <strong>{foundationGroupCount(liquidGroup)}</strong>
+            <span>{foundationGroupBalance(liquidGroup)}</span>
+          </article>
+          <article className="foundation-summary-card restricted">
+            <small>受限账户</small>
+            <strong>{foundationGroupCount(restrictedGroup)}</strong>
+            <span>{foundationGroupBalance(restrictedGroup)}</span>
+          </article>
+          <article className="foundation-summary-card asset">
+            <small>目标/资产</small>
+            <strong>{foundationGroupCount(fixedAssetGroup)}</strong>
+            <span>{foundationGroupBalance(fixedAssetGroup)}</span>
+          </article>
+          <article className="foundation-summary-card loan">
+            <small>贷款</small>
+            <strong>{foundationGroupCount(loanGroup)}</strong>
+            <span>{foundationGroupBalance(loanGroup)}</span>
+          </article>
+          <article className="foundation-summary-card market">
+            <small>市场假设</small>
+            <strong>{marketSnapshot?.data.region ?? "未选择"}</strong>
+            <span>
+              {marketSnapshot
+                ? `商贷 ${marketSnapshot.data.commercial_loan_rate !== null ? percent(marketSnapshot.data.commercial_loan_rate) : "按房源"} · 中介 ${marketSnapshot.data.default_broker_fee_rate !== null ? percent(marketSnapshot.data.default_broker_fee_rate) : "按规则"} · 转嫁 ${marketSnapshot.data.seller_tax_pass_through_rate !== null ? percent(marketSnapshot.data.seller_tax_pass_through_rate) : "按规则"}`
+                : "未纳入本次输入"}
+            </span>
+          </article>
+        </div>
+        {goals.length ? (
+          <div className="goal-sequence-list">
+            {goals.map((goal) => (
+              <article key={goal.id} className={`goal-sequence-card${planningGoalIsNotPlanned(goal) ? " muted" : ""}`}>
+                <small>{planningGoalTypeLabel(goal.goal_type)} · {planningGoalOrderLabel(goal)}</small>
+                <strong>{goal.name}</strong>
+                <span>{planningGoalTimingSummary(goal)}</span>
+                {goal.source === "calculation" ? <em>{planningGoalIsNotPlanned(goal) ? "上下文可见" : "已进入本次计算"}</em> : null}
+                {!planningGoalIsNotPlanned(goal) && generatedStrategySummaryForGoal(goal.id) ? (
+                  <em className="strategy-entity-pill">{generatedStrategySummaryForGoal(goal.id)}</em>
+                ) : null}
+                {!planningGoalIsNotPlanned(goal) && coreObjectSummaryForGoal(goal.id) ? (
+                  <em className="core-object-pill">{coreObjectSummaryForGoal(goal.id)}</em>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 
 export function App() {
   const [households, setHouseholds] = useState<RecordEnvelope<HouseholdData>[]>([]);
   const [scenarios, setScenarios] = useState<RecordEnvelope<ScenarioData>[]>([]);
   const [rulePacks, setRulePacks] = useState<RecordEnvelope<RulePackData>[]>([]);
+  const [marketSnapshots, setMarketSnapshots] = useState<RecordEnvelope<MarketSnapshotData>[]>([]);
+  const [planningGoals, setPlanningGoals] = useState<PlanningGoalRecord[]>([]);
+  const [planningSequence, setPlanningSequence] = useState<PlanningSequenceResult | null>(null);
+  const [coreObjects, setCoreObjects] = useState<CoreObjectRecord[]>([]);
+  const [accountConcepts, setAccountConcepts] = useState<AccountConceptSummary[]>([]);
+  const [coreObjectGroups, setCoreObjectGroups] = useState<CoreObjectGroupSummary[]>([]);
+  const [generatedStrategies, setGeneratedStrategies] = useState<GeneratedStrategyRecord[]>([]);
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>(noPurchaseScenarioId);
   const [scenarioResults, setScenarioResults] = useState<Record<string, AffordabilityResult>>({});
   const [selectedPlanVariants, setSelectedPlanVariants] = useState<Record<string, string>>({});
@@ -1664,12 +1887,40 @@ export function App() {
   const household = households[0];
   const selectedScenario = scenarios.find((item) => item.id === selectedScenarioId) ?? scenarios[0] ?? noPurchaseScenario;
   const activeRulePack = rulePacks.find((item) => item.data.status === "active") ?? rulePacks[0];
+  const activeMarketSnapshot = marketSnapshots[0] ?? null;
   const hasCurrentCalculation = calculatedVersion === calculationVersion && !isCalculating;
   const calculationPending = !hasCurrentCalculation;
-  const displayScenarioResults = hasCurrentCalculation ? scenarioResults : {};
+  const displayScenarioResults = useMemo<Record<string, AffordabilityResult>>(() => {
+    if (!hasCurrentCalculation) return {};
+    return Object.fromEntries(Object.entries(scenarioResults).map(([scenarioId, scenarioResult]) => {
+      const scenario = scenarios.find((item) => item.id === scenarioId);
+      const purchasePlans = generatedPurchasePlanAnalyses(generatedStrategies, scenario);
+      return [
+        scenarioId,
+        purchasePlans.length
+          ? { ...scenarioResult, purchase_plan_analyses: purchasePlans }
+          : scenarioResult
+      ];
+    }));
+  }, [generatedStrategies, hasCurrentCalculation, scenarioResults, scenarios]);
   const result = selectedScenario ? displayScenarioResults[selectedScenario.id] ?? null : null;
+  const selectedScenarioPurchasePlansFromEntities = selectedScenario
+    ? generatedPurchasePlanAnalyses(generatedStrategies, selectedScenario)
+    : [];
+  const purchasePlanSourceLabel = selectedScenarioPurchasePlansFromEntities.length ? "后端策略实体" : "计算响应";
+  const planningContextGoals = result?.calculation_context?.planning_goals ?? [];
+  const planningContextCoreObjects = result?.calculation_context?.core_objects ?? [];
   const incomeMembers = household?.data.members ?? [];
   const carPlan = household?.data.car_plan ?? defaultCarPlan;
+  const vehiclePlans = carPlan.vehicle_plans ?? [];
+  const carStrategiesFromEntities = useMemo(
+    () => generatedCarPlanAnalyses(generatedStrategies, vehiclePlans),
+    [generatedStrategies, vehiclePlans]
+  );
+  const carStrategiesForPage = carStrategiesFromEntities.length
+    ? carStrategiesFromEntities
+    : result?.car_plan_analyses ?? [];
+  const carStrategySourceLabel = carStrategiesFromEntities.length ? "后端策略实体" : "计算响应";
   const phasedLoans = household?.data.phased_loans ?? [];
   const scheduledExpenses = household?.data.scheduled_expenses ?? [];
   const dailyExpenseStages = household?.data.daily_expense_stages?.length
@@ -1680,18 +1931,56 @@ export function App() {
     : [defaultRentExpenseStage];
   const elderlyDependents = household?.data.elderly_dependents ?? [];
   const childPlans = household?.data.child_plans ?? [];
+  const childPlanStrategiesFromEntities = useMemo(
+    () => generatedChildPlanStrategies(generatedStrategies, childPlans),
+    [generatedStrategies, childPlans]
+  );
+  const childPlanStrategiesForPage = childPlanStrategiesFromEntities.length
+    ? childPlanStrategiesFromEntities
+    : result?.child_plan_strategies ?? [];
+  const childPlanStrategySourceLabel = childPlanStrategiesFromEntities.length ? "后端策略实体" : "计算响应";
+  const investmentRecommendationsFromEntities = useMemo(
+    () => generatedInvestmentRecommendations(generatedStrategies),
+    [generatedStrategies]
+  );
+  const investmentRecommendationsForPage = investmentRecommendationsFromEntities.length
+    ? investmentRecommendationsFromEntities
+    : result?.investment_plan_recommendations ?? [];
+  const investmentRecommendationSourceLabel = investmentRecommendationsFromEntities.length ? "后端策略实体" : "计算响应";
+  const taxStrategyItemsFromEntities = useMemo(
+    () => generatedTaxStrategyItems(generatedStrategies),
+    [generatedStrategies]
+  );
+  const taxStrategyTimelineFromEntities = useMemo(
+    () => generatedTaxStrategyTimeline(generatedStrategies),
+    [generatedStrategies]
+  );
+  const taxStrategyItemsForPage = taxStrategyItemsFromEntities.length
+    ? taxStrategyItemsFromEntities
+    : result?.tax_strategy_items ?? [];
+  const taxStrategyTimelineForPage = taxStrategyTimelineFromEntities.length
+    ? taxStrategyTimelineFromEntities
+    : result?.tax_strategy_timeline ?? [];
+  const taxStrategySourceLabel =
+    taxStrategyTimelineFromEntities.length || taxStrategyItemsFromEntities.length
+      ? "后端策略实体"
+      : "计算响应";
+  const firstHomeGoalId = useMemo(() => planningGoals.find((goal) => goal.goal_type === "home")?.id ?? "", [planningGoals]);
   const specialDeductions = household?.data.special_deductions ?? [];
   const selectedPlanVariant = selectedScenario
     ? selectedScenario.data.selected_purchase_plan_variant || selectedPlanVariants[selectedScenario.id] || ""
     : "";
+  const selectedScenarioPurchasePlans = selectedScenarioPurchasePlansFromEntities.length
+    ? selectedScenarioPurchasePlansFromEntities
+    : result?.purchase_plan_analyses ?? [];
   const currentRecommendation = useMemo(
-    () => result ? recommendedPurchasePlan(result.purchase_plan_analyses) : null,
-    [result]
+    () => recommendedPurchasePlan(selectedScenarioPurchasePlans),
+    [selectedScenarioPurchasePlans]
   );
   const selectedPlan =
-    result?.purchase_plan_analyses.find((plan) => plan.variant === selectedPlanVariant) ??
+    selectedScenarioPurchasePlans.find((plan) => plan.variant === selectedPlanVariant) ??
     currentRecommendation ??
-    result?.purchase_plan_analyses[0] ??
+    selectedScenarioPurchasePlans[0] ??
     null;
   const scenarioComparisons = useMemo<ScenarioComparison[]>(
     () => scenarios
@@ -1715,7 +2004,9 @@ export function App() {
   const markDirty = (affectsCalculation = true) => {
     dirtyVersionRef.current += 1;
     setSaveState("dirty");
-    if (affectsCalculation) setCalculationVersion((version) => version + 1);
+    if (affectsCalculation) {
+      setCalculationVersion((version) => version + 1);
+    }
   };
 
   const updateHousehold = <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => {
@@ -1726,15 +2017,68 @@ export function App() {
     markDirty(!Object.keys(patch).every((key) => key === "name"));
     setHouseholds((items) => items.map((item, index) => index === 0 ? { ...item, data: { ...item.data, ...patch } } : item));
   };
-  const updateScenario = <K extends keyof ScenarioData>(key: K, value: ScenarioData[K]) => {
-    if (!selectedScenario || selectedScenario.id === noPurchaseScenarioId) return;
-    markDirty(!["selected_purchase_plan_variant", "name", "district", "ring_area"].includes(String(key)));
-    setScenarios((items) => items.map((item) => item.id === selectedScenario.id ? { ...item, data: { ...item.data, [key]: value } } : item));
-  };
+  const applyPlanningFoundation = useCallback((foundation: Awaited<ReturnType<typeof fetchPlanningFoundation>>) => {
+    setPlanningGoals(foundation.planning_goals);
+    setPlanningSequence(foundation.planning_sequence);
+    setCoreObjects(foundation.core_objects);
+    setAccountConcepts(foundation.account_concepts);
+    setCoreObjectGroups(foundation.core_object_groups);
+  }, []);
+  const refreshPlanningFoundation = useCallback(async (householdId: string, options: { clearGeneratedStrategies?: boolean } = {}) => {
+    const [householdRecords, foundation] = await Promise.all([
+      fetchHouseholds(),
+      fetchPlanningFoundation(householdId)
+    ]);
+    setHouseholds(householdRecords.map(completeHouseholdDefaults));
+    applyPlanningFoundation(foundation);
+    if (options.clearGeneratedStrategies) setGeneratedStrategies([]);
+    setCalculationVersion((version) => version + 1);
+  }, [applyPlanningFoundation]);
+  const refreshScenariosAndPlanningFoundation = useCallback(async (householdId: string, options: { clearGeneratedStrategies?: boolean } = {}) => {
+    const [scenarioRecords] = await Promise.all([
+      fetchScenarios(householdId),
+      refreshPlanningFoundation(householdId, options)
+    ]);
+    setScenarios(scenarioRecords.map(completeScenarioDefaults));
+  }, [refreshPlanningFoundation]);
+  const saveHomePlanningGoal = useCallback(async (goalId: string, goalData: PlanningGoalData) => {
+    await savePlanningGoal(goalId, goalData, household?.id ?? null);
+  }, [household?.id]);
+  const refreshHomePlanningGoal = useCallback(() => {
+    if (household?.id) void refreshScenariosAndPlanningFoundation(household.id);
+  }, [household?.id, refreshScenariosAndPlanningFoundation]);
+  const scheduleHomeGoalSave = useDebouncedPlanningGoalSave<ScenarioData>({
+    buildGoalData: homePlanningGoalData,
+    saveGoal: saveHomePlanningGoal,
+    onSaved: refreshHomePlanningGoal,
+    onError: (err) => setError(userFacingError("保存购房目标", err)),
+    ignoreGoalIds: new Set([noPurchaseScenarioId])
+  });
+  const saveChildPlanningGoal = useCallback(async (goalId: string, goalData: PlanningGoalData) => {
+    await savePlanningGoal(goalId, goalData, household?.id ?? null);
+  }, [household?.id]);
+  const refreshChildPlanningGoal = useCallback(() => {
+    if (household?.id) void refreshPlanningFoundation(household.id);
+  }, [household?.id, refreshPlanningFoundation]);
+  const scheduleChildGoalSave = useDebouncedPlanningGoalSave<{ child: ChildPlanData; index: number }>({
+    buildGoalData: ({ child, index }) => childPlanningGoalData(child, index, firstHomeGoalId),
+    saveGoal: saveChildPlanningGoal,
+    onSaved: refreshChildPlanningGoal,
+    onError: (err) => setError(userFacingError("保存子女目标", err))
+  });
   const updateScenarioRecord = (id: string, patch: Partial<ScenarioData>) => {
     if (id === noPurchaseScenarioId) return;
     markDirty(!Object.keys(patch).every((key) => ["selected_purchase_plan_variant", "name", "district", "ring_area"].includes(key)));
-    setScenarios((items) => items.map((item) => item.id === id ? { ...item, data: { ...item.data, ...patch } } : item));
+    setScenarios((items) => items.map((item) => {
+      if (item.id !== id) return item;
+      const nextScenario = { ...item.data, ...patch };
+      scheduleHomeGoalSave(nextScenario.planning_goal_id || id, nextScenario);
+      return { ...item, data: nextScenario };
+    }));
+  };
+  const updateScenario = <K extends keyof ScenarioData>(key: K, value: ScenarioData[K]) => {
+    if (!selectedScenario || selectedScenario.id === noPurchaseScenarioId) return;
+    updateScenarioRecord(selectedScenario.id, { [key]: value } as Partial<ScenarioData>);
   };
   const updateInvestmentAnnualReturn = (annualReturn: number) => {
     markDirty(true);
@@ -1973,25 +2317,113 @@ export function App() {
   const updateElderlyDependent = <K extends keyof ElderlyDependentData>(index: number, key: K, value: ElderlyDependentData[K]) => updateHousehold("elderly_dependents", updateArrayItem(elderlyDependents, index, key, value));
   const addElderlyDependent = () => updateHousehold("elderly_dependents", [...elderlyDependents, { member_name: incomeMembers[0]?.name ?? "成员 1", relationship_label: "直系亲属老人", birth_month: "", is_only_child: false, shared_monthly_deduction: 1500 }]);
   const removeElderlyDependent = (index: number) => updateHousehold("elderly_dependents", elderlyDependents.filter((_, itemIndex) => itemIndex !== index));
-  const updateChildPlan = <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => updateHousehold("child_plans", updateArrayItem(childPlans, index, key, value));
   const updateChildPlanPatch = (index: number, patch: Partial<ChildPlanData>) => {
-    updateHousehold("child_plans", childPlans.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item));
+    const currentChild = childPlans[index];
+    if (!currentChild) return;
+    const nextChild = { ...currentChild, ...patch };
+    const nextChildPlans = childPlans.map((item, itemIndex) => itemIndex === index ? nextChild : item);
+    updateHousehold("child_plans", nextChildPlans);
+    if (nextChild?.planning_goal_id) {
+      scheduleChildGoalSave(nextChild.planning_goal_id, { child: nextChild, index });
+    }
   };
-  const addChildPlan = () => updateHouseholdPatch({
-    child_plans: [
-      ...childPlans,
-      {
-        ...defaultChildPlan,
-        ...childExpensePresets.balanced,
-        name: `子女计划 ${childPlans.length + 1}`
-      }
-    ],
-    child_count: Math.max(household.data.child_count ?? 0, childPlans.length + 1)
-  });
-  const removeChildPlan = (index: number) => updateHouseholdPatch({
-    child_plans: childPlans.filter((_, itemIndex) => itemIndex !== index),
-    child_count: Math.max(0, childPlans.filter((_, itemIndex) => itemIndex !== index).filter((item) => item.enabled).length)
-  });
+  const updateChildPlan = <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => {
+    updateChildPlanPatch(index, { [key]: value } as Partial<ChildPlanData>);
+  };
+  const addChildPlan = async () => {
+    if (!household) return;
+    setSaving(true);
+    setError(null);
+    const child: ChildPlanData = {
+      ...defaultChildPlan,
+      ...childExpensePresets.balanced,
+      name: `子女计划 ${childPlans.length + 1}`
+    };
+    try {
+      await createPlanningGoal(childPlanningGoalData(child, childPlans.length, firstHomeGoalId), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("添加子女目标", err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const removeChildPlan = async (index: number) => {
+    if (!household) return;
+    const child = childPlans[index];
+    if (!child) return;
+    const goalId = child.planning_goal_id;
+    if (!goalId) {
+      updateHouseholdPatch({
+        child_plans: childPlans.filter((_, itemIndex) => itemIndex !== index),
+        child_count: Math.max(0, childPlans.filter((_, itemIndex) => itemIndex !== index).filter((item) => item.enabled).length)
+      });
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await deletePlanningGoal(goalId);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+    } catch (err) {
+      setError(userFacingError("删除子女目标", err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const createVehiclePlanningGoal = useCallback(async (vehicle: VehiclePlanData, index: number): Promise<boolean> => {
+    if (!household) return false;
+    setSaving(true);
+    setError(null);
+    try {
+      await createPlanningGoal(vehiclePlanningGoalData(vehicle, index), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+      return true;
+    } catch (err) {
+      setError(userFacingError("添加车辆需求", err));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [household, refreshPlanningFoundation]);
+  const deleteVehiclePlanningGoal = useCallback(async (goalId: string): Promise<boolean> => {
+    if (!household) return false;
+    setSaving(true);
+    setError(null);
+    try {
+      await deletePlanningGoal(goalId);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id, { clearGeneratedStrategies: true });
+      return true;
+    } catch (err) {
+      setError(userFacingError("删除车辆需求", err));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [household, refreshPlanningFoundation]);
+  const saveVehiclePlanningGoal = useCallback(async (goalId: string, vehicle: VehiclePlanData, index: number): Promise<boolean> => {
+    if (!household) return false;
+    setSaving(true);
+    setError(null);
+    try {
+      await savePlanningGoal(goalId, vehiclePlanningGoalData(vehicle, index), household.id);
+      setSaveState("saved");
+      await refreshPlanningFoundation(household.id);
+      return true;
+    } catch (err) {
+      setError(userFacingError("保存车辆需求", err));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [household, refreshPlanningFoundation]);
+  const savePlanningGoalData = useCallback(async (goalId: string, goalData: PlanningGoalData): Promise<void> => {
+    await savePlanningGoal(goalId, goalData, household?.id ?? null);
+  }, [household?.id]);
   const updateSpecialDeduction = <K extends keyof SpecialDeductionItemData>(index: number, key: K, value: SpecialDeductionItemData[K]) => updateHousehold("special_deductions", updateArrayItem(specialDeductions, index, key, value));
   const addSpecialDeduction = (deductionType: SpecialDeductionItemData["deduction_type"] = "housing_rent") => {
     const labels: Record<SpecialDeductionItemData["deduction_type"], string> = {
@@ -2047,34 +2479,36 @@ export function App() {
   };
 
   const addScenario = async (patch: Partial<ScenarioData> = {}) => {
+    if (!household) return;
     const sequence = Math.max(1, patch.purchase_sequence ?? scenarios.length + 1);
     const created = await createScenario({
       ...createTargetScenarioData(sequence),
       annual_investment_return: selectedScenario.data.annual_investment_return ?? 0.025,
       ...patch
-    });
-    setScenarios((items) => [...items, completeScenarioDefaults(created, items.length)]);
+    }, household.id);
     setSelectedScenarioId(created.id);
-    markDirty(true);
+    await refreshScenariosAndPlanningFoundation(household.id, { clearGeneratedStrategies: true });
   };
   const removeScenario = async (id: string) => {
+    if (!household) return;
     setScenarios((items) => {
       const nextScenarios = items.filter((item) => item.id !== id);
       if (selectedScenarioId === id) setSelectedScenarioId(nextScenarios[0]?.id ?? noPurchaseScenarioId);
       return nextScenarios;
     });
-    markDirty(true);
     await deleteScenario(id);
+    await refreshScenariosAndPlanningFoundation(household.id, { clearGeneratedStrategies: true });
   };
   const removeScenarios = async (ids: string[]) => {
+    if (!household) return;
     const idSet = new Set(ids);
     setScenarios((items) => {
       const nextScenarios = items.filter((item) => !idSet.has(item.id));
       if (idSet.has(selectedScenarioId)) setSelectedScenarioId(nextScenarios[0]?.id ?? noPurchaseScenarioId);
       return nextScenarios;
     });
-    markDirty(true);
     await Promise.all(ids.map((id) => deleteScenario(id)));
+    await refreshScenariosAndPlanningFoundation(household.id, { clearGeneratedStrategies: true });
   };
 
   const runCalculation = useCallback(async () => {
@@ -2085,16 +2519,34 @@ export function App() {
     setError(null);
     try {
       const scenariosForCalculation = scenarios.length > 0 ? scenarios : [noPurchaseScenario];
-      const calculated = await Promise.all(scenariosForCalculation.map(async (scenario) => [scenario.id, await calculateAffordability(household.data, scenario.data, activeRulePack.data)] as const));
+      const calculated = await Promise.all(scenariosForCalculation.map(async (scenario) => [scenario.id, await calculateAffordability(household.id, scenario.id, household.data, scenario.data, activeRulePack.data, activeMarketSnapshot?.data ?? null)] as const));
       if (requestSeq !== calculationSeqRef.current) return;
       setScenarioResults(Object.fromEntries(calculated));
+      const cacheLayerGroups = Array.from(new Map(calculated.map(([, item]) => [
+        `${item.cache_layers.engine}:${item.cache_layers.input}:${item.cache_layers.strategy}:${item.cache_layers.ledger}:${item.cache_layers.visualization}`,
+        item.cache_layers
+      ])).values());
+      let generatedRows: GeneratedStrategyRecord[] | null = null;
+      try {
+        generatedRows = await fetchGeneratedStrategiesByCacheLayers({
+          cache_layers: cacheLayerGroups,
+          current_only: true
+        });
+      } catch {
+        generatedRows = null;
+      }
+      if (requestSeq !== calculationSeqRef.current) return;
+      if (generatedRows !== null) {
+        const generatedRowsById = new Map(generatedRows.map((item) => [item.id, item]));
+        setGeneratedStrategies(Array.from(generatedRowsById.values()));
+      }
       setCalculatedVersion(requestVersion);
     } catch (err) {
       if (requestSeq === calculationSeqRef.current) setError(userFacingError("计算", err));
     } finally {
       if (requestSeq === calculationSeqRef.current) setIsCalculating(false);
     }
-  }, [activeRulePack, calculationVersion, household, scenarios]);
+  }, [activeMarketSnapshot, activeRulePack, calculationVersion, household, scenarios]);
 
   const persistAll = useCallback(async () => {
     if (!household || !activeRulePack) return;
@@ -2116,6 +2568,7 @@ export function App() {
             return savedScenario ? completeScenarioDefaults(savedScenario, index) : item;
           }));
         }
+        applyPlanningFoundation(await fetchPlanningFoundation(savedHousehold.id));
         setRulePacks((items) => items.map((item) => item.id === savedRulePack.id ? savedRulePack : item));
         setSaveState("saved");
       } else {
@@ -2126,23 +2579,31 @@ export function App() {
     } finally {
       setSaving(false);
     }
-  }, [activeRulePack, household, scenarios]);
+  }, [activeRulePack, applyPlanningFoundation, household, scenarios]);
   const previewSource = async () => setSourcePreview(await fetchSourcePreview(sourceUrl));
 
   useEffect(() => {
     let active = true;
     loadInitialData()
-      .then(([householdRecords, scenarioRecords, ruleRecords]) => {
+      .then(async ([householdRecords, scenarioRecords, ruleRecords, marketSnapshotRecords]) => {
         if (!active) return;
         setHouseholds(householdRecords.map(completeHouseholdDefaults));
         setScenarios(scenarioRecords.map(completeScenarioDefaults));
         setRulePacks(ruleRecords);
+        setMarketSnapshots(marketSnapshotRecords);
         setSelectedScenarioId(scenarioRecords[0]?.id ?? noPurchaseScenarioId);
+        const firstHouseholdId = householdRecords[0]?.id;
+        if (firstHouseholdId) {
+          const foundation = await fetchPlanningFoundation(firstHouseholdId);
+          if (active) {
+            applyPlanningFoundation(foundation);
+          }
+        }
       })
       .catch((err) => setError(userFacingError("加载", err)))
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, []);
+  }, [applyPlanningFoundation]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("planner-theme", theme);
@@ -2162,16 +2623,16 @@ export function App() {
   if (!household || !activeRulePack) return <div className="loading-screen">初始化数据缺失</div>;
 
   const pageContent = (() => {
-    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} dailyExpenseStages={dailyExpenseStages} rentExpenseStages={rentExpenseStages} elderlyDependents={elderlyDependents} result={result} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} addAnnualScheduledExpense={addAnnualScheduledExpense} addOneTimeScheduledExpense={addOneTimeScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateDailyExpenseStage={updateDailyExpenseStage} addDailyExpenseStage={addDailyExpenseStage} removeDailyExpenseStage={removeDailyExpenseStage} updateRentExpenseStage={updateRentExpenseStage} addRentExpenseStage={addRentExpenseStage} removeRentExpenseStage={removeRentExpenseStage} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
-    if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} childPlans={childPlans} specialDeductions={specialDeductions} result={result} updateHousehold={updateHousehold} updateChildPlan={updateChildPlan} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
-    if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} updateHousehold={updateHousehold} />;
-    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={result?.child_plan_strategies ?? []} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} addChildPlan={addChildPlan} removeChildPlan={removeChildPlan} />;
-    if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
-    if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} calculationPending={calculationPending} />;
-    if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} calculationPending={calculationPending} />;
+    if (activePage === "家庭财务") return <IncomePage household={household.data} scenario={selectedScenario.data} incomeMembers={incomeMembers} phasedLoans={phasedLoans} scheduledExpenses={scheduledExpenses} dailyExpenseStages={dailyExpenseStages} rentExpenseStages={rentExpenseStages} elderlyDependents={elderlyDependents} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} updateHousehold={updateHousehold} updateIncomeMember={updateIncomeMember} addIncomeMember={addIncomeMember} removeIncomeMember={removeIncomeMember} updateIncomeStage={updateIncomeStage} updateIncomeStagePatch={updateIncomeStagePatch} addIncomeStage={addIncomeStage} removeIncomeStage={removeIncomeStage} updatePhasedLoan={updatePhasedLoan} addPhasedLoan={addPhasedLoan} removePhasedLoan={removePhasedLoan} updateScheduledExpense={updateScheduledExpense} addScheduledExpense={addScheduledExpense} addAnnualScheduledExpense={addAnnualScheduledExpense} addOneTimeScheduledExpense={addOneTimeScheduledExpense} removeScheduledExpense={removeScheduledExpense} updateDailyExpenseStage={updateDailyExpenseStage} addDailyExpenseStage={addDailyExpenseStage} removeDailyExpenseStage={removeDailyExpenseStage} updateRentExpenseStage={updateRentExpenseStage} addRentExpenseStage={addRentExpenseStage} removeRentExpenseStage={removeRentExpenseStage} updateElderlyDependent={updateElderlyDependent} addElderlyDependent={addElderlyDependent} removeElderlyDependent={removeElderlyDependent} />;
+    if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} childPlans={childPlans} specialDeductions={specialDeductions} result={result} taxStrategyItems={taxStrategyItemsForPage} taxStrategyTimeline={taxStrategyTimelineForPage} taxStrategySourceLabel={taxStrategySourceLabel} updateHousehold={updateHousehold} updateChildPlan={updateChildPlan} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
+    if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} generatedStrategies={generatedStrategies} updateHousehold={updateHousehold} />;
+    if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={childPlanStrategiesForPage} childPlanStrategySourceLabel={childPlanStrategySourceLabel} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} addChildPlan={addChildPlan} removeChildPlan={removeChildPlan} />;
+    if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} investmentRecommendations={investmentRecommendationsForPage} investmentRecommendationSourceLabel={investmentRecommendationSourceLabel} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
+    if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} planningSequence={planningSequence} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} purchasePlanSourceLabel={purchasePlanSourceLabel} calculationPending={calculationPending} />;
+    if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} planningSequence={planningSequence} carStrategies={carStrategiesForPage} carStrategySourceLabel={carStrategySourceLabel} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} createVehiclePlanningGoal={createVehiclePlanningGoal} saveVehiclePlanningGoal={saveVehiclePlanningGoal} deleteVehiclePlanningGoal={deleteVehiclePlanningGoal} savePlanningGoalData={savePlanningGoalData} calculationPending={calculationPending} />;
     if (activePage === "政策规则") return <RulePage activeRulePack={activeRulePack.data} ruleNumber={ruleNumber} updateRulePack={updateRulePack} updateRuleParam={updateRuleParam} sourceUrl={sourceUrl} setSourceUrl={setSourceUrl} sourcePreview={sourcePreview} previewSource={() => void previewSource()} saving={saving} />;
-    if (activePage === "可视化") return <VisualizationPage result={result} household={household.data} selectedScenario={selectedScenario} scenarioComparisons={scenarioComparisons} setSelectedScenarioId={setSelectedScenarioId} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} activeRulePack={activeRulePack.data} calculationPending={calculationPending} />;
-    return <ExportPage result={result} scenario={selectedScenario.data} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} runCalculation={runCalculation} />;
+    if (activePage === "可视化") return <VisualizationPage result={result} household={household.data} selectedScenario={selectedScenario} scenarioComparisons={scenarioComparisons} setSelectedScenarioId={setSelectedScenarioId} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} activeRulePack={activeRulePack.data} calculationPending={calculationPending} />;
+    return <ExportPage result={result} scenario={selectedScenario.data} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioPurchasePlans} runCalculation={runCalculation} />;
   })();
 
   return (
@@ -2201,6 +2662,18 @@ export function App() {
           </button>
         ))}
       </nav>
+      <PlanningFoundationStrip
+        sequence={planningSequence}
+        contextGoals={planningContextGoals}
+        contextCoreObjects={planningContextCoreObjects}
+        planningGoals={planningGoals}
+        accountConcepts={result?.account_concepts ?? accountConcepts}
+        coreObjectGroups={result?.core_object_groups ?? coreObjectGroups}
+        cacheLayers={result?.cache_layers ?? null}
+        coreObjects={coreObjects}
+        generatedStrategies={generatedStrategies}
+        marketSnapshot={activeMarketSnapshot}
+      />
       <main className="page-workspace">{pageContent}</main>
     </div>
   );
@@ -2216,6 +2689,8 @@ function IncomePage({
   rentExpenseStages,
   elderlyDependents,
   result,
+  accountConcepts,
+  coreObjectGroups,
   updateHousehold,
   updateIncomeMember,
   addIncomeMember,
@@ -2251,6 +2726,8 @@ function IncomePage({
   rentExpenseStages: RentExpenseStageData[];
   elderlyDependents: ElderlyDependentData[];
   result: AffordabilityResult | null;
+  accountConcepts: AccountConceptSummary[];
+  coreObjectGroups: CoreObjectGroupSummary[];
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
   updateIncomeMember: <K extends keyof IncomeMember>(
     index: number,
@@ -2343,6 +2820,12 @@ function IncomePage({
     const merged = normalizeCareerShockForMembers({ ...careerShock, member_settings: memberSettings }, incomeMembers);
     updateHousehold("career_shock", merged);
   };
+  const updateScheduledExpensePatch = (index: number, patch: Partial<ScheduledExpenseData>) => {
+    updateHousehold(
+      "scheduled_expenses",
+      scheduledExpenses.map((expense, itemIndex) => (itemIndex === index ? { ...expense, ...patch } : expense))
+    );
+  };
   const currentRentStage = rentExpenseStageAt(household, today);
   const currentMonthlyExpense = householdExpenseAt(household, today, 0);
   const currentRentCashCost = currentRentStage ? rentStageCashCostAt(currentRentStage, today) : 0;
@@ -2363,8 +2846,26 @@ function IncomePage({
   const derivedExistingMortgageCount = incomeMembers.reduce((sum, member) => sum + (member.existing_mortgage_count ?? 0), 0) || household.existing_mortgage_count || 0;
   const derivedInitialCashBalance = incomeMembers.reduce((sum, member) => sum + (member.initial_cash_balance ?? 0), 0);
   const derivedInitialInvestments = incomeMembers.reduce((sum, member) => sum + (member.initial_investments ?? 0), 0);
-  const derivedOtherAssetValue = incomeMembers.reduce((sum, member) => sum + (member.initial_other_asset_value ?? 0), 0);
-  const derivedOtherDebtBalance = incomeMembers.reduce((sum, member) => sum + (member.initial_other_debt_balance ?? 0), 0);
+  const conceptByCode = accountConceptMap(accountConcepts);
+  const coreGroupByCode = coreObjectGroupMap(coreObjectGroups);
+  const liquidAssetGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.liquidAssets);
+  const restrictedAccountGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.restrictedAccounts);
+  const fixedAssetGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.fixedAssets);
+  const loanAccountGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.loanAccounts);
+  const accountDashboardConcepts = dashboardAccountConcepts(accountConcepts);
+  const coreGroupMetricValue = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectBalanceText(group);
+  const coreGroupCountText = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectCountText(group);
+  const conceptMetricValue = (code: string) => coreObjectBalanceText(conceptByCode.get(code));
+  const investmentAccountBalanceText = accountConceptBalanceTextWithHouseholdFallback(
+    accountConcepts,
+    ACCOUNT_CONCEPT_CODES.investment,
+    household
+  );
+  const accountSetupDone =
+    Boolean(liquidAssetGroup || restrictedAccountGroup) &&
+    ((liquidAssetGroup?.current_balance ?? 0) > 0 || (restrictedAccountGroup?.current_balance ?? 0) > 0);
   const memberCompositionText = incomeMembers.length > 0
     ? `${incomeMembers.length} 人：${incomeMembers.map((member) => member.name || "未命名成员").join("、")}`
     : "待添加成员";
@@ -2407,13 +2908,13 @@ function IncomePage({
   const setupChecklist = [
     { label: "家庭成员与工资阶段", done: incomeMembers.some((member) => incomeStagesForMember(member).some((stage) => stage.monthly_salary_gross > 0 || stage.annual_bonus > 0)) },
     { label: "日常、租房与计划支出", done: dailyExpenseStages.some((stage) => stage.base_living_expense > 0) || rentExpenseStages.some((stage) => stage.rent_amount > 0) || scheduledExpenses.some((expense) => expense.monthly_amount > 0) },
-    { label: "现金、投资和成员公积金账户", done: household.cash_account_balance > 0 || household.investments > 0 || incomeMembers.some((member) => (member.provident_fund_balance ?? 0) > 0) },
+    { label: "账户与安全垫核心对象", done: accountSetupDone },
     { label: "已有贷款、赡养扣除和职业冲击", done: phasedLoans.length > 0 || elderlyDependents.length > 0 || Boolean(household.career_shock?.enabled) },
   ];
   const memberIncomeSection = (
     <section className="form-panel">
       <div className="member-header">
-        <PanelTitle icon={<Banknote size={18} />} title="成员工资与收入阶段" />
+        <PanelTitle icon={<Banknote size={18} />} title="成员工资与收入阶段" collapsible />
         <span className="section-subtle-note">成员增删、出生年月和年龄在家庭画像中维护</span>
       </div>
       <div className="member-list roomy">
@@ -2790,7 +3291,7 @@ function IncomePage({
 
   const assetCashSection = (
     <section className="form-panel income-workbench-card account-panel">
-      <PanelTitle icon={<ShieldCheck size={18} />} title="账户与安全垫" />
+      <PanelTitle icon={<ShieldCheck size={18} />} title="账户与安全垫" collapsible />
       <div className="form-grid two">
         <NumberField
           label="当前可动用现金"
@@ -2816,16 +3317,58 @@ function IncomePage({
         />
       </div>
       <div className="account-member-balances">
-        <strong className="setting-group-title">成员政策账户概览</strong>
+        <strong className="setting-group-title">后端核心对象摘要</strong>
         <div className="read-only-grid">
-          <Metric label="公积金账户合计" value={money(incomeMembers.reduce((sum, member) => sum + (member.provident_account_enabled ? member.provident_fund_balance ?? 0 : 0), 0))} />
-          <Metric label="养老个人账户合计" value={money(incomeMembers.reduce((sum, member) => sum + (member.pension_account_enabled ? member.pension_account_balance ?? 0 : 0), 0))} />
-          <Metric label="医保个人账户合计" value={money(incomeMembers.reduce((sum, member) => sum + (member.medical_account_enabled ? member.medical_account_balance ?? 0 : 0), 0))} />
-          <Metric label="个人养老金账户合计" value={money(incomeMembers.reduce((sum, member) => sum + (member.personal_pension_account_enabled ? member.personal_pension_account_balance ?? 0 : 0), 0))} />
+          <Metric
+            label="流动资产"
+            value={coreGroupMetricValue(liquidAssetGroup)}
+          />
+          <Metric
+            label="政策受限账户"
+            value={coreGroupMetricValue(restrictedAccountGroup)}
+          />
+          <Metric
+            label="固定资产与目标"
+            value={coreGroupMetricValue(fixedAssetGroup)}
+          />
+          <Metric
+            label="贷款账户"
+            value={coreGroupMetricValue(loanAccountGroup)}
+          />
         </div>
+        <div className="read-only-grid">
+          <Metric
+            label="现金账户"
+            value={conceptMetricValue(ACCOUNT_CONCEPT_CODES.cash)}
+          />
+          <Metric
+            label="投资账户"
+            value={investmentAccountBalanceText}
+          />
+          <Metric
+            label="公积金账户"
+            value={conceptMetricValue(ACCOUNT_CONCEPT_CODES.provident)}
+          />
+          <Metric
+            label="养老医保账户"
+            value={coreObjectBalanceText(conceptByCode.get(ACCOUNT_CONCEPT_CODES.socialSecurity))}
+          />
+        </div>
+        {accountDashboardConcepts.length ? (
+          <div className="setup-steps concept-chip-row">
+            {accountDashboardConcepts.map((concept) => (
+              <span className="setup-step done" key={concept.code}>
+                {concept.name} {coreObjectCountText(concept)}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        <p className="field-hint compact">
+          核心对象数量：流动资产 {coreGroupCountText(liquidAssetGroup)}，受限账户 {coreGroupCountText(restrictedAccountGroup)}，固定资产/目标 {coreGroupCountText(fixedAssetGroup)}，贷款 {coreGroupCountText(loanAccountGroup)}。
+        </p>
       </div>
       <p className="field-hint">
-        现金和投资账户按当前家庭合计填写；成员公积金、基本养老、医保和个人养老金账户在家庭画像的成员卡片里统一维护。实际账户余额和模型不一致时，请到“记账校准”页面按月份校准账户。
+        可编辑输入仍按真实账户填写；上方只读摘要来自后端核心对象分组，和规划底座、导出表、可视化概念保持同一口径。实际账户余额和模型不一致时，请到“记账校准”页面按月份校准账户。
       </p>
     </section>
   );
@@ -2837,7 +3380,7 @@ function IncomePage({
       summary={<p>按“家庭画像 → 成员与账户 → 收入阶段 → 支出阶段 → 已有贷款”的顺序维护基础数据；计算结果和账户校准不要混在画像字段里。</p>}
     >
       <section className="form-panel setup-guide">
-        <PanelTitle icon={<Sparkles size={18} />} title="初始化指引" />
+        <PanelTitle icon={<Sparkles size={18} />} title="初始化指引" collapsible />
         <p className="field-hint">
           首次使用建议按下面顺序填写家庭画像、收入支出、资产负债和计划目标，完成后点击“保存本地”写入本机数据库。
         </p>
@@ -2853,7 +3396,7 @@ function IncomePage({
 
       <div className="income-overview-grid profile-only">
         <section className="form-panel income-overview-panel household-profile-panel">
-          <PanelTitle icon={<ClipboardCheck size={18} />} title="家庭画像" />
+          <PanelTitle icon={<ClipboardCheck size={18} />} title="家庭画像" collapsible />
           <div className="profile-summary-grid">
             <Metric label="成员组成" value={memberCompositionText} />
             <Metric label="成员年龄" value={memberAgeText} />
@@ -3240,7 +3783,7 @@ function IncomePage({
       <div className="income-detail-grid">
       <section className="form-panel income-workbench-card expense-panel">
         <div className="member-header">
-          <PanelTitle icon={<WalletCards size={18} />} title="家庭支出" />
+          <PanelTitle icon={<WalletCards size={18} />} title="家庭支出" collapsible />
           <div className="header-actions">
             <button className="ghost-button" onClick={addDailyExpenseStage}>
               <Plus size={16} /> 新增日常阶段
@@ -3505,12 +4048,33 @@ function IncomePage({
                     onChange={(event) => updateScheduledExpense(index, "end_month", event.target.value || null)}
                   />
                 </Field>
-                <SwitchField
-                  label={expense.medical_account_payable ? "医保账户可支付" : "现金账户支付"}
-                  checked={expense.medical_account_payable ?? false}
-                  onChange={(checked) => updateScheduledExpense(index, "medical_account_payable", checked)}
-                  description="仅对明确属于医保个人账户可支付的医疗支出生效；医保余额不足的部分仍进入现金支出。"
-                />
+                <Field label="支出口径">
+                  <select
+                    value={expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general")}
+                    onChange={(event) => {
+                      const expenseCategory = event.target.value as ScheduledExpenseData["expense_category"];
+                      updateScheduledExpensePatch(index, {
+                        expense_category: expenseCategory,
+                        medical_account_payable: expenseCategory === "medical" ? expense.medical_account_payable ?? false : false
+                      });
+                    }}
+                  >
+                    <option value="general">普通家庭支出</option>
+                    <option value="medical">医疗支出</option>
+                  </select>
+                </Field>
+                {(expense.expense_category ?? (expense.medical_account_payable ? "medical" : "general")) === "medical" ? (
+                  <>
+                    <SwitchField
+                      label={expense.medical_account_payable ? "医保账户可支付" : "现金账户支付"}
+                      checked={expense.medical_account_payable ?? false}
+                      onChange={(checked) => updateScheduledExpense(index, "medical_account_payable", checked)}
+                    />
+                    <p className="field-hint form-grid-note">
+                      仅对明确属于医保个人账户可支付的医疗支出生效；医保余额不足的部分仍进入现金支出。
+                    </p>
+                  </>
+                ) : null}
               </div>
               <p className="expense-note-display">
                 {expense.notes || ((expense.frequency ?? "monthly") === "one_time" && (expense.one_time_timing_mode ?? "fixed_month") === "flexible_range"
@@ -3530,15 +4094,14 @@ function IncomePage({
       {assetCashSection}
 
       <section className="form-panel income-workbench-card career-panel">
-        <PanelTitle icon={<AlertTriangle size={18} />} title="职业冲击自缴支出规则" />
+        <PanelTitle icon={<AlertTriangle size={18} />} title="职业冲击自缴支出规则" collapsible />
         <div className="loan-summary-strip">
           <Metric label="启用职业冲击成员" value={careerShockSummaryText} tone={activeCareerShockSettings.length > 0 ? "warn" : undefined} />
           <Metric label="失业金月数" value={`${estimatedUnemploymentBenefitMonths} 个月`} />
           <Metric label="自缴社保/月" value={money(estimatedSelfSocialInsuranceMonthly)} />
           <Metric label="自缴公积金/月" value={money(estimatedFlexibleHousingFundMonthly)} />
         </div>
-        <div className="setting-group">
-          <strong className="setting-group-title">后端自动估算口径</strong>
+        <CollapsibleSettingGroup title="后端自动估算口径">
           <div className="switch-grid">
             <SwitchField
               label="自动估算失业保险待遇"
@@ -3575,12 +4138,12 @@ function IncomePage({
           <p className="field-hint">
             成员是否启用职业冲击、裁员年龄、冲击期自由职业收入和手动养老金，已经合并到上方“成员工资与收入阶段”的职业冲击收入阶段。这里仅配置无法由成员阶段表达的全局政策估算口径；自缴社保和自缴公积金会作为按人月度家庭支出进入后端现金流和可视化。
           </p>
-        </div>
+        </CollapsibleSettingGroup>
       </section>
 
       <section className="form-panel income-workbench-card elderly-panel">
         <div className="member-header">
-          <PanelTitle icon={<ShieldCheck size={18} />} title="赡养老人专项扣除" />
+          <PanelTitle icon={<ShieldCheck size={18} />} title="赡养老人专项扣除" collapsible />
           <button className="ghost-button" onClick={addElderlyDependent}>
             <Plus size={16} /> 新增老人
           </button>
@@ -3664,7 +4227,7 @@ function IncomePage({
 
       <section className="form-panel income-workbench-card current-loans-panel income-span-full">
         <div className="member-header">
-          <PanelTitle icon={<WalletCards size={18} />} title="已有贷款" />
+          <PanelTitle icon={<WalletCards size={18} />} title="已有贷款" collapsible />
           <button className="ghost-button" onClick={addPhasedLoan}>
             <Plus size={16} /> 新增贷款
           </button>
@@ -3825,15 +4388,64 @@ function IncomePage({
 function AccountCalibrationPage({
   household,
   result,
+  accountConcepts,
+  coreObjectGroups,
+  generatedStrategies,
   updateHousehold
 }: {
   household: HouseholdData;
   result: AffordabilityResult | null;
+  accountConcepts: AccountConceptSummary[];
+  coreObjectGroups: CoreObjectGroupSummary[];
+  generatedStrategies: GeneratedStrategyRecord[];
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
 }) {
   const today = new Date();
   const accountCalibrations = household.account_calibrations ?? [];
   const currentMonthText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+  const coreGroupByCode = coreObjectGroupMap(coreObjectGroups);
+  const liquidAssetGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.liquidAssets);
+  const restrictedAccountGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.restrictedAccounts);
+  const fixedAssetGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.fixedAssets);
+  const loanAccountGroup = coreGroupByCode.get(CORE_OBJECT_GROUP_CODES.loanAccounts);
+  const defaultCalibrationAmount = (target: AccountCalibrationTarget) => {
+    return calibrationDefaultAmountFromConcepts(
+      accountConcepts,
+      coreObjectGroups,
+      target,
+      calibrationFallbackAmountFromHousehold(household, target)
+    );
+  };
+  const monthValueFromIndex = (monthIndex: number) => {
+    const targetDate = addMonths(today, Math.max(0, monthIndex));
+    return `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, "0")}`;
+  };
+  const targetForEventCategory = (category: string): AccountCalibrationTarget => {
+    if (category === "loan") return "total_loan";
+    if (category === "provident") return "provident";
+    if (category === "investment") return "investment";
+    if (category === "home_purchase") return "property_asset";
+    if (category === "vehicle") return "vehicle_asset";
+    if (category === "renovation") return "fixed_asset";
+    return "cash";
+  };
+  const targetForConceptCode = (code: string): AccountCalibrationTarget | null => {
+    if (code === ACCOUNT_CONCEPT_CODES.cash) return "cash";
+    if (code === ACCOUNT_CONCEPT_CODES.investment) return "investment";
+    if (code === ACCOUNT_CONCEPT_CODES.provident) return "provident";
+    if (code === ACCOUNT_CONCEPT_CODES.pension) return "pension";
+    if (code === ACCOUNT_CONCEPT_CODES.medical) return "medical";
+    if (code === ACCOUNT_CONCEPT_CODES.fixedAsset) return "fixed_asset";
+    if (code === ACCOUNT_CONCEPT_CODES.loan) return "total_loan";
+    return null;
+  };
+  const targetForStrategyType = (strategyType: GeneratedStrategyRecord["strategy_type"]): AccountCalibrationTarget => {
+    if (strategyType === "purchase") return "property_asset";
+    if (strategyType === "vehicle") return "vehicle_asset";
+    if (strategyType === "investment") return "investment";
+    if (strategyType === "tax" || strategyType === "career_shock") return "cash";
+    return "fixed_asset";
+  };
   const updateAccountCalibration = <K extends keyof AccountCalibrationData>(
     index: number,
     key: K,
@@ -3843,30 +4455,63 @@ function AccountCalibrationPage({
       itemIndex === index ? { ...item, [key]: value } : item
     )));
   };
-  const addAccountCalibration = (target: AccountCalibrationTarget = "cash") => {
-    const defaultAmountByTarget: Record<AccountCalibrationTarget, number> = {
-      cash: household.cash_account_balance ?? 0,
-      investment: household.investments ?? 0,
-      provident: household.members.reduce((sum, member) => sum + (member.provident_account_enabled ? member.provident_fund_balance ?? 0 : 0), 0),
-      pension: household.members.reduce((sum, member) => sum + (member.pension_account_enabled ? member.pension_account_balance ?? 0 : 0), 0),
-      medical: household.members.reduce((sum, member) => sum + (member.medical_account_enabled ? member.medical_account_balance ?? 0 : 0), 0),
-      property_asset: 0,
-      vehicle_asset: 0,
-      fixed_asset: household.members.reduce((sum, member) => sum + (member.initial_other_asset_value ?? 0), 0),
-      total_loan: household.phased_loans.reduce((sum, loan) => sum + (loan.principal ?? 0), 0)
-    };
+  const addAccountCalibration = (target: AccountCalibrationTarget = "cash", patch: Partial<AccountCalibrationData> = {}) => {
     updateHousehold("account_calibrations", [
       ...accountCalibrations,
       {
         enabled: true,
         month: currentMonthText,
+        calibration_scope: "account",
         target,
-        amount: defaultAmountByTarget[target] ?? 0,
+        amount: defaultCalibrationAmount(target),
         member_name: "",
         reference_name: "",
-        note: ""
+        source_id: "",
+        source_category: "",
+        source_title: "",
+        note: "",
+        ...patch
       }
     ]);
+  };
+  const addConceptCalibration = (concept: AccountConceptSummary) => {
+    const target = targetForConceptCode(concept.code);
+    if (!target) return;
+    addAccountCalibration(target, {
+      calibration_scope: "concept",
+      amount: concept.current_balance,
+      source_id: concept.code,
+      source_category: concept.category,
+      source_title: concept.name,
+      reference_name: concept.name,
+      note: `${concept.name}按后端账户概念摘要校准`
+    });
+  };
+  const addEventCalibration = (event: NonNullable<AffordabilityResult["plan_events"]>[number]) => {
+    const target = targetForEventCategory(event.category);
+    addAccountCalibration(target, {
+      calibration_scope: "major_event",
+      month: monthValueFromIndex(event.month),
+      amount: Math.max(0, event.amount ?? defaultCalibrationAmount(target)),
+      source_id: `${event.plan_variant}:${event.month}:${event.title}`,
+      source_category: event.category,
+      source_title: event.title,
+      reference_name: event.title,
+      note: event.detail
+    });
+  };
+  const addStrategyCalibration = (strategy: GeneratedStrategyRecord) => {
+    const target = targetForStrategyType(strategy.strategy_type);
+    const title = `${generatedStrategyTypeLabel(strategy.strategy_type)}策略：${strategy.variant || strategy.strategy_key}`;
+    addAccountCalibration(target, {
+      calibration_scope: "strategy_event",
+      amount: defaultCalibrationAmount(target),
+      source_id: strategy.id,
+      source_category: strategy.strategy_type,
+      source_title: title,
+      reference_name: title,
+      note: `策略键 ${strategy.strategy_key}${strategy.owner_key ? `，归属 ${strategy.owner_key}` : ""}`
+    });
   };
   const removeAccountCalibration = (index: number) => {
     updateHousehold("account_calibrations", accountCalibrations.filter((_, itemIndex) => itemIndex !== index));
@@ -3878,10 +4523,21 @@ function AccountCalibrationPage({
   };
   const enabledCount = accountCalibrations.filter((item) => item.enabled).length;
   const latestSnapshot = result?.account_snapshots?.[result.account_snapshots.length - 1];
+  const coreGroupMetricValue = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectBalanceText(group);
+  const coreGroupCountText = (group: CoreObjectGroupSummary | undefined) =>
+    coreObjectCountText(group, "个对象");
   const targetSummary = ACCOUNT_CALIBRATION_TARGET_OPTIONS.map((option) => ({
     ...option,
     count: accountCalibrations.filter((item) => item.target === option.value).length
   })).filter((item) => item.count > 0);
+  const conceptCalibrationOptions = accountConcepts
+    .filter((concept) => targetForConceptCode(concept.code))
+    .slice(0, 8);
+  const majorEventCalibrationOptions = (result?.plan_events ?? [])
+    .filter((event) => event.category !== "account")
+    .slice(0, 8);
+  const strategyCalibrationOptions = generatedStrategies.slice(0, 8);
 
   return (
     <div className="page-stack account-calibration-page">
@@ -3907,11 +4563,16 @@ function AccountCalibrationPage({
         <div className="metric-grid">
           <Metric label="校准记录" value={`${accountCalibrations.length} 条`} />
           <Metric label="启用记录" value={`${enabledCount} 条`} tone={enabledCount > 0 ? "good" : undefined} />
-          <Metric label="当前现金账户" value={money(household.cash_account_balance)} />
-          <Metric label="当前投资账户" value={money(household.investments)} />
+          <Metric label="当前流动资产" value={coreGroupMetricValue(liquidAssetGroup)} />
+          <Metric label="政策受限账户" value={coreGroupMetricValue(restrictedAccountGroup)} />
+          <Metric label="固定资产与目标" value={coreGroupMetricValue(fixedAssetGroup)} />
+          <Metric label="贷款账户" value={coreGroupMetricValue(loanAccountGroup)} />
           <Metric label="测算末月现金" value={latestSnapshot ? money(latestSnapshot.cash_balance) : "等待计算"} />
           <Metric label="测算末月贷款" value={latestSnapshot ? money(latestSnapshot.total_loan_balance) : "等待计算"} />
         </div>
+        <p className="field-hint">
+          当前对象摘要来自后端核心对象分组：流动资产 {coreGroupCountText(liquidAssetGroup)}，受限账户 {coreGroupCountText(restrictedAccountGroup)}，固定资产/目标 {coreGroupCountText(fixedAssetGroup)}，贷款 {coreGroupCountText(loanAccountGroup)}。新增校准默认金额优先取后端账户概念，只有后端摘要尚未同步时才回退到本页输入值。
+        </p>
         <div className="quick-action-row">
           {ACCOUNT_CALIBRATION_TARGET_OPTIONS.slice(0, 5).map((option) => (
             <button className="ghost-button" type="button" key={option.value} onClick={() => addAccountCalibration(option.value)}>
@@ -3919,6 +4580,33 @@ function AccountCalibrationPage({
             </button>
           ))}
         </div>
+        {conceptCalibrationOptions.length ? (
+          <div className="quick-action-row">
+            {conceptCalibrationOptions.map((concept) => (
+              <button className="ghost-button" type="button" key={concept.code} onClick={() => addConceptCalibration(concept)}>
+                <Plus size={15} /> {concept.name}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {majorEventCalibrationOptions.length ? (
+          <div className="quick-action-row">
+            {majorEventCalibrationOptions.map((event, index) => (
+              <button className="ghost-button" type="button" key={`${event.plan_variant}-${event.month}-${event.title}-${index}`} onClick={() => addEventCalibration(event)}>
+                <Plus size={15} /> {formatMonthDate(today, event.month)} · {event.title}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {strategyCalibrationOptions.length ? (
+          <div className="quick-action-row">
+            {strategyCalibrationOptions.map((strategy) => (
+              <button className="ghost-button" type="button" key={strategy.id} onClick={() => addStrategyCalibration(strategy)}>
+                <Plus size={15} /> {generatedStrategyTypeLabel(strategy.strategy_type)} · {strategy.variant || strategy.strategy_key}
+              </button>
+            ))}
+          </div>
+        ) : null}
         {targetSummary.length ? (
           <div className="setup-steps">
             {targetSummary.map((item) => (
@@ -3947,6 +4635,16 @@ function AccountCalibrationPage({
                     onChange={(event) => updateAccountCalibration(index, "month", event.target.value)}
                   />
                 </Field>
+                <Field label="校准范围">
+                  <select
+                    value={calibration.calibration_scope ?? "account"}
+                    onChange={(event) => updateAccountCalibration(index, "calibration_scope", event.target.value as AccountCalibrationScope)}
+                  >
+                    {Object.entries(accountCalibrationScopeLabels).map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                </Field>
                 <Field label="校准对象">
                   <select
                     value={calibration.target}
@@ -3957,6 +4655,15 @@ function AccountCalibrationPage({
                     ))}
                   </select>
                 </Field>
+                {(calibration.calibration_scope ?? "account") !== "account" ? (
+                  <Field label="来源事件/策略">
+                    <input
+                      value={calibration.source_title || calibration.reference_name}
+                      placeholder="如购房交易、购车策略、贷款切换"
+                      onChange={(event) => updateAccountCalibration(index, "source_title", event.target.value)}
+                    />
+                  </Field>
+                ) : null}
                 <NumberField
                   label="真实余额/估值"
                   value={calibration.amount}
@@ -3990,6 +4697,7 @@ function ChildPlanPage({
   incomeMembers,
   childPlans,
   childPlanStrategies,
+  childPlanStrategySourceLabel,
   updateChildPlan,
   updateChildPlanPatch,
   addChildPlan,
@@ -3998,6 +4706,7 @@ function ChildPlanPage({
   incomeMembers: IncomeMember[];
   childPlans: ChildPlanData[];
   childPlanStrategies: ChildPlanStrategyPoint[];
+  childPlanStrategySourceLabel: string;
   updateChildPlan: <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => void;
   updateChildPlanPatch: (index: number, patch: Partial<ChildPlanData>) => void;
   addChildPlan: () => void;
@@ -4007,21 +4716,21 @@ function ChildPlanPage({
   const activeChildIndex = childPlans.length ? Math.min(selectedChildIndex, childPlans.length - 1) : 0;
   const activeChild = childPlans[activeChildIndex] ?? null;
   const today = useMemo(() => new Date(), []);
-  const enabledChildren = childPlans.filter((child) => child.enabled).length;
-  const plannedChildren = childPlans.filter((child) => child.timing_mode !== "not_planned").length;
+  const includedChildren = childPlans.filter(childPlanIsIncludedInPlanning).length;
+  const plannedChildren = childPlans.filter(childPlanHasPlanningTiming).length;
   const totalCurrentMonthlyCost = childPlans
-    .filter((child) => child.enabled)
+    .filter(childPlanIsIncludedInPlanning)
     .reduce((sum, child) => sum + childMonthlyCostAt(child, today), 0);
   const nextBirth = childPlans
-    .map((child) => resolveChildBirthMonth(child, today))
+    .map((child) => resolveChildBirthMonth(child))
     .filter((item): item is { year: number; month: number } => Boolean(item))
     .sort(compareMonth)[0];
-  const strategyByName = new Map(childPlanStrategies.map((item) => [item.child_name, item]));
+  const strategyForChild = (child: ChildPlanData) => childPlanStrategyForChild(childPlanStrategies, child);
   const advisorText = childPlans.length === 0
     ? "当前没有子女目标。先添加计划，系统会把出生时间、教育阶段和养育支出放进家庭现金流。"
-    : enabledChildren === 0
+    : includedChildren === 0
       ? "已有子女目标都未纳入当前规划，现金流暂不受影响；需要测算时打开对应目标。"
-      : `已有 ${enabledChildren} 个子女目标进入测算，当前口径下月度养育支出约 ${money(totalCurrentMonthlyCost)}。`;
+      : `已有 ${includedChildren} 个子女目标进入测算，当前口径下月度养育支出约 ${money(totalCurrentMonthlyCost)}。`;
 
   return (
     <PlannerPageShell
@@ -4033,7 +4742,7 @@ function ChildPlanPage({
         <div className="strategy-hero-main">
           <div className="recommend-title">
             <h3>养娃策略</h3>
-            <span>{enabledChildren ? "测算中" : "待添加"}</span>
+            <span>{includedChildren ? "测算中" : "待添加"}</span>
           </div>
           <p>{advisorText}</p>
           <div className="advisor-note-list child-advisor-notes">
@@ -4042,9 +4751,10 @@ function ChildPlanPage({
           </div>
         </div>
         <div className="strategy-hero-side">
-          <Metric label="纳入规划子女" value={`${enabledChildren} 人`} />
+          <Metric label="纳入规划子女" value={`${includedChildren} 人`} />
           <Metric label="已有子女计划" value={`${childPlans.length} 项`} />
           <Metric label="计划中子女" value={`${plannedChildren} 项`} />
+          <Metric label="策略来源" value={childPlanStrategySourceLabel} />
           <Metric label="当前月度养育支出" value={money(totalCurrentMonthlyCost)} />
           <Metric label="下一次出生节点" value={nextBirth ? `${nextBirth.year}年${nextBirth.month}月` : "未安排"} tone={nextBirth ? "good" : undefined} />
         </div>
@@ -4071,19 +4781,20 @@ function ChildPlanPage({
         ) : (
           <div className="child-goal-grid horizontal-card-list">
             {childPlans.map((child, index) => {
-              const strategy = strategyByName.get(child.name);
-              const birth = resolveChildBirthMonth(child, today);
+              const strategy = strategyForChild(child);
+              const birth = resolveChildBirthMonth(child);
               const ageText = child.birth_month ? formatAgeFromBirthMonth(child.birth_month, today) : (birth ? "计划中" : "待安排");
               const stageLabel = childEducationStageLabel(child, today);
               const monthlyCost = childMonthlyCostAt(child, today);
+              const includedInPlanning = childPlanIsIncludedInPlanning(child);
               return (
-                <article className={`${child.enabled ? "planning-goal-card child-goal-card" : "planning-goal-card child-goal-card"} ${index === activeChildIndex ? "active" : ""}`} key={`child-goal-${index}`}>
+                <article className={`planning-goal-card child-goal-card ${index === activeChildIndex ? "active" : ""}`} key={`child-goal-${index}`}>
                   <button className="planning-goal-select" type="button" onClick={() => setSelectedChildIndex(index)}>
-                    <span className={child.enabled ? "goal-status enabled" : "goal-status paused"}>
-                      {child.enabled ? "纳入规划" : "暂停测算"}
+                    <span className={includedInPlanning ? "goal-status enabled" : "goal-status paused"}>
+                      {planningInclusionStatusLabel(includedInPlanning, child.enabled, { disabledLabel: "暂停测算" })}
                     </span>
                     <strong>{child.name || `子女目标 ${index + 1}`}</strong>
-                    <small>{childTimingLabel(child)} · {strategy?.birth_month_label || (birth ? `${birth.year}年${birth.month}月` : "出生时间待定")}</small>
+                    <small>{childPlanningTimingLabel(child)} · {strategy?.birth_month_label || (birth ? `${birth.year}年${birth.month}月` : "出生时间待定")}</small>
                     <em>{stageLabel} · 当前月支出 {money(monthlyCost)}</em>
                   </button>
                   <div className="child-mini-metrics">
@@ -4115,11 +4826,12 @@ function ChildPlanPage({
             {(() => {
               const index = activeChildIndex;
               const child = activeChild;
-              const strategy = strategyByName.get(child.name);
-              const birth = resolveChildBirthMonth(child, today);
+              const strategy = strategyForChild(child);
+              const birth = resolveChildBirthMonth(child);
               const stageLabel = childEducationStageLabel(child, today);
               const currentCost = childMonthlyCostAt(child, today);
               const annualCost = currentCost * 12;
+              const includedInPlanning = childPlanIsIncludedInPlanning(child);
               return (
                 <section className="member-card child-plan-card" key={`child-plan-editor-${index}`}>
                   <div className="member-card-head">
@@ -4127,7 +4839,7 @@ function ChildPlanPage({
                       <strong>{child.name || `子女目标 ${index + 1}`}</strong>
                       <span>{stageLabel} · {birth ? `${birth.year}年${birth.month}月出生口径` : "出生节点待后端策略确定"}</span>
                     </div>
-                    <span className={child.enabled ? "decision-pill good" : "decision-pill"}>{child.enabled ? "影响现金流" : "仅保留目标"}</span>
+                    <span className={includedInPlanning ? "decision-pill good" : "decision-pill"}>{includedInPlanning ? "影响现金流" : "仅保留目标"}</span>
                   </div>
                   <div className="child-plan-layout">
                     <div className="child-plan-section">
@@ -4162,10 +4874,16 @@ function ChildPlanPage({
                           <input value={child.name} onChange={(event) => updateChildPlan(index, "name", event.target.value)} />
                         </Field>
                         <Field label="开始方式">
-                          <select value={child.timing_mode} onChange={(event) => updateChildPlan(index, "timing_mode", event.target.value as ChildPlanData["timing_mode"])}>
-                            <option value="after_first_home">买房后开始计划</option>
-                            <option value="manual_month">指定出生年月</option>
-                            <option value="not_planned">暂不纳入规划</option>
+                          <select
+                            value={child.timing_mode}
+                            onChange={(event) => {
+                              const timingMode = event.target.value as ChildPlanData["timing_mode"];
+                              updateChildPlanPatch(index, childPlanningTimingPatch(timingMode));
+                            }}
+                          >
+                            {CHILD_PLANNING_TIMING_OPTIONS.map((option) => (
+                              <option value={option.value} key={option.value}>{option.label}</option>
+                            ))}
                           </select>
                         </Field>
                         <Field label="出生窗口开始">
@@ -4264,6 +4982,9 @@ function TaxPage({
   childPlans,
   specialDeductions,
   result,
+  taxStrategyItems,
+  taxStrategyTimeline,
+  taxStrategySourceLabel,
   updateHousehold,
   updateChildPlan,
   updateSpecialDeduction,
@@ -4275,6 +4996,9 @@ function TaxPage({
   childPlans: ChildPlanData[];
   specialDeductions: SpecialDeductionItemData[];
   result: AffordabilityResult | null;
+  taxStrategyItems: TaxStrategyItem[];
+  taxStrategyTimeline: TaxStrategyTimelinePoint[];
+  taxStrategySourceLabel: string;
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
   updateChildPlan: <K extends keyof ChildPlanData>(index: number, key: K, value: ChildPlanData[K]) => void;
   updateSpecialDeduction: <K extends keyof SpecialDeductionItemData>(index: number, key: K, value: SpecialDeductionItemData[K]) => void;
@@ -4298,8 +5022,6 @@ function TaxPage({
   const taxYearSummaries = result?.tax_year_summaries ?? [];
   const selectedYearSummary = taxYearSummaries[0];
   const taxMemberRows = selectedYearSummary?.summaries ?? result?.tax_summaries ?? [];
-  const taxStrategyItems = result?.tax_strategy_items ?? [];
-  const taxStrategyTimeline = result?.tax_strategy_timeline ?? [];
   const autoTaxStrategyItems = taxStrategyItems.filter((item) => item.source !== "manual");
   const manualTaxStrategyItems = taxStrategyItems.filter((item) => item.source === "manual");
   const childPlanIndexByName = new Map(childPlans.map((child, index) => [child.name, index]));
@@ -4373,6 +5095,7 @@ function TaxPage({
         <div className="metric-grid">
           <Metric label="下一次策略动作" value={nextTimelinePoint ? `${nextTimelinePoint.year}-${String(nextTimelinePoint.month_of_year).padStart(2, "0")}` : "等待后端生成"} />
           <Metric label="时间线节点" value={`${taxStrategyTimeline.length} 个`} />
+          <Metric label="策略来源" value={taxStrategySourceLabel} />
           <Metric label="已估算节税" value={money(timelineSavingTotal)} tone={timelineSavingTotal > 0 ? "good" : undefined} />
           <Metric label="理财有效税率" value={percent(investmentTaxTimeline?.amount ?? investmentTaxWeightedRate)} />
         </div>
@@ -4627,6 +5350,9 @@ function InvestmentPlanPage({
   household,
   scenario,
   result,
+  accountConcepts,
+  investmentRecommendations,
+  investmentRecommendationSourceLabel,
   updateHousehold,
   updateHouseholdPatch,
   updateInvestmentAnnualReturn
@@ -4634,17 +5360,20 @@ function InvestmentPlanPage({
   household: HouseholdData;
   scenario: ScenarioData;
   result: AffordabilityResult | null;
+  accountConcepts: AccountConceptSummary[];
+  investmentRecommendations: InvestmentPlanRecommendation[];
+  investmentRecommendationSourceLabel: string;
   updateHousehold: <K extends keyof HouseholdData>(key: K, value: HouseholdData[K]) => void;
   updateHouseholdPatch: (patch: Partial<HouseholdData>) => void;
   updateInvestmentAnnualReturn: (annualReturn: number) => void;
 }) {
   const latestRecommendationsRef = useRef<InvestmentPlanRecommendation[]>([]);
-  if (result?.investment_plan_recommendations?.length) {
-    latestRecommendationsRef.current = result.investment_plan_recommendations;
+  if (investmentRecommendations.length) {
+    latestRecommendationsRef.current = investmentRecommendations;
   }
   const recommendations =
-    result?.investment_plan_recommendations?.length
-      ? result.investment_plan_recommendations
+    investmentRecommendations.length
+      ? investmentRecommendations
       : latestRecommendationsRef.current;
   const recommendedInvestment = recommendations[0];
   const currentInvestmentAllocation =
@@ -4698,6 +5427,11 @@ function InvestmentPlanPage({
     { name: "固收", 比例: Math.round((household.investment_bond_ratio ?? 0.45) * 100) },
     { name: "现金", 比例: Math.round((household.investment_cash_ratio ?? 0.3) * 100) }
   ];
+  const investmentAccountBalanceText = accountConceptBalanceTextWithHouseholdFallback(
+    accountConcepts,
+    ACCOUNT_CONCEPT_CODES.investment,
+    household
+  );
   const applyInvestmentPlan = (plan: InvestmentPlanRecommendation) => {
     updateHouseholdPatch({
       investment_plan_name: plan.plan_name,
@@ -4761,8 +5495,9 @@ function InvestmentPlanPage({
           </div>
         </div>
         <div className="strategy-hero-side">
-          <Metric label="当前投资资产" value={money(household.investments)} />
+          <Metric label="当前投资资产" value={investmentAccountBalanceText} />
           <Metric label="系统建议月定投" value={money(recommendedInvestment?.monthly_investment ?? 0)} />
+          <Metric label="策略来源" value={investmentRecommendationSourceLabel} />
           <Metric label="当前月结余" value={money(currentInvestmentAllocation.monthly_surplus)} tone={currentInvestmentAllocation.monthly_surplus > 0 ? "good" : "bad"} />
           <Metric label="安全垫缺口" value={money(currentInvestmentAllocation.reserve_gap)} tone={currentInvestmentAllocation.reserve_gap > 0 ? "warn" : "good"} />
         </div>
@@ -4826,7 +5561,7 @@ function InvestmentPlanPage({
         >
           <div className="investment-config-grid">
             <section className="investment-settings">
-              <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动参数" compact />
+              <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动参数" compact collapsible />
               <div className="form-grid two">
                 <Field label="理财计划">
                   <select
@@ -4873,7 +5608,7 @@ function InvestmentPlanPage({
               </p>
             </section>
             <section className="investment-allocation">
-              <PanelTitle icon={<Gauge size={18} />} title="目标配置" compact />
+              <PanelTitle icon={<Gauge size={18} />} title="目标配置" compact collapsible />
               <ResponsiveContainer width="100%" height={210}>
                 <BarChart data={allocationData}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
@@ -4940,9 +5675,12 @@ function ScenarioPage({
   removeScenario,
   removeScenarios,
   result,
+  planningSequence,
   scenarioComparisons,
   selectedPlanVariant,
   setSelectedPlanVariant,
+  availablePlans,
+  purchasePlanSourceLabel,
   calculationPending
 }: {
   scenarios: RecordEnvelope<ScenarioData>[];
@@ -4955,12 +5693,15 @@ function ScenarioPage({
   removeScenario: (id: string) => void;
   removeScenarios: (ids: string[]) => void;
   result: AffordabilityResult | null;
+  planningSequence: PlanningSequenceResult | null;
   scenarioComparisons: ScenarioComparison[];
   selectedPlanVariant: string;
   setSelectedPlanVariant: (variant: string) => void;
+  availablePlans: PurchasePlanAnalysis[];
+  purchasePlanSourceLabel: string;
   calculationPending: boolean;
 }) {
-  const generatedPlans = result?.purchase_plan_analyses ?? [];
+  const generatedPlans = availablePlans;
   const recommended = useMemo(() => recommendedPurchasePlan(generatedPlans), [generatedPlans]);
   const selectedPlan =
     generatedPlans.find((plan) => plan.variant === selectedPlanVariant) ??
@@ -4971,15 +5712,20 @@ function ScenarioPage({
     () => purchaseRecommendationByVariant(generatedPlans),
     [generatedPlans]
   );
-  const scenarioTimingLabel = (scenario: ScenarioData) => {
-    if (!scenario.enabled) return "暂不纳入规划";
-    if (scenario.purchase_planning_mode === "parallel") return "允许并行考虑";
-    return scenario.purchase_sequence <= 1
-      ? "自动安排"
-      : `排在第 ${scenario.purchase_sequence - 1} 个目标之后 ${scenario.after_previous_purchase_delay_months || 0} 个月`;
-  };
   const selectedPropertyType = selectedScenario.data.property_type ?? "二手房";
   const isSecondHandProperty = selectedPropertyType.includes("二手");
+  const selectedProvidentAccountStrategy = selectedScenario.data.provident_account_repayment_strategy ?? "auto";
+  const canConfigureProvidentAccountSwitch =
+    selectedProvidentAccountStrategy === "monthly_repayment_withdrawal" ||
+    selectedProvidentAccountStrategy === "semiannual_principal_offset";
+  const fallbackProvidentAccountSwitchTarget: ProvidentAccountRepaymentSwitchTarget =
+    selectedProvidentAccountStrategy === "monthly_repayment_withdrawal"
+      ? "semiannual_principal_offset"
+      : "monthly_repayment_withdrawal";
+  const selectedProvidentAccountSwitchTarget =
+    selectedScenario.data.provident_account_repayment_switch_to_strategy === selectedProvidentAccountStrategy
+      ? fallbackProvidentAccountSwitchTarget
+      : selectedScenario.data.provident_account_repayment_switch_to_strategy ?? fallbackProvidentAccountSwitchTarget;
   const updateScenarioPropertyType = (propertyType: ScenarioData["property_type"]) => {
     const patch: Partial<ScenarioData> = { property_type: propertyType };
     if (!propertyType.includes("二手")) {
@@ -4990,27 +5736,134 @@ function ScenarioPage({
     }
     updateScenarioRecord(selectedScenario.id, patch);
   };
+  const updateProvidentAccountRepaymentStrategy = (strategy: ProvidentAccountRepaymentStrategy) => {
+    const stagedModes: ProvidentAccountRepaymentSwitchTarget[] = [
+      "monthly_repayment_withdrawal",
+      "semiannual_principal_offset"
+    ];
+    const canSwitch = stagedModes.includes(strategy as ProvidentAccountRepaymentSwitchTarget);
+    const currentTarget = selectedScenario.data.provident_account_repayment_switch_to_strategy ?? "semiannual_principal_offset";
+    const fallbackTarget: ProvidentAccountRepaymentSwitchTarget =
+      strategy === "monthly_repayment_withdrawal" ? "semiannual_principal_offset" : "monthly_repayment_withdrawal";
+    updateScenarioRecord(selectedScenario.id, {
+      provident_account_repayment_strategy: strategy,
+      provident_account_repayment_switch_enabled:
+        canSwitch && Boolean(selectedScenario.data.provident_account_repayment_switch_enabled),
+      provident_account_repayment_switch_to_strategy:
+        canSwitch && currentTarget !== strategy ? currentTarget : fallbackTarget
+    });
+  };
+  const updateProvidentAccountRepaymentSwitchTarget = (target: ProvidentAccountRepaymentSwitchTarget) => {
+    const fallbackTarget: ProvidentAccountRepaymentSwitchTarget =
+      selectedProvidentAccountStrategy === "monthly_repayment_withdrawal"
+        ? "semiannual_principal_offset"
+        : "monthly_repayment_withdrawal";
+    updateScenarioRecord(selectedScenario.id, {
+      provident_account_repayment_switch_to_strategy:
+        target === selectedProvidentAccountStrategy ? fallbackTarget : target
+    });
+  };
   const purchaseDemandGroups = useMemo(() => {
-    const groups = new Map<number, RecordEnvelope<ScenarioData>[]>();
+    const contextHomeGoals = (result?.calculation_context?.planning_goals ?? [])
+      .filter((goal) => goal.goal_type === "home")
+      .map((goal) => ({
+        id: goal.id,
+        sequence_index: goal.sequence_index,
+        normalized_timing_mode: goal.normalized_timing_mode,
+        resolved_not_before_month: goal.resolved_not_before_month,
+        explanation: goal.explanation,
+      }));
+    const libraryHomeGoals = (planningSequence?.goals ?? [])
+      .filter((goal) => goal.goal_type === "home")
+      .map((goal) => ({
+        id: goal.id,
+        sequence_index: goal.sequence_index,
+        normalized_timing_mode: goal.normalized_timing_mode,
+        resolved_not_before_month: goal.resolved_not_before_month,
+        explanation: goal.explanation,
+      }));
+    const homeGoalById = new Map(
+      (contextHomeGoals.length ? contextHomeGoals : libraryHomeGoals)
+        .map((goal) => [goal.id, goal])
+    );
+    const resolvedGoalForScenario = (scenario: RecordEnvelope<ScenarioData>) =>
+      homeGoalById.get(scenario.data.planning_goal_id || "") ?? homeGoalById.get(scenario.id);
+    const groups = new Map<number, {
+      items: RecordEnvelope<ScenarioData>[];
+      resolvedSequence: number | null;
+      resolvedNotBeforeMonth: number;
+      timingMode: PlanningTimingMode | "";
+      explanation: string;
+    }>();
     scenarios.forEach((scenario) => {
       const sequence = Math.max(1, scenario.data.purchase_sequence || 1);
-      groups.set(sequence, [...(groups.get(sequence) ?? []), scenario]);
+      const resolvedGoal = resolvedGoalForScenario(scenario);
+      const existing = groups.get(sequence) ?? {
+        items: [],
+        resolvedSequence: null,
+        resolvedNotBeforeMonth: 0,
+        timingMode: "",
+        explanation: "",
+      };
+      groups.set(sequence, {
+        items: [...existing.items, scenario],
+        resolvedSequence: resolvedGoal?.sequence_index && resolvedGoal.sequence_index > 0
+          ? Math.min(existing.resolvedSequence ?? resolvedGoal.sequence_index, resolvedGoal.sequence_index)
+          : existing.resolvedSequence,
+        resolvedNotBeforeMonth: Math.max(existing.resolvedNotBeforeMonth, resolvedGoal?.resolved_not_before_month ?? 0),
+        timingMode: existing.timingMode || resolvedGoal?.normalized_timing_mode || "",
+        explanation: existing.explanation || resolvedGoal?.explanation || "",
+      });
     });
     return Array.from(groups.entries())
-      .sort(([left], [right]) => left - right)
-      .map(([sequence, items]) => ({
+      .sort(([leftSequence, left], [rightSequence, right]) =>
+        (left.resolvedSequence ?? leftSequence) - (right.resolvedSequence ?? rightSequence)
+        || leftSequence - rightSequence
+      )
+      .map(([sequence, group]) => ({
         sequence,
-        items: items.slice().sort((left, right) => left.created_at.localeCompare(right.created_at)),
+        resolvedSequence: group.resolvedSequence,
+        resolvedNotBeforeMonth: group.resolvedNotBeforeMonth,
+        timingMode: group.timingMode,
+        explanation: group.explanation,
+        items: group.items.slice().sort((left, right) => left.created_at.localeCompare(right.created_at)),
       }));
-  }, [scenarios]);
+  }, [planningSequence?.goals, result?.calculation_context?.planning_goals, scenarios]);
   const selectedDemand =
     purchaseDemandGroups.find((group) => group.sequence === selectedScenario.data.purchase_sequence) ??
     purchaseDemandGroups[0] ??
     { sequence: 1, items: [] };
   const selectedDemandScenarios = selectedDemand.items;
+  const selectedDemandEnabled = selectedDemandScenarios.some((item) => item.data.enabled);
+  const selectedDemandIncludedInPlanning = homeDemandIsIncludedInPlanning(
+    selectedDemandScenarios.map((item) => item.data),
+    selectedDemand.timingMode
+  );
+  const dependencyGoalOptions = useMemo(() => {
+    const excludedIds = new Set(
+      selectedDemandScenarios
+        .map((item) => item.data.planning_goal_id || item.id)
+        .filter(Boolean)
+    );
+    return planningGoalDependencyOptions(planningSequence?.goals ?? [], excludedIds);
+  }, [planningSequence?.goals, selectedDemandScenarios]);
+  const dependencyGoalLabel = (goalId: string) =>
+    planningGoalDependencyLabel(goalId, dependencyGoalOptions, planningSequence?.goals ?? []);
   const demandLabel = (sequence: number) => sequence <= 1 ? "第一套购房需求" : `第 ${sequence} 套购房需求`;
   const candidateLabel = (index: number) => `候选房源 ${index + 1}`;
-  const demandTimingLabel = (items: RecordEnvelope<ScenarioData>[]) => scenarioTimingLabel(items[0]?.data ?? selectedScenario.data);
+  const demandTimingLabel = (group: (typeof purchaseDemandGroups)[number]) =>
+    group.explanation ||
+    (group.items[0]?.data.depends_on_goal_id
+      ? scenarioPlanningTimingSummary(group.items[0].data, dependencyGoalLabel(group.items[0].data.depends_on_goal_id))
+      : group.resolvedSequence ? `后端规划顺序第 ${group.resolvedSequence} 项，最早第 ${group.resolvedNotBeforeMonth} 个月考虑。` : scenarioPlanningTimingSummary(group.items[0]?.data ?? selectedScenario.data));
+  const demandOrderLabel = (group: (typeof purchaseDemandGroups)[number]) => {
+    const normalizedMode: PlanningTimingMode =
+      group.timingMode || planningTimingModeFromScenario(group.items[0]?.data ?? selectedScenario.data);
+    return planningGoalOrderLabel({
+      normalized_timing_mode: normalizedMode,
+      sequence_index: group.resolvedSequence ?? group.sequence,
+    });
+  };
   const updateSelectedDemand = (patch: Partial<ScenarioData>) => {
     selectedDemandScenarios.forEach((scenario) => updateScenarioRecord(scenario.id, patch));
   };
@@ -5019,7 +5872,8 @@ function ScenarioPage({
     addScenario({
       name: `${demandLabel(nextSequence)} · 候选房源 1`,
       purchase_sequence: nextSequence,
-      purchase_planning_mode: nextSequence <= 1 ? "parallel" : "after_previous_purchase",
+      purchase_planning_mode: homePurchasePlanningModeForSequence(nextSequence),
+      depends_on_goal_id: "",
       after_previous_purchase_delay_months: 0,
       selected_purchase_plan_variant: "",
     });
@@ -5082,7 +5936,7 @@ function ScenarioPage({
           </div>
         </section>
         <section className="result-panel">
-          <PanelTitle icon={<Home size={18} />} title="购房需求与候选房源" compact />
+          <PanelTitle icon={<Home size={18} />} title="购房需求与候选房源" compact collapsible />
           <div className="empty-state target-empty-state">
             <strong>默认不买房</strong>
             <span>当前没有购房需求，购房策略、房贷、公积金贷款和交易事件都不会进入计划。</span>
@@ -5092,7 +5946,7 @@ function ScenarioPage({
           </div>
         </section>
         <section className="result-panel">
-          <PanelTitle icon={<ClipboardCheck size={18} />} title="多套房管理逻辑" compact />
+          <PanelTitle icon={<ClipboardCheck size={18} />} title="多套房管理逻辑" compact collapsible />
           <div className="explanation-grid">
             <article>
               <strong>第一套房手动添加</strong>
@@ -5184,28 +6038,35 @@ function ScenarioPage({
                 : "手动添加第一套房"
             }
           />
+          <Metric label="策略来源" value={purchasePlanSourceLabel} />
         </div>
       </section>
 
       <div className="strategy-layout">
         <aside className="strategy-side-panel">
           <div className="strategy-panel-head">
-            <PanelTitle icon={<Home size={18} />} title="购房需求与候选房源" compact />
+            <PanelTitle icon={<Home size={18} />} title="购房需求与候选房源" compact collapsible />
           </div>
           <div className="planning-goal-grid purchase-demand-grid">
             {purchaseDemandGroups.map((group) => {
               const firstScenario = group.items[0];
               const active = group.sequence === selectedDemand.sequence;
-              const enabledCount = group.items.filter((item) => item.data.enabled).length;
+              const demandEnabled = group.items.some((item) => item.data.enabled);
+              const includedInPlanning = homeDemandIsIncludedInPlanning(
+                group.items.map((item) => item.data),
+                group.timingMode
+              );
               return (
                 <article className={active ? "planning-goal-card active" : "planning-goal-card"} key={`purchase-demand-${group.sequence}`}>
                   <button type="button" className="planning-goal-select" onClick={() => firstScenario && setSelectedScenarioId(firstScenario.id)}>
-                    <span className={enabledCount > 0 ? "goal-status enabled" : "goal-status paused"}>
-                      {enabledCount > 0 ? "纳入规划" : "已停用"}
+                    <span className={includedInPlanning ? "goal-status enabled" : "goal-status paused"}>
+                      {planningInclusionStatusLabel(includedInPlanning, demandEnabled)}
                     </span>
                     <strong>{demandLabel(group.sequence)}</strong>
-                    <small>{group.items.length} 个候选房源 · 顺序 {group.sequence}</small>
-                    <em>{demandTimingLabel(group.items)}</em>
+                    <small>
+                      {group.items.length} 个候选房源 · {demandOrderLabel(group)}
+                    </small>
+                    <em>{demandTimingLabel(group)}</em>
                   </button>
                   <div className="planning-goal-actions">
                     <button className="ghost-button small" type="button" onClick={() => firstScenario && setSelectedScenarioId(firstScenario.id)}>
@@ -5214,8 +6075,8 @@ function ScenarioPage({
                     <button className="ghost-button small" type="button" onClick={() => addPropertyCandidate(group.sequence)}>
                       <Plus size={14} /> 候选
                     </button>
-                    <button className="ghost-button small" type="button" onClick={() => active && updateSelectedDemand({ enabled: enabledCount <= 0 })} disabled={!active}>
-                      {enabledCount > 0 ? "停用" : "启用"}
+                    <button className="ghost-button small" type="button" onClick={() => active && updateSelectedDemand({ enabled: !demandEnabled })} disabled={!active}>
+                      {demandEnabled ? "停用" : "启用"}
                     </button>
                     <button className="ghost-button small danger-action" type="button" onClick={() => removePurchaseDemand(group.sequence)} aria-label={`删除${demandLabel(group.sequence)}`} title="删除该购房需求下的全部候选房源">
                       <Trash2 size={14} /> 删除
@@ -5229,12 +6090,11 @@ function ScenarioPage({
             <p className="goal-updating-note">购房需求已更新，正在重新生成候选房源对比与贷款策略。</p>
           ) : null}
           <div className="side-form structured-settings demand-settings-panel">
-            <section className="setting-group">
-              <strong className="setting-group-title">购房需求设定</strong>
+            <CollapsibleSettingGroup title="购房需求设定">
               <div className="form-grid two">
                 <SwitchField
-                  label={selectedDemandScenarios.some((item) => item.data.enabled) ? "纳入当前规划" : "暂不纳入规划"}
-                  checked={selectedDemandScenarios.some((item) => item.data.enabled)}
+                  label={selectedDemandIncludedInPlanning ? "纳入当前规划" : "暂不纳入规划"}
+                  checked={selectedDemandEnabled}
                   onChange={(checked) => updateSelectedDemand({ enabled: checked })}
                 />
                 <NumberField
@@ -5257,15 +6117,32 @@ function ScenarioPage({
                   <select
                     value={selectedScenario.data.purchase_planning_mode}
                     onChange={(event) =>
-                      updateSelectedDemand({ purchase_planning_mode: event.target.value as ScenarioData["purchase_planning_mode"] })
+                      updateSelectedDemand(homePlanningTimingPatch(
+                        selectedScenario.data,
+                        event.target.value as ScenarioData["purchase_planning_mode"]
+                      ))
                     }
                   >
-                    <option value="after_previous_purchase">按规划顺序排队</option>
-                    <option value="parallel">可并行考虑</option>
+                    {HOME_PLANNING_TIMING_OPTIONS.map((option) => (
+                      <option value={option.value} key={option.value}>{option.label}</option>
+                    ))}
                   </select>
                 </Field>
+                {selectedScenario.data.purchase_planning_mode !== "parallel" ? (
+                  <Field label="跟随目标">
+                    <select
+                      value={selectedScenario.data.depends_on_goal_id ?? ""}
+                      onChange={(event) => updateSelectedDemand({ depends_on_goal_id: event.target.value })}
+                    >
+                      <option value="">{PLANNING_GOAL_AUTO_DEPENDENCY_LABEL}</option>
+                      {dependencyGoalOptions.map((goal) => (
+                        <option value={goal.id} key={goal.id}>{goal.label}</option>
+                      ))}
+                    </select>
+                  </Field>
+                ) : null}
               </div>
-            </section>
+            </CollapsibleSettingGroup>
           </div>
           <div className="vehicle-source-toolbar property-source-toolbar">
             <strong>{demandLabel(selectedDemand.sequence)}的候选房源</strong>
@@ -5274,33 +6151,36 @@ function ScenarioPage({
             </button>
           </div>
           <div className="vehicle-source-grid property-source-grid">
-            {selectedDemandScenarios.map((item, candidateIndex) => (
-              <article className={item.id === selectedScenario.id ? "vehicle-source-card active" : "vehicle-source-card"} key={item.id}>
-                <div className="vehicle-source-head">
-                  <button type="button" className="planning-goal-select compact-select" onClick={() => setSelectedScenarioId(item.id)}>
-                    <span className={item.data.enabled ? "goal-status enabled" : "goal-status paused"}>
-                      {item.data.enabled ? "纳入规划" : "已停用"}
-                    </span>
-                    <strong>{item.data.name || candidateLabel(candidateIndex)}</strong>
-                    <small>{money(item.data.total_price)} · {item.data.property_type}</small>
-                  </button>
-                  <button className="ghost-button small danger-action" type="button" onClick={() => void removeScenario(item.id)} aria-label={`删除候选房源 ${item.data.name}`}>
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-                <div className="planning-goal-actions">
-                  <button className="ghost-button small" type="button" onClick={() => setSelectedScenarioId(item.id)}>
-                    选择房源
-                  </button>
-                  <button className="ghost-button small" type="button" onClick={() => duplicatePropertyCandidate(item)}>
-                    <Copy size={14} /> 复制
-                  </button>
-                  <button className="ghost-button small" type="button" onClick={() => updateScenarioRecord(item.id, { enabled: !item.data.enabled })}>
-                    {item.data.enabled ? "停用" : "启用"}
-                  </button>
-                </div>
-              </article>
-            ))}
+            {selectedDemandScenarios.map((item, candidateIndex) => {
+              const includedInPlanning = homePlanIsIncludedInPlanning(item.data, selectedDemand.timingMode);
+              return (
+                <article className={item.id === selectedScenario.id ? "vehicle-source-card active" : "vehicle-source-card"} key={item.id}>
+                  <div className="vehicle-source-head">
+                    <button type="button" className="planning-goal-select compact-select" onClick={() => setSelectedScenarioId(item.id)}>
+                      <span className={includedInPlanning ? "goal-status enabled" : "goal-status paused"}>
+                        {planningInclusionStatusLabel(includedInPlanning, item.data.enabled)}
+                      </span>
+                      <strong>{item.data.name || candidateLabel(candidateIndex)}</strong>
+                      <small>{money(item.data.total_price)} · {item.data.property_type}</small>
+                    </button>
+                    <button className="ghost-button small danger-action" type="button" onClick={() => void removeScenario(item.id)} aria-label={`删除候选房源 ${item.data.name}`}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  <div className="planning-goal-actions">
+                    <button className="ghost-button small" type="button" onClick={() => setSelectedScenarioId(item.id)}>
+                      选择房源
+                    </button>
+                    <button className="ghost-button small" type="button" onClick={() => duplicatePropertyCandidate(item)}>
+                      <Copy size={14} /> 复制
+                    </button>
+                    <button className="ghost-button small" type="button" onClick={() => updateScenarioRecord(item.id, { enabled: !item.data.enabled })}>
+                      {item.data.enabled ? "停用" : "启用"}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
           </div>
           {selectedDemandScenarios.length === 0 ? (
             <div className="empty-state compact-empty-state">
@@ -5311,11 +6191,10 @@ function ScenarioPage({
             </div>
           ) : null}
           <div className="side-form structured-settings">
-            <section className="setting-group">
-              <strong className="setting-group-title">候选房源身份</strong>
+            <CollapsibleSettingGroup title="候选房源身份">
               <div className="form-grid two">
                 <SwitchField
-                  label={selectedScenario.data.enabled ? "纳入当前规划" : "暂不纳入规划"}
+                  label={homePlanIsIncludedInPlanning(selectedScenario.data, selectedDemand.timingMode) ? "纳入当前规划" : "暂不纳入规划"}
                   checked={selectedScenario.data.enabled}
                   onChange={(checked) => updateScenario("enabled", checked)}
                 />
@@ -5349,10 +6228,9 @@ function ScenarioPage({
                   </select>
                 </Field>
               </div>
-            </section>
+            </CollapsibleSettingGroup>
 
-            <section className="setting-group">
-              <strong className="setting-group-title">价格与贷款</strong>
+            <CollapsibleSettingGroup title="价格与贷款">
               <div className="form-grid two">
                 <NumberField label="房源总价" value={selectedScenario.data.total_price} min={0} step={10000} onChange={(value) => updateScenario("total_price", value)} />
                 <NumberField label="建筑面积" value={selectedScenario.data.area_sqm} min={0} step={1} onChange={(value) => updateScenario("area_sqm", value)} />
@@ -5381,12 +6259,9 @@ function ScenarioPage({
                 </Field>
                 <Field label="公积金账户还贷策略" description={parameterExplanations["公积金账户还贷策略"]}>
                   <select
-                    value={selectedScenario.data.provident_account_repayment_strategy ?? "auto"}
+                    value={selectedProvidentAccountStrategy}
                     onChange={(event) =>
-                      updateScenario(
-                        "provident_account_repayment_strategy",
-                        event.target.value as ProvidentAccountRepaymentStrategy
-                      )
+                      updateProvidentAccountRepaymentStrategy(event.target.value as ProvidentAccountRepaymentStrategy)
                     }
                   >
                     {Object.entries(providentAccountRepaymentStrategyLabels).map(([value, label]) => (
@@ -5394,11 +6269,46 @@ function ScenarioPage({
                     ))}
                   </select>
                 </Field>
+                {canConfigureProvidentAccountSwitch ? (
+                  <>
+                    <SwitchField
+                      label="公积金还贷切换"
+                      checked={Boolean(selectedScenario.data.provident_account_repayment_switch_enabled)}
+                      onChange={(checked) => updateScenario("provident_account_repayment_switch_enabled", checked)}
+                      description={parameterExplanations["公积金还贷切换"]}
+                    />
+                    {selectedScenario.data.provident_account_repayment_switch_enabled ? (
+                      <>
+                        <NumberField
+                          label="切换还款月"
+                          value={selectedScenario.data.provident_account_repayment_switch_after_month ?? 12}
+                          min={1}
+                          max={360}
+                          step={1}
+                          onChange={(value) => updateScenario("provident_account_repayment_switch_after_month", value)}
+                        />
+                        <Field label="切换后模式">
+                          <select
+                            value={selectedProvidentAccountSwitchTarget}
+                            onChange={(event) =>
+                              updateProvidentAccountRepaymentSwitchTarget(event.target.value as ProvidentAccountRepaymentSwitchTarget)
+                            }
+                          >
+                            {Object.entries(providentAccountRepaymentSwitchTargetLabels)
+                              .filter(([value]) => value !== selectedProvidentAccountStrategy)
+                              .map(([value, label]) => (
+                                <option key={value} value={value}>{label}</option>
+                              ))}
+                          </select>
+                        </Field>
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
               </div>
-            </section>
+            </CollapsibleSettingGroup>
 
-            <section className="setting-group">
-              <strong className="setting-group-title">政策属性</strong>
+            <CollapsibleSettingGroup title="政策属性">
               <div className="form-grid two">
                 {isSecondHandProperty ? (
                   <>
@@ -5466,18 +6376,17 @@ function ScenarioPage({
                   onChange={(checked) => updateScenario("is_ultra_low_energy_building", checked)}
                 />
               </div>
-            </section>
+            </CollapsibleSettingGroup>
           </div>
         </aside>
 
         <section className="strategy-main-panel">
           <div className="strategy-panel-head">
-            <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动调整策略参数" compact />
+            <PanelTitle icon={<SlidersHorizontal size={18} />} title="手动调整策略参数" compact collapsible />
             <span>修改后会自动重算推荐、贷款结构和现金流</span>
           </div>
           <div className="structured-settings strategy-settings-groups">
-            <section className="setting-group">
-              <strong className="setting-group-title">计划时间窗口与贷款结构</strong>
+            <CollapsibleSettingGroup title="计划时间窗口与贷款结构">
               <div className="form-grid">
                 <PlanningWindowFields
                   startMonth={selectedScenario.data.planning_window_start_month ?? ""}
@@ -5529,10 +6438,9 @@ function ScenarioPage({
                   </>
                 ) : null}
               </div>
-            </section>
+            </CollapsibleSettingGroup>
 
-            <section className="setting-group">
-              <strong className="setting-group-title">交易成本与装修</strong>
+            <CollapsibleSettingGroup title="交易成本与装修">
               <div className="form-grid">
                 <ReadOnlyField label="政策契税比例" value={selectedPlan ? percent(selectedPlan.deed_tax_rate) : "待生成"} />
                 <ReadOnlyField label="政策契税金额" value={selectedPlan ? money(selectedPlan.deed_tax_amount) : "待生成"} />
@@ -5558,10 +6466,9 @@ function ScenarioPage({
                   </select>
                 </Field>
               </div>
-            </section>
+            </CollapsibleSettingGroup>
 
-            <section className="setting-group">
-              <strong className="setting-group-title">投资动用与偏好评分</strong>
+            <CollapsibleSettingGroup title="投资动用与偏好评分">
               <div className="form-grid">
                 <ReadOnlyField
                   label="理财计划年化"
@@ -5594,7 +6501,7 @@ function ScenarioPage({
                   </select>
                 </Field>
               </div>
-            </section>
+            </CollapsibleSettingGroup>
           </div>
           <p className="field-hint">
             计划时间窗口会约束所有购房策略的最早搜索月份，系统会在窗口内校验现金安全、政策贷款和买后压力；“最早买入距今月数”保留给需要用相对月份精确控制的情况。微量商贷手动比例填 0 时由系统在政策规则上下限内自动寻找更早可买且商贷尽量少的比例，填入比例后按该比例固定测算。理财年化、定投和手续费来自理财计划当前策略，购房页只决定交易时如何动用投资账户。商贷提前还本选择“策略自动生成”时，后端会在合同允许最早月之后比较商贷成本、理财预期净收益、现金安全和买后结余，再决定是否额外还本；选择“手动指定”时按你填写的起始月和每月金额测算。买房动用投资选择“自动优化提取”时，后端只卖出覆盖交易现金和安全垫所需的投资资产；选择“清空投资账户”才会在交易月全部变现；选择“手动保留余额”时按设定余额尽量保留长期投资。
@@ -5858,21 +6765,51 @@ function StrategyNarrative({
 function CarPlanPage({
   carPlan,
   result,
+  planningSequence,
+  carStrategies,
+  carStrategySourceLabel,
   updateCarPlan,
   updateCarPlanPatch,
   updateCarPlanSelection,
+  createVehiclePlanningGoal,
+  saveVehiclePlanningGoal,
+  deleteVehiclePlanningGoal,
+  savePlanningGoalData,
   calculationPending
 }: {
   carPlan: CarPlanData;
   result: AffordabilityResult | null;
+  planningSequence: PlanningSequenceResult | null;
+  carStrategies: CarPlanAnalysis[];
+  carStrategySourceLabel: string;
   updateCarPlan: <K extends keyof CarPlanData>(key: K, value: CarPlanData[K]) => void;
   updateCarPlanPatch: (patch: Partial<CarPlanData>) => void;
   updateCarPlanSelection: (vehicleIndex: number, variant: string) => void;
+  createVehiclePlanningGoal: (vehicle: VehiclePlanData, index: number) => Promise<boolean>;
+  saveVehiclePlanningGoal: (goalId: string, vehicle: VehiclePlanData, index: number) => Promise<boolean>;
+  deleteVehiclePlanningGoal: (goalId: string) => Promise<boolean>;
+  savePlanningGoalData: (goalId: string, goalData: PlanningGoalData) => Promise<void>;
   calculationPending: boolean;
 }) {
-  const carStrategies = result?.car_plan_analyses ?? [];
   const vehiclePlans = carPlan.vehicle_plans ?? [];
   const [selectedVehicleIndex, setSelectedVehicleIndex] = useState(0);
+  const activeVehicleGoalId = vehiclePlans[selectedVehicleIndex]?.planning_goal_id ?? "";
+  const resolvedVehicleGoalById = useMemo(() => (
+    new Map((planningSequence?.goals ?? []).filter((goal) => goal.goal_type === "vehicle").map((goal) => [goal.id, goal]))
+  ), [planningSequence?.goals]);
+  const vehicleDependencyOptions = useMemo(() => (
+    planningGoalDependencyOptions(
+      planningSequence?.goals ?? [],
+      activeVehicleGoalId ? new Set([activeVehicleGoalId]) : new Set()
+    )
+  ), [activeVehicleGoalId, planningSequence?.goals]);
+  const vehicleDependencyLabel = (goalId: string) =>
+    planningGoalDependencyLabel(goalId, vehicleDependencyOptions, planningSequence?.goals ?? []);
+  const scheduleVehicleGoalSave = useDebouncedPlanningGoalSave<{ vehicle: VehiclePlanData; index: number }>({
+    buildGoalData: ({ vehicle, index }) => vehiclePlanningGoalData(vehicle, index),
+    saveGoal: savePlanningGoalData,
+    onError: (err) => console.error(userFacingError("保存车辆需求", err))
+  });
   useEffect(() => {
     if (vehiclePlans.length === 0) {
       if (selectedVehicleIndex !== 0) setSelectedVehicleIndex(0);
@@ -5970,6 +6907,9 @@ function CarPlanPage({
   })();
   const selectedCarStrategy = vehiclePlans.length
     ? vehiclePlans.map((vehicle, index) => {
+      if (!vehiclePlanIsIncludedInPlanning(vehicle)) {
+        return `${vehicle.name || `车辆 ${index + 1}`}：暂不纳入规划`;
+      }
       const activeStrategy = resolveActiveCarStrategy(vehicle, index);
       if (activeStrategy) {
         return `${vehicle.name || `车辆 ${index + 1}`}：${displayStrategyName(activeStrategy)}`;
@@ -6024,12 +6964,7 @@ function CarPlanPage({
     license_plate_rental_initial_fee: base?.license_plate_rental_initial_fee ?? 0,
     beijing_family_indicator_score: base?.beijing_family_indicator_score ?? 0,
     beijing_family_indicator_estimated_wait_months: base?.beijing_family_indicator_estimated_wait_months ?? null,
-    planning_sequence: base?.planning_sequence ?? vehicleIndex + 1,
-    purchase_timing_mode: base?.purchase_timing_mode ?? "auto_sequence",
-    after_previous_event_delay_months: base?.after_previous_event_delay_months ?? 0,
-    manual_purchase_delay_months: base?.manual_purchase_delay_months ?? base?.purchase_delay_months ?? 0,
-    planning_window_start_month: base?.planning_window_start_month ?? "",
-    planning_window_end_month: base?.planning_window_end_month ?? "",
+    ...vehiclePlanningControlDefaults(vehicleIndex, base),
     total_price: base?.total_price ?? 200000,
     down_payment_ratio: base?.down_payment_ratio ?? 0.3,
     down_payment: base?.down_payment ?? Math.round((base?.total_price ?? 200000) * (base?.down_payment_ratio ?? 0.3)),
@@ -6070,50 +7005,76 @@ function CarPlanPage({
       ...source,
       name: `用车需求 ${index + 1}`,
       selected_strategy_variant: "target",
-      planning_sequence: index + 1,
-      purchase_timing_mode: "auto_sequence",
-      after_previous_event_delay_months: 0,
-      manual_purchase_delay_months: source.purchase_delay_months,
+      ...vehiclePlanningControlDefaults(index, source),
       candidate_vehicles: [source]
     };
   };
 
-  const updateVehiclePlans = (nextVehicles: VehiclePlanData[], selectedStrategy = "target") => {
+  const updateVehiclePlans = (
+    nextVehicles: VehiclePlanData[],
+    selectedStrategy = "target",
+    saveVehicleIndex: number | null = null,
+    saveDelayMs = 700
+  ) => {
     updateCarPlanPatch({
       enabled: nextVehicles.length > 0,
       vehicle_plans: nextVehicles,
       selected_strategy_variant: nextVehicles.length ? selectedStrategy : "no_car"
     });
+    if (saveVehicleIndex !== null) {
+      const vehicle = nextVehicles[saveVehicleIndex];
+      if (vehicle?.planning_goal_id) {
+        scheduleVehicleGoalSave(vehicle.planning_goal_id, { vehicle, index: saveVehicleIndex }, saveDelayMs);
+      }
+    }
   };
 
-  const addVehicle = () => {
-    const nextVehicles = [...vehiclePlans, buildVehiclePlan(vehiclePlans.length)];
-    updateVehiclePlans(nextVehicles, nextVehicles[nextVehicles.length - 1].selected_strategy_variant);
-    setSelectedVehicleIndex(nextVehicles.length - 1);
+  const addVehicle = async () => {
+    const vehicle = buildVehiclePlan(vehiclePlans.length);
+    const created = await createVehiclePlanningGoal(vehicle, vehiclePlans.length);
+    if (created) {
+      setSelectedVehicleIndex(vehiclePlans.length);
+    }
   };
 
-  const duplicateVehicle = (index: number) => {
+  const duplicateVehicle = async (index: number) => {
     const source = vehiclePlans[index];
     if (!source) return;
     const nextVehicle: VehiclePlanData = {
       ...source,
+      planning_goal_id: "",
       enabled: true,
       name: `${source.name || "用车需求"} 复制`,
       selected_strategy_variant: "target",
       planning_sequence: vehiclePlans.length + 1,
       candidate_vehicles: (source.candidate_vehicles ?? []).map((candidate, candidateIndex) => ({
         ...candidate,
+        planning_goal_id: "",
         name: `${candidate.name || `车源 ${candidateIndex + 1}`} 复制`,
         selected_strategy_variant: "target",
         candidate_vehicles: []
       }))
     };
-    const nextVehicles = [...vehiclePlans, nextVehicle];
-    updateVehiclePlans(nextVehicles, "target");
-    setSelectedVehicleIndex(nextVehicles.length - 1);
+    const created = await createVehiclePlanningGoal(nextVehicle, vehiclePlans.length);
+    if (created) {
+      setSelectedVehicleIndex(vehiclePlans.length);
+    }
   };
 
-  const updateVehicle = (index: number, patch: Partial<VehiclePlanData>) => {
+  const updateVehicle = async (index: number, patch: Partial<VehiclePlanData>) => {
+    const currentVehicle = vehiclePlans[index];
+    if (!currentVehicle) return;
+    const nextVehicle = { ...currentVehicle, selected_strategy_variant: "target", ...patch };
+    const nextVehicles = vehiclePlans.map((vehicle, vehicleIndex) => (
+      vehicleIndex === index ? nextVehicle : vehicle
+    ));
+    updateVehiclePlans(nextVehicles);
+    if (nextVehicle.planning_goal_id) {
+      await saveVehiclePlanningGoal(nextVehicle.planning_goal_id, nextVehicle, index);
+      return;
+    }
+  };
+  const updateVehicleLocal = (index: number, patch: Partial<VehiclePlanData>) => {
     const nextVehicles = vehiclePlans.map((vehicle, vehicleIndex) => (
       vehicleIndex === index
         ? { ...vehicle, selected_strategy_variant: "target", ...patch }
@@ -6121,11 +7082,29 @@ function CarPlanPage({
     ));
     updateVehiclePlans(nextVehicles);
   };
+  const updateVehiclePolicy = (index: number, patch: Partial<VehiclePlanData>) => {
+    const nextVehicles = vehiclePlans.map((vehicle, vehicleIndex) => (
+      vehicleIndex === index
+        ? { ...vehicle, selected_strategy_variant: "target", ...patch }
+        : vehicle
+    ));
+    updateVehiclePlans(nextVehicles, "target", index, 250);
+  };
 
-  const removeVehicle = (index: number) => {
-    const nextVehicles = vehiclePlans.filter((_, vehicleIndex) => vehicleIndex !== index);
-    updateVehiclePlans(nextVehicles);
-    setSelectedVehicleIndex(Math.max(0, Math.min(index, nextVehicles.length - 1)));
+  const removeVehicle = async (index: number) => {
+    const vehicle = vehiclePlans[index];
+    if (!vehicle) return;
+    const goalId = vehicle.planning_goal_id;
+    if (!goalId) {
+      const nextVehicles = vehiclePlans.filter((_, vehicleIndex) => vehicleIndex !== index);
+      updateVehiclePlans(nextVehicles);
+      setSelectedVehicleIndex(Math.max(0, Math.min(index, nextVehicles.length - 1)));
+      return;
+    }
+    const deleted = await deleteVehiclePlanningGoal(goalId);
+    if (deleted) {
+      setSelectedVehicleIndex(Math.max(0, Math.min(index, vehiclePlans.length - 2)));
+    }
   };
 
   const addCandidate = (vehicleIndex: number) => {
@@ -6140,6 +7119,7 @@ function CarPlanPage({
             name: `车源 ${candidates.length + 1}`,
             planning_sequence: vehicle.planning_sequence,
             purchase_timing_mode: vehicle.purchase_timing_mode,
+            depends_on_goal_id: vehicle.depends_on_goal_id,
             after_previous_event_delay_months: vehicle.after_previous_event_delay_months,
             manual_purchase_delay_months: vehicle.manual_purchase_delay_months,
             total_price: candidates[candidates.length - 1]?.total_price ?? vehicle.total_price ?? 200000,
@@ -6150,7 +7130,7 @@ function CarPlanPage({
         ]
       };
     });
-    updateVehiclePlans(nextVehicles);
+    updateVehiclePlans(nextVehicles, "target", vehicleIndex);
   };
 
   const updateCandidate = (vehicleIndex: number, candidateIndex: number, patch: Partial<VehiclePlanData>) => {
@@ -6166,42 +7146,39 @@ function CarPlanPage({
       });
       return { ...vehicle, selected_strategy_variant: "target", candidate_vehicles: candidates };
     });
-    updateVehiclePlans(nextVehicles);
+    updateVehiclePlans(nextVehicles, "target", vehicleIndex, 250);
   };
 
-  const updateCandidateIndicatorApplicants = (
+  const updateVehicleIndicatorApplicants = (
     vehicleIndex: number,
-    candidateIndex: number,
     updater: (applicants: VehicleIndicatorApplicantData[]) => VehicleIndicatorApplicantData[]
   ) => {
     const vehicle = vehiclePlans[vehicleIndex];
-    const candidate = vehicle?.candidate_vehicles?.[candidateIndex];
-    const currentApplicants = normalizeVehicleIndicatorApplicants(candidate?.beijing_family_indicator_applicants);
-    updateCandidate(vehicleIndex, candidateIndex, {
+    const currentApplicants = normalizeVehicleIndicatorApplicants(vehicle?.beijing_family_indicator_applicants);
+    updateVehiclePolicy(vehicleIndex, {
       beijing_family_indicator_applicants: updater(currentApplicants)
     });
   };
 
-  const addIndicatorApplicant = (vehicleIndex: number, candidateIndex: number, patch: Partial<VehicleIndicatorApplicantData> = {}) => {
-    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) => [
+  const addVehicleIndicatorApplicant = (vehicleIndex: number, patch: Partial<VehicleIndicatorApplicantData> = {}) => {
+    updateVehicleIndicatorApplicants(vehicleIndex, (applicants) => [
       ...applicants,
       defaultVehicleIndicatorApplicant(applicants.length, patch)
     ]);
   };
 
-  const updateIndicatorApplicant = (
+  const updateVehicleIndicatorApplicant = (
     vehicleIndex: number,
-    candidateIndex: number,
     applicantIndex: number,
     patch: Partial<VehicleIndicatorApplicantData>
   ) => {
-    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) =>
+    updateVehicleIndicatorApplicants(vehicleIndex, (applicants) =>
       applicants.map((applicant, index) => index === applicantIndex ? defaultVehicleIndicatorApplicant(index, { ...applicant, ...patch }) : applicant)
     );
   };
 
-  const removeIndicatorApplicant = (vehicleIndex: number, candidateIndex: number, applicantIndex: number) => {
-    updateCandidateIndicatorApplicants(vehicleIndex, candidateIndex, (applicants) => applicants.filter((_, index) => index !== applicantIndex));
+  const removeVehicleIndicatorApplicant = (vehicleIndex: number, applicantIndex: number) => {
+    updateVehicleIndicatorApplicants(vehicleIndex, (applicants) => applicants.filter((_, index) => index !== applicantIndex));
   };
 
   const buildFinancingOption = (index: number, base?: Partial<VehicleFinancingOptionData>): VehicleFinancingOptionData =>
@@ -6243,7 +7220,7 @@ function CarPlanPage({
       });
       return { ...vehicle, selected_strategy_variant: "target", candidate_vehicles: candidates };
     });
-    updateVehiclePlans(nextVehicles);
+    updateVehiclePlans(nextVehicles, "target", vehicleIndex, 250);
   };
 
   const addFinancingOption = (vehicleIndex: number, candidateIndex: number) => {
@@ -6321,7 +7298,7 @@ function CarPlanPage({
         ]
       };
     });
-    updateVehiclePlans(nextVehicles);
+    updateVehiclePlans(nextVehicles, "target", vehicleIndex, 250);
   };
 
   const removeCandidate = (vehicleIndex: number, candidateIndex: number) => {
@@ -6334,7 +7311,7 @@ function CarPlanPage({
         candidate_vehicles: nextCandidates
       };
     });
-    updateVehiclePlans(nextVehicles);
+    updateVehiclePlans(nextVehicles, "target", vehicleIndex, 250);
   };
 
   const selectStrategy = (strategy: CarPlanAnalysis) => {
@@ -6345,14 +7322,6 @@ function CarPlanPage({
     .map((vehicle, index) => resolveActiveCarStrategy(vehicle, index))
     .filter((strategy): strategy is CarPlanAnalysis => strategy !== null);
   const primarySelectedStrategy = selectedStrategyDetails[0] ?? carStrategyComparisonRows[0] ?? null;
-  const prepaymentModeLabel = (strategy: CarPlanAnalysis) => {
-    if (!strategy.prepayment_allowed) return "合同不允许提前还本";
-    if (!strategy.prepayment_enabled) return "不提前还本";
-    if (strategy.prepayment_strategy_type === "lump_sum") return "一次性提前还本";
-    if (strategy.prepayment_strategy_type === "monthly") return "分月提前还本";
-    if (strategy.prepayment_strategy_type === "hybrid") return "一次性 + 分月组合";
-    return "手动提前还本";
-  };
   const carTimelineBaseDate = useMemo(() => new Date(), []);
   const financingTypeLabel = (type: string) => ({
     dealer_subsidy: "经销商贴息",
@@ -6489,34 +7458,33 @@ function CarPlanPage({
             value={vehiclePlans.length ? heroCarStrategy ? strategyLabel(heroCarStrategy.strategy_key) : "待生成" : "不购车基线"}
             tone={heroCarStrategy ? strategyDecisionTone(heroCarStrategy) === "bad" ? "bad" : "good" : "warn"}
           />
+          <Metric label="策略来源" value={carStrategySourceLabel} />
         </div>
       </section>
 
       <div className="strategy-layout">
         <aside className="strategy-side-panel car-planner-panel">
         <div className="strategy-panel-head">
-          <PanelTitle icon={<CircleDollarSign size={18} />} title="用车需求与候选车源" compact />
+          <PanelTitle icon={<CircleDollarSign size={18} />} title="用车需求与候选车源" compact collapsible />
           <span>{selectedCarStrategy}</span>
         </div>
         <div className="planning-goal-grid vehicle-goal-grid">
           {vehiclePlans.map((vehicle, vehicleIndex) => {
             const firstCandidate = vehicle.candidate_vehicles?.[0] ?? vehicle;
+            const resolvedGoal = resolvedVehicleGoalById.get(vehicle.planning_goal_id || "");
+            const includedInPlanning = vehiclePlanIsIncludedInPlanning(vehicle);
             return (
               <article className={vehicleIndex === selectedVehicleIndex ? "planning-goal-card active" : "planning-goal-card"} key={`vehicle-goal-${vehicleIndex}`}>
                 <button className="planning-goal-select" type="button" onClick={() => setSelectedVehicleIndex(vehicleIndex)}>
-                  <span className={vehicle.enabled ? "goal-status enabled" : "goal-status paused"}>
-                    {vehicle.enabled ? "纳入规划" : "已停用"}
+                  <span className={includedInPlanning ? "goal-status enabled" : "goal-status paused"}>
+                    {planningInclusionStatusLabel(includedInPlanning, vehicle.enabled)}
                   </span>
                   <strong>{vehicle.name || `用车需求 ${vehicleIndex + 1}`}</strong>
-                  <small>{money(firstCandidate.total_price || vehicle.total_price)} · 顺序 {vehicle.planning_sequence}</small>
+                  <small>
+                    {money(firstCandidate.total_price || vehicle.total_price)} · {resolvedGoal ? planningGoalOrderLabel(resolvedGoal) : `顺序 ${vehicle.planning_sequence}`}
+                  </small>
                   <em>
-                    {vehicle.enabled
-                      ? vehicle.purchase_timing_mode === "parallel"
-                        ? "允许并行考虑"
-                        : vehicle.purchase_timing_mode === "manual_month"
-                          ? `不早于 ${vehicle.manual_purchase_delay_months || vehicle.purchase_delay_months || 0} 个月后`
-                          : `按消费顺序自动排，前一事件后 ${vehicle.after_previous_event_delay_months || 0} 个月`
-                      : "暂不纳入规划"}
+                    {resolvedGoal ? planningGoalTimingSummary(resolvedGoal) : vehiclePlanningTimingSummary(vehicle, vehicleDependencyLabel(vehicle.depends_on_goal_id || ""))}
                   </em>
                 </button>
                 <div className="planning-goal-actions">
@@ -6587,23 +7555,28 @@ function CarPlanPage({
 
         <section className="strategy-main-panel car-config-panel">
           <div className="strategy-panel-head">
-            <PanelTitle icon={<SlidersHorizontal size={18} />} title="车辆参数与手动策略" compact />
+            <PanelTitle icon={<SlidersHorizontal size={18} />} title="车辆参数与手动策略" compact collapsible />
             <span>修改后会自动重算购车策略、贷款结构和现金流</span>
           </div>
         <div className="member-list compact-list vehicle-plan-list">
           {vehiclePlans.filter((_, vehicleIndex) => vehicleIndex === selectedVehicleIndex).map((vehicle) => {
             const vehicleIndex = selectedVehicleIndex;
             const candidates = vehicle.candidate_vehicles ?? [];
+            const includedInPlanning = vehiclePlanIsIncludedInPlanning(vehicle);
             return (
               <section className="member-card vehicle-plan-card" key={`vehicle-plan-${vehicleIndex}`}>
                 <div className="member-card-head">
                   <Field label="用车需求名称">
-                    <input value={vehicle.name} onChange={(event) => updateVehicle(vehicleIndex, { name: event.target.value })} />
+                    <input
+                      value={vehicle.name}
+                      onChange={(event) => updateVehicleLocal(vehicleIndex, { name: event.target.value })}
+                      onBlur={() => void updateVehicle(vehicleIndex, { name: vehiclePlans[vehicleIndex]?.name ?? vehicle.name })}
+                    />
                   </Field>
                   <SwitchField
-                    label={vehicle.enabled ? "纳入当前规划" : "暂不纳入规划"}
+                    label={includedInPlanning ? "纳入当前规划" : "暂不纳入规划"}
                     checked={vehicle.enabled}
-                    onChange={(checked) => updateVehicle(vehicleIndex, { enabled: checked })}
+                    onChange={(checked) => updateVehicle(vehicleIndex, vehiclePlanningEnabledPatch(vehicle, checked))}
                   />
                   <button className="ghost-button small danger-action" type="button" onClick={() => removeVehicle(vehicleIndex)} aria-label="删除用车需求">
                     <Trash2 size={14} /> 删除需求
@@ -6620,14 +7593,30 @@ function CarPlanPage({
                   />
                   <Field label="购车时间规则">
                     <select
-                      value={vehicle.purchase_timing_mode ?? "auto_sequence"}
-                      onChange={(event) => updateVehicle(vehicleIndex, { purchase_timing_mode: event.target.value as VehiclePlanData["purchase_timing_mode"] })}
+                      value={vehiclePlanningTimingModeValue(vehicle)}
+                      onChange={(event) => updateVehicle(
+                        vehicleIndex,
+                        vehiclePlanningTimingPatch(vehicle, event.target.value as VehiclePlanData["purchase_timing_mode"])
+                      )}
                     >
-                      <option value="auto_sequence">按消费顺序自动排</option>
-                      <option value="parallel">可并行考虑</option>
-                      <option value="manual_month">手动指定月份</option>
+                      {VEHICLE_PLANNING_TIMING_OPTIONS.map((option) => (
+                        <option value={option.value} key={option.value}>{option.label}</option>
+                      ))}
                     </select>
                   </Field>
+                  {vehiclePlanUsesDependencySelector(vehicle) ? (
+                    <Field label="跟随目标">
+                      <select
+                        value={vehicle.depends_on_goal_id ?? ""}
+                        onChange={(event) => updateVehicle(vehicleIndex, { depends_on_goal_id: event.target.value })}
+                      >
+                        <option value="">{PLANNING_GOAL_AUTO_DEPENDENCY_LABEL}</option>
+                        {vehicleDependencyOptions.map((goal) => (
+                          <option value={goal.id} key={goal.id}>{goal.label}</option>
+                        ))}
+                      </select>
+                    </Field>
+                  ) : null}
                   <NumberField
                     label="前一事件后等待月数"
                     value={vehicle.after_previous_event_delay_months ?? 0}
@@ -6678,8 +7667,7 @@ function CarPlanPage({
                           </button>
                         </div>
                         <div className="vehicle-setting-stack">
-                          <section className="setting-group">
-                            <strong className="setting-group-title">车辆属性</strong>
+                          <CollapsibleSettingGroup title="车辆属性">
                             <div className="form-grid compact-fields">
                               <NumberField label="车辆总价" value={candidate.total_price} min={0} step={10000} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { total_price: value })} />
                               <Field label="能源类型">
@@ -6694,6 +7682,19 @@ function CarPlanPage({
                                   <option value="fuel">燃油车</option>
                                 </select>
                               </Field>
+                              <SwitchField
+                                label="符合新能源购置税目录"
+                                checked={candidate.new_energy_catalog_eligible ?? true}
+                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { new_energy_catalog_eligible: checked })}
+                              />
+                              <NumberField
+                                label="车船税覆盖值/年"
+                                value={candidate.vehicle_vessel_tax_annual_override ?? 0}
+                                min={0}
+                                max={10000}
+                                step={10}
+                                onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { vehicle_vessel_tax_annual_override: value > 0 ? value : null })}
+                              />
                               <NumberField label="年行驶里程" value={candidate.annual_mileage_km ?? 12000} min={0} max={100000} step={1000} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { annual_mileage_km: value })} />
                               <NumberField label="百公里电耗" value={candidate.electricity_kwh_per_100km ?? 14} min={0} max={50} step={0.5} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { electricity_kwh_per_100km: value })} />
                               <NumberField label="充电单价" value={candidate.electricity_price_per_kwh ?? 0.8} min={0} max={5} step={0.05} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { electricity_price_per_kwh: value })} />
@@ -6709,299 +7710,17 @@ function CarPlanPage({
                             <p className="field-hint">
                               车辆没有固定强制报废年限时，后端会按实际使用年限和报废/更新里程择早估算更新月份。实际使用年限默认 10 年，可按性能衰减、维修经济性和家庭体验手动调整；到该月后，车辆资产、电费、停车费、保险、保养和车船税停止计入，若车贷未结清，贷款余额和月供仍继续进入现金流。
                             </p>
-                          </section>
+                          </CollapsibleSettingGroup>
 
-                          <section className="setting-group">
-                            <strong className="setting-group-title">政策与上牌</strong>
-                            <div className="form-grid compact-fields">
-                              <SwitchField
-                                label="符合新能源购置税目录"
-                                checked={candidate.new_energy_catalog_eligible ?? true}
-                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { new_energy_catalog_eligible: checked })}
-                              />
-                              <Field label="北京小客车指标">
-                                <select
-                                  value={candidate.beijing_license_indicator_status ?? "unknown"}
-                                  onChange={(event) => updateCandidate(vehicleIndex, candidateIndex, { beijing_license_indicator_status: event.target.value as VehiclePlanData["beijing_license_indicator_status"] })}
-                                >
-                                  <option value="unknown">未确认指标状态</option>
-                                  <option value="already_have">已取得指标</option>
-                                  <option value="family_new_energy_pending">家庭新能源指标等待中</option>
-                                  <option value="personal_new_energy_pending">个人新能源指标等待中</option>
-                                  <option value="ordinary_indicator_pending">普通小客车指标等待中</option>
-                                  <option value="not_eligible">暂不具备申请资格</option>
-                                </select>
-                              </Field>
-                              <NumberField
-                                label="预计指标等待月数"
-                                value={candidate.beijing_indicator_expected_delay_months ?? 0}
-                                min={0}
-                                max={240}
-                                step={1}
-                                onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_indicator_expected_delay_months: value })}
-                              />
-                              <SwitchField
-                                label={candidate.license_plate_rental_enabled ? "启用租牌过渡" : "不租牌"}
-                                checked={candidate.license_plate_rental_enabled ?? false}
-                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_enabled: checked })}
-                              />
-                              {candidate.license_plate_rental_enabled ? (
-                                <>
-                                  <NumberField
-                                    label="首期租牌费"
-                                    value={candidate.license_plate_rental_upfront_fee ?? 20000}
-                                    min={0}
-                                    step={1000}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_upfront_fee: value })}
-                                  />
-                                  <NumberField
-                                    label="首期租牌周期"
-                                    value={candidate.license_plate_rental_term_months ?? 36}
-                                    min={1}
-                                    max={120}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_term_months: value })}
-                                  />
-                                  <Field label="到期处理">
-                                    <select
-                                      value={candidate.license_plate_rental_after_term_mode ?? "renew_until_own_indicator"}
-                                      onChange={(event) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_after_term_mode: event.target.value as VehiclePlanData["license_plate_rental_after_term_mode"] })}
-                                    >
-                                      <option value="renew_until_own_indicator">继续租到取得自有指标</option>
-                                      <option value="switch_to_own_indicator">到期改用自有指标</option>
-                                    </select>
-                                  </Field>
-                                  {candidate.license_plate_rental_after_term_mode !== "switch_to_own_indicator" ? (
-                                    <>
-                                      <NumberField
-                                        label="续租费用"
-                                        value={candidate.license_plate_rental_renewal_fee ?? 20000}
-                                        min={0}
-                                        step={1000}
-                                        onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_renewal_fee: value })}
-                                      />
-                                      <NumberField
-                                        label="续租周期"
-                                        value={candidate.license_plate_rental_renewal_term_months ?? 36}
-                                        min={1}
-                                        max={120}
-                                        step={1}
-                                        onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { license_plate_rental_renewal_term_months: value })}
-                                      />
-                                    </>
-                                  ) : null}
-                                </>
-                              ) : null}
-                              <SwitchField
-                                label={candidate.beijing_family_indicator_score_enabled ? "估算家庭新能源积分" : "不估算家庭积分"}
-                                checked={candidate.beijing_family_indicator_score_enabled ?? false}
-                                onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_score_enabled: checked })}
-                              />
-                              {candidate.beijing_family_indicator_score_enabled ? (
-                                <>
-                                  <Field label="家庭指标开始月">
-                                    <input
-                                      type="month"
-                                      value={candidate.beijing_family_indicator_application_start_month ?? ""}
-                                      onChange={(event) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_application_start_month: event.target.value })}
-                                    />
-                                  </Field>
-                                  <NumberField
-                                    label="家庭代际数"
-                                    value={candidate.beijing_family_indicator_generations ?? 1}
-                                    min={1}
-                                    max={3}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_generations: value })}
-                                  />
-                                  <SwitchField
-                                    label={candidate.beijing_family_indicator_has_spouse ? "含配偶申请人" : "不含配偶"}
-                                    checked={candidate.beijing_family_indicator_has_spouse ?? true}
-                                    onChange={(checked) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_has_spouse: checked })}
-                                  />
-                                  <NumberField
-                                    label="主申请人积分"
-                                    value={candidate.beijing_family_indicator_main_points ?? 2}
-                                    min={0}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_main_points: value })}
-                                  />
-                                  {candidate.beijing_family_indicator_has_spouse ? (
-                                    <NumberField
-                                      label="配偶积分"
-                                      value={candidate.beijing_family_indicator_spouse_points ?? 1}
-                                      min={0}
-                                      step={1}
-                                      onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_spouse_points: value })}
-                                    />
-                                  ) : null}
-                                  <NumberField
-                                    label="其他申请人数"
-                                    value={candidate.beijing_family_indicator_other_applicant_count ?? 0}
-                                    min={0}
-                                    max={20}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_other_applicant_count: value })}
-                                  />
-                                  <NumberField
-                                    label="其他申请人积分合计"
-                                    value={candidate.beijing_family_indicator_other_points_total ?? 0}
-                                    min={0}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_other_points_total: value })}
-                                  />
-                                  <NumberField
-                                    label="共同申请年数"
-                                    value={candidate.beijing_family_indicator_application_years ?? 0}
-                                    min={0}
-                                    max={50}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_application_years: value })}
-                                  />
-                                  <NumberField
-                                    label="最近入围分"
-                                    value={candidate.beijing_family_indicator_current_cutoff_score ?? 36}
-                                    min={0}
-                                    step={0.01}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_current_cutoff_score: value })}
-                                  />
-                                  <NumberField
-                                    label="入围分年变化"
-                                    value={candidate.beijing_family_indicator_cutoff_score_annual_change ?? 0}
-                                    min={-20}
-                                    max={20}
-                                    step={0.1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_cutoff_score_annual_change: value })}
-                                  />
-                                  <NumberField
-                                    label="公告年份"
-                                    value={candidate.beijing_family_indicator_last_config_year ?? 2026}
-                                    min={2020}
-                                    max={2100}
-                                    step={1}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_last_config_year: value })}
-                                  />
-                                  <NumberField
-                                    label="家庭新能源指标量"
-                                    value={candidate.beijing_family_indicator_annual_quota ?? 119200}
-                                    min={0}
-                                    step={100}
-                                    onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { beijing_family_indicator_annual_quota: value })}
-                                  />
-                                </>
-                              ) : null}
-                              <NumberField
-                                label="车船税覆盖值/年"
-                                value={candidate.vehicle_vessel_tax_annual_override ?? 0}
-                                min={0}
-                                max={10000}
-                                step={10}
-                                onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { vehicle_vessel_tax_annual_override: value > 0 ? value : null })}
-                              />
-                            </div>
-                            <p className="field-hint">
-                              后端会按购车月份计算购置税减免、北京指标等待、租牌现金支出和车船税。纯电车优先按北京新能源指标估算；插混、增程和燃油车按普通指标口径处理。租牌费只属于上牌现金情景支出，不属于车价、首付或贷款本金，合规和合同风险需要单独复核。
-                            </p>
-                            {candidate.beijing_family_indicator_score_enabled ? (
-                              <div className="indicator-applicant-panel">
-                                <div className="vehicle-source-toolbar">
-                                  <strong>家庭指标申请人明细</strong>
-                                  <div className="template-chip-row">
-                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "main", name: "主申请人", has_valid_driver_license: true })}>
-                                      <Plus size={14} /> 主申请人
-                                    </button>
-                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "spouse", name: "配偶", generation: "self_generation" })}>
-                                      <Plus size={14} /> 配偶
-                                    </button>
-                                    <button className="ghost-button small" type="button" onClick={() => addIndicatorApplicant(vehicleIndex, candidateIndex, { relationship: "parent", name: "老人", generation: "parent_generation", eligibility_type: "beijing_residence_permit_social_tax", only_for_indicator_scoring: true })}>
-                                      <Plus size={14} /> 老人算分
-                                    </button>
-                                  </div>
-                                </div>
-                                <p className="field-hint">
-                                  这里的申请人只用于北京家庭指标算分，不会自动进入家庭现金流。主申请人、配偶权重按 2 计，其他家庭申请人权重按 1 计，再乘家庭代际数；个人摇号阶梯或新能源轮候历史会进入基础分。
-                                </p>
-                                <div className="indicator-applicant-grid">
-                                  {normalizeVehicleIndicatorApplicants(candidate.beijing_family_indicator_applicants).map((applicant, applicantIndex) => (
-                                    <article className="indicator-applicant-card" key={`indicator-${vehicleIndex}-${candidateIndex}-${applicantIndex}`}>
-                                      <div className="vehicle-source-head">
-                                        <Field label="申请人名称">
-                                          <input value={applicant.name} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { name: event.target.value })} />
-                                        </Field>
-                                        <SwitchField
-                                          label={applicant.enabled ? "参与算分" : "不参与算分"}
-                                          checked={applicant.enabled}
-                                          onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { enabled: checked })}
-                                        />
-                                        <button className="ghost-button small danger-action" type="button" onClick={() => removeIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex)}>
-                                          <Trash2 size={14} /> 删除
-                                        </button>
-                                      </div>
-                                      <div className="form-grid compact-fields">
-                                        <Field label="家庭关系">
-                                          <select value={applicant.relationship} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { relationship: event.target.value as VehicleIndicatorApplicantData["relationship"] })}>
-                                            <option value="main">主申请人</option>
-                                            <option value="spouse">配偶</option>
-                                            <option value="child">子女</option>
-                                            <option value="parent">父母</option>
-                                            <option value="parent_in_law">配偶父母</option>
-                                            <option value="other">其他</option>
-                                          </select>
-                                        </Field>
-                                        <Field label="所属代际">
-                                          <select value={applicant.generation} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { generation: event.target.value as VehicleIndicatorApplicantData["generation"] })}>
-                                            <option value="self_generation">本人/配偶一代</option>
-                                            <option value="child_generation">子女一代</option>
-                                            <option value="parent_generation">父母一代</option>
-                                          </select>
-                                        </Field>
-                                        <Field label="资格口径">
-                                          <select value={applicant.eligibility_type} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { eligibility_type: event.target.value as VehicleIndicatorApplicantData["eligibility_type"] })}>
-                                            <option value="unknown">待确认</option>
-                                            <option value="beijing_household">北京户籍</option>
-                                            <option value="beijing_work_residence_permit">北京工作居住证</option>
-                                            <option value="beijing_residence_permit_social_tax">北京居住证+连续社保/个税</option>
-                                            <option value="active_military_or_police">驻京现役军人/武警</option>
-                                            <option value="hongkong_macao_taiwan_foreign">港澳台/外籍按规定居留</option>
-                                          </select>
-                                        </Field>
-                                        <Field label="加入家庭指标月">
-                                          <input type="month" value={applicant.family_application_start_month} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { family_application_start_month: event.target.value })} />
-                                        </Field>
-                                        <Field label="个人指标历史">
-                                          <select value={applicant.personal_indicator_history_type} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { personal_indicator_history_type: event.target.value as VehicleIndicatorApplicantData["personal_indicator_history_type"] })}>
-                                            <option value="none">无个人历史</option>
-                                            <option value="ordinary_lottery">普通指标摇号阶梯</option>
-                                            <option value="new_energy_queue">新能源个人轮候</option>
-                                            <option value="both">普通阶梯+新能源轮候</option>
-                                          </select>
-                                        </Field>
-                                        <NumberField label="普通摇号阶梯数" value={applicant.ordinary_lottery_steps} min={0} max={200} step={1} onChange={(value) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { ordinary_lottery_steps: value })} />
-                                        <Field label="新能源轮候开始月">
-                                          <input type="month" value={applicant.new_energy_queue_start_month} onChange={(event) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { new_energy_queue_start_month: event.target.value })} />
-                                        </Field>
-                                        <NumberField label="个人历史分覆盖" value={applicant.personal_history_points_override ?? 0} min={0} step={1} onChange={(value) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { personal_history_points_override: value > 0 ? value : null })} />
-                                        <SwitchField label="有驾驶证" checked={applicant.has_valid_driver_license} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { has_valid_driver_license: checked })} />
-                                        <SwitchField label="名下无京牌车" checked={applicant.has_no_beijing_vehicle} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { has_no_beijing_vehicle: checked })} />
-                                        <SwitchField label="仅参与指标算分" checked={applicant.only_for_indicator_scoring} onChange={(checked) => updateIndicatorApplicant(vehicleIndex, candidateIndex, applicantIndex, { only_for_indicator_scoring: checked })} />
-                                      </div>
-                                    </article>
-                                  ))}
-                                  {normalizeVehicleIndicatorApplicants(candidate.beijing_family_indicator_applicants).length === 0 ? (
-                                    <div className="empty-state compact-empty-state">还没有申请人明细；不添加时后端会使用上方简化积分参数估算。</div>
-                                  ) : null}
-                                </div>
-                              </div>
-                            ) : null}
-                          </section>
-
-                          <section className="setting-group vehicle-financing-group">
-                            <div className="vehicle-source-toolbar">
-                              <strong className="setting-group-title">经销商金融方案</strong>
+                          <CollapsibleSettingGroup
+                            title="经销商金融方案"
+                            className="vehicle-financing-group"
+                            action={(
                               <button className="ghost-button small" type="button" onClick={() => addFinancingOption(vehicleIndex, candidateIndex)}>
                                 <Plus size={14} /> 添加金融方案
                               </button>
-                            </div>
+                            )}
+                          >
                             <p className="field-hint">金融方案是经销商或银行给出的可选政策，购车策略只能选择使用哪一种，再决定首付比例和提前还本节奏。</p>
                             <div className="template-chip-row">
                               {defaultVehicleFinancingOptions().map((template) => (
@@ -7100,10 +7819,9 @@ function CarPlanPage({
                                 </article>
                               ))}
                             </div>
-                          </section>
+                          </CollapsibleSettingGroup>
 
-                          <section className="setting-group">
-                            <strong className="setting-group-title">策略偏好</strong>
+                          <CollapsibleSettingGroup title="策略偏好">
                             <div className="form-grid compact-fields">
                               <NumberField label="目标首付比例" value={candidate.down_payment_ratio ?? 0.3} min={0} max={1} step={0.05} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { down_payment_ratio: value, down_payment: Math.round((candidate.total_price ?? 0) * value) })} />
                               <NumberField label="目标首付金额" value={candidate.down_payment ?? 0} min={0} step={1000} onChange={(value) => updateCandidate(vehicleIndex, candidateIndex, { down_payment: value, down_payment_ratio: candidate.total_price > 0 ? Math.min(1, Math.max(0, value / candidate.total_price)) : 0 })} />
@@ -7122,7 +7840,7 @@ function CarPlanPage({
                                 </>
                               ) : null}
                             </div>
-                          </section>
+                          </CollapsibleSettingGroup>
                         </div>
                       </article>
                     ))}
@@ -7162,6 +7880,295 @@ function CarPlanPage({
             )}
           </div>
         ) : null}
+        </section>
+
+        <section className="strategy-main-panel car-policy-panel">
+          <div className="strategy-panel-head">
+            <PanelTitle icon={<ShieldCheck size={18} />} title="政策与上牌" compact collapsible />
+            <span>按当前用车需求统一配置指标、租牌和家庭新能源指标口径</span>
+          </div>
+          {activeVehiclePlan ? (
+            <div className="member-list compact-list vehicle-plan-list">
+              <section className="member-card vehicle-plan-card">
+                <CollapsibleSettingGroup title="北京指标与租牌">
+                  <div className="form-grid compact-fields">
+                    <Field label="北京小客车指标">
+                      <select
+                        value={activeVehiclePlan.beijing_license_indicator_status ?? "unknown"}
+                        onChange={(event) => updateVehiclePolicy(selectedVehicleIndex, { beijing_license_indicator_status: event.target.value as VehiclePlanData["beijing_license_indicator_status"] })}
+                      >
+                        <option value="unknown">未确认指标状态</option>
+                        <option value="already_have">已取得指标</option>
+                        <option value="family_new_energy_pending">家庭新能源指标等待中</option>
+                        <option value="personal_new_energy_pending">个人新能源指标等待中</option>
+                        <option value="ordinary_indicator_pending">普通小客车指标等待中</option>
+                        <option value="not_eligible">暂不具备申请资格</option>
+                      </select>
+                    </Field>
+                    <NumberField
+                      label="预计指标等待月数"
+                      value={activeVehiclePlan.beijing_indicator_expected_delay_months ?? 0}
+                      min={0}
+                      max={240}
+                      step={1}
+                      onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_indicator_expected_delay_months: value })}
+                    />
+                    <SwitchField
+                      label={activeVehiclePlan.license_plate_rental_enabled ? "启用租牌过渡" : "不租牌"}
+                      checked={activeVehiclePlan.license_plate_rental_enabled ?? false}
+                      onChange={(checked) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_enabled: checked })}
+                    />
+                    {activeVehiclePlan.license_plate_rental_enabled ? (
+                      <>
+                        <NumberField
+                          label="首期租牌费"
+                          value={activeVehiclePlan.license_plate_rental_upfront_fee ?? 20000}
+                          min={0}
+                          step={1000}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_upfront_fee: value })}
+                        />
+                        <NumberField
+                          label="首期租牌周期"
+                          value={activeVehiclePlan.license_plate_rental_term_months ?? 36}
+                          min={1}
+                          max={120}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_term_months: value })}
+                        />
+                        <Field label="到期处理">
+                          <select
+                            value={activeVehiclePlan.license_plate_rental_after_term_mode ?? "renew_until_own_indicator"}
+                            onChange={(event) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_after_term_mode: event.target.value as VehiclePlanData["license_plate_rental_after_term_mode"] })}
+                          >
+                            <option value="renew_until_own_indicator">继续租到取得自有指标</option>
+                            <option value="switch_to_own_indicator">到期改用自有指标</option>
+                          </select>
+                        </Field>
+                        {activeVehiclePlan.license_plate_rental_after_term_mode !== "switch_to_own_indicator" ? (
+                          <>
+                            <NumberField
+                              label="续租费用"
+                              value={activeVehiclePlan.license_plate_rental_renewal_fee ?? 20000}
+                              min={0}
+                              step={1000}
+                              onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_renewal_fee: value })}
+                            />
+                            <NumberField
+                              label="续租周期"
+                              value={activeVehiclePlan.license_plate_rental_renewal_term_months ?? 36}
+                              min={1}
+                              max={120}
+                              step={1}
+                              onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { license_plate_rental_renewal_term_months: value })}
+                            />
+                          </>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </div>
+                  <p className="field-hint">
+                    指标和租牌是用车需求级政策口径，会统一应用到该需求下的所有候选车源；车型自身的能源类型、购置税目录资格和车船税覆盖值仍在每个候选车源的“车辆属性”里配置。
+                  </p>
+                </CollapsibleSettingGroup>
+
+                <CollapsibleSettingGroup title="家庭新能源指标算分">
+                  <div className="form-grid compact-fields">
+                    <SwitchField
+                      label={activeVehiclePlan.beijing_family_indicator_score_enabled ? "估算家庭新能源积分" : "不估算家庭积分"}
+                      checked={activeVehiclePlan.beijing_family_indicator_score_enabled ?? false}
+                      onChange={(checked) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_score_enabled: checked })}
+                    />
+                    {activeVehiclePlan.beijing_family_indicator_score_enabled ? (
+                      <>
+                        <Field label="家庭指标开始月">
+                          <input
+                            type="month"
+                            value={activeVehiclePlan.beijing_family_indicator_application_start_month ?? ""}
+                            onChange={(event) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_application_start_month: event.target.value })}
+                          />
+                        </Field>
+                        <NumberField
+                          label="家庭代际数"
+                          value={activeVehiclePlan.beijing_family_indicator_generations ?? 1}
+                          min={1}
+                          max={3}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_generations: value })}
+                        />
+                        <SwitchField
+                          label={activeVehiclePlan.beijing_family_indicator_has_spouse ? "含配偶申请人" : "不含配偶"}
+                          checked={activeVehiclePlan.beijing_family_indicator_has_spouse ?? true}
+                          onChange={(checked) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_has_spouse: checked })}
+                        />
+                        <NumberField
+                          label="主申请人积分"
+                          value={activeVehiclePlan.beijing_family_indicator_main_points ?? 2}
+                          min={0}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_main_points: value })}
+                        />
+                        {activeVehiclePlan.beijing_family_indicator_has_spouse ? (
+                          <NumberField
+                            label="配偶积分"
+                            value={activeVehiclePlan.beijing_family_indicator_spouse_points ?? 1}
+                            min={0}
+                            step={1}
+                            onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_spouse_points: value })}
+                          />
+                        ) : null}
+                        <NumberField
+                          label="其他申请人数"
+                          value={activeVehiclePlan.beijing_family_indicator_other_applicant_count ?? 0}
+                          min={0}
+                          max={20}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_other_applicant_count: value })}
+                        />
+                        <NumberField
+                          label="其他申请人积分合计"
+                          value={activeVehiclePlan.beijing_family_indicator_other_points_total ?? 0}
+                          min={0}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_other_points_total: value })}
+                        />
+                        <NumberField
+                          label="共同申请年数"
+                          value={activeVehiclePlan.beijing_family_indicator_application_years ?? 0}
+                          min={0}
+                          max={50}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_application_years: value })}
+                        />
+                        <NumberField
+                          label="最近入围分"
+                          value={activeVehiclePlan.beijing_family_indicator_current_cutoff_score ?? 36}
+                          min={0}
+                          step={0.01}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_current_cutoff_score: value })}
+                        />
+                        <NumberField
+                          label="入围分年变化"
+                          value={activeVehiclePlan.beijing_family_indicator_cutoff_score_annual_change ?? 0}
+                          min={-20}
+                          max={20}
+                          step={0.1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_cutoff_score_annual_change: value })}
+                        />
+                        <NumberField
+                          label="公告年份"
+                          value={activeVehiclePlan.beijing_family_indicator_last_config_year ?? 2026}
+                          min={2020}
+                          max={2100}
+                          step={1}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_last_config_year: value })}
+                        />
+                        <NumberField
+                          label="家庭新能源指标量"
+                          value={activeVehiclePlan.beijing_family_indicator_annual_quota ?? 119200}
+                          min={0}
+                          step={100}
+                          onChange={(value) => updateVehiclePolicy(selectedVehicleIndex, { beijing_family_indicator_annual_quota: value })}
+                        />
+                      </>
+                    ) : null}
+                  </div>
+                  {activeVehiclePlan.beijing_family_indicator_score_enabled ? (
+                    <div className="indicator-applicant-panel">
+                      <div className="vehicle-source-toolbar">
+                        <strong>家庭指标申请人明细</strong>
+                        <div className="template-chip-row">
+                          <button className="ghost-button small" type="button" onClick={() => addVehicleIndicatorApplicant(selectedVehicleIndex, { relationship: "main", name: "主申请人", has_valid_driver_license: true })}>
+                            <Plus size={14} /> 主申请人
+                          </button>
+                          <button className="ghost-button small" type="button" onClick={() => addVehicleIndicatorApplicant(selectedVehicleIndex, { relationship: "spouse", name: "配偶", generation: "self_generation" })}>
+                            <Plus size={14} /> 配偶
+                          </button>
+                          <button className="ghost-button small" type="button" onClick={() => addVehicleIndicatorApplicant(selectedVehicleIndex, { relationship: "parent", name: "老人", generation: "parent_generation", eligibility_type: "beijing_residence_permit_social_tax", only_for_indicator_scoring: true })}>
+                            <Plus size={14} /> 老人算分
+                          </button>
+                        </div>
+                      </div>
+                      <p className="field-hint">
+                        这里的申请人只用于北京家庭指标算分，不会自动进入家庭现金流。主申请人、配偶权重按 2 计，其他家庭申请人权重按 1 计，再乘家庭代际数；个人摇号阶梯或新能源轮候历史会进入基础分。
+                      </p>
+                      <div className="indicator-applicant-grid">
+                        {normalizeVehicleIndicatorApplicants(activeVehiclePlan.beijing_family_indicator_applicants).map((applicant, applicantIndex) => (
+                          <article className="indicator-applicant-card" key={`vehicle-indicator-${selectedVehicleIndex}-${applicantIndex}`}>
+                            <div className="vehicle-source-head">
+                              <Field label="申请人名称">
+                                <input value={applicant.name} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { name: event.target.value })} />
+                              </Field>
+                              <SwitchField
+                                label={applicant.enabled ? "参与算分" : "不参与算分"}
+                                checked={applicant.enabled}
+                                onChange={(checked) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { enabled: checked })}
+                              />
+                              <button className="ghost-button small danger-action" type="button" onClick={() => removeVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex)}>
+                                <Trash2 size={14} /> 删除
+                              </button>
+                            </div>
+                            <div className="form-grid compact-fields">
+                              <Field label="家庭关系">
+                                <select value={applicant.relationship} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { relationship: event.target.value as VehicleIndicatorApplicantData["relationship"] })}>
+                                  <option value="main">主申请人</option>
+                                  <option value="spouse">配偶</option>
+                                  <option value="child">子女</option>
+                                  <option value="parent">父母</option>
+                                  <option value="parent_in_law">配偶父母</option>
+                                  <option value="other">其他</option>
+                                </select>
+                              </Field>
+                              <Field label="所属代际">
+                                <select value={applicant.generation} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { generation: event.target.value as VehicleIndicatorApplicantData["generation"] })}>
+                                  <option value="self_generation">本人/配偶一代</option>
+                                  <option value="child_generation">子女一代</option>
+                                  <option value="parent_generation">父母一代</option>
+                                </select>
+                              </Field>
+                              <Field label="资格口径">
+                                <select value={applicant.eligibility_type} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { eligibility_type: event.target.value as VehicleIndicatorApplicantData["eligibility_type"] })}>
+                                  <option value="unknown">待确认</option>
+                                  <option value="beijing_household">北京户籍</option>
+                                  <option value="beijing_work_residence_permit">北京工作居住证</option>
+                                  <option value="beijing_residence_permit_social_tax">北京居住证+连续社保/个税</option>
+                                  <option value="active_military_or_police">驻京现役军人/武警</option>
+                                  <option value="hongkong_macao_taiwan_foreign">港澳台/外籍按规定居留</option>
+                                </select>
+                              </Field>
+                              <Field label="加入家庭指标月">
+                                <input type="month" value={applicant.family_application_start_month} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { family_application_start_month: event.target.value })} />
+                              </Field>
+                              <Field label="个人指标历史">
+                                <select value={applicant.personal_indicator_history_type} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { personal_indicator_history_type: event.target.value as VehicleIndicatorApplicantData["personal_indicator_history_type"] })}>
+                                  <option value="none">无个人历史</option>
+                                  <option value="ordinary_lottery">普通指标摇号阶梯</option>
+                                  <option value="new_energy_queue">新能源个人轮候</option>
+                                  <option value="both">普通阶梯+新能源轮候</option>
+                                </select>
+                              </Field>
+                              <NumberField label="普通摇号阶梯数" value={applicant.ordinary_lottery_steps} min={0} max={200} step={1} onChange={(value) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { ordinary_lottery_steps: value })} />
+                              <Field label="新能源轮候开始月">
+                                <input type="month" value={applicant.new_energy_queue_start_month} onChange={(event) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { new_energy_queue_start_month: event.target.value })} />
+                              </Field>
+                              <NumberField label="个人历史分覆盖" value={applicant.personal_history_points_override ?? 0} min={0} step={1} onChange={(value) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { personal_history_points_override: value > 0 ? value : null })} />
+                              <SwitchField label="有驾驶证" checked={applicant.has_valid_driver_license} onChange={(checked) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { has_valid_driver_license: checked })} />
+                              <SwitchField label="名下无京牌车" checked={applicant.has_no_beijing_vehicle} onChange={(checked) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { has_no_beijing_vehicle: checked })} />
+                              <SwitchField label="仅参与指标算分" checked={applicant.only_for_indicator_scoring} onChange={(checked) => updateVehicleIndicatorApplicant(selectedVehicleIndex, applicantIndex, { only_for_indicator_scoring: checked })} />
+                            </div>
+                          </article>
+                        ))}
+                        {normalizeVehicleIndicatorApplicants(activeVehiclePlan.beijing_family_indicator_applicants).length === 0 ? (
+                          <div className="empty-state compact-empty-state">还没有申请人明细；不添加时后端会使用上方简化积分参数估算。</div>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
+                </CollapsibleSettingGroup>
+              </section>
+            </div>
+          ) : (
+            <div className="empty-state">添加用车需求后，可以统一配置北京指标、租牌和家庭新能源指标算分。</div>
+          )}
         </section>
       </div>
 
@@ -7353,7 +8360,7 @@ function CarPlanPage({
             </article>
             <article>
               <span>还款动作</span>
-              <strong>{prepaymentModeLabel(primarySelectedStrategy)}</strong>
+              <strong>{vehiclePrepaymentModeLabel(primarySelectedStrategy)}</strong>
               <p>{carStrategyPrepaymentText(primarySelectedStrategy)}</p>
             </article>
             <article className="wide">
@@ -7396,7 +8403,7 @@ function CarPlanPage({
             </article>
             <article>
               <span>提前还本策略</span>
-              <strong>{prepaymentModeLabel(primarySelectedStrategy)}</strong>
+              <strong>{vehiclePrepaymentModeLabel(primarySelectedStrategy)}</strong>
               <p>
                 {primarySelectedStrategy.prepayment_enabled
                   ? `${primarySelectedStrategy.prepayment_explanation} 分月额外还本 ${money(primarySelectedStrategy.prepayment_monthly_amount)}，一次性还本 ${money(primarySelectedStrategy.prepayment_lump_sum_amount)}，预计 ${primarySelectedStrategy.actual_payoff_months} 个月结清。`
@@ -7699,7 +8706,7 @@ function RulePage({
     <div className="page-stack">
       <SectionHeader icon={<Database size={20} />} title="政策规则" />
       <section className="rule-panel">
-        <PanelTitle icon={<Database size={18} />} title="规则包与来源" />
+        <PanelTitle icon={<Database size={18} />} title="规则包与来源" collapsible />
         <div className="rule-grid rule-meta-grid">
           <Field label="规则包名称">
             <input
@@ -7722,17 +8729,18 @@ function RulePage({
         </div>
         <div className="rule-category-stack">
           {ruleGroups.map((group) => (
-            <section className="rule-category-panel" key={group.title}>
-              <div className="strategy-panel-head">
+            <details className="rule-category-panel collapsible-rule-category" key={group.title} open>
+              <summary className="strategy-panel-head">
                 <div>
                   <strong>{group.title}</strong>
                   <span>{group.description}</span>
                 </div>
-              </div>
+                <ChevronDown size={17} aria-hidden="true" />
+              </summary>
               <div className="rule-grid categorized-rule-grid">
                 {group.params.map(renderRuleControl)}
               </div>
-            </section>
+            </details>
           ))}
         </div>
         <div className="source-row">
@@ -7767,6 +8775,7 @@ function VisualizationPage({
   selectedPlan,
   selectedPlanVariant,
   setSelectedPlanVariant,
+  availablePlans,
   activeRulePack,
   calculationPending
 }: {
@@ -7778,10 +8787,10 @@ function VisualizationPage({
   selectedPlan: PurchasePlanAnalysis | null;
   selectedPlanVariant: string;
   setSelectedPlanVariant: (variant: string) => void;
+  availablePlans: PurchasePlanAnalysis[];
   activeRulePack: RulePackData;
   calculationPending: boolean;
 }) {
-  const availablePlans = result?.purchase_plan_analyses ?? [];
   const scenario = selectedScenario.data;
   const comparisonDecision = (plan: PurchasePlanAnalysis | null) => {
     if (!plan) return { label: "待生成", tone: "muted" };
@@ -7894,6 +8903,7 @@ function VisualizationPage({
               household={household}
               scenario={scenario}
               plan={selectedPlan}
+              availablePlans={availablePlans}
               rulePack={activeRulePack}
             />
           </>
@@ -7913,12 +8923,14 @@ function SelectedPlanVisualization({
   household,
   scenario,
   plan,
+  availablePlans,
   rulePack
 }: {
   result: AffordabilityResult;
   household: HouseholdData;
   scenario: ScenarioData;
   plan: PurchasePlanAnalysis;
+  availablePlans: PurchasePlanAnalysis[];
   rulePack: RulePackData;
 }) {
   const timelineBaseDate = useMemo(() => new Date(), []);
@@ -7957,51 +8969,63 @@ function SelectedPlanVisualization({
     window.addEventListener("resize", syncCompactChart);
     return () => window.removeEventListener("resize", syncCompactChart);
   }, []);
+  const visualizationPlanVariant = useMemo(() => {
+    const variants = Array.from(
+      new Set(
+        (result.monthly_cashflow_visualization ?? [])
+          .map((item) => item.plan_variant)
+          .filter(Boolean)
+      )
+    );
+    if (variants.includes(plan.variant)) return plan.variant;
+    return variants[0] ?? plan.variant;
+  }, [result.monthly_cashflow_visualization, plan.variant]);
+  const visualizationVariantMismatch = visualizationPlanVariant !== plan.variant;
   const loanVisualizationSeries = useMemo(
-    () => (result.loan_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
-    [result.loan_visualization, plan.variant]
+    () => (result.loan_visualization ?? []).filter((item) => item.plan_variant === visualizationPlanVariant),
+    [result.loan_visualization, visualizationPlanVariant]
   );
   const loanVisualizationByMonth = useMemo(
     () => new Map(loanVisualizationSeries.map((item) => [item.month, item])),
     [loanVisualizationSeries]
   );
   const providentVisualizationSeries = useMemo(
-    () => (result.provident_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
-    [result.provident_visualization, plan.variant]
+    () => (result.provident_visualization ?? []).filter((item) => item.plan_variant === visualizationPlanVariant),
+    [result.provident_visualization, visualizationPlanVariant]
   );
   const providentVisualizationByMonth = useMemo(
     () => new Map(providentVisualizationSeries.map((item) => [item.month, item])),
     [providentVisualizationSeries]
   );
   const socialSecurityVisualizationSeries = useMemo(
-    () => (result.social_security_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
-    [result.social_security_visualization, plan.variant]
+    () => (result.social_security_visualization ?? []).filter((item) => item.plan_variant === visualizationPlanVariant),
+    [result.social_security_visualization, visualizationPlanVariant]
   );
   const socialSecurityVisualizationByMonth = useMemo(
     () => new Map(socialSecurityVisualizationSeries.map((item) => [item.month, item])),
     [socialSecurityVisualizationSeries]
   );
   const backendCashflowSeries = useMemo(
-    () => (result.monthly_cashflow_visualization ?? []).filter((item) => item.plan_variant === plan.variant),
-    [result.monthly_cashflow_visualization, plan.variant]
+    () => (result.monthly_cashflow_visualization ?? []).filter((item) => item.plan_variant === visualizationPlanVariant),
+    [result.monthly_cashflow_visualization, visualizationPlanVariant]
   );
   const monthlyVisualizationDetailByMonth = useMemo(
     () =>
       new Map(
         (result.monthly_visualization_details ?? [])
-          .filter((item) => item.plan_variant === plan.variant)
+          .filter((item) => item.plan_variant === visualizationPlanVariant)
           .map((item) => [item.month, item])
       ),
-    [result.monthly_visualization_details, plan.variant]
+    [result.monthly_visualization_details, visualizationPlanVariant]
   );
   const annualVisualizationDetailByYear = useMemo(
     () =>
       new Map(
         (result.annual_visualization_details ?? [])
-          .filter((item) => item.plan_variant === plan.variant)
+          .filter((item) => item.plan_variant === visualizationPlanVariant)
           .map((item) => [item.year, item])
       ),
-    [result.annual_visualization_details, plan.variant]
+    [result.annual_visualization_details, visualizationPlanVariant]
   );
   const taxVisualizationDetailByMonth = useMemo(
     () =>
@@ -8141,122 +9165,18 @@ function SelectedPlanVisualization({
     height: 34,
     tickFormatter: formatChartMonthTick
   };
-  const monthlySeries =
-    backendCashflowSeries
-      .filter((item) => item.month <= horizonMonths)
-      .map((item) => {
-            const loanPoint = loanVisualizationByMonth.get(item.month);
-            const providentPoint = providentVisualizationByMonth.get(item.month);
-            const socialSecurityPoint = socialSecurityVisualizationByMonth.get(item.month);
-            const houseContractPayment = item.house_contract_payment ?? loanPoint?.home_monthly_payment ?? 0;
-            const providentHouseOffsetPayment =
-              item.provident_house_offset_payment ??
-              loanPoint?.provident_offset_payment ??
-              (providentPoint
-                ? (providentPoint.monthly_repayment_withdrawal ?? 0) + (providentPoint.loan_offset_payment ?? 0)
-                : 0);
-            const providentHousePaymentRelief =
-              item.provident_house_payment_relief ??
-              loanPoint?.provident_monthly_payment_relief ??
-              Math.min(loanPoint?.provident_monthly_payment ?? 0, providentHouseOffsetPayment);
-            const housePayment = item.house_payment ?? Math.max(0, houseContractPayment - providentHousePaymentRelief);
-            const vehiclePayment = item.vehicle_payment ?? loanPoint?.vehicle_monthly_payment ?? 0;
-            const debtPayment = item.debt_payment ?? loanPoint?.existing_monthly_payment ?? 0;
-            const vehicleOperatingCost = item.vehicle_operating_cost ?? 0;
-            const propertyAssetValue = item.property_asset_value ?? 0;
-            const vehicleAssetValue = item.vehicle_asset_value ?? Math.max(0, item.fixed_asset_value - propertyAssetValue);
-            const firstVehicleAssetValue = item.first_vehicle_asset_value ?? vehicleAssetValue;
-            const secondVehicleAssetValue = item.second_vehicle_asset_value ?? 0;
-            const investmentBuyFee = item.investment_buy_fee ?? item.investment_fee ?? 0;
-            const investmentSellFee = item.investment_sell_fee ?? 0;
-            const investmentContribution = item.investment_contribution ?? 0;
-            return {
-              month: item.month,
-              name: formatMonthDate(timelineBaseDate, item.month),
-              period: item.phase,
-              现金池: Math.round(item.cash_balance),
-              投资资产: Math.round(item.investment_balance),
-              固定资产: Math.round(item.fixed_asset_value),
-              房产估值: Math.round(propertyAssetValue),
-              车辆估值: Math.round(vehicleAssetValue),
-              第一辆车估值: Math.round(firstVehicleAssetValue),
-              第二辆车估值: Math.round(secondVehicleAssetValue),
-              流动资产: Math.round(item.liquid_asset_value ?? item.cash_balance + item.investment_balance),
-              流动固定资产合计: Math.round((item.liquid_asset_value ?? item.cash_balance + item.investment_balance) + item.fixed_asset_value),
-              净资产: Math.round(item.net_worth),
-              happinessScore: item.happiness_score ?? plan.happiness_score,
-              公积金余额: Math.round(item.provident_balance),
-              安全垫: Math.round(plan.required_liquidity_reserve),
-              cashIncome: item.cash_income,
-              livingExpense: item.living_expense + item.scheduled_expense + (item.child_expense ?? 0) + (item.career_shock_self_payment ?? 0),
-              baseLivingExpense: item.living_expense,
-              scheduledLivingExpense: item.scheduled_expense,
-              childExpense: item.child_expense ?? 0,
-              careerShockSelfPayment: item.career_shock_self_payment ?? 0,
-              scheduledExpenseRows: scheduledExpenseRowsAt(household, timelineBaseDate, item.month),
-              debtPayment,
-              regularDebtPayment: item.regular_debt_payment ?? Math.max(0, debtPayment - (item.phased_loan_payment ?? 0)),
-              phasedLoanPayment: item.phased_loan_payment ?? Math.max(0, debtPayment - household.monthly_debt_payment),
-              carCost: vehiclePayment + vehicleOperatingCost,
-              firstCarLoanPayment: item.first_vehicle_payment ?? vehiclePayment,
-              firstCarEnergyCost: item.first_vehicle_energy_cost ?? 0,
-              firstCarInsuranceCost: item.first_vehicle_insurance_cost ?? 0,
-              firstCarMaintenanceCost: item.first_vehicle_maintenance_cost ?? 0,
-              firstCarParkingCost: item.first_vehicle_parking_cost ?? 0,
-              secondCarLoanPayment: item.second_vehicle_payment ?? 0,
-              secondCarEnergyCost: item.second_vehicle_energy_cost ?? 0,
-              secondCarInsuranceCost: item.second_vehicle_insurance_cost ?? 0,
-              secondCarMaintenanceCost: item.second_vehicle_maintenance_cost ?? 0,
-              secondCarParkingCost: item.second_vehicle_parking_cost ?? 0,
-              noCarCommuteCost: item.no_car_commute_cost ?? 0,
-              vehiclePlateRentalPayment: item.vehicle_plate_rental_payment ?? 0,
-              housePayment,
-              houseContractPayment,
-              providentHouseOffsetPayment,
-              providentHousePaymentRelief,
-              providentHousePayment: Math.max(
-                0,
-                (loanPoint?.provident_monthly_payment ?? 0) - providentHousePaymentRelief
-              ),
-              providentHouseContractPayment: loanPoint?.provident_monthly_payment ?? 0,
-              commercialHousePayment: loanPoint?.commercial_monthly_payment ?? 0,
-              commercialExtraPrincipalPayment: loanPoint?.commercial_extra_principal_payment ?? 0,
-              vehicleExtraPrincipalPayment: loanPoint?.vehicle_extra_principal_payment ?? 0,
-              monthlyInvestment: investmentContribution,
-              monthlyInvestmentBase: item.investment_contribution_base ?? investmentContribution,
-              monthlyInvestmentCashSweep: item.investment_contribution_cash_sweep ?? 0,
-              monthlyInvestmentBuyFee: investmentBuyFee,
-              monthlyInvestmentNet: Math.max(0, investmentContribution - investmentBuyFee),
-              investmentReturn: item.investment_return,
-              investmentTax: item.investment_tax ?? 0,
-              investmentSellFee,
-              investmentSellProceeds: item.investment_sell_proceeds ?? 0,
-              personalPensionContribution: item.personal_pension_contribution ?? 0,
-              personalPensionReturn: item.personal_pension_return ?? 0,
-              personalPensionBalance: item.personal_pension_balance ?? 0,
-              purchaseCashOut: item.transaction_cash_out,
-              purchaseCashIn: item.transaction_cash_in,
-              houseTransactionCashOut: Math.max(0, item.transaction_cash_out - (item.vehicle_down_payment ?? 0)),
-              carDownPaymentCashOut: item.first_vehicle_down_payment ?? item.vehicle_down_payment ?? 0,
-              secondCarDownPaymentCashOut: item.second_vehicle_down_payment ?? 0,
-              monthlyCashDelta: item.monthly_cash_delta,
-              providentInterest: providentPoint?.interest ?? 0,
-              providentDeposit: item.provident_deposit,
-              providentRentWithdrawal: providentPoint?.rent_withdrawal ?? 0,
-              providentUpfrontWithdrawal: providentPoint?.upfront_withdrawal ?? 0,
-              providentPostTransactionWithdrawal: providentPoint?.post_transaction_withdrawal ?? 0,
-              providentAgreedWithdrawal: providentPoint?.agreed_withdrawal ?? 0,
-              providentRetirementWithdrawal: providentPoint?.retirement_withdrawal ?? 0,
-              providentLoanOffsetPayment: providentHouseOffsetPayment,
-              providentMonthlyRepaymentWithdrawal: providentPoint?.monthly_repayment_withdrawal ?? 0,
-              providentPrincipalOffsetPayment: providentPoint?.loan_offset_payment ?? 0,
-              providentMonthlyWithdrawal: item.provident_withdrawal,
-              pensionAccountBalance: item.pension_account_balance ?? socialSecurityPoint?.pension_balance_end ?? 0,
-              medicalAccountBalance: item.medical_account_balance ?? socialSecurityPoint?.medical_balance_end ?? 0,
-              socialSecurityAccountBalance: item.social_security_account_balance ?? socialSecurityPoint?.total_balance_end ?? 0,
-              backendLedgerEntries: item.ledger_entries
-            };
-          });
+  const monthlySeries = buildMonthlyChartSeries({
+    backendCashflowSeries,
+    horizonMonths,
+    requiredLiquidityReserve: plan.required_liquidity_reserve,
+    fallbackHappinessScore: plan.happiness_score,
+    loanVisualizationByMonth,
+    providentVisualizationByMonth,
+    socialSecurityVisualizationByMonth,
+    formatMonthName: (month) => formatMonthDate(timelineBaseDate, month),
+    scheduledExpenseRowsAt: (month) => scheduledExpenseRowsAt(household, timelineBaseDate, month),
+    householdMonthlyDebtPayment: household.monthly_debt_payment
+  });
   const hasBackendMonthlySeries = monthlySeries.length > 0;
   const timelineEndMonth = Math.max(
     0,
@@ -8271,81 +9191,43 @@ function SelectedPlanVisualization({
   const selectedMonth =
     monthlySeries.find((item) => item.month === safeSelectedMonthIndex) ??
     monthlySeries[Math.min(safeSelectedMonthIndex, monthlySeries.length - 1)] ??
-    {
-      month: 0,
-      name: formatMonthDate(timelineBaseDate, 0),
-      period: "等待后端计算",
-      现金池: 0,
-      投资资产: 0,
-      固定资产: 0,
-      房产估值: 0,
-      车辆估值: 0,
-      第一辆车估值: 0,
-      第二辆车估值: 0,
-      流动资产: 0,
-      流动固定资产合计: 0,
-      净资产: 0,
-      公积金余额: 0,
-      安全垫: Math.round(plan.required_liquidity_reserve),
-      cashIncome: 0,
-      livingExpense: 0,
-      baseLivingExpense: 0,
-      scheduledLivingExpense: 0,
-      careerShockSelfPayment: 0,
-      scheduledExpenseRows: [],
-      debtPayment: 0,
-      regularDebtPayment: 0,
-      phasedLoanPayment: 0,
-      carCost: 0,
-      firstCarLoanPayment: 0,
-      firstCarEnergyCost: 0,
-      firstCarInsuranceCost: 0,
-      firstCarMaintenanceCost: 0,
-      firstCarParkingCost: 0,
-      secondCarLoanPayment: 0,
-      secondCarEnergyCost: 0,
-      secondCarInsuranceCost: 0,
-      secondCarMaintenanceCost: 0,
-      secondCarParkingCost: 0,
-      noCarCommuteCost: 0,
-      housePayment: 0,
-      houseContractPayment: 0,
-      providentHouseOffsetPayment: 0,
-      providentHousePayment: 0,
-      providentHouseContractPayment: 0,
-      commercialHousePayment: 0,
-      monthlyInvestment: 0,
-      monthlyInvestmentBase: 0,
-      monthlyInvestmentCashSweep: 0,
-      monthlyInvestmentBuyFee: 0,
-      monthlyInvestmentNet: 0,
-      investmentReturn: 0,
-      investmentSellFee: 0,
-      investmentSellProceeds: 0,
-      personalPensionContribution: 0,
-      personalPensionReturn: 0,
-      personalPensionBalance: 0,
-      purchaseCashOut: 0,
-      purchaseCashIn: 0,
-      houseTransactionCashOut: 0,
-      carDownPaymentCashOut: 0,
-      secondCarDownPaymentCashOut: 0,
-      monthlyCashDelta: 0,
-      providentInterest: 0,
-      providentDeposit: 0,
-      providentRentWithdrawal: 0,
-      providentUpfrontWithdrawal: 0,
-      providentPostTransactionWithdrawal: 0,
-      providentAgreedWithdrawal: 0,
-      providentRetirementWithdrawal: 0,
-      providentLoanOffsetPayment: 0,
-      providentMonthlyWithdrawal: 0,
-      pensionAccountBalance: 0,
-      medicalAccountBalance: 0,
-      socialSecurityAccountBalance: 0,
-      backendLedgerEntries: []
-    };
+    emptyMonthlyChartPoint(formatMonthDate(timelineBaseDate, 0), plan.required_liquidity_reserve);
   const selectedMonthDetail = monthlyVisualizationDetailByMonth.get(selectedMonth.month);
+  const emptyMonthlyDetail = useMemo(() => {
+    return {
+      income_pie: [],
+      income_legend: [],
+      expense_pie: [],
+      cash_flow_items: [],
+      cash_flow_drivers: [],
+      advisor_text:
+        selectedMonthDetail === undefined
+          ? `${selectedMonth.name} 的月度现金流明细还没有由后端生成。`
+          : `${selectedMonth.name} 没有可展示的现金流项目。`,
+      explanation_items: [
+        {
+          title: "等待后端明细",
+          body: "月现金流逐项明细以后端月度账本为准；前端不再用本地公式补算，以免和账户、税务、贷款、投资策略口径不一致。"
+        }
+      ]
+    };
+  }, [selectedMonth.name, selectedMonthDetail]);
+  const effectiveMonthlyDetail = {
+    income_pie: selectedMonthDetail?.income_pie ?? emptyMonthlyDetail.income_pie,
+    income_legend: selectedMonthDetail?.income_legend ?? emptyMonthlyDetail.income_legend,
+    expense_pie: selectedMonthDetail?.expense_pie ?? emptyMonthlyDetail.expense_pie,
+    loan_payment_pie: selectedMonthDetail?.loan_payment_pie ?? [],
+    provident_inflow_pie: selectedMonthDetail?.provident_inflow_pie ?? [],
+    provident_outflow_pie: selectedMonthDetail?.provident_outflow_pie ?? [],
+    social_security_inflow_pie: selectedMonthDetail?.social_security_inflow_pie ?? [],
+    social_security_outflow_pie: selectedMonthDetail?.social_security_outflow_pie ?? [],
+    cash_flow_items: selectedMonthDetail?.cash_flow_items ?? emptyMonthlyDetail.cash_flow_items,
+    cash_flow_drivers: selectedMonthDetail?.cash_flow_drivers ?? emptyMonthlyDetail.cash_flow_drivers,
+    advisor_text: selectedMonthDetail?.advisor_text || emptyMonthlyDetail.advisor_text,
+    explanation_items: selectedMonthDetail?.explanation_items?.length
+      ? selectedMonthDetail.explanation_items
+      : emptyMonthlyDetail.explanation_items
+  };
   const plannedHomeLoanAmount = Math.max(0, plan.commercial_loan_amount + plan.provident_loan_amount);
   const plannedVehicleLoanAmount = Math.max(0, result.car_loan.loan_principal ?? 0);
   const selectedLoanPoint = loanVisualizationByMonth.get(safeSelectedMonthIndex);
@@ -8730,7 +9612,7 @@ function SelectedPlanVisualization({
   const annualNetIncome = selectedYearTaxSummary?.net_annual_income ?? 0;
   const selectedMonthTax = selectedMemberIncomeRows.reduce((sum, member) => sum + member.incomeTax, 0);
   const selectedAnnualFinancialSummary = result.annual_financial_summaries?.find(
-    (item) => item.plan_variant === plan.variant && item.year === selectedTaxYear
+    (item) => item.plan_variant === visualizationPlanVariant && item.year === selectedTaxYear
   );
   const selectedAnnualVisualizationDetail = annualVisualizationDetailByYear.get(selectedTaxYear);
   const selectedTaxVisualizationDetail =
@@ -8815,9 +9697,9 @@ function SelectedPlanVisualization({
       }),
     [household.members, selectedSocialSecurityPoint?.member_accounts]
   );
-  const socialSecurityInflowPieData = selectedMonthDetail?.social_security_inflow_pie ?? [];
+  const socialSecurityInflowPieData = effectiveMonthlyDetail.social_security_inflow_pie;
   const socialSecurityInflowPieTotal = annualPieTotal(socialSecurityInflowPieData);
-  const socialSecurityOutflowPieData = selectedMonthDetail?.social_security_outflow_pie ?? [];
+  const socialSecurityOutflowPieData = effectiveMonthlyDetail.social_security_outflow_pie;
   const socialSecurityOutflowPieTotal = annualPieTotal(socialSecurityOutflowPieData);
   const selectedMonthGrossIncome = selectedMemberIncomeRows.reduce(
     (sum, member) => sum + member.grossMonthly + member.bonusMonthly + member.otherMonthly,
@@ -9109,7 +9991,7 @@ function SelectedPlanVisualization({
       ifOverflow="extendDomain"
     />
   );
-  const cashFlowData = (selectedMonthDetail?.cash_flow_items ?? []).map((item) => ({
+  const cashFlowData = effectiveMonthlyDetail.cash_flow_items.map((item) => ({
     name: item.name,
     amount: Math.round(item.amount ?? item.value),
     kind: item.kind ?? "expense"
@@ -9122,20 +10004,20 @@ function SelectedPlanVisualization({
     if (kind === "result") return selectedMonth.monthlyCashDelta >= 0 ? visualColors.safe : visualColors.danger;
     return visualColors.expense;
   };
-  const selectedMonthDrivers = (selectedMonthDetail?.cash_flow_drivers ?? []).map((item) => ({
+  const selectedMonthDrivers = effectiveMonthlyDetail.cash_flow_drivers.map((item) => ({
     name: item.name,
     amount: Math.round(item.amount ?? item.value),
     kind: item.kind ?? "expense"
   }));
   const monthAdvisorText =
-    selectedMonthDetail?.advisor_text ??
+    effectiveMonthlyDetail.advisor_text ??
     (selectedMonth.monthlyCashDelta >= 0
       ? `${selectedMonth.name} 现金净流入 ${money(selectedMonth.monthlyCashDelta)}。`
       : `${selectedMonth.name} 现金净流出 ${money(Math.abs(selectedMonth.monthlyCashDelta))}。`);
-  const incomeLegendData = selectedMonthDetail?.income_legend ?? [];
-  const incomePieData = selectedMonthDetail?.income_pie ?? [];
-  const expensePieData = selectedMonthDetail?.expense_pie ?? [];
-  const selectedLoanPaymentPieData = selectedMonthDetail?.loan_payment_pie ?? [];
+  const incomeLegendData = effectiveMonthlyDetail.income_legend;
+  const incomePieData = effectiveMonthlyDetail.income_pie;
+  const expensePieData = effectiveMonthlyDetail.expense_pie;
+  const selectedLoanPaymentPieData = effectiveMonthlyDetail.loan_payment_pie;
   const sumPieValues = (items: Array<{ value: number }>) =>
     items.reduce((sum, item) => sum + Math.max(0, Number(item.value) || 0), 0);
   const annualTaxMemberPieData =
@@ -9228,61 +10110,33 @@ function SelectedPlanVisualization({
     money(Number(value)),
     item.payload?.name ?? "金额"
   ];
-  const providentInflowPieData = selectedMonthDetail?.provident_inflow_pie ?? [];
-  const providentOutflowPieData = selectedMonthDetail?.provident_outflow_pie ?? [];
+  const providentInflowPieData = effectiveMonthlyDetail.provident_inflow_pie;
+  const providentOutflowPieData = effectiveMonthlyDetail.provident_outflow_pie;
   const incomePieTotal = sumPieValues(incomePieData);
   const expensePieTotal = sumPieValues(expensePieData);
   const selectedLoanPaymentPieTotal = sumPieValues(selectedLoanPaymentPieData);
   const providentInflowPieTotal = sumPieValues(providentInflowPieData);
   const providentOutflowPieTotal = sumPieValues(providentOutflowPieData);
-  const cashFlowGroups: Array<{ title: string; rows: Array<[string, number]> }> = [
+  const cashFlowDetailGroups: Array<{
+    title: string;
+    items: VisualizationBreakdownItem[];
+  }> = [
     {
-      title: "收入与入账",
-      rows: [
-        ...(selectedMonth.cashIncome > 0
-          ? selectedMemberIncomeRows.flatMap((member): Array<[string, number]> => [
-              [`${member.name}工资净入账`, member.salaryNetMonthly],
-              ...(member.bonusMonthly > 0 ? [[`${member.name}奖金净入账`, member.bonusNetMonthly] as [string, number]] : []),
-              ...(member.otherMonthly > 0 ? [[`${member.name}其他净入账`, member.otherNetMonthly] as [string, number]] : []),
-              ...(member.pensionMonthly > 0 ? [[`${member.name}养老金领取`, member.pensionNetMonthly] as [string, number]] : []),
-              ...(member.nonTaxableMonthly > 0 ? [[`${member.name}非税收入`, member.nonTaxableNetMonthly] as [string, number]] : [])
-            ])
-          : []),
-        ["复利收益留存", selectedMonth.investmentReturn],
-        ["投资卖出到账", selectedMonth.investmentSellProceeds],
-        ["当月公积金现金到账", selectedMonth.providentRentWithdrawal + selectedMonth.providentPostTransactionWithdrawal + (selectedMonth.providentAgreedWithdrawal ?? 0) + (selectedMonth.providentRetirementWithdrawal ?? 0)],
-        ["公积金账户抵扣/冲本金（非收入）", selectedMonth.providentLoanOffsetPayment ?? 0]
-      ]
+      title: "现金流入",
+      items: effectiveMonthlyDetail.cash_flow_items.filter((item) => item.kind === "income")
     },
     {
-      title: "购房后月支出",
-      rows: [
-        ["基础生活支出", -selectedMonth.baseLivingExpense],
-        ...selectedMonth.scheduledExpenseRows.map((item): [string, number] => [item.name, -item.amount]),
-        ["固定还款与已有贷款", -selectedMonth.debtPayment],
-        ["通勤/用车", -selectedMonth.carCost],
-        ["房贷现金还款", -selectedMonth.housePayment],
-        ["公积金账户代扣房贷", selectedMonth.providentHouseOffsetPayment ?? 0],
-        ["基础定投现金支出", -selectedMonth.monthlyInvestmentBase],
-        ["安全垫达标后追加定投", -selectedMonth.monthlyInvestmentCashSweep],
-        ["定投买入净额", -selectedMonth.monthlyInvestmentNet],
-        ["理财买入手续费", -selectedMonth.monthlyInvestmentBuyFee],
-        ["投资卖出手续费", -selectedMonth.investmentSellFee],
-        ["交易现金净额", selectedMonth.purchaseCashIn - selectedMonth.purchaseCashOut]
-      ]
+      title: "现金流出",
+      items: effectiveMonthlyDetail.cash_flow_items.filter((item) => item.kind === "expense")
     },
     {
-      title: "月度结果",
-      rows: [
-        ["当月现金净流入", selectedMonth.monthlyCashDelta],
-        ["月末现金账户", selectedMonth.现金池],
-        ["月末投资账户", selectedMonth.投资资产],
-        ["月末公积金余额", selectedMonth.公积金余额]
-      ]
+      title: "账户转移与收益",
+      items: effectiveMonthlyDetail.cash_flow_items.filter((item) => item.kind === "asset" || item.kind === "deduction")
     }
-  ];
-  const selectedMonthExplanationItems = selectedMonthDetail?.explanation_items ?? [];
-  const happinessData = result.purchase_plan_analyses.map((item) => ({
+  ].filter((group) => group.items.length > 0);
+  const cashFlowResultItems = effectiveMonthlyDetail.cash_flow_items.filter((item) => item.kind === "result");
+  const selectedMonthExplanationItems = effectiveMonthlyDetail.explanation_items;
+  const happinessData = availablePlans.map((item) => ({
     name: item.variant,
     幸福指数: Number(item.happiness_score.toFixed(1)),
     selected: item.variant === plan.variant
@@ -9293,7 +10147,7 @@ function SelectedPlanVisualization({
     幸福指数: Number((item.happinessScore ?? plan.happiness_score).toFixed(2))
   }));
   const timelineItems = (result.plan_events ?? [])
-    .filter((item) => item.plan_variant === plan.variant)
+    .filter((item) => item.plan_variant === visualizationPlanVariant)
     .sort((left, right) => left.month - right.month || left.title.localeCompare(right.title, "zh-Hans-CN"))
     .map((item) => ({
       month: item.month,
@@ -9351,6 +10205,11 @@ function SelectedPlanVisualization({
       <p className={cashStressOk ? "field-hint" : "field-hint danger-text"}>
         {stressCashSummary}
       </p>
+      {visualizationVariantMismatch ? (
+        <p className="field-hint">
+          账户曲线正在使用本次计算响应中的「{visualizationPlanVariant}」账本；当前策略实体「{plan.variant}」刷新完成后会自动对齐。
+        </p>
+      ) : null}
 
       <section className="visual-story-block key-attribution-block">
         <div className="strategy-panel-head">
@@ -10461,22 +11320,44 @@ function SelectedPlanVisualization({
               </div>
             ))}
           </div>
-          <details className="details-panel month-detail-panel">
-            <summary>
-              <span>查看收入、支出和账户明细</span>
-              <small>{selectedMonth.name} 的逐项现金流默认收起，避免影响图表阅读</small>
-            </summary>
-            <div className="cash-flow-sections">
-              {cashFlowGroups.map((group) => (
-                <div className="cash-flow-section" key={group.title}>
-                  <strong>{group.title}</strong>
-                  {group.rows.map(([label, value]) => (
-                    <Row key={label} label={label} value={money(Number(value))} />
-                  ))}
-                </div>
-              ))}
+          <div className="month-detail-panel backend-cash-flow-detail">
+            <div className="month-detail-heading">
+              <strong>后端逐项现金流</strong>
+              <span>{selectedMonth.name} 的明细来自后端月度账本</span>
             </div>
-          </details>
+            {cashFlowDetailGroups.length > 0 || cashFlowResultItems.length > 0 ? (
+              <div className="cash-flow-sections">
+                {cashFlowDetailGroups.map((group) => (
+                  <div className="cash-flow-section" key={group.title}>
+                    <strong>{group.title}</strong>
+                    {group.items.map((item) => (
+                      <Row
+                        key={`${group.title}-${item.name}`}
+                        label={item.name}
+                        value={money(Number(item.amount ?? item.value))}
+                      />
+                    ))}
+                  </div>
+                ))}
+                {cashFlowResultItems.length > 0 ? (
+                  <div className="cash-flow-section result-section">
+                    <strong>月度结果</strong>
+                    {cashFlowResultItems.map((item) => (
+                      <Row
+                        key={`result-${item.name}`}
+                        label={item.name}
+                        value={money(Number(item.amount ?? item.value))}
+                      />
+                    ))}
+                    <Row label="月末现金账户" value={money(selectedMonth.现金池)} />
+                    <Row label="月末投资账户" value={money(selectedMonth.投资资产)} />
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="field-hint">后端还没有返回本月逐项现金流。请先重新计算，或检查后端服务是否完成账户曲线生成。</p>
+            )}
+          </div>
           <details className="details-panel month-detail-panel">
             <summary>
               <span>查看本月财务解释</span>
@@ -10618,6 +11499,7 @@ function ExportPage({
   selectedPlan,
   selectedPlanVariant,
   setSelectedPlanVariant,
+  availablePlans,
   runCalculation
 }: {
   result: AffordabilityResult | null;
@@ -10625,9 +11507,9 @@ function ExportPage({
   selectedPlan: PurchasePlanAnalysis | null;
   selectedPlanVariant: string;
   setSelectedPlanVariant: (variant: string) => void;
+  availablePlans: PurchasePlanAnalysis[];
   runCalculation: () => void;
 }) {
-  const availablePlans = result?.purchase_plan_analyses ?? [];
   const exportTargets = [
     {
       key: "current_plan",
@@ -10911,21 +11793,85 @@ function WorkflowSection({
   title,
   description,
   children,
-  className = ""
+  className = "",
+  defaultOpen = true
 }: {
   icon: ReactNode;
   title: string;
   description?: ReactNode;
   children: ReactNode;
   className?: string;
+  defaultOpen?: boolean;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <section className={`form-panel workflow-section ${className}`}>
       <div className="workflow-section-head">
-        <PanelTitle icon={icon} title={title} compact />
+        <button className="collapsible-title-button" type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+          <PanelTitle icon={icon} title={title} compact />
+          {open ? <ChevronUp size={17} /> : <ChevronDown size={17} />}
+        </button>
         {description ? <span className="workflow-section-description">{description}</span> : null}
       </div>
-      {children}
+      {open ? children : null}
+    </section>
+  );
+}
+
+function CollapsiblePanel({
+  icon,
+  title,
+  children,
+  className = "",
+  defaultOpen = true,
+  action,
+}: {
+  icon: ReactNode;
+  title: string;
+  children: ReactNode;
+  className?: string;
+  defaultOpen?: boolean;
+  action?: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className={`form-panel collapsible-panel ${className}`}>
+      <div className="collapsible-panel-head">
+        <button className="collapsible-title-button" type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+          <PanelTitle icon={icon} title={title} compact />
+          {open ? <ChevronUp size={17} /> : <ChevronDown size={17} />}
+        </button>
+        {action}
+      </div>
+      {open ? children : null}
+    </section>
+  );
+}
+
+function CollapsibleSettingGroup({
+  title,
+  children,
+  className = "",
+  defaultOpen = true,
+  action,
+}: {
+  title: string;
+  children: ReactNode;
+  className?: string;
+  defaultOpen?: boolean;
+  action?: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className={`setting-group collapsible-setting-group ${className}`}>
+      <div className="setting-group-head">
+        <button className="setting-group-toggle" type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+          <strong className="setting-group-title">{title}</strong>
+          {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </button>
+        {action ? <div className="setting-group-actions">{action}</div> : null}
+      </div>
+      {open ? children : null}
     </section>
   );
 }
@@ -10950,9 +11896,32 @@ function EmptyState({
   );
 }
 
-function PanelTitle({ icon, title, compact = false }: { icon: ReactNode; title: string; compact?: boolean }) {
+function PanelTitle({
+  icon,
+  title,
+  compact = false,
+  collapsible = false,
+  defaultOpen = true,
+}: {
+  icon: ReactNode;
+  title: string;
+  compact?: boolean;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+}) {
+  const className = `${compact ? "panel-title compact" : "panel-title"}${collapsible ? " panel-title-collapsible" : ""}`;
+  if (collapsible) {
+    return (
+      <label className={className}>
+        <input className="panel-collapse-input" type="checkbox" defaultChecked={defaultOpen} />
+        {icon}
+        <h2>{title}</h2>
+        <ChevronDown className="panel-collapse-chevron" size={17} aria-hidden="true" />
+      </label>
+    );
+  }
   return (
-    <div className={compact ? "panel-title compact" : "panel-title"}>
+    <div className={className}>
       {icon}
       <h2>{title}</h2>
     </div>

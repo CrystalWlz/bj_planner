@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from ..policies import (
+    DEFAULT_COMPREHENSIVE_TAX_BRACKETS,
+    DEFAULT_MONTHLY_CONVERTED_BONUS_TAX_BRACKETS,
+    get_policy,
+)
 from ..schemas import BonusTaxMethod, IncomeMember, IncomeStageData, RulePackData
 from .time import (
     month_distance,
@@ -12,25 +17,8 @@ from .time import (
 )
 
 
-DEFAULT_COMPREHENSIVE_BRACKETS = [
-    {"threshold": 36000, "rate": 0.03, "quick_deduction": 0},
-    {"threshold": 144000, "rate": 0.10, "quick_deduction": 2520},
-    {"threshold": 300000, "rate": 0.20, "quick_deduction": 16920},
-    {"threshold": 420000, "rate": 0.25, "quick_deduction": 31920},
-    {"threshold": 660000, "rate": 0.30, "quick_deduction": 52920},
-    {"threshold": 960000, "rate": 0.35, "quick_deduction": 85920},
-    {"threshold": 999999999, "rate": 0.45, "quick_deduction": 181920},
-]
-
-DEFAULT_BONUS_BRACKETS = [
-    {"threshold": 3000, "rate": 0.03, "quick_deduction": 0},
-    {"threshold": 12000, "rate": 0.10, "quick_deduction": 210},
-    {"threshold": 25000, "rate": 0.20, "quick_deduction": 1410},
-    {"threshold": 35000, "rate": 0.25, "quick_deduction": 2660},
-    {"threshold": 55000, "rate": 0.30, "quick_deduction": 4410},
-    {"threshold": 80000, "rate": 0.35, "quick_deduction": 7160},
-    {"threshold": 999999999, "rate": 0.45, "quick_deduction": 15160},
-]
+DEFAULT_COMPREHENSIVE_BRACKETS = DEFAULT_COMPREHENSIVE_TAX_BRACKETS
+DEFAULT_BONUS_BRACKETS = DEFAULT_MONTHLY_CONVERTED_BONUS_TAX_BRACKETS
 
 
 @dataclass(frozen=True)
@@ -177,32 +165,38 @@ def beijing_contribution_details(member: IncomeMember | IncomeStageData, rules: 
         )
     if member.monthly_salary_gross <= 0:
         return ContributionDetails(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    params = rules.params
+    payroll_policy = get_policy(rules).payroll_contribution_policy()
     social_base = clamp(
         member.monthly_salary_gross,
-        float(params.get("beijing_social_base_floor", 7162)),
-        float(params.get("beijing_social_base_ceiling", 35811)),
+        payroll_policy.social_base_floor,
+        payroll_policy.social_base_ceiling,
     )
     fund_base = clamp(
         member.monthly_salary_gross,
-        float(params.get("beijing_housing_fund_base_floor", 2540)),
-        float(params.get("beijing_housing_fund_base_ceiling", 35811)),
+        payroll_policy.housing_fund_base_floor,
+        payroll_policy.housing_fund_base_ceiling,
     )
-    fund_rate_floor = float(params.get("housing_fund_min_rate", 0.05))
-    fund_rate_ceiling = float(params.get("housing_fund_max_rate", 0.12))
-    personal_fund_rate = clamp(member.housing_fund_personal_rate, fund_rate_floor, fund_rate_ceiling)
-    employer_fund_rate = clamp(member.housing_fund_employer_rate, fund_rate_floor, fund_rate_ceiling)
+    personal_fund_rate = clamp(
+        member.housing_fund_personal_rate,
+        payroll_policy.housing_fund_rate_floor,
+        payroll_policy.housing_fund_rate_ceiling,
+    )
+    employer_fund_rate = clamp(
+        member.housing_fund_employer_rate,
+        payroll_policy.housing_fund_rate_floor,
+        payroll_policy.housing_fund_rate_ceiling,
+    )
 
-    employee_pension = social_base * float(params.get("employee_pension_rate", 0.08))
-    employee_medical = social_base * float(params.get("employee_medical_rate", 0.02))
-    employee_medical_fixed = float(params.get("employee_medical_fixed", 3))
-    employee_unemployment = social_base * float(params.get("employee_unemployment_rate", 0.005))
+    employee_pension = social_base * payroll_policy.employee_pension_rate
+    employee_medical = social_base * payroll_policy.employee_medical_rate
+    employee_medical_fixed = payroll_policy.employee_medical_fixed
+    employee_unemployment = social_base * payroll_policy.employee_unemployment_rate
     personal_social = employee_pension + employee_medical + employee_medical_fixed + employee_unemployment
     employer_social = (
-        social_base * float(params.get("employer_pension_rate", 0.16))
-        + social_base * float(params.get("employer_medical_maternity_rate", 0.098))
-        + social_base * float(params.get("employer_unemployment_rate", 0.005))
-        + social_base * float(params.get("employer_work_injury_rate", 0.002))
+        social_base * payroll_policy.employer_pension_rate
+        + social_base * payroll_policy.employer_medical_maternity_rate
+        + social_base * payroll_policy.employer_unemployment_rate
+        + social_base * payroll_policy.employer_work_injury_rate
     )
     personal_housing_fund = fund_base * personal_fund_rate
     employer_housing_fund = fund_base * employer_fund_rate
@@ -230,19 +224,7 @@ def beijing_contributions(member: IncomeMember | IncomeStageData, rules: RulePac
 
 
 def annual_bonus_separate_tax_available(rules: RulePackData, target_year: int) -> bool:
-    periods = rules.params.get("annual_bonus_policy_periods")
-    if isinstance(periods, list):
-        for period in periods:
-            if not isinstance(period, dict):
-                continue
-            start = parse_iso_date(str(period.get("effective_from") or ""), date(1900, 1, 1))
-            end = parse_iso_date(str(period.get("effective_to") or ""), date(9999, 12, 31))
-            if start.year <= target_year <= end.year:
-                return bool(period.get("separate_tax_enabled", True))
-    if bool(rules.params.get("annual_bonus_separate_tax_default_continues", True)):
-        return True
-    valid_until = parse_iso_date(str(rules.params.get("annual_bonus_separate_tax_valid_until") or ""), date(9999, 12, 31))
-    return target_year <= valid_until.year
+    return get_policy(rules).tax_calculation_policy().annual_bonus_separate_tax_available(target_year)
 
 
 def stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData, target_year: int | None = None) -> BonusTaxMethod:
@@ -254,10 +236,10 @@ def stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData, tar
     if method in {"merged", "separate"}:
         return method
 
-    params = rules.params
-    annual_brackets = list(params.get("comprehensive_tax_brackets") or DEFAULT_COMPREHENSIVE_BRACKETS)
-    bonus_brackets = list(params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
-    standard_deduction = float(params.get("personal_standard_deduction_annual", 60000))
+    tax_policy = get_policy(rules).tax_calculation_policy()
+    annual_brackets = tax_policy.comprehensive_brackets
+    bonus_brackets = tax_policy.monthly_converted_bonus_brackets
+    standard_deduction = tax_policy.personal_standard_deduction_annual
     personal_social, personal_housing_fund, _, _ = beijing_contributions(stage, rules)
     common_deductions = (
         standard_deduction

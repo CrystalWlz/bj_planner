@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..policies import get_policy
 from ..schemas import HouseholdData, RulePackData, ScenarioData
 
 
@@ -27,9 +28,9 @@ def household_with_member_derived_profile(household: HouseholdData) -> Household
 
 
 def evaluate_home_purchase_eligibility(household: HouseholdData, rules: RulePackData) -> tuple[bool, list[str]]:
-    params = rules.params
-    required_months = int(params.get("required_social_security_months", 36))
-    max_home_count = int(params.get("max_home_count", 2))
+    policy = get_policy(rules).home_purchase_eligibility_policy()
+    required_months = policy.required_social_security_months
+    max_home_count = policy.max_home_count
 
     notes: list[str] = []
     has_local_qualification = household.has_beijing_hukou or household.social_security_months >= required_months

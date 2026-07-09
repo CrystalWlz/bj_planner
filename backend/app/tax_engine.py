@@ -12,8 +12,6 @@ from .domain.time import (
     parse_year_month as _parse_year_month,
 )
 from .domain.tax import (
-    DEFAULT_BONUS_BRACKETS,
-    DEFAULT_COMPREHENSIVE_BRACKETS,
     active_months_in_period as _active_months_in_period,
     annual_bonus_separate_tax_available as _annual_bonus_separate_tax_available,
     beijing_contributions as _beijing_contributions,
@@ -25,6 +23,7 @@ from .domain.tax import (
     stage_monthly_spread_bonus_amount as _stage_monthly_spread_bonus_amount,
     stage_selected_bonus_method as _stage_selected_bonus_method,
 )
+from .policies import get_policy
 from .schemas import (
     BonusTaxMethod,
     ElderlyDependentData,
@@ -147,7 +146,7 @@ def _personal_pension_deduction_for_member_at(
 ) -> float:
     if household is None:
         return 0.0
-    cap = max(0.0, float(rules.params.get("personal_pension_deduction_annual_cap", 12000)))
+    cap = get_policy(rules).tax_benefit_policy().personal_pension_deduction_annual_cap
     member = next((item for item in household.members if item.name == member_name), None)
     if member is None or not bool(getattr(member, "personal_pension_account_enabled", False)):
         return 0.0
@@ -210,7 +209,7 @@ def _personal_pension_cash_contribution_for_member_at(
         return 0.0
     if end is not None and _month_distance(target, end) < 0:
         return 0.0
-    cap = max(0.0, float(rules.params.get("personal_pension_deduction_annual_cap", 12000)))
+    cap = get_policy(rules).tax_benefit_policy().personal_pension_deduction_annual_cap
     if mode == "auto_tax_optimal":
         stage = _income_stage_for_month(member, target_month.year, target_month.month)
         if stage is None or stage.stage_kind in {"pension", "unemployment"}:
@@ -265,8 +264,9 @@ def _auto_child_special_deduction_for_member_at(
 ) -> float:
     if household is None:
         return 0.0
-    infant_monthly = float(rules.params.get("infant_care_deduction_monthly", 2000))
-    education_monthly = float(rules.params.get("child_education_deduction_monthly", 2000))
+    tax_benefit = get_policy(rules).tax_benefit_policy()
+    infant_monthly = tax_benefit.infant_care_monthly
+    education_monthly = tax_benefit.child_education_monthly
     total = 0.0
     for child in household.child_plans:
         if not child.enabled or child.tax_deduction_owner != member_name:
@@ -291,7 +291,7 @@ def _configured_special_deduction_for_member_at(
 ) -> float:
     if household is None:
         return 0.0
-    params = rules.params
+    tax_benefit = get_policy(rules).tax_benefit_policy()
     monthly_total = 0.0
     rent_total = 0.0
     mortgage_total = 0.0
@@ -304,29 +304,29 @@ def _configured_special_deduction_for_member_at(
         if item.settlement_mode == "annual_settlement":
             if include_annual_settlement:
                 if item.deduction_type == "serious_illness":
-                    threshold = float(params.get("serious_illness_medical_threshold", 15000))
-                    cap = float(params.get("serious_illness_medical_cap", 80000))
+                    threshold = tax_benefit.serious_illness_medical_threshold
+                    cap = tax_benefit.serious_illness_medical_cap
                     annual_total += min(cap, max(0.0, item.annual_amount - threshold))
                 else:
                     annual_total += max(0.0, item.annual_amount)
             continue
         if item.deduction_type == "housing_rent":
-            rent_total += item.monthly_amount or float(params.get("beijing_housing_rent_deduction_monthly", 1500))
+            rent_total += item.monthly_amount or tax_benefit.housing_rent_monthly
         elif item.deduction_type == "mortgage_interest":
             used = max(0, item.claimed_months_used)
             elapsed = _month_distance(_parse_year_month(item.start_month) or (target_month.year, target_month.month), (target_month.year, target_month.month))
-            max_months = int(params.get("first_home_mortgage_interest_max_months", 240))
+            max_months = tax_benefit.first_home_mortgage_interest_max_months
             if item.is_first_home_loan and used + elapsed < max_months:
-                mortgage_total += item.monthly_amount or float(params.get("first_home_mortgage_interest_deduction_monthly", 1000))
+                mortgage_total += item.monthly_amount or tax_benefit.first_home_mortgage_interest_monthly
         elif item.deduction_type == "child_education":
-            monthly_total += item.monthly_amount or float(params.get("child_education_deduction_monthly", 2000))
+            monthly_total += item.monthly_amount or tax_benefit.child_education_monthly
         elif item.deduction_type == "infant_care":
-            monthly_total += item.monthly_amount or float(params.get("infant_care_deduction_monthly", 2000))
+            monthly_total += item.monthly_amount or tax_benefit.infant_care_monthly
         elif item.deduction_type == "personal_pension":
-            monthly_total += min(item.annual_amount or item.monthly_amount * 12, float(params.get("personal_pension_deduction_annual_cap", 12000))) / 12
+            monthly_total += min(item.annual_amount or item.monthly_amount * 12, tax_benefit.personal_pension_deduction_annual_cap) / 12
         else:
             monthly_total += max(0.0, item.monthly_amount)
-    if bool(params.get("rent_and_mortgage_deduction_mutually_exclusive", True)):
+    if tax_benefit.rent_and_mortgage_mutually_exclusive:
         monthly_total += max(rent_total, mortgage_total)
     else:
         monthly_total += rent_total + mortgage_total
@@ -355,7 +355,7 @@ def _auto_housing_special_deduction_for_member_at(
         start = _parse_iso_date(stage.start_month, date(1900, 1, 1))
         end = _parse_iso_date(stage.end_month, date(9999, 12, 31)) if stage.end_month else date(9999, 12, 31)
         if start <= target_month <= end:
-            return float(rules.params.get("beijing_housing_rent_deduction_monthly", 1500))
+            return get_policy(rules).tax_benefit_policy().housing_rent_monthly
     return 0.0
 
 
@@ -413,9 +413,9 @@ def _member_cumulative_salary_tax_state(
     if through_month <= 0:
         return MemberSalaryTaxState(0.0, 0.0, 0.0)
 
-    params = rules.params
-    annual_brackets = list(params.get("comprehensive_tax_brackets") or DEFAULT_COMPREHENSIVE_BRACKETS)
-    monthly_standard_deduction = float(params.get("personal_standard_deduction_annual", 60000)) / 12
+    tax_policy = get_policy(rules).tax_calculation_policy()
+    annual_brackets = tax_policy.comprehensive_brackets
+    monthly_standard_deduction = tax_policy.personal_standard_deduction_annual / 12
     active_months = 0
     cumulative_income = 0.0
     cumulative_social_and_fund = 0.0
@@ -499,7 +499,7 @@ def _member_monthly_income_profile(
     bonus_payout = lump_sum_bonus_payout + monthly_spread_bonus
     bonus_tax_due = 0.0
     if selected_bonus_method == "separate":
-        bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
+        bonus_brackets = get_policy(rules).tax_calculation_policy().monthly_converted_bonus_brackets
         bonus_tax_due = _bonus_tax(lump_sum_bonus_payout, bonus_brackets) if lump_sum_bonus_payout > 0 else 0.0
 
     taxable_cash_income = (
@@ -590,12 +590,13 @@ def _member_tax_summary(
     member: IncomeMember,
     rules: RulePackData,
     household: HouseholdData | None = None,
+    *,
+    projection_year: int,
 ) -> TaxMemberSummary:
-    params = rules.params
-    annual_brackets = list(params.get("comprehensive_tax_brackets") or DEFAULT_COMPREHENSIVE_BRACKETS)
-    bonus_brackets = list(params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
-    standard_deduction = float(params.get("personal_standard_deduction_annual", 60000))
-    projection_year = int(params.get("_income_projection_year", 2027))
+    tax_policy = get_policy(rules).tax_calculation_policy()
+    annual_brackets = tax_policy.comprehensive_brackets
+    bonus_brackets = tax_policy.monthly_converted_bonus_brackets
+    standard_deduction = tax_policy.personal_standard_deduction_annual
     stages = member.income_stages or []
 
     active_months = 0
@@ -735,15 +736,10 @@ def calculate_household_tax(household: HouseholdData, rules: RulePackData) -> tu
         gross_monthly = household.monthly_income
         return [], gross_monthly, gross_monthly, 0.0
 
-    projected_rules = rules.model_copy(
-        update={
-            "params": {
-                **rules.params,
-                "_income_projection_year": household.income_projection_year,
-            }
-        }
-    )
-    summaries = [_member_tax_summary(member, projected_rules, household) for member in household.members]
+    summaries = [
+        _member_tax_summary(member, rules, household, projection_year=household.income_projection_year)
+        for member in household.members
+    ]
     gross_monthly = sum(item.gross_annual_income for item in summaries) / 12
     net_monthly = sum(item.net_annual_income for item in summaries) / 12
     annual_tax = sum(item.total_tax for item in summaries)
@@ -752,15 +748,10 @@ def calculate_household_tax(household: HouseholdData, rules: RulePackData) -> tu
 
 def calculate_household_tax_for_year(household: HouseholdData, rules: RulePackData, year: int) -> TaxYearSummary:
     household = _household_with_pension_income_stages(household, rules)
-    projected_rules = rules.model_copy(
-        update={
-            "params": {
-                **rules.params,
-                "_income_projection_year": year,
-            }
-        }
-    )
-    summaries = [_member_tax_summary(member, projected_rules, household) for member in household.members]
+    summaries = [
+        _member_tax_summary(member, rules, household, projection_year=year)
+        for member in household.members
+    ]
     return TaxYearSummary(
         year=year,
         summaries=summaries,
@@ -811,7 +802,7 @@ def _build_tax_member_monthly_point(
     bonus_income = lump_sum_bonus_income + monthly_spread_bonus
     bonus_tax_due = 0.0
     if selected_bonus_method == "separate" and lump_sum_bonus_income > 0:
-        bonus_brackets = list(rules.params.get("monthly_converted_bonus_tax_brackets") or DEFAULT_BONUS_BRACKETS)
+        bonus_brackets = get_policy(rules).tax_calculation_policy().monthly_converted_bonus_brackets
         bonus_tax_due = _bonus_tax(lump_sum_bonus_income, bonus_brackets)
 
     other_taxable_income = stage.monthly_freelance_income + stage.other_annual_taxable_income / 12
@@ -934,8 +925,7 @@ def _estimate_personal_pension_tax_saving(
     rules: RulePackData,
     projection_year: int,
 ) -> float:
-    scoped_rules = rules.model_copy(update={"params": {**rules.params, "_income_projection_year": projection_year}})
-    summary_with = _member_tax_summary(member, scoped_rules, household=household)
+    summary_with = _member_tax_summary(member, rules, household=household, projection_year=projection_year)
     member_without = member.model_copy(
         update={
             "personal_pension_account_enabled": False,
@@ -951,7 +941,12 @@ def _estimate_personal_pension_tax_saving(
             ]
         }
     )
-    summary_without = _member_tax_summary(member_without, scoped_rules, household=household_without)
+    summary_without = _member_tax_summary(
+        member_without,
+        rules,
+        household=household_without,
+        projection_year=projection_year,
+    )
     return max(0.0, summary_without.total_tax - summary_with.total_tax)
 
 

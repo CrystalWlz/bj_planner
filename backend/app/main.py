@@ -1,31 +1,33 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 from starlette.middleware.gzip import GZipMiddleware
 
-from .cache import affordability_cache_key
+from .cache import affordability_cache_key, calculation_code_fingerprints
 from .calculator import calculate_affordability
 from .database import (
     delete_record,
     delete_planning_goal_record,
     delete_scenario_record,
-    get_calculation_cache,
     get_calculation_cache_payload,
     initialize_database,
     insert_household_record,
     insert_planning_goal_record,
     insert_record,
     insert_scenario_record,
+    list_core_object_records,
     list_generated_strategies,
+    list_generated_strategies_for_cache_layers,
     list_household_records,
-    list_planning_goal_records,
     list_records,
+    list_scenario_records,
     normalize_household_data,
+    normalize_market_snapshot_data,
     normalize_planning_goal_data,
     normalize_rule_pack_data,
     normalize_scenario_data,
@@ -35,11 +37,28 @@ from .database import (
     upsert_generated_strategies,
     update_record,
     update_scenario_record,
-    list_scenario_records,
 )
+from .planning_context import (
+    apply_planning_goal_constraints,
+    core_object_snapshot_from_record,
+    payload_with_calculation_context,
+    planning_foundation_for_request,
+    planning_goal_records_for_request,
+    planning_goal_sequence_for_request,
+)
+from .reporting import build_account_concepts_from_core_object_snapshots, build_core_object_group_summaries
 from .schemas import (
     AffordabilityRequest,
     AffordabilityResult,
+    AccountConceptSummary,
+    CacheLayerHashes,
+    CalculationContextSnapshot,
+    CoreObjectGroupSummary,
+    CoreObjectRecord,
+    CoreObjectCategory,
+    CoreObjectType,
+    GeneratedStrategyBatchRequest,
+    GeneratedStrategyType,
     HouseholdCreate,
     HouseholdData,
     HouseholdRecord,
@@ -48,7 +67,10 @@ from .schemas import (
     MarketSnapshotRecord,
     PlanningGoalCreate,
     PlanningGoalData,
+    PlanningFoundationSummary,
     PlanningGoalRecord,
+    PlanningGoalType,
+    PlanningSequenceResult,
     RulePackCreate,
     RulePackData,
     RulePackRecord,
@@ -59,6 +81,53 @@ from .schemas import (
     SourceFetchRequest,
 )
 from .source_monitor import fetch_preview
+
+
+def _cached_affordability_payload_is_current(payload: str) -> bool:
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(result, dict):
+        return False
+    monthly_rows = result.get("monthly_cashflow_visualization")
+    monthly_details = result.get("monthly_visualization_details")
+    if isinstance(monthly_rows, list) and monthly_rows and not monthly_details:
+        return False
+    if isinstance(monthly_rows, list) and isinstance(monthly_details, list) and monthly_rows:
+        has_cashflow_activity = any(
+            isinstance(row, dict)
+            and (
+                abs(float(row.get("cash_income") or 0)) > 0
+                or abs(float(row.get("living_expense") or 0)) > 0
+                or abs(float(row.get("monthly_cash_delta") or 0)) > 0
+                or bool(row.get("ledger_entries"))
+            )
+            for row in monthly_rows
+        )
+        has_cashflow_detail_items = any(
+            isinstance(detail, dict) and bool(detail.get("cash_flow_items"))
+            for detail in monthly_details
+        )
+        if has_cashflow_activity and not has_cashflow_detail_items:
+            return False
+    return True
+
+
+def _upgrade_cached_affordability_payload(
+    payload: str,
+    cache_layers: CacheLayerHashes,
+    calculation_context: CalculationContextSnapshot | None,
+) -> dict | None:
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(result, dict):
+        return None
+    result["cache_layers"] = cache_layers.model_dump(mode="json")
+    result["calculation_context"] = calculation_context.model_dump(mode="json") if calculation_context else None
+    return result
 
 
 @asynccontextmanager
@@ -115,9 +184,44 @@ def save_household(record_id: str, payload: HouseholdCreate) -> dict:
     return record
 
 
+@app.get("/api/core-objects", response_model=list[CoreObjectRecord])
+def get_core_objects(
+    household_id: str | None = None,
+    object_type: CoreObjectType | None = None,
+    category: CoreObjectCategory | None = None,
+    owner_key: str | None = None,
+) -> list[dict]:
+    return list_core_object_records(
+        household_id=household_id,
+        object_type=object_type,
+        category=category,
+        owner_key=owner_key,
+    )
+
+
+@app.get("/api/account-concepts", response_model=list[AccountConceptSummary])
+def get_account_concepts(household_id: str | None = None) -> list[AccountConceptSummary]:
+    records = list_core_object_records(household_id=household_id)
+    snapshots = [core_object_snapshot_from_record(record) for record in records]
+    return build_account_concepts_from_core_object_snapshots(snapshots)
+
+
+@app.get("/api/core-object-groups", response_model=list[CoreObjectGroupSummary])
+def get_core_object_groups(household_id: str | None = None) -> list[CoreObjectGroupSummary]:
+    records = list_core_object_records(household_id=household_id)
+    snapshots = [core_object_snapshot_from_record(record) for record in records]
+    account_concepts = build_account_concepts_from_core_object_snapshots(snapshots)
+    return build_core_object_group_summaries(account_concepts)
+
+
+@app.get("/api/planning-foundation", response_model=PlanningFoundationSummary)
+def get_planning_foundation(household_id: str | None = None) -> PlanningFoundationSummary:
+    return planning_foundation_for_request(household_id=household_id)
+
+
 @app.get("/api/scenarios", response_model=list[ScenarioRecord])
-def get_scenarios() -> list[dict]:
-    return list_scenario_records()
+def get_scenarios(household_id: str | None = None) -> list[dict]:
+    return list_scenario_records(household_id=household_id)
 
 
 @app.post("/api/scenarios", response_model=ScenarioRecord)
@@ -142,8 +246,13 @@ def delete_scenario(record_id: str) -> dict[str, bool]:
 
 
 @app.get("/api/planning-goals", response_model=list[PlanningGoalRecord])
-def get_planning_goals(household_id: str | None = None, goal_type: str | None = None) -> list[dict]:
-    return list_planning_goal_records(household_id=household_id, goal_type=goal_type)
+def get_planning_goals(household_id: str | None = None, goal_type: PlanningGoalType | None = None) -> list[dict]:
+    return planning_goal_records_for_request(household_id=household_id, goal_type=goal_type)
+
+
+@app.get("/api/planning-goals/sequence", response_model=PlanningSequenceResult)
+def get_planning_goal_sequence(household_id: str | None = None, goal_type: PlanningGoalType | None = None) -> PlanningSequenceResult:
+    return planning_goal_sequence_for_request(household_id=household_id, goal_type=goal_type)
 
 
 @app.post("/api/planning-goals", response_model=PlanningGoalRecord)
@@ -153,7 +262,12 @@ def create_planning_goal(payload: PlanningGoalCreate) -> dict:
 
 @app.put("/api/planning-goals/{record_id}", response_model=PlanningGoalRecord)
 def save_planning_goal(record_id: str, payload: PlanningGoalCreate) -> dict:
-    record = update_planning_goal_record(record_id, normalize_planning_goal_data(payload.data.model_dump(mode="json")), payload.household_id)
+    record = update_planning_goal_record(
+        record_id,
+        normalize_planning_goal_data(payload.data.model_dump(mode="json")),
+        payload.household_id,
+        preserve_household_when_omitted="household_id" not in payload.model_fields_set,
+    )
     if record is None:
         raise HTTPException(status_code=404, detail="Planning goal not found")
     return record
@@ -192,32 +306,74 @@ def get_market_snapshots() -> list[dict]:
 
 @app.post("/api/market-snapshots", response_model=MarketSnapshotRecord)
 def create_market_snapshot(payload: MarketSnapshotCreate) -> dict:
-    return insert_record("market_snapshots", payload.data.model_dump(mode="json"))
+    return insert_record("market_snapshots", normalize_market_snapshot_data(payload.data.model_dump(mode="json")))
 
 
 @app.post("/api/calculations/affordability", response_model=AffordabilityResult)
-def calculate(payload: AffordabilityRequest) -> AffordabilityResult | Response:
-    cache_key, engine_fingerprint, cache_layers = affordability_cache_key(payload)
+def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
+    cache_payload = payload_with_calculation_context(payload)
+    cache_key, engine_fingerprint, cache_layers = affordability_cache_key(cache_payload)
     cached_payload = get_calculation_cache_payload(cache_key)
-    if cached_payload is not None:
-        return Response(content=cached_payload, media_type="application/json")
+    if cached_payload is not None and _cached_affordability_payload_is_current(cached_payload):
+        upgraded_payload = _upgrade_cached_affordability_payload(
+            cached_payload,
+            cache_layers,
+            cache_payload.calculation_context,
+        )
+        if upgraded_payload is not None:
+            upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
+            upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
+            return AffordabilityResult.model_validate(upgraded_payload)
 
+    payload = apply_planning_goal_constraints(cache_payload)
     result = calculate_affordability(
         payload.household,
         payload.scenario,
         payload.rule_pack,
+        market_snapshot=payload.market_snapshot,
         include_stress_tests=payload.include_stress_tests,
+        calculation_context=payload.calculation_context,
     )
-    result = result.model_copy(update={"cache_layers": cache_layers})
+    result = result.model_copy(update={"cache_layers": cache_layers, "calculation_context": payload.calculation_context})
     result_payload = result.model_dump(mode="json")
-    upsert_calculation_cache(cache_key, engine_fingerprint, result_payload)
-    upsert_generated_strategies(cache_key, engine_fingerprint, result_payload)
+    upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, result_payload)
+    upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, result_payload)
     return result
 
 
 @app.get("/api/generated-strategies")
-def get_generated_strategies(cache_key: str | None = None, strategy_type: str | None = None) -> list[dict]:
-    return list_generated_strategies(cache_key=cache_key, strategy_type=strategy_type)
+def get_generated_strategies(
+    cache_key: str | None = None,
+    strategy_type: GeneratedStrategyType | None = None,
+    owner_key: str | None = None,
+    current_only: bool = True,
+    input_hash: str | None = None,
+    strategy_hash: str | None = None,
+    ledger_hash: str | None = None,
+    visualization_hash: str | None = None,
+) -> list[dict]:
+    engine_fingerprint = calculation_code_fingerprints()["engine"] if current_only and cache_key is None else None
+    return list_generated_strategies(
+        cache_key=cache_key,
+        strategy_type=strategy_type,
+        owner_key=owner_key,
+        engine_fingerprint=engine_fingerprint,
+        input_hash=input_hash,
+        strategy_hash=strategy_hash,
+        ledger_hash=ledger_hash,
+        visualization_hash=visualization_hash,
+    )
+
+
+@app.post("/api/generated-strategies/by-cache-layers")
+def get_generated_strategies_by_cache_layers(payload: GeneratedStrategyBatchRequest) -> list[dict]:
+    engine_fingerprint = calculation_code_fingerprints()["engine"] if payload.current_only else None
+    return list_generated_strategies_for_cache_layers(
+        payload.cache_layers,
+        strategy_type=payload.strategy_type,
+        owner_key=payload.owner_key,
+        engine_fingerprint=engine_fingerprint,
+    )
 
 
 @app.post("/api/sources/fetch-preview", response_model=SourceDocumentRecord)

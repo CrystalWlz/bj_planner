@@ -8,7 +8,9 @@ from .domain.expenses import (
 from .projection_facade import household_initial_provident_balance
 from .schemas import (
     CarLoanSummary,
+    CalculationContextSnapshot,
     HouseholdData,
+    MarketSnapshotData,
     PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
@@ -39,6 +41,8 @@ def build_purchase_plan_analyses(
     net_monthly_income: float,
     car_loan: CarLoanSummary,
     taxes_and_fees: float,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[PurchasePlanAnalysis]:
     return strategy_build_purchase_plan_analyses(
         household,
@@ -79,6 +83,8 @@ def build_purchase_plan_analyses(
         ),
         initial_provident_balance=household_initial_provident_balance(household, rules),
         planning_window_delay_provider=planning_window_delay_months,
+        calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )
 
 
@@ -92,6 +98,7 @@ def build_yield_sensitivity(
     car_loan: CarLoanSummary,
     taxes_and_fees: float,
     parallel_workers: int = 1,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[YieldSensitivityPoint]:
     return strategy_build_yield_sensitivity(
         household,
@@ -103,6 +110,7 @@ def build_yield_sensitivity(
         taxes_and_fees=taxes_and_fees,
         purchase_plan_builder=build_purchase_plan_analyses,
         parallel_workers=parallel_workers,
+        market_snapshot=market_snapshot,
     )
 
 

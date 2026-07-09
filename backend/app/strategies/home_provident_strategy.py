@@ -35,17 +35,22 @@ def _pf_strategy_switch_month(mode: str) -> int:
         return 12
 
 
+def _is_staged_pf_strategy(mode: str) -> bool:
+    return mode.startswith("monthly_then_semiannual_offset") or mode.startswith("semiannual_offset_then_monthly")
+
+
 def post_purchase_monthly_pf_withdrawal(
     *,
     monthly_pf_deposit: float,
     provident_monthly_payment: float,
     rules: RulePackData,
 ) -> tuple[float, str]:
-    if not bool(rules.params.get("provident_post_purchase_cashflow_enabled", False)):
+    post_purchase_policy = get_policy(rules).provident_post_purchase_policy()
+    if not post_purchase_policy.cashflow_enabled:
         return 0.0, "kept_in_account"
-    if not bool(rules.params.get("provident_monthly_withdrawal_after_purchase_enabled", False)):
+    if not post_purchase_policy.monthly_withdrawal_enabled:
         return 0.0, "kept_in_account"
-    mode = str(rules.params.get("provident_post_purchase_withdrawal_mode", "purchase_agreed"))
+    mode = post_purchase_policy.withdrawal_mode
     if mode in {"loan_offset", "monthly_repayment_withdrawal"}:
         return min(monthly_pf_deposit, provident_monthly_payment), "monthly_repayment_withdrawal"
     return monthly_pf_deposit, "purchase_agreed"
@@ -98,11 +103,10 @@ def policy_default_pf_account_strategy(
         if household
         else get_policy(rules).provident_account_management_center()
     )
-    if center == "national" and bool(rules.params.get("provident_national_monthly_direct_offset_supported", True)):
+    policy = get_policy(rules)
+    if policy.provident_monthly_repayment_withdrawal_supported(center):
         return "monthly_repayment_withdrawal"
-    if bool(rules.params.get("provident_municipal_monthly_repayment_withdrawal_supported", True)):
-        return "monthly_repayment_withdrawal"
-    if bool(rules.params.get("provident_municipal_semiannual_principal_offset_supported", True)):
+    if policy.provident_semiannual_principal_offset_supported(center):
         return "semiannual_principal_offset"
     return "keep_in_account"
 
@@ -112,8 +116,18 @@ def effective_pf_account_strategy(scenario: ScenarioData, rules: RulePackData, h
     if strategy == "auto":
         return "auto"
     if strategy == "loan_offset":
-        return "semiannual_principal_offset"
-    if strategy in {"monthly_repayment_withdrawal", "semiannual_principal_offset", "keep_in_account"}:
+        strategy = "semiannual_principal_offset"
+    if strategy in {"monthly_repayment_withdrawal", "semiannual_principal_offset"}:
+        switch_enabled = bool(getattr(scenario, "provident_account_repayment_switch_enabled", False))
+        switch_to = str(getattr(scenario, "provident_account_repayment_switch_to_strategy", "") or "")
+        switch_month = int(getattr(scenario, "provident_account_repayment_switch_after_month", 12) or 12)
+        if switch_enabled and switch_to != strategy:
+            if strategy == "monthly_repayment_withdrawal" and switch_to == "semiannual_principal_offset":
+                return pf_strategy_monthly_then_offset(switch_month, auto=False)
+            if strategy == "semiannual_principal_offset" and switch_to == "monthly_repayment_withdrawal":
+                return pf_strategy_semiannual_offset_then_monthly(switch_month, auto=False)
+        return strategy
+    if strategy == "keep_in_account":
         return strategy
     return policy_default_pf_account_strategy(rules, household)
 
@@ -137,8 +151,9 @@ def semiannual_loan_offset_projection(
     if monthly_pf_deposit <= 0 or provident_monthly_payment <= 0:
         return 0.0, 0.0
     pf_balance = max(0.0, starting_pf_balance)
-    retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
-    pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
+    policy = get_policy(rules)
+    retained_balance = policy.provident_loan_offset_retained_balance()
+    pf_interest_rate = policy.provident_account_balance_annual_interest_rate()
     pf_monthly_rate = max(0.0, pf_interest_rate) / 12
     total_cash_relief = 0.0
     total_offset_payment = 0.0
@@ -191,15 +206,24 @@ def pf_strategy_monthly_then_offset(switch_month: int = 12, *, auto: bool = True
     return f"{prefix}:{max(1, switch_month)}"
 
 
+def pf_strategy_semiannual_offset_then_monthly(switch_month: int = 12, *, auto: bool = True) -> str:
+    prefix = "semiannual_offset_then_monthly_auto" if auto else "semiannual_offset_then_monthly"
+    return f"{prefix}:{max(1, switch_month)}"
+
+
 def pf_strategy_active_mode(mode: str, *, purchase_month: int, current_month: int | None = None) -> str:
-    if not mode.startswith("monthly_then_semiannual_offset"):
-        return mode
-    if current_month is None:
-        return "monthly_repayment_withdrawal_auto" if "_auto" in mode else "monthly_repayment_withdrawal"
-    repayment_month = max(1, current_month - purchase_month)
-    if repayment_month <= _pf_strategy_switch_month(mode):
-        return "monthly_repayment_withdrawal_auto" if "_auto" in mode else "monthly_repayment_withdrawal"
-    return "loan_offset_semiannual_auto" if "_auto" in mode else "loan_offset_semiannual"
+    auto_suffix = "_auto" if "_auto" in mode else ""
+    if mode.startswith("monthly_then_semiannual_offset"):
+        repayment_month = max(1, current_month - purchase_month) if current_month is not None else 1
+        if current_month is None or repayment_month <= _pf_strategy_switch_month(mode):
+            return f"monthly_repayment_withdrawal{auto_suffix}"
+        return f"loan_offset_semiannual{auto_suffix}"
+    if mode.startswith("semiannual_offset_then_monthly"):
+        repayment_month = max(1, current_month - purchase_month) if current_month is not None else 1
+        if current_month is None or repayment_month <= _pf_strategy_switch_month(mode):
+            return f"loan_offset_semiannual{auto_suffix}"
+        return f"monthly_repayment_withdrawal{auto_suffix}"
+    return mode
 
 
 def post_purchase_pf_strategy(
@@ -216,23 +240,22 @@ def post_purchase_pf_strategy(
     strategy_preference: str = "auto",
     current_month: int | None = None,
 ) -> tuple[float, str]:
-    strategy_mode = str(rules.params.get("provident_post_purchase_strategy_mode", "auto"))
+    post_purchase_policy = get_policy(rules).provident_post_purchase_policy()
+    strategy_mode = post_purchase_policy.strategy_mode
     if strategy_preference != "auto":
         strategy_mode = strategy_preference
-    manual_enabled = bool(rules.params.get("provident_post_purchase_cashflow_enabled", False)) and bool(
-        rules.params.get("provident_monthly_withdrawal_after_purchase_enabled", False)
-    )
+    manual_enabled = post_purchase_policy.cashflow_enabled and post_purchase_policy.monthly_withdrawal_enabled
     if strategy_mode == "manual":
         if not manual_enabled:
             return 0.0, "kept_in_account"
-        manual_mode = str(rules.params.get("provident_post_purchase_withdrawal_mode", "monthly_repayment_withdrawal"))
+        manual_mode = post_purchase_policy.withdrawal_mode
         if manual_mode in {"monthly_repayment_withdrawal", "semiannual_principal_offset", "keep_in_account"}:
             strategy_mode = manual_mode
         else:
             strategy_mode = "purchase_agreed"
     if strategy_mode == "keep_in_account":
         return 0.0, "kept_in_account"
-    if strategy_mode.startswith("monthly_then_semiannual_offset"):
+    if _is_staged_pf_strategy(strategy_mode):
         active_mode = pf_strategy_active_mode(
             strategy_mode,
             purchase_month=purchase_month,
@@ -290,11 +313,17 @@ def post_purchase_pf_strategy(
         provident_monthly_payment=provident_monthly_payment,
         rules=rules,
     )
+    borrower_center = borrower_provident_account_management_center(
+        household,
+        rules,
+        months_from_now=purchase_month,
+    )
+    policy = get_policy(rules)
     can_switch_between_modes = (
         monthly_relief > 0
         and loan_offset_improvement > 0
-        and bool(rules.params.get("provident_municipal_monthly_repayment_withdrawal_supported", True))
-        and bool(rules.params.get("provident_municipal_semiannual_principal_offset_supported", True))
+        and policy.provident_monthly_repayment_withdrawal_supported(borrower_center)
+        and policy.provident_semiannual_principal_offset_supported(borrower_center)
     )
     if can_switch_between_modes:
         monthly_fixes_cash_deficit = free_cash_flow < 0 <= free_cash_flow + monthly_relief
@@ -325,7 +354,11 @@ def post_purchase_pf_strategy(
 
 def post_purchase_pf_withdrawal_label(mode: str) -> str:
     if mode.startswith("monthly_then_semiannual_offset"):
-        return f"自动先按月提取还公积金贷，第 {_pf_strategy_switch_month(mode)} 个还款月后切换为北京半年度冲还贷"
+        prefix = "自动先" if "_auto" in mode else "先"
+        return f"{prefix}按月约定提取还公积金贷，第 {_pf_strategy_switch_month(mode)} 个还款月后切换为北京半年度冲还贷"
+    if mode.startswith("semiannual_offset_then_monthly"):
+        prefix = "自动先" if "_auto" in mode else "先"
+        return f"{prefix}按北京半年度冲还贷，第 {_pf_strategy_switch_month(mode)} 个还款月后切换为按月约定提取抵月供"
     labels = {
         "kept_in_account": "默认留存在公积金账户",
         "purchase_agreed": "显式开启后按购房约定提取估算",
@@ -341,11 +374,22 @@ def post_purchase_pf_withdrawal_label(mode: str) -> str:
 def post_purchase_pf_strategy_note(mode: str, *, monthly_relief: float = 0.0) -> str:
     if mode.startswith("monthly_then_semiannual_offset"):
         switch_month = _pf_strategy_switch_month(mode)
+        prefix = "自动策略" if "_auto" in mode else "手动策略"
         return (
-            f"自动策略采用阶段切换：买房后前 {switch_month} 个还款月走按月约定提取偿还公积金贷款，"
+            f"{prefix}采用阶段切换：买房后前 {switch_month} 个还款月走按月约定提取偿还公积金贷款，"
             f"优先缓解现金流压力，月均减少现金压力约 {_money_text(monthly_relief)}；"
             f"第 {switch_month + 1} 个还款月起切换为北京半年度冲还贷，在每年 1 月/7 月合同约定日集中冲抵公积金贷款本金。"
             "两种模式互斥，切换到冲还贷后原按月约定提取会终止，后端账户曲线按切换后的规则逐月记账。"
+        )
+    if mode.startswith("semiannual_offset_then_monthly"):
+        switch_month = _pf_strategy_switch_month(mode)
+        prefix = "自动策略" if "_auto" in mode else "手动策略"
+        return (
+            f"{prefix}采用阶段切换：买房后前 {switch_month} 个还款月先按北京半年度冲还贷处理，"
+            "在每年 1 月/7 月合同约定日集中冲抵公积金贷款本金；"
+            f"第 {switch_month + 1} 个还款月起切换为按月约定提取抵扣公积金贷款月供，"
+            f"月均减少现金压力约 {_money_text(monthly_relief)}。"
+            "两种模式互斥，后端账户曲线只按当前阶段启用的单一模式逐月记账。"
         )
     if "monthly_repayment_withdrawal" in mode:
         return "按月约定提取偿还公积金贷款时，系统按每月先用公积金账户余额覆盖当期公积金贷月供、不足部分由银行卡补扣估算。"
@@ -387,7 +431,8 @@ def post_purchase_cash_stress(
     pf_balance = max(0.0, starting_pf_balance)
     minimum_cash = cash_balance
     minimum_month: int | None = purchase_month
-    pf_interest_rate = float(rules.params.get("provident_balance_annual_interest_rate", 0.015))
+    policy = get_policy(rules)
+    pf_interest_rate = policy.provident_account_balance_annual_interest_rate()
     pf_monthly_rate = max(0.0, pf_interest_rate) / 12
     extra_monthly_payment = max(0.0, extra_monthly_payment)
     extra_payment_start_month = max(1, extra_payment_start_month)
@@ -423,7 +468,7 @@ def post_purchase_cash_stress(
             current_month=absolute_month,
         )
         if "loan_offset" in active_pf_mode:
-            retained_balance = max(0.0, float(rules.params.get("provident_loan_offset_retained_balance", 10.0)))
+            retained_balance = policy.provident_loan_offset_retained_balance()
             available = max(0.0, pf_balance - retained_balance)
             pf_withdrawal = available if is_beijing_pf_offset_month(absolute_month) and available > 0 else 0.0
         else:

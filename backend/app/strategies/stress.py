@@ -4,7 +4,9 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 
-from ..schemas import HouseholdData, RulePackData, ScenarioData, StressResult
+from ..domain.housing import commercial_loan_rate
+from ..policies import get_policy
+from ..schemas import HouseholdData, MarketSnapshotData, RulePackData, ScenarioData, StressResult
 
 
 class StressCalculationResultLike(Protocol):
@@ -25,24 +27,15 @@ def build_stress_tests(
     *,
     affordability_calculator: AffordabilityCalculator,
     parallel_workers: int = 1,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[StressResult]:
-    params = rules.params
-    rate_add = float(params.get("rate_stress_add", 0.005))
-    income_factor = float(params.get("income_stress_factor", 0.90))
-    price_factor = float(params.get("price_stress_factor", 1.05))
-
-    provident_rate_keys = (
-        "provident_first_home_rate_1_to_5_years",
-        "provident_first_home_rate_6_to_30_years",
-        "provident_second_home_rate_1_to_5_years",
-        "provident_second_home_rate_6_to_30_years",
-    )
-    stressed_rate_params = dict(rules.params)
-    default_params = RulePackData().params
-    for key in provident_rate_keys:
-        stressed_rate_params[key] = float(stressed_rate_params.get(key, default_params.get(key, 0.0))) + rate_add
-    rate_rules = rules.model_copy(update={"params": stressed_rate_params})
-    rate_scenario = scenario.model_copy(update={"commercial_rate": scenario.commercial_rate + rate_add})
+    policy = get_policy(rules)
+    stress_policy = policy.stress_test_policy()
+    rate_add = stress_policy.rate_add
+    income_factor = stress_policy.income_factor
+    price_factor = stress_policy.price_factor
+    rate_rules = policy.stressed_interest_rate_rules(rate_add)
+    rate_scenario = scenario.model_copy(update={"commercial_rate": commercial_loan_rate(scenario, market_snapshot) + rate_add})
     income_household = household.model_copy(update={"monthly_income": household.monthly_income * income_factor})
     if household.members:
         income_household = income_household.model_copy(

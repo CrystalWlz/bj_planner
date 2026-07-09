@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import date
 
+from .core_object_concepts import CALIBRATION_TARGET_LABELS
 from .domain.children import build_child_plan_strategies
 from .domain.time import month_distance, months_between_months, parse_iso_date, parse_year_month
-from .projection.accounts_ledger import ACCOUNT_CALIBRATION_TARGET_LABELS
 from .schemas import (
     CarLoanSummary,
     CarPlanData,
+    CalculationContextSnapshot,
     HouseholdData,
     IncomeStageData,
     MonthlyCashflowPoint,
@@ -73,18 +74,21 @@ def account_plan_events(
         if target_month is None:
             continue
         month_index = max(0, month_distance((current_month.year, current_month.month), target_month))
-        target_label = ACCOUNT_CALIBRATION_TARGET_LABELS.get(calibration.target, "账户")
+        target_label = CALIBRATION_TARGET_LABELS.get(calibration.target, "账户")
+        source_title = calibration.source_title or calibration.reference_name
+        source_text = f"；来源：{source_title}" if source_title else ""
         note = f"；备注：{calibration.note}" if calibration.note else ""
         events.append(
             PlanEventPoint(
                 plan_variant=plan_variant,
                 month=month_index,
                 category="loan" if calibration.target == "total_loan" else "account",
-                title=f"手动校准：{target_label}",
+                title=f"手动校准：{source_title or target_label}",
                 detail=(
                     f"{calibration.month} 将{target_label}"
                     f"对齐为 {_money_text(calibration.amount)}。"
                     "现金账户、投资账户会直接改变后续推演基准；账户和资产类校准会以偏移量延续到之后月份。"
+                    f"{source_text}"
                     f"{note}"
                 ),
                 amount=round(calibration.amount, 2),
@@ -225,6 +229,7 @@ def child_plan_events(
     plan_variant: str,
     home_purchase_month: int | None,
     current_month: date,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[PlanEventPoint]:
     events: list[PlanEventPoint] = []
     for child_strategy in build_child_plan_strategies(
@@ -232,6 +237,7 @@ def child_plan_events(
         rules,
         home_purchase_month=home_purchase_month,
         as_of=current_month,
+        calculation_context=calculation_context,
     ):
         if not child_strategy.enabled:
             continue
@@ -289,6 +295,52 @@ def child_plan_events(
     return events
 
 
+def planning_goal_constraint_events(
+    calculation_context: CalculationContextSnapshot | None,
+    *,
+    plan_variant: str,
+) -> list[PlanEventPoint]:
+    if calculation_context is None or not calculation_context.planning_goals:
+        return []
+    category_by_type = {
+        "home": "home_purchase",
+        "vehicle": "vehicle",
+        "child": "child",
+        "renovation": "renovation",
+        "other": "risk",
+    }
+    events: list[PlanEventPoint] = []
+    for goal in calculation_context.planning_goals:
+        if goal.normalized_timing_mode == "not_planned":
+            month = 0
+            severity = "info"
+            detail = f"{goal.name} 已保留在目标库中，但当前未纳入策略排程和现金流测算。"
+        else:
+            month = max(0, goal.resolved_window_start_month or goal.resolved_not_before_month)
+            severity = "warning" if goal.dependency_warning else "info"
+            detail_parts = [goal.explanation or "该目标的时间约束来自统一规划目标表。"]
+            if goal.resolved_window_end_month is not None:
+                detail_parts.append(f"规划窗口约束为第 {goal.resolved_window_start_month} 到第 {goal.resolved_window_end_month} 个月。")
+            elif goal.resolved_not_before_month > 0:
+                detail_parts.append(f"最早从第 {goal.resolved_not_before_month} 个月开始纳入策略搜索。")
+            if goal.dependency_warning:
+                detail_parts.append(goal.dependency_warning)
+            detail = " ".join(part for part in detail_parts if part)
+        events.append(
+            PlanEventPoint(
+                plan_variant=plan_variant,
+                month=month,
+                category=category_by_type.get(goal.goal_type, "risk"),
+                title=f"规划目标：{goal.name}",
+                detail=detail,
+                amount=None,
+                severity=severity,
+                source="planning_goals",
+            )
+        )
+    return events
+
+
 def build_plan_events(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -301,6 +353,7 @@ def build_plan_events(
     initial_provident_balance: float,
     retirement_window_end: int,
     vehicle_loan_states_for_plan: Callable[[PurchasePlanAnalysis], list[VehicleLoanState]],
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[PlanEventPoint]:
     monthly_by_plan_month = {(row.plan_variant, row.month): row for row in monthly_cashflow}
     provident_by_plan = {
@@ -353,6 +406,12 @@ def build_plan_events(
                 current_month=current_month,
             )
         )
+        events.extend(
+            planning_goal_constraint_events(
+                calculation_context,
+                plan_variant=plan.variant,
+            )
+        )
         retirement_event = retirement_observation_window_event(
             plan_variant=plan.variant,
             retirement_window_end=retirement_window_end,
@@ -401,6 +460,7 @@ def build_plan_events_from_context(
     retirement_window_end_provider: Callable[[HouseholdData, date], int],
     vehicle_loan_states_for_plan: Callable[[PurchasePlanAnalysis], list[VehicleLoanState]],
     as_of: date | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[PlanEventPoint]:
     base = as_of or date.today()
     current_month = date(base.year, base.month, 1)
@@ -415,4 +475,5 @@ def build_plan_events_from_context(
         initial_provident_balance=initial_provident_balance_provider(household, rules),
         retirement_window_end=retirement_window_end_provider(household, current_month),
         vehicle_loan_states_for_plan=vehicle_loan_states_for_plan,
+        calculation_context=calculation_context,
     )

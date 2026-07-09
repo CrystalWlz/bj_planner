@@ -14,6 +14,7 @@ from .schemas import (
     CarPlanAnalysis,
     CareerShockProjection,
     ChildPlanStrategyPoint,
+    CoreObjectGroupSummary,
     InvestmentAllocationSummary,
     InvestmentPlanRecommendation,
     LoanSummary,
@@ -88,6 +89,7 @@ class AffordabilityResultInputs:
     provident_visualization: list[ProvidentVisualizationPoint]
     social_security_visualization: list[SocialSecurityVisualizationPoint]
     account_concepts: list[AccountConceptSummary]
+    core_object_groups: list[CoreObjectGroupSummary]
     strategy_explanations: list[StrategyExplanationPoint]
     plan_events: list[PlanEventPoint]
     property_goal_assumption: str
@@ -170,6 +172,7 @@ def build_affordability_result(inputs: AffordabilityResultInputs) -> Affordabili
         provident_visualization=inputs.provident_visualization,
         social_security_visualization=inputs.social_security_visualization,
         account_concepts=inputs.account_concepts,
+        core_object_groups=inputs.core_object_groups,
         strategy_explanations=inputs.strategy_explanations,
         plan_events=inputs.plan_events,
         stress_tests=[],

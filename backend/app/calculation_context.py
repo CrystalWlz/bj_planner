@@ -18,12 +18,14 @@ from .domain.loans import summarize_phased_loans
 from .domain.household import household_with_member_derived_profile, household_with_property_goal
 from .projection.horizon import retirement_tail_months
 from .schemas import (
+    CalculationContextSnapshot,
     CarLoanSummary,
     CarPlanAnalysis,
     CareerShockProjection,
     HouseholdData,
     InvestmentAllocationSummary,
     InvestmentPlanRecommendation,
+    MarketSnapshotData,
     PhasedLoanSummary,
     RulePackData,
     ScenarioData,
@@ -135,7 +137,7 @@ def prepare_household_context(
         effective_household,
         rules,
     )
-    tax_horizon_months = min(840, max(180, retirement_tail_months(effective_household, as_of=base_month)))
+    tax_horizon_months = min(840, max(180, retirement_tail_months(effective_household, as_of=base_month, rules=rules)))
     tax_year_summaries = build_tax_year_summaries(
         effective_household,
         rules,
@@ -191,6 +193,8 @@ def build_vehicle_planning_context(
     household_context: PreparedHouseholdContext,
     scenario: ScenarioData,
     rules: RulePackData,
+    *,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> VehiclePlanningContext:
     cashflow_household = household_context.cashflow_household
     car_plan_analyses = build_car_plan_analyses(
@@ -198,6 +202,7 @@ def build_vehicle_planning_context(
         net_monthly_income=household_context.net_monthly_income,
         annual_investment_return=scenario.annual_investment_return,
         rules=rules,
+        calculation_context=calculation_context,
     )
     effective_car_plan = car_plan_with_selected_strategies(cashflow_household.car_plan, car_plan_analyses)
     cashflow_household = cashflow_household.model_copy(update={"car_plan": effective_car_plan})
@@ -213,6 +218,7 @@ def build_vehicle_planning_context(
         initial_cash=cashflow_household.cash_account_balance + cashflow_household.investments,
         monthly_cash_savings_before_car=monthly_cash_savings_before_car,
         rules=rules,
+        calculation_context=calculation_context,
     )
     purchase_strategy_car_loan = aggregate_car_loan(
         cashflow_household.car_plan,
@@ -221,14 +227,16 @@ def build_vehicle_planning_context(
         scenario=scenario,
         include_after_home=False,
         rules=rules,
+        calculation_context=calculation_context,
     )
     pre_home_vehicle_states = vehicle_loan_states(
         cashflow_household.car_plan,
         scenario=scenario,
         include_after_home=False,
         rules=rules,
+        calculation_context=calculation_context,
     )
-    vehicle_states = vehicle_loan_states(cashflow_household.car_plan, scenario=scenario, rules=rules)
+    vehicle_states = vehicle_loan_states(cashflow_household.car_plan, scenario=scenario, rules=rules, calculation_context=calculation_context)
     car_monthly_cost = car_monthly_cash_cost_at(
         cashflow_household.car_plan,
         0,
@@ -273,6 +281,7 @@ def build_purchase_cash_context(
     rules: RulePackData,
     *,
     min_down_payment_ratio: float,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> PurchaseCashContext:
     has_purchase_target = bool(scenario.enabled and scenario.total_price > 0)
     minimum_down_payment = scenario.total_price * min_down_payment_ratio if has_purchase_target else 0.0
@@ -282,6 +291,7 @@ def build_purchase_cash_context(
             household,
             scenario,
             rules,
+            market_snapshot,
         )
     else:
         deed_tax_rate = broker_fee_rate = deed_tax = broker_fee = 0.0
@@ -290,7 +300,11 @@ def build_purchase_cash_context(
         if has_purchase_target and scenario.renovation_funding_mode == "upfront_cash"
         else 0.0
     )
-    seller_tax_pass_through = seller_tax_pass_through_amount(scenario) if has_purchase_target else 0.0
+    seller_tax_pass_through = (
+        seller_tax_pass_through_amount(scenario, rules, market_snapshot)
+        if has_purchase_target
+        else 0.0
+    )
     taxes_and_fees = (
         deed_tax
         + broker_fee

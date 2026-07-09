@@ -16,6 +16,7 @@ from .projection_facade import (
 from .reporting import (
     build_account_concepts,
     build_annual_financial_summaries_from_ledger,
+    build_core_object_group_summaries,
     build_strategy_explanations,
 )
 from .schemas import (
@@ -23,11 +24,14 @@ from .schemas import (
     AccountSnapshotPoint,
     AnnualFinancialSummary,
     AnnualVisualizationDetail,
+    CalculationContextSnapshot,
     CarLoanSummary,
     CarPlanData,
     ChildPlanStrategyPoint,
+    CoreObjectGroupSummary,
     HouseholdData,
     LoanVisualizationPoint,
+    MarketSnapshotData,
     MonthlyCashflowPoint,
     MonthlyLedgerEntry,
     MonthlyVisualizationDetail,
@@ -61,6 +65,7 @@ class StrategyProjectionPipelineResult:
     monthly_ledger: list[MonthlyLedgerEntry] = field(default_factory=list)
     annual_financial_summaries: list[AnnualFinancialSummary] = field(default_factory=list)
     account_concepts: list[AccountConceptSummary] = field(default_factory=list)
+    core_object_groups: list[CoreObjectGroupSummary] = field(default_factory=list)
     strategy_explanations: list[StrategyExplanationPoint] = field(default_factory=list)
     plan_events: list[PlanEventPoint] = field(default_factory=list)
     child_plan_strategies: list[ChildPlanStrategyPoint] = field(default_factory=list)
@@ -91,11 +96,24 @@ def build_strategy_projection_pipeline(
     base_month: date,
     base_monthly_debt_payment: float,
     vehicle_states: list[VehicleLoanState] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> StrategyProjectionPipelineResult:
+    selected_month = selected_purchase_month(scenario, purchase_plans)
     effective_vehicle_states = (
-        vehicle_states
-        if vehicle_states is not None
-        else vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules)
+        vehicle_loan_states(
+            household.car_plan,
+            scenario=scenario,
+            home_purchase_month=selected_month,
+            rules=rules,
+            calculation_context=calculation_context,
+        )
+        if selected_month is not None
+        else (
+            vehicle_states
+            if vehicle_states is not None
+            else vehicle_loan_states(household.car_plan, scenario=scenario, rules=rules, calculation_context=calculation_context)
+        )
     )
     provident_rows = build_provident_visualization(
         household,
@@ -121,6 +139,8 @@ def build_strategy_projection_pipeline(
         provident_visualization=provident_rows,
         vehicle_states=effective_vehicle_states,
         rules=rules,
+        calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )
     ledger_result = build_monthly_ledger(
         household,
@@ -131,6 +151,7 @@ def build_strategy_projection_pipeline(
         loan_rows,
         provident_rows,
         social_security_rows,
+        calculation_context=calculation_context,
     )
     monthly_cashflow_rows = build_monthly_cashflow_points(
         ledger_result.projection_states,
@@ -146,7 +167,7 @@ def build_strategy_projection_pipeline(
         social_security_rows,
         base_date=base_month,
     )
-    selected_month = selected_purchase_month(scenario, purchase_plans)
+    account_concepts = build_account_concepts(calculation_context)
     return StrategyProjectionPipelineResult(
         loan_visualization=loan_rows,
         provident_visualization=provident_rows,
@@ -160,7 +181,8 @@ def build_strategy_projection_pipeline(
         account_snapshots=account_snapshots,
         monthly_ledger=monthly_ledger_entries,
         annual_financial_summaries=annual_summaries,
-        account_concepts=build_account_concepts(),
+        account_concepts=account_concepts,
+        core_object_groups=build_core_object_group_summaries(account_concepts),
         strategy_explanations=build_strategy_explanations(purchase_plans),
         plan_events=build_plan_events_from_context(
             household,
@@ -173,19 +195,24 @@ def build_strategy_projection_pipeline(
             retirement_window_end_provider=lambda target_household, current_month: retirement_tail_months(
                 target_household,
                 as_of=current_month,
+                rules=rules,
             ),
             vehicle_loan_states_for_plan=lambda plan: vehicle_loan_states(
                 household.car_plan,
                 scenario=scenario,
                 home_purchase_month=plan.months_to_buy,
+                rules=rules,
+                calculation_context=calculation_context,
             ),
             as_of=base_month,
+            calculation_context=calculation_context,
         ),
         child_plan_strategies=build_child_plan_strategies(
             household,
             rules,
             home_purchase_month=selected_month,
             as_of=base_month,
+            calculation_context=calculation_context,
         ),
         selected_home_purchase_month=selected_month,
     )
@@ -196,6 +223,7 @@ def empty_strategy_projection_pipeline(
     rules: RulePackData,
     *,
     base_month: date,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> StrategyProjectionPipelineResult:
     return StrategyProjectionPipelineResult(
         child_plan_strategies=build_child_plan_strategies(
@@ -203,5 +231,6 @@ def empty_strategy_projection_pipeline(
             rules,
             home_purchase_month=None,
             as_of=base_month,
+            calculation_context=calculation_context,
         )
     )

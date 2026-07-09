@@ -28,6 +28,10 @@ ProvidentAccountRepaymentStrategy = Literal[
     "semiannual_principal_offset",
     "keep_in_account",
 ]
+ProvidentAccountRepaymentSwitchTarget = Literal[
+    "monthly_repayment_withdrawal",
+    "semiannual_principal_offset",
+]
 ExistingLoanPrepaymentMode = Literal["none", "manual", "auto"]
 AccountCalibrationTarget = Literal[
     "cash",
@@ -40,10 +44,35 @@ AccountCalibrationTarget = Literal[
     "fixed_asset",
     "total_loan",
 ]
-PlanningGoalType = Literal["home", "vehicle", "renovation", "other"]
+AccountCalibrationScope = Literal["account", "concept", "major_event", "strategy_event"]
+PlanningGoalType = Literal["home", "vehicle", "child", "renovation", "other"]
 PlanningTimingMode = Literal["auto_sequence", "parallel", "manual_month", "after_goal", "not_planned"]
+CoreObjectType = Literal["account", "loan", "asset", "adjustment"]
+CoreObjectCategory = Literal[
+    "cash",
+    "investment",
+    "provident",
+    "pension",
+    "medical",
+    "personal_pension",
+    "property_asset",
+    "vehicle_asset",
+    "child_goal",
+    "planning_goal",
+    "fixed_asset",
+    "mortgage",
+    "car_loan",
+    "education",
+    "consumer",
+    "manual_adjustment",
+    "other",
+]
+CoreObjectSource = Literal["household", "member", "loan", "goal", "manual"]
+GeneratedStrategyType = Literal["purchase", "vehicle", "investment", "child_plan", "tax", "career_shock"]
+VehiclePurchaseTimingMode = Literal["auto_sequence", "parallel", "manual_month", "not_planned"]
 ScheduledExpenseFrequency = Literal["monthly", "annual_once", "one_time"]
 ScheduledExpenseTimingMode = Literal["fixed_month", "flexible_range"]
+ScheduledExpenseCategory = Literal["general", "medical"]
 RentPaymentMode = Literal["cash", "provident"]
 RentPaymentFrequency = Literal["monthly", "quarterly"]
 ChildPlanTimingMode = Literal["after_first_home", "manual_month", "not_planned"]
@@ -326,8 +355,10 @@ class VehiclePlanData(BaseModel):
     beijing_family_indicator_last_config_year: int = Field(2026, ge=2020, le=2100)
     beijing_family_indicator_annual_quota: int = Field(119200, ge=0)
     vehicle_vessel_tax_annual_override: float | None = Field(None, ge=0)
+    planning_goal_id: str = ""
     planning_sequence: int = Field(1, ge=1, le=50)
-    purchase_timing_mode: Literal["auto_sequence", "parallel", "manual_month"] = "auto_sequence"
+    purchase_timing_mode: VehiclePurchaseTimingMode = "auto_sequence"
+    depends_on_goal_id: str = ""
     after_previous_event_delay_months: int = Field(0, ge=0, le=240)
     manual_purchase_delay_months: int = Field(0, ge=0, le=600)
     planning_window_start_month: str = ""
@@ -377,6 +408,7 @@ class PropertyPurchaseGoalData(BaseModel):
     enabled: bool = True
     intended_use: Literal["self_use", "improvement", "investment", "other"] = "self_use"
     planning_mode: Literal["after_previous_purchase", "parallel"] = "after_previous_purchase"
+    depends_on_goal_id: str = ""
     after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
     earliest_purchase_delay_months: int = Field(0, ge=0, le=600)
     planning_window_start_month: str = ""
@@ -418,6 +450,86 @@ class PlanningGoalRecord(BaseModel):
 class PlanningGoalCreate(BaseModel):
     household_id: str | None = None
     data: PlanningGoalData
+
+
+class ResolvedPlanningGoal(BaseModel):
+    id: str
+    household_id: str | None = None
+    goal_type: PlanningGoalType
+    name: str
+    enabled: bool = True
+    priority: int
+    sequence_index: int
+    timing_mode: PlanningTimingMode
+    normalized_timing_mode: PlanningTimingMode
+    depends_on_goal_id: str = ""
+    depends_on_goal_name: str = ""
+    delay_after_dependency_months: int = 0
+    allow_parallel: bool = False
+    earliest_purchase_month: str = ""
+    earliest_purchase_delay_months: int = 0
+    planning_window_start_month: str = ""
+    planning_window_end_month: str = ""
+    resolved_not_before_month: int = 0
+    resolved_window_start_month: int = 0
+    resolved_window_end_month: int | None = None
+    dependency_warning: str = ""
+    explanation: str = ""
+
+
+class PlanningSequenceResult(BaseModel):
+    base_month: str = ""
+    goals: list[ResolvedPlanningGoal] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CalculationContextGoalSnapshot(BaseModel):
+    id: str
+    goal_type: PlanningGoalType
+    name: str
+    enabled: bool = True
+    priority: int
+    sequence_index: int
+    normalized_timing_mode: PlanningTimingMode = "auto_sequence"
+    depends_on_goal_id: str = ""
+    depends_on_goal_name: str = ""
+    resolved_not_before_month: int = 0
+    resolved_window_start_month: int = 0
+    resolved_window_end_month: int | None = None
+    explanation: str = ""
+    dependency_warning: str = ""
+
+
+class CalculationContextCoreObjectSnapshot(BaseModel):
+    id: str
+    object_type: CoreObjectType
+    category: CoreObjectCategory
+    name: str
+    source: CoreObjectSource | Literal[""] = ""
+    owner_key: str = ""
+    reference_id: str = ""
+    member_name: str = ""
+    current_balance: float = 0.0
+    monthly_flow: float = 0.0
+
+
+class CalculationContextSnapshot(BaseModel):
+    base_month: str = ""
+    household_id: str = ""
+    scenario_id: str = ""
+    current_goal_id: str = ""
+    current_goal_name: str = ""
+    current_goal_resolved_not_before_month: int = 0
+    current_goal_normalized_timing_mode: PlanningTimingMode | Literal[""] = ""
+    planning_goal_ids: list[str] = Field(default_factory=list)
+    planning_goals: list[CalculationContextGoalSnapshot] = Field(default_factory=list)
+    core_object_ids: list[str] = Field(default_factory=list)
+    core_objects: list[CalculationContextCoreObjectSnapshot] = Field(default_factory=list)
+    planning_goal_fingerprint: str = ""
+    core_object_fingerprint: str = ""
+    resolved_goal_count: int = 0
+    core_object_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
 
 
 class PhasedLoanData(BaseModel):
@@ -472,9 +584,24 @@ class ScheduledExpenseData(BaseModel):
     annual_occurrence_month: int = Field(1, ge=1, le=12)
     start_month: str = "2026-07"
     end_month: str | None = None
+    expense_category: ScheduledExpenseCategory = "general"
     medical_account_payable: bool = False
     tax_deductible_elderly_care: bool = False
     notes: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_medical_payment_scope(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        next_data = dict(data)
+        category = next_data.get("expense_category")
+        if category not in {"general", "medical"}:
+            category = "medical" if bool(next_data.get("medical_account_payable", False)) else "general"
+        next_data["expense_category"] = category
+        if category != "medical":
+            next_data["medical_account_payable"] = False
+        return next_data
 
 
 class DailyExpenseStageData(BaseModel):
@@ -506,6 +633,7 @@ class ElderlyDependentData(BaseModel):
 
 
 class ChildPlanData(BaseModel):
+    planning_goal_id: str = ""
     name: str = "子女计划"
     enabled: bool = True
     timing_mode: ChildPlanTimingMode = "after_first_home"
@@ -568,11 +696,43 @@ class InvestmentTaxProfileData(BaseModel):
 class AccountCalibrationData(BaseModel):
     enabled: bool = True
     month: str = "2026-07"
+    calibration_scope: AccountCalibrationScope = "account"
     target: AccountCalibrationTarget = "cash"
     amount: float = Field(0, ge=0)
     member_name: str = ""
     reference_name: str = ""
+    source_id: str = ""
+    source_category: str = ""
+    source_title: str = ""
     note: str = ""
+
+
+class CoreObjectData(BaseModel):
+    schema_version: int = Field(48, ge=1)
+    object_type: CoreObjectType
+    category: CoreObjectCategory
+    name: str
+    enabled: bool = True
+    member_name: str = ""
+    owner_key: str = ""
+    reference_id: str = ""
+    source: CoreObjectSource = "household"
+    current_balance: float = 0.0
+    monthly_flow: float = 0.0
+    annual_rate: float = 0.0
+    start_month: str = ""
+    end_month: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CoreObjectRecord(BaseModel):
+    id: str
+    household_id: str | None = None
+    object_type: CoreObjectType
+    category: CoreObjectCategory
+    data: CoreObjectData
+    created_at: datetime
+    updated_at: datetime
 
 
 class HouseholdData(BaseModel):
@@ -648,10 +808,12 @@ class HouseholdCreate(BaseModel):
 
 class ScenarioData(BaseModel):
     schema_version: int = Field(39, ge=1)
+    planning_goal_id: str = ""
     name: str = "示例房源（请修改）"
     enabled: bool = True
     purchase_sequence: int = Field(1, ge=1, le=20)
     purchase_planning_mode: Literal["after_previous_purchase", "parallel"] = "after_previous_purchase"
+    depends_on_goal_id: str = ""
     after_previous_purchase_delay_months: int = Field(0, ge=0, le=240)
     district: str = "未设置"
     ring_area: str = "未设置"
@@ -684,6 +846,9 @@ class ScenarioData(BaseModel):
     commercial_prepayment_allowed_after_month: int = Field(12, ge=1, le=360)
     commercial_prepayment_monthly_amount: float = Field(0, ge=0)
     provident_account_repayment_strategy: ProvidentAccountRepaymentStrategy = "auto"
+    provident_account_repayment_switch_enabled: bool = False
+    provident_account_repayment_switch_after_month: int = Field(12, ge=1, le=360)
+    provident_account_repayment_switch_to_strategy: ProvidentAccountRepaymentSwitchTarget = "semiannual_principal_offset"
     deed_tax_rate: float = Field(0.015, ge=0, le=0.2)
     broker_fee_rate: float = Field(0.022, ge=0, le=0.2)
     seller_tax_pass_through_enabled: bool = False
@@ -716,6 +881,12 @@ class ScenarioData(BaseModel):
             self.green_building_level = "none"
             self.prefab_building_level = "none"
             self.is_ultra_low_energy_building = False
+        staged_modes = {"monthly_repayment_withdrawal", "semiannual_principal_offset"}
+        if (
+            self.provident_account_repayment_strategy not in staged_modes
+            or self.provident_account_repayment_switch_to_strategy == self.provident_account_repayment_strategy
+        ):
+            self.provident_account_repayment_switch_enabled = False
         return self
 
 
@@ -956,6 +1127,9 @@ class MarketSnapshotData(BaseModel):
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
     source_url: str = "https://zjw.beijing.gov.cn/bjjs/fwgl/fdcjy/index.shtml"
+    commercial_loan_rate: float | None = Field(default=None, ge=0, le=0.2)
+    default_broker_fee_rate: float | None = Field(default=None, ge=0, le=0.2)
+    seller_tax_pass_through_rate: float | None = Field(default=None, ge=0, le=0.2)
     avg_unit_price: float | None = None
     transaction_count: int | None = None
     listing_count: int | None = None
@@ -1051,6 +1225,8 @@ class CarLoanSummary(BaseModel):
 class CarPlanAnalysis(BaseModel):
     variant: str
     description: str
+    planning_goal_id: str = ""
+    source: str = "car_plan"
     vehicle_index: int = 0
     vehicle_name: str = "车辆计划"
     vehicle_candidate_index: int | None = None
@@ -1124,6 +1300,8 @@ class HappinessBreakdownItem(BaseModel):
 class PurchasePlanAnalysis(BaseModel):
     variant: str
     description: str
+    planning_goal_id: str = ""
+    source: str = "scenario"
     months_to_buy: int | None
     years_to_buy: float | None
     minimum_down_payment: float
@@ -1330,6 +1508,8 @@ class MonthlyLedgerEntry(BaseModel):
 
 
 class ChildPlanStrategyPoint(BaseModel):
+    planning_goal_id: str = ""
+    source: str = "child_plans"
     child_name: str
     enabled: bool = True
     timing_mode: ChildPlanTimingMode = "after_first_home"
@@ -1502,6 +1682,28 @@ class AccountConceptSummary(BaseModel):
     category: Literal["account", "cash", "investment", "provident", "social_security", "fixed_asset", "loan", "policy"]
     description: str
     managed_by: Literal["backend", "user_input", "policy"]
+    core_object_count: int = 0
+    current_balance: float = 0.0
+    monthly_flow: float = 0.0
+
+
+class CoreObjectGroupSummary(BaseModel):
+    code: str
+    name: str
+    category: Literal["liquid_asset", "restricted_account", "fixed_asset", "loan", "policy"]
+    description: str
+    concept_codes: list[str] = Field(default_factory=list)
+    core_object_count: int = 0
+    current_balance: float = 0.0
+    monthly_flow: float = 0.0
+
+
+class PlanningFoundationSummary(BaseModel):
+    planning_goals: list[PlanningGoalRecord] = Field(default_factory=list)
+    planning_sequence: PlanningSequenceResult | None = None
+    core_objects: list[CoreObjectRecord] = Field(default_factory=list)
+    account_concepts: list[AccountConceptSummary] = Field(default_factory=list)
+    core_object_groups: list[CoreObjectGroupSummary] = Field(default_factory=list)
 
 
 class StrategyExplanationPoint(BaseModel):
@@ -1812,14 +2014,34 @@ class StressResult(BaseModel):
 
 
 class AffordabilityRequest(BaseModel):
+    household_id: str = ""
+    scenario_id: str = ""
     household: HouseholdData
     scenario: ScenarioData
     rule_pack: RulePackData
+    market_snapshot: MarketSnapshotData | None = None
     include_stress_tests: bool = False
+    calculation_context: CalculationContextSnapshot | None = None
+
+
+class CacheLayerHashes(BaseModel):
+    input: str = ""
+    strategy: str = ""
+    ledger: str = ""
+    visualization: str = ""
+    engine: str = ""
+
+
+class GeneratedStrategyBatchRequest(BaseModel):
+    cache_layers: list[CacheLayerHashes] = Field(default_factory=list)
+    strategy_type: GeneratedStrategyType | None = None
+    owner_key: str | None = None
+    current_only: bool = True
 
 
 class AffordabilityResult(BaseModel):
-    cache_layers: dict[str, str] = Field(default_factory=dict)
+    cache_layers: CacheLayerHashes = Field(default_factory=CacheLayerHashes)
+    calculation_context: CalculationContextSnapshot | None = None
     status: str
     status_reason: str
     eligible: bool
@@ -1867,6 +2089,7 @@ class AffordabilityResult(BaseModel):
     provident_visualization: list[ProvidentVisualizationPoint] = []
     social_security_visualization: list[SocialSecurityVisualizationPoint] = []
     account_concepts: list[AccountConceptSummary] = []
+    core_object_groups: list[CoreObjectGroupSummary] = []
     strategy_explanations: list[StrategyExplanationPoint] = []
     plan_events: list[PlanEventPoint] = []
     export_sheets: list[ExportSheet] = []

@@ -11,6 +11,7 @@ from ..schemas import (
     IncomeStageData,
     RulePackData,
 )
+from ..policies import get_policy
 from .tax import clamp
 from .time import (
     add_months,
@@ -55,15 +56,8 @@ def default_retirement_age_for_member(index: int) -> int:
     return 63 if index == 0 else 58
 
 
-def policy_retirement_age_for_member(member: IncomeMember, index: int) -> int:
-    category = getattr(member, "retirement_category", None)
-    if category == "female_50":
-        return 55
-    if category == "female_55":
-        return 58
-    if category == "male_60":
-        return 63
-    return default_retirement_age_for_member(index)
+def policy_retirement_age_for_member_with_rules(member: IncomeMember, index: int, rules: RulePackData) -> int:
+    return get_policy(rules).retirement_age_for_member(member, index)
 
 
 def career_shock_settings_by_member(household: HouseholdData) -> dict[str, CareerShockMemberSetting | None]:
@@ -75,6 +69,7 @@ def career_shock_settings_by_member(household: HouseholdData) -> dict[str, Caree
 def member_retirement_months_by_index(
     household: HouseholdData,
     *,
+    rules: RulePackData,
     as_of: date | None = None,
 ) -> dict[int, int]:
     current = as_of or date.today()
@@ -85,7 +80,7 @@ def member_retirement_months_by_index(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = policy_retirement_age_for_member(member, index)
+        retirement_age = policy_retirement_age_for_member_with_rules(member, index, rules)
         retirement_start = month_start_for_birth_month_or_age(
             current_month,
             effective_birth_month,
@@ -107,18 +102,7 @@ def unemployment_benefit_months_from_service(service_months: int) -> int:
 
 
 def unemployment_benefit_monthly_from_service(service_months: int, rules: RulePackData) -> float:
-    params = rules.params
-    if service_months >= 240:
-        return float(params.get("beijing_unemployment_benefit_20y_plus", 2286))
-    if service_months >= 180:
-        return float(params.get("beijing_unemployment_benefit_15_to_20y", 2215))
-    if service_months >= 120:
-        return float(params.get("beijing_unemployment_benefit_10_to_15y", 2188))
-    if service_months >= 60:
-        return float(params.get("beijing_unemployment_benefit_5_to_10y", 2156))
-    if service_months >= 12:
-        return float(params.get("beijing_unemployment_benefit_under_5y", 2129))
-    return 0.0
+    return get_policy(rules).unemployment_benefit_monthly_from_service(service_months)
 
 
 def career_shock_unemployment_months(household: HouseholdData) -> int:
@@ -132,30 +116,14 @@ def career_shock_self_social_monthly(household: HouseholdData, rules: RulePackDa
     shock = household.career_shock
     if not shock.auto_self_social_insurance:
         return max(0.0, shock.self_social_insurance_monthly)
-    params = rules.params
-    base = float(params.get("flexible_employment_social_base", params.get("beijing_social_base_floor", 7162)))
-    floor = float(params.get("beijing_social_base_floor", 7162))
-    ceiling = float(params.get("beijing_social_base_ceiling", 35811))
-    base = clamp(base, floor, ceiling)
-    pension = base * float(params.get("flexible_employment_pension_rate", 0.20))
-    unemployment = base * float(params.get("flexible_employment_unemployment_rate", 0.01))
-    medical = float(params.get("flexible_employment_medical_monthly", 584.92))
-    return round(max(0.0, pension + unemployment + medical), 2)
+    return get_policy(rules).flexible_employment_social_monthly()
 
 
 def career_shock_flexible_housing_fund_monthly(household: HouseholdData, rules: RulePackData) -> float:
     shock = household.career_shock
     if not shock.auto_flexible_housing_fund:
         return max(0.0, shock.self_housing_fund_monthly)
-    params = rules.params
-    if not bool(params.get("flexible_employment_housing_fund_enabled", True)):
-        return 0.0
-    raw_base = float(params.get("flexible_employment_housing_fund_base", params.get("beijing_housing_fund_base_floor", 2540)))
-    floor = float(params.get("beijing_housing_fund_base_floor", 2540))
-    ceiling = float(params.get("beijing_housing_fund_base_ceiling", 35811))
-    base = clamp(raw_base, floor, ceiling)
-    rate = clamp(float(params.get("flexible_employment_housing_fund_rate", 0.12)), 0.0, 0.24)
-    return round(base * rate, 2)
+    return get_policy(rules).flexible_employment_housing_fund_monthly()
 
 
 def career_shock_self_payment_monthly(household: HouseholdData, rules: RulePackData) -> float:
@@ -198,7 +166,7 @@ def career_shock_self_payment_at_month(
             current_month,
             effective_birth_month,
             effective_current_age,
-            policy_retirement_age_for_member(member, index),
+            policy_retirement_age_for_member_with_rules(member, index, rules),
         )
         self_payment_start = add_months(layoff_start, career_shock_unemployment_months(household))
         if self_payment_start <= target_month < retirement_start:
@@ -213,10 +181,10 @@ def estimate_auto_pension_monthly(
     retirement_start: date,
     as_of: date,
 ) -> float:
-    params = rules.params
     manual_value = max(0.0, setting.pension_monthly)
     if not setting.auto_pension_monthly:
         return manual_value
+    pension_policy = get_policy(rules).pension_estimate_policy()
 
     current_month = date(as_of.year, as_of.month, 1)
     months_to_retirement = max(0, months_between_months(current_month, retirement_start))
@@ -229,58 +197,41 @@ def estimate_auto_pension_monthly(
         annual_bonus=member.annual_bonus,
     )
     current_salary = max(member.monthly_salary_gross, current_stage.monthly_salary_gross)
-    social_floor = float(params.get("beijing_social_base_floor", 7162))
-    social_ceiling = float(params.get("beijing_social_base_ceiling", 35811))
-    contribution_base = clamp(current_salary if current_salary > 0 else social_floor, social_floor, social_ceiling)
-    flexible_base = clamp(
-        float(params.get("flexible_employment_social_base", social_floor)),
-        social_floor,
-        social_ceiling,
+    contribution_base = clamp(
+        current_salary if current_salary > 0 else pension_policy.social_base_floor,
+        pension_policy.social_base_floor,
+        pension_policy.social_base_ceiling,
     )
-    avg_salary_now = max(
-        social_floor,
-        min(
-            social_ceiling,
-            float(params.get("pension_reference_average_salary", params.get("beijing_social_base_ceiling", 35811))),
-        ),
-    )
-    salary_growth = clamp(float(params.get("pension_average_salary_growth_rate", 0.03)), 0.0, 0.10)
-    projected_avg_salary = avg_salary_now * ((1 + salary_growth) ** (months_to_retirement / 12))
+    flexible_base = pension_policy.flexible_employment_social_base
+    projected_avg_salary = pension_policy.reference_average_salary * ((1 + pension_policy.average_salary_growth_rate) ** (months_to_retirement / 12))
     existing_paid_years = max(
-        float(params.get("pension_default_paid_years", 15)),
+        pension_policy.default_paid_years,
         max(0, member.current_age - 22),
     )
     future_paid_years = months_to_retirement / 12
     total_paid_years = max(15.0, existing_paid_years + future_paid_years)
     indexed_base = (contribution_base + flexible_base) / 2
     basic_pension = projected_avg_salary * (1 + indexed_base / projected_avg_salary) / 2 * total_paid_years * 0.01
-    employee_rate = float(params.get("employee_pension_rate", 0.08))
-    flexible_rate = float(params.get("flexible_employment_pension_rate", 0.20))
-    account_return = clamp(float(params.get("pension_personal_account_annual_return", 0.025)), 0.0, 0.08)
-    existing_account = contribution_base * employee_rate * 12 * existing_paid_years
+    existing_account = contribution_base * pension_policy.employee_pension_rate * 12 * existing_paid_years
     future_account = 0.0
     for _ in range(max(0, months_to_retirement)):
-        future_account = (future_account + flexible_base * flexible_rate * 0.40) * ((1 + account_return) ** (1 / 12))
-    account_months = max(1.0, float(params.get("pension_personal_account_months", 139)))
-    personal_account_pension = (existing_account + future_account) / account_months
+        future_account = (future_account + flexible_base * pension_policy.flexible_employment_pension_rate * 0.40) * ((1 + pension_policy.personal_account_annual_return) ** (1 / 12))
+    personal_account_pension = (existing_account + future_account) / pension_policy.personal_account_months
     raw_pension = basic_pension + personal_account_pension
-    floor_rate = clamp(float(params.get("pension_replacement_rate_floor", 0.20)), 0.0, 1.0)
-    ceiling_rate = clamp(float(params.get("pension_replacement_rate_ceiling", 0.65)), floor_rate, 1.2)
-    floor_value = projected_avg_salary * floor_rate
-    ceiling_value = projected_avg_salary * ceiling_rate
+    floor_value = projected_avg_salary * pension_policy.replacement_rate_floor
+    ceiling_value = projected_avg_salary * pension_policy.replacement_rate_ceiling
     return round(clamp(raw_pension, floor_value, ceiling_value), 2)
 
 
 def household_with_career_income_stages(
     household: HouseholdData,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
     *,
     as_of: date | None = None,
 ) -> HouseholdData:
     shock = household.career_shock
     if household.career_shock_applied or not household.members:
         return household
-    active_rules = rules or RulePackData()
 
     current = as_of or date.today()
     synthetic_prefix = "自动情景："
@@ -295,14 +246,14 @@ def household_with_career_income_stages(
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = policy_retirement_age_for_member(member, index)
+        retirement_age = policy_retirement_age_for_member_with_rules(member, index, rules)
         retirement_start = month_start_for_birth_month_or_age(
             current,
             effective_birth_month,
             effective_current_age,
             retirement_age,
         )
-        pension_monthly = estimate_auto_pension_monthly(member, setting, active_rules, retirement_start, current) if setting else 0
+        pension_monthly = estimate_auto_pension_monthly(member, setting, rules, retirement_start, current) if setting else 0
         shock_freelance_income = max(0.0, setting.freelance_income_monthly) if setting else 0.0
 
         if shock.enabled and setting and setting.enabled:
@@ -323,7 +274,7 @@ def household_with_career_income_stages(
                             update={
                                 "stage_kind": "unemployment",
                                 "monthly_freelance_income": shock_freelance_income,
-                                "monthly_non_taxable_income": unemployment_benefit_monthly_from_service(household.social_security_months, active_rules),
+                                "monthly_non_taxable_income": unemployment_benefit_monthly_from_service(household.social_security_months, rules),
                             }
                         )
                     )
@@ -337,7 +288,7 @@ def household_with_career_income_stages(
                                     update={
                                         "stage_kind": "unemployment",
                                         "monthly_freelance_income": shock_freelance_income,
-                                        "monthly_non_taxable_income": float(active_rules.params.get("beijing_unemployment_benefit_after_12_months", 2129)),
+                                        "monthly_non_taxable_income": get_policy(rules).later_unemployment_benefit_monthly(),
                                     }
                                 )
                             )
@@ -414,7 +365,7 @@ def household_with_pension_income_stages(
 
     for index, member in enumerate(household.members):
         stages = list(member.income_stages or [])
-        retirement_age = policy_retirement_age_for_member(member, index)
+        retirement_age = policy_retirement_age_for_member_with_rules(member, index, rules)
         setting = settings_by_member.get(member.name)
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
@@ -476,7 +427,7 @@ def build_career_shock_projection(
         if shock.auto_unemployment_benefit
         else max(0.0, shock.unemployment_benefit_monthly)
     )
-    later_unemployment = float(rules.params.get("beijing_unemployment_benefit_after_12_months", 2129))
+    later_unemployment = get_policy(rules).later_unemployment_benefit_monthly()
     self_social = career_shock_self_social_monthly(household, rules)
     flexible_housing = career_shock_flexible_housing_fund_monthly(household, rules)
     self_payment = round(self_social + flexible_housing, 2)
@@ -490,7 +441,7 @@ def build_career_shock_projection(
         generated_stages = [stage for stage in (effective_member.income_stages or []) if stage.name.startswith(synthetic_prefix)]
         effective_birth_month = member.birth_month or (setting.birth_month if setting else "")
         effective_current_age = member.current_age if member.birth_month else (setting.current_age if setting else member.current_age)
-        retirement_age = policy_retirement_age_for_member(member, index)
+        retirement_age = policy_retirement_age_for_member_with_rules(member, index, rules)
         retirement_start = month_start_for_birth_month_or_age(
             current_month,
             effective_birth_month,

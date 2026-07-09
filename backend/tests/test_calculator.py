@@ -1,5 +1,6 @@
 import pytest
 from datetime import date
+from pathlib import Path
 from pydantic import ValidationError
 
 import app.calculator as calculator_module
@@ -23,8 +24,12 @@ from app.calculator import (
     monthly_household_expense_at,
     summarize_phased_loans,
 )
+from app.domain.scoring import purchase_happiness_weights
+from app.engine_config import parallel_worker_count
 from app.domain.time import month_after
-from app.schemas import CareerShockData, CareerShockMemberSetting, CarPlanData, ChildPlanData, DailyExpenseStageData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, InvestmentTaxProfileData, RentExpenseStageData, RulePackData, ScenarioData, ScheduledExpenseData, SpecialDeductionItemData, PhasedLoanData, VehicleFinancingOptionData
+from app.projection.horizon import visualization_horizon_months
+from app.schemas import CareerShockData, CareerShockMemberSetting, CalculationContextGoalSnapshot, CalculationContextSnapshot, CarPlanData, ChildPlanData, DailyExpenseStageData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, InvestmentTaxProfileData, MarketSnapshotData, RentExpenseStageData, RulePackData, ScenarioData, ScheduledExpenseData, SpecialDeductionItemData, PhasedLoanData, VehicleFinancingOptionData
+from app.strategies.vehicle import vehicle_candidate_plans
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -45,6 +50,69 @@ def _zero_contribution_rule() -> RulePackData:
             }
         }
     )
+
+
+def test_domain_projection_and_strategy_layers_do_not_construct_default_rule_pack() -> None:
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    allowed_default_rule_pack_files = {
+        Path("calculator.py"),
+        Path("database.py"),
+        Path("policies.py"),
+        Path("projection_facade.py"),
+        Path("storage/normalization.py"),
+        Path("vehicle_facade.py"),
+    }
+    allowed_rule_param_access_files = {
+        Path("engine_config.py"),
+        Path("policies.py"),
+        Path("storage/normalization.py"),
+    }
+    allowed_execution_config_key_files = {
+        Path("engine_config.py"),
+        Path("schemas.py"),
+    }
+    forbidden_fragments = [
+        "RulePackData()",
+        "rules or RulePackData",
+        "active_rules = rules or",
+        "effective_rules = rules or",
+        "rules: RulePackData | None",
+    ]
+    forbidden_rule_param_fragments = [
+        ".params.get(",
+        ".params[",
+    ]
+
+    violations: list[str] = []
+    for path in app_dir.rglob("*.py"):
+        relative_path = path.relative_to(app_dir)
+        text = path.read_text(encoding="utf-8")
+        if relative_path not in allowed_default_rule_pack_files:
+            for fragment in forbidden_fragments:
+                if fragment in text:
+                    violations.append(f"{relative_path} contains {fragment}")
+        if relative_path not in allowed_rule_param_access_files:
+            for fragment in forbidden_rule_param_fragments:
+                if fragment in text:
+                    violations.append(f"{relative_path} reads RulePackData.params via {fragment}")
+        if relative_path not in allowed_execution_config_key_files and "backend_parallel_workers" in text:
+            violations.append(f"{relative_path} references execution config key backend_parallel_workers")
+
+    assert violations == []
+
+
+def test_domain_layers_do_not_import_policy_default_constants() -> None:
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    scanned_dirs = [app_dir / "domain", app_dir / "strategies", app_dir / "projection"]
+
+    violations = [
+        str(path.relative_to(app_dir))
+        for directory in scanned_dirs
+        for path in directory.rglob("*.py")
+        if "DEFAULT_PURCHASE_HAPPINESS_WEIGHTS" in path.read_text(encoding="utf-8")
+    ]
+
+    assert violations == []
 
 
 def _sample_phased_loans() -> list[PhasedLoanData]:
@@ -104,6 +172,34 @@ def test_affordability_marks_cash_gap_as_not_viable() -> None:
     assert result.funding_gap > 0
 
 
+def test_affordability_risk_thresholds_are_read_from_policy_interface() -> None:
+    base_rules = RulePackData()
+    strict_rules = base_rules.model_copy(
+        update={
+            "params": {
+                **base_rules.params,
+                "caution_dti": 0.01,
+                "danger_dti": 0.95,
+                "recommended_emergency_months": 0,
+            }
+        }
+    )
+    household = HouseholdData(
+        cash_account_balance=2_000_000,
+        monthly_expense=8_000,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=60_000, annual_bonus=0)],
+    )
+    scenario = ScenarioData(total_price=2_000_000, down_payment_amount=1_000_000, commercial_loan_amount=1_000_000)
+
+    baseline = calculate_affordability(household, scenario, base_rules)
+    strict = calculate_affordability(household, scenario, strict_rules)
+
+    assert baseline.status in {"可行", "谨慎可行"}
+    assert strict.status == "谨慎可行"
+    assert strict.debt_to_income_ratio > 0.01
+    assert strict.status_reason == "资金可覆盖购房，但现金流或应急金低于推荐安全垫。"
+
+
 def test_affordability_skips_stress_tests_by_default() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData())
     assert result.stress_tests == []
@@ -113,6 +209,81 @@ def test_affordability_builds_stress_tests_when_requested() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData(), include_stress_tests=True)
     assert len(result.stress_tests) == 3
     assert all(item.name for item in result.stress_tests)
+
+
+def test_stress_test_assumptions_are_read_from_policy_interface() -> None:
+    base_rules = RulePackData()
+    rules = base_rules.model_copy(
+        update={
+            "params": {
+                **base_rules.params,
+                "rate_stress_add": 0.02,
+                "income_stress_factor": 1.0,
+                "price_stress_factor": 1.0,
+            }
+        }
+    )
+    household = HouseholdData(cash_account_balance=1_000_000, monthly_income=50_000, monthly_expense=10_000)
+    scenario = ScenarioData(total_price=3_000_000, commercial_loan_amount=2_000_000, provident_loan_amount=0)
+
+    result = calculate_affordability(household, scenario, rules, include_stress_tests=True)
+    base_monthly_payment = result.monthly_payment
+    rate_stress = next(item for item in result.stress_tests if item.name == "利率上行")
+
+    assert rate_stress.monthly_payment > base_monthly_payment
+
+
+def test_visualization_horizon_retirement_tail_uses_current_policy_rules() -> None:
+    base_rules = RulePackData()
+    delayed_rules = base_rules.model_copy(
+        update={
+            "params": {
+                **base_rules.params,
+                "retirement_age_male": 70,
+            }
+        }
+    )
+    household = HouseholdData(
+        members=[
+            IncomeMember(
+                name="样例成员A",
+                birth_month="1980-07",
+                retirement_category="male_60",
+            )
+        ]
+    )
+    disabled_car_loan = calculate_car_loan(CarPlanData(enabled=False))
+
+    baseline = visualization_horizon_months(
+        household,
+        [],
+        disabled_car_loan,
+        as_of=date(2026, 7, 1),
+        rules=base_rules,
+    )
+    delayed = visualization_horizon_months(
+        household,
+        [],
+        disabled_car_loan,
+        as_of=date(2026, 7, 1),
+        rules=delayed_rules,
+    )
+
+    assert baseline == 324
+    assert delayed == 408
+    assert delayed - baseline == 84
+
+
+def test_parallel_worker_count_is_runtime_config_not_calculator_rule_read() -> None:
+    base_params = RulePackData().params
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": 1}), 4) == 1
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": 4}), 2) == 2
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": 99}), 20) == 8
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": "bad"}), 5) == 4
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": 0}), 5) == 1
+    assert parallel_worker_count(RulePackData(params={**base_params, "backend_parallel_workers": 4}), 1) == 1
+
+
 def test_parallel_affordability_matches_serial_result() -> None:
     serial_rules = RulePackData(
         params={**RulePackData().params, "backend_parallel_workers": 1}
@@ -210,6 +381,17 @@ def test_scheduled_family_support_expense_starts_in_2027_july_without_tax_deduct
     assert monthly_household_expense_at(household, as_of=date(2027, 6, 1)) == 8_000
     assert monthly_household_expense_at(household, as_of=date(2027, 7, 1)) == 11_500
     assert household.scheduled_expenses[0].tax_deductible_elderly_care is False
+
+
+def test_domain_monthly_expense_requires_explicit_rule_pack() -> None:
+    from app.domain.expenses import monthly_household_expense_at as domain_monthly_household_expense_at
+
+    household = HouseholdData(monthly_expense=8_000)
+
+    with pytest.raises(ValueError, match="explicit rule pack"):
+        domain_monthly_household_expense_at(household, as_of=date(2027, 6, 1), rules=None)  # type: ignore[arg-type]
+
+    assert monthly_household_expense_at(household, as_of=date(2027, 6, 1)) == 8_000
 
 
 def test_annual_once_scheduled_expense_only_hits_occurrence_month() -> None:
@@ -653,6 +835,8 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
     }
     assert "账户月度快照" in export_sheet_titles
     assert "后端月度流水" in export_sheet_titles
+    assert "核心对象与账户概念" in export_sheet_titles
+    assert "核心对象分组摘要" in export_sheet_titles
     snapshot_sheet = next(
         item
         for item in result.export_sheets
@@ -663,7 +847,21 @@ def test_affordability_result_contains_backend_annual_financial_summary() -> Non
         for item in result.export_sheets
         if item.plan_variant == plan.variant and item.title == "后端月度流水"
     )
+    core_object_sheet = next(
+        item
+        for item in result.export_sheets
+        if item.plan_variant == plan.variant and item.title == "核心对象与账户概念"
+    )
+    core_object_group_sheet = next(
+        item
+        for item in result.export_sheets
+        if item.plan_variant == plan.variant and item.title == "核心对象分组摘要"
+    )
     assert snapshot_sheet.headers[:4] == ["月份序号", "真实年月", "阶段", "现金账户"]
+    assert core_object_sheet.headers[:6] == ["概念编码", "名称", "类别", "核心对象数量", "当前余额/目标金额", "月流量"]
+    assert any(row[0] == "cash_account" for row in core_object_sheet.rows)
+    assert core_object_group_sheet.headers[:4] == ["分组编码", "名称", "类别", "包含概念"]
+    assert any(row[0] == "liquid_assets" for row in core_object_group_sheet.rows)
     assert len(snapshot_sheet.rows) == len(selected_plan_snapshot_rows := [
         item for item in result.account_snapshots if item.plan_variant == plan.variant
     ])
@@ -1428,6 +1626,34 @@ def test_plug_in_vehicle_vessel_tax_can_change_after_policy_period() -> None:
     assert any("2027" in note for note in loan.policy_notes)
 
 
+def test_vehicle_taxes_follow_policy_pack_parameters() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "vehicle_purchase_tax_rate": 0.05,
+                "vehicle_purchase_tax_taxable_price_ratio": 1.0,
+                "fuel_vehicle_vessel_tax_annual_default": 960,
+            }
+        }
+    )
+    loan = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=200_000,
+            down_payment_ratio=0.4,
+            energy_type="fuel",
+            new_energy_catalog_eligible=False,
+        ),
+        rules=rule,
+    )
+
+    assert loan.purchase_tax == pytest.approx(10_000, abs=0.01)
+    assert loan.purchase_tax_relief == 0
+    assert loan.annual_vehicle_vessel_tax == pytest.approx(960)
+    assert any("5%" in note for note in loan.policy_notes)
+
+
 def test_beijing_vehicle_indicator_delay_affects_generated_car_strategy() -> None:
     household = HouseholdData(
         cash_account_balance=300_000,
@@ -1696,6 +1922,54 @@ def test_plug_in_vehicle_does_not_use_beijing_new_energy_indicator_by_default() 
 
     assert any("国家新能源购置税口径不等于北京新能源小客车指标口径" in note for note in loan.policy_notes)
     assert any("不能按北京家庭新能源指标上牌" in note for note in loan.policy_notes)
+
+
+def test_vehicle_indicator_rules_follow_policy_pack() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "beijing_new_energy_indicator_vehicle_types": ["pure_electric", "range_extended"],
+                "beijing_tail_restriction_exempt_vehicle_types": ["pure_electric", "range_extended"],
+            }
+        }
+    )
+    loan = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=200_000,
+            down_payment_ratio=0.3,
+            energy_type="range_extended",
+            new_energy_catalog_eligible=True,
+            beijing_license_indicator_status="family_new_energy_pending",
+        ),
+        rules=rule,
+    )
+
+    joined_notes = "；".join(loan.policy_notes)
+    assert "不能按北京家庭新能源指标上牌" not in joined_notes
+    assert "国家新能源购置税口径不等于北京新能源小客车指标口径" not in joined_notes
+    assert "按北京家庭新能源指标等待处理" in joined_notes
+
+
+def test_vehicle_indicator_can_be_disabled_by_policy_pack() -> None:
+    rule = RulePackData().model_copy(
+        update={"params": {**RulePackData().params, "beijing_small_passenger_indicator_required": False}}
+    )
+    loan = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=200_000,
+            down_payment_ratio=0.3,
+            energy_type="fuel",
+            beijing_license_indicator_status="unknown",
+        ),
+        rules=rule,
+    )
+
+    joined_notes = "；".join(loan.policy_notes)
+    assert "北京小客车上牌需要指标" not in joined_notes
+    assert "普通小客车指标等待" not in joined_notes
 
 
 def test_ordinary_indicator_status_is_available_for_non_pure_vehicle() -> None:
@@ -2717,6 +2991,43 @@ def test_car_plan_generates_strategies_for_each_vehicle_source_candidate() -> No
     assert compact_target.variant.endswith("target")
 
 
+def test_vehicle_candidate_plans_use_demand_level_registration_policy() -> None:
+    vehicle = CarPlanData(
+        enabled=True,
+        name="示例用车需求",
+        total_price=220_000,
+        beijing_license_indicator_status="family_new_energy_pending",
+        beijing_indicator_expected_delay_months=18,
+        license_plate_rental_enabled=True,
+        license_plate_rental_upfront_fee=18_000,
+        beijing_family_indicator_score_enabled=True,
+        beijing_family_indicator_generations=3,
+        candidate_vehicles=[
+            CarPlanData(
+                enabled=True,
+                name="候选车源A",
+                total_price=180_000,
+                beijing_license_indicator_status="already_have",
+                beijing_indicator_expected_delay_months=0,
+                license_plate_rental_enabled=False,
+                beijing_family_indicator_score_enabled=False,
+                beijing_family_indicator_generations=1,
+            )
+        ],
+    )
+
+    _, candidate = vehicle_candidate_plans(vehicle)[0]
+
+    assert candidate.beijing_license_indicator_status == "family_new_energy_pending"
+    assert candidate.beijing_indicator_expected_delay_months == 18
+    assert candidate.license_plate_rental_enabled is True
+    assert candidate.license_plate_rental_upfront_fee == 18_000
+    assert candidate.beijing_family_indicator_score_enabled is True
+    assert candidate.beijing_family_indicator_generations == 3
+    assert candidate.energy_type == "pure_electric"
+    assert candidate.total_price == 180_000
+
+
 def test_car_plan_generates_strategies_for_each_vehicle_financing_option() -> None:
     car_plan = CarPlanData(
         enabled=True,
@@ -2815,6 +3126,275 @@ def test_vehicle_purchase_events_can_be_ordered_around_home_purchase() -> None:
     assert after_home_vehicle[3] == 24
 
 
+def test_vehicle_order_uses_planning_goal_sequence_before_legacy_purchase_sequence() -> None:
+    car_plan = CarPlanData(
+        enabled=True,
+        vehicle_plans=[
+            CarPlanData(
+                enabled=True,
+                name="目标车辆",
+                planning_goal_id="vehicle-goal",
+                total_price=180_000,
+                down_payment_ratio=0.4,
+                planning_sequence=1,
+                purchase_delay_months=2,
+                after_previous_event_delay_months=5,
+            ),
+        ],
+    )
+    scenario = ScenarioData(total_price=3_000_000, purchase_sequence=2)
+    context = CalculationContextSnapshot(
+        household_id="household-a",
+        scenario_id="home-goal",
+        current_goal_id="home-goal",
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="home-goal",
+                goal_type="home",
+                name="目标房源",
+                priority=1,
+                sequence_index=1,
+                normalized_timing_mode="auto_sequence",
+            ),
+            CalculationContextGoalSnapshot(
+                id="vehicle-goal",
+                goal_type="vehicle",
+                name="目标车辆",
+                priority=2,
+                sequence_index=2,
+                normalized_timing_mode="auto_sequence",
+            ),
+        ],
+    )
+
+    pre_home_states = calculator_module._vehicle_loan_states(
+        car_plan,
+        scenario=scenario,
+        include_after_home=False,
+        calculation_context=context,
+    )
+    plan_states = calculator_module._vehicle_loan_states(
+        car_plan,
+        scenario=scenario,
+        home_purchase_month=18,
+        calculation_context=context,
+    )
+
+    assert pre_home_states == []
+    assert [item[1].name for item in plan_states] == ["目标车辆"]
+    assert plan_states[0][3] == 23
+
+
+def test_projection_vehicle_state_uses_selected_home_purchase_month_for_goal_dependency() -> None:
+    household = HouseholdData(
+        cash_account_balance=900_000,
+        investments=0,
+        monthly_expense=6_000,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=50_000, annual_bonus=0)],
+        car_plan=CarPlanData(
+            enabled=True,
+            vehicle_plans=[
+                CarPlanData(
+                    enabled=True,
+                    name="房后车辆",
+                    planning_goal_id="vehicle-goal",
+                    total_price=120_000,
+                    down_payment_ratio=0.5,
+                    planning_sequence=1,
+                    purchase_delay_months=0,
+                    after_previous_event_delay_months=6,
+                    selected_strategy_variant="target",
+                )
+            ],
+        ),
+    )
+    scenario = ScenarioData(
+        planning_goal_id="home-goal",
+        selected_purchase_plan_variant="手动指定",
+        total_price=1_000_000,
+        down_payment_amount=300_000,
+        commercial_loan_amount=500_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=2,
+        purchase_sequence=2,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+    context = CalculationContextSnapshot(
+        household_id="household-a",
+        scenario_id="home-goal",
+        current_goal_id="home-goal",
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="home-goal",
+                goal_type="home",
+                name="目标房源",
+                priority=1,
+                sequence_index=1,
+                normalized_timing_mode="manual_month",
+                resolved_not_before_month=2,
+            ),
+            CalculationContextGoalSnapshot(
+                id="vehicle-goal",
+                goal_type="vehicle",
+                name="房后车辆",
+                priority=2,
+                sequence_index=2,
+                normalized_timing_mode="auto_sequence",
+            ),
+        ],
+    )
+
+    result = calculate_affordability(household, scenario, _zero_contribution_rule(), calculation_context=context)
+    plan = next(item for item in result.purchase_plan_analyses if item.variant == "手动指定")
+    vehicle_down_payment_months = [
+        item.month
+        for item in result.monthly_cashflow_visualization
+        if item.plan_variant == plan.variant and item.vehicle_down_payment > 0
+    ]
+
+    assert plan.months_to_buy is not None
+    assert plan.months_to_buy >= 2
+    assert vehicle_down_payment_months
+    assert min(vehicle_down_payment_months) >= plan.months_to_buy + 6
+
+
+def test_loan_projection_vehicle_dependency_uses_each_purchase_plan_month() -> None:
+    household = HouseholdData(
+        cash_account_balance=900_000,
+        investments=0,
+        monthly_expense=6_000,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=50_000, annual_bonus=0)],
+        car_plan=CarPlanData(
+            enabled=True,
+            vehicle_plans=[
+                CarPlanData(
+                    enabled=True,
+                    name="房后车辆",
+                    planning_goal_id="vehicle-goal",
+                    total_price=120_000,
+                    down_payment_ratio=0.5,
+                    planning_sequence=1,
+                    purchase_delay_months=0,
+                    after_previous_event_delay_months=6,
+                    selected_strategy_variant="target",
+                )
+            ],
+        ),
+    )
+    scenario = ScenarioData(
+        planning_goal_id="home-goal",
+        selected_purchase_plan_variant="手动指定",
+        total_price=1_000_000,
+        down_payment_amount=300_000,
+        commercial_loan_amount=500_000,
+        provident_loan_amount=0,
+        manual_purchase_delay_months=2,
+        purchase_sequence=2,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+    context = CalculationContextSnapshot(
+        household_id="household-a",
+        scenario_id="home-goal",
+        current_goal_id="home-goal",
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="home-goal",
+                goal_type="home",
+                name="目标房源",
+                priority=1,
+                sequence_index=1,
+                normalized_timing_mode="manual_month",
+                resolved_not_before_month=2,
+            ),
+            CalculationContextGoalSnapshot(
+                id="vehicle-goal",
+                goal_type="vehicle",
+                name="房后车辆",
+                priority=2,
+                sequence_index=2,
+                normalized_timing_mode="auto_sequence",
+            ),
+        ],
+    )
+
+    result = calculate_affordability(household, scenario, _zero_contribution_rule(), calculation_context=context)
+    plan_by_variant = {item.variant: item for item in result.purchase_plan_analyses}
+    manual_plan = plan_by_variant["手动指定"]
+    delayed_plan = next(
+        item
+        for item in result.purchase_plan_analyses
+        if item.variant != manual_plan.variant and item.months_to_buy is not None and item.months_to_buy > manual_plan.months_to_buy
+    )
+
+    first_vehicle_balance_month_by_variant: dict[str, int] = {}
+    for row in result.loan_visualization:
+        if row.vehicle_loan_balance > 0 and row.plan_variant not in first_vehicle_balance_month_by_variant:
+            first_vehicle_balance_month_by_variant[row.plan_variant] = row.month
+
+    assert manual_plan.months_to_buy is not None
+    assert delayed_plan.months_to_buy is not None
+    assert first_vehicle_balance_month_by_variant[manual_plan.variant] >= manual_plan.months_to_buy + 6
+    assert first_vehicle_balance_month_by_variant[delayed_plan.variant] >= delayed_plan.months_to_buy + 6
+    assert first_vehicle_balance_month_by_variant[delayed_plan.variant] > first_vehicle_balance_month_by_variant[manual_plan.variant]
+
+
+def test_vehicle_list_order_uses_resolved_planning_goal_sequence() -> None:
+    car_plan = CarPlanData(
+        enabled=True,
+        vehicle_plans=[
+            CarPlanData(
+                enabled=True,
+                name="旧顺序靠前车辆",
+                planning_goal_id="vehicle-goal-b",
+                total_price=200_000,
+                down_payment_ratio=0.5,
+                planning_sequence=1,
+                purchase_delay_months=1,
+            ),
+            CarPlanData(
+                enabled=True,
+                name="目标顺序靠前车辆",
+                planning_goal_id="vehicle-goal-a",
+                total_price=160_000,
+                down_payment_ratio=0.5,
+                planning_sequence=2,
+                purchase_delay_months=1,
+            ),
+        ],
+    )
+    context = CalculationContextSnapshot(
+        household_id="household-a",
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="vehicle-goal-a",
+                goal_type="vehicle",
+                name="目标顺序靠前车辆",
+                priority=9,
+                sequence_index=1,
+                normalized_timing_mode="auto_sequence",
+            ),
+            CalculationContextGoalSnapshot(
+                id="vehicle-goal-b",
+                goal_type="vehicle",
+                name="旧顺序靠前车辆",
+                priority=1,
+                sequence_index=2,
+                normalized_timing_mode="auto_sequence",
+            ),
+        ],
+    )
+
+    plan_states = calculator_module._vehicle_loan_states(
+        car_plan,
+        calculation_context=context,
+    )
+
+    assert [item[1].name for item in plan_states] == ["目标顺序靠前车辆", "旧顺序靠前车辆"]
+    assert [item[1].planning_sequence for item in plan_states] == [1, 2]
+
+
 def test_manual_car_target_strategy_reflects_user_inputs() -> None:
     result = calculate_affordability(
         HouseholdData(
@@ -2905,6 +3485,98 @@ def test_provident_loan_cap_uses_150k_per_deposit_year() -> None:
     assert {item.provident_loan_amount for item in generated} == {600_000}
 
 
+def test_provident_loan_cap_comes_from_policy_interface() -> None:
+    from app.domain.housing import provident_loan_cap
+
+    household = HouseholdData(existing_home_count=0, social_security_months=120)
+    scenario = ScenarioData(total_price=3_000_000, property_type="新房")
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_loan_amount_per_deposit_year": 80_000,
+            "provident_first_home_loan_cap": 700_000,
+            "provident_green_three_star_bonus": 200_000,
+            "provident_policy_bonus_cap": 200_000,
+        }
+    )
+    efficient_home = scenario.model_copy(update={"green_building_level": "three_star"})
+
+    regular_cap, regular_bonus = provident_loan_cap(household, scenario, rules)
+    efficient_cap, efficient_bonus = provident_loan_cap(household, efficient_home, rules)
+
+    assert regular_bonus == 0
+    assert regular_cap == pytest.approx(700_000)
+    assert efficient_bonus == pytest.approx(200_000)
+    assert efficient_cap == pytest.approx(900_000)
+
+
+def test_home_purchase_eligibility_comes_from_policy_interface() -> None:
+    from app.domain.household import evaluate_home_purchase_eligibility
+
+    household = HouseholdData(
+        has_beijing_hukou=False,
+        social_security_months=48,
+        existing_home_count=1,
+    )
+    base_rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "required_social_security_months": 60,
+            "max_home_count": 2,
+        }
+    )
+    relaxed_rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "required_social_security_months": 36,
+            "max_home_count": 1,
+        }
+    )
+
+    eligible_by_months, month_notes = evaluate_home_purchase_eligibility(household, relaxed_rules)
+    eligible_by_home_count, home_count_notes = evaluate_home_purchase_eligibility(household, base_rules)
+
+    assert eligible_by_months is False
+    assert any("上限 1 套" in note for note in month_notes)
+    assert eligible_by_home_count is False
+    assert any("60 个月" in note for note in home_count_notes)
+
+
+def test_provident_repayment_capacity_cap_comes_from_policy_interface() -> None:
+    from app.domain.housing import provident_loan_cap
+
+    household = HouseholdData(existing_home_count=0, social_security_months=240)
+    scenario = ScenarioData(total_price=3_000_000, property_type="新房", loan_years=30)
+    base_rules = RulePackData()
+    constrained_rules = RulePackData(
+        params={
+            **base_rules.params,
+            "provident_repayment_capacity_enabled": True,
+            "provident_repayment_income_ratio": 0.10,
+            "provident_basic_living_cost_per_person": 0,
+        }
+    )
+
+    base_cap, _ = provident_loan_cap(
+        household,
+        scenario,
+        base_rules,
+        monthly_income_for_capacity=30_000,
+        borrower_count=1,
+    )
+    constrained_cap, _ = provident_loan_cap(
+        household,
+        scenario,
+        constrained_rules,
+        monthly_income_for_capacity=30_000,
+        borrower_count=1,
+    )
+
+    assert base_cap == pytest.approx(1_200_000)
+    assert constrained_cap < base_cap
+    assert constrained_cap == pytest.approx(749_364, rel=0.01)
+
+
 def test_first_home_provident_minimum_down_payment_uses_current_20_percent_policy() -> None:
     household = HouseholdData(
         existing_home_count=0,
@@ -2928,6 +3600,40 @@ def test_first_home_provident_minimum_down_payment_uses_current_20_percent_polic
 
     assert provident_plans
     assert min(item.minimum_down_payment for item in provident_plans) == pytest.approx(scenario.total_price * 0.20)
+
+
+def test_affordability_summary_minimum_down_payment_uses_policy_interface() -> None:
+    household = HouseholdData(
+        existing_home_count=0,
+        existing_mortgage_count=0,
+        social_security_months=180,
+        cash_account_balance=2_000_000,
+        monthly_expense=8_000,
+        required_liquidity_months=1,
+        car_plan=CarPlanData(enabled=False),
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+    )
+    rule = RulePackData()
+    rule = rule.model_copy(
+        update={
+            "params": {
+                **rule.params,
+                "minimum_down_payment_ratio": 0.80,
+                "first_home_provident_min_down_payment_ratio": 0.20,
+                "first_home_commercial_min_down_payment_ratio": 0.15,
+            }
+        }
+    )
+
+    result = calculate_affordability(household, scenario, rule)
+
+    assert result.minimum_down_payment == pytest.approx(scenario.total_price * 0.20)
 
 
 def test_second_home_provident_plan_uses_25_percent_minimum_down_payment() -> None:
@@ -3290,6 +3996,8 @@ def test_generated_purchase_plans_calculate_loan_mix_from_target_and_rules() -> 
 
 
 def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
+    from app.policies import get_policy
+
     rules = RulePackData()
     rules = rules.model_copy(
         update={
@@ -3301,6 +4009,7 @@ def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
             }
         }
     )
+    home_policy = get_policy(rules).home_strategy_policy()
     household = HouseholdData(
         cash_account_balance=1_150_000,
         investments=0,
@@ -3338,6 +4047,9 @@ def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
     )
     micro_plan = positive_commercial[0]
 
+    assert home_policy.micro_commercial_loan_ratio == pytest.approx(0.05)
+    assert home_policy.micro_commercial_loan_ratio_min == pytest.approx(0.02)
+    assert home_policy.micro_commercial_loan_ratio_max == pytest.approx(0.12)
     assert scenario.total_price * 0.02 <= micro_plan.commercial_loan_amount <= scenario.total_price * 0.12
     assert micro_plan.months_to_buy is not None
     assert zero_commercial.months_to_buy is None or micro_plan.months_to_buy <= zero_commercial.months_to_buy
@@ -4282,6 +4994,105 @@ def test_monthly_repayment_withdrawal_offsets_provident_payment_every_month() ->
     assert loan_row.provident_loan_balance > 0
 
 
+def test_manual_provident_strategy_switches_from_monthly_withdrawal_to_semiannual_offset() -> None:
+    household = HouseholdData(
+        cash_account_balance=2_500_000,
+        investments=0,
+        provident_fund_balance=80_000,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        social_security_months=180,
+        members=[
+            IncomeMember(name="样例成员A", monthly_salary_gross=80_000, annual_bonus=0),
+            IncomeMember(name="样例成员B", monthly_salary_gross=80_000, annual_bonus=0),
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        provident_account_repayment_strategy="monthly_repayment_withdrawal",
+        provident_account_repayment_switch_enabled=True,
+        provident_account_repayment_switch_after_month=2,
+        provident_account_repayment_switch_to_strategy="semiannual_principal_offset",
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    purchase_month = plan.months_to_buy or 0
+    monthly_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month == purchase_month + 1
+    )
+    offset_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month > purchase_month + 2 and row.loan_offset_payment > 0
+    )
+    switch_event = next(
+        event
+        for event in result.plan_events
+        if event.plan_variant == plan.variant and event.category == "provident" and "切换" in event.title
+    )
+
+    assert plan.post_purchase_pf_strategy == "monthly_then_semiannual_offset:2"
+    assert monthly_row.monthly_repayment_withdrawal > 0
+    assert monthly_row.loan_offset_payment == 0
+    assert offset_row.loan_offset_payment > 0
+    assert offset_row.monthly_repayment_withdrawal == 0
+    assert switch_event.month == purchase_month + 3
+    assert "两种模式互斥" in switch_event.detail
+
+
+def test_manual_provident_strategy_switches_from_semiannual_offset_to_monthly_withdrawal() -> None:
+    household = HouseholdData(
+        cash_account_balance=2_500_000,
+        investments=0,
+        provident_fund_balance=80_000,
+        monthly_expense=8_000,
+        required_liquidity_months=3,
+        social_security_months=180,
+        members=[
+            IncomeMember(name="样例成员A", monthly_salary_gross=80_000, annual_bonus=0),
+            IncomeMember(name="样例成员B", monthly_salary_gross=80_000, annual_bonus=0),
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        provident_account_repayment_strategy="semiannual_principal_offset",
+        provident_account_repayment_switch_enabled=True,
+        provident_account_repayment_switch_after_month=2,
+        provident_account_repayment_switch_to_strategy="monthly_repayment_withdrawal",
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["0商贷"]
+    purchase_month = plan.months_to_buy or 0
+    switched_month_row = next(
+        row
+        for row in result.provident_visualization
+        if row.plan_variant == plan.variant and row.month == purchase_month + 3
+    )
+    switch_event = next(
+        event
+        for event in result.plan_events
+        if event.plan_variant == plan.variant and event.category == "provident" and "切换" in event.title
+    )
+
+    assert plan.post_purchase_pf_strategy == "semiannual_offset_then_monthly:2"
+    assert switched_month_row.monthly_repayment_withdrawal > 0
+    assert switched_month_row.loan_offset_payment == 0
+    assert switch_event.month == purchase_month + 3
+    assert "两种模式互斥" in switch_event.detail
+
+
 def test_national_provident_member_uses_monthly_repayment_default_strategy() -> None:
     rules = RulePackData(
         params={
@@ -4335,6 +5146,39 @@ def test_national_provident_member_uses_monthly_repayment_default_strategy() -> 
     assert plan.post_purchase_pf_strategy == "monthly_repayment_withdrawal_auto"
     assert provident_row.monthly_repayment_withdrawal > 0
     assert provident_row.loan_offset_payment == 0
+
+
+def test_provident_repayment_support_is_exposed_by_policy_interface() -> None:
+    from app.policies import get_policy
+
+    rules = RulePackData(
+        params={
+            **RulePackData().params,
+            "provident_balance_annual_interest_rate": 0.012,
+            "provident_loan_offset_retained_balance": 88,
+            "provident_upfront_purchase_extract_ratio_new_home": 0.75,
+            "provident_upfront_purchase_extract_ratio_second_hand": 0.25,
+            "provident_post_transaction_extract_ratio": 0.6,
+            "provident_municipal_monthly_repayment_withdrawal_supported": False,
+            "provident_municipal_semiannual_principal_offset_supported": True,
+            "provident_national_monthly_direct_offset_supported": False,
+            "provident_national_semiannual_principal_offset_supported": True,
+        }
+    )
+    policy = get_policy(rules)
+
+    assert policy.provident_account_balance_annual_interest_rate() == pytest.approx(0.012)
+    assert policy.provident_loan_offset_retained_balance() == pytest.approx(88)
+    assert policy.provident_upfront_purchase_extract_ratio(ScenarioData(property_type="新房")) == pytest.approx(0.75)
+    assert policy.provident_upfront_purchase_extract_ratio(ScenarioData(property_type="二手房")) == pytest.approx(0.25)
+    assert policy.provident_post_transaction_extract_ratio(ScenarioData()) == pytest.approx(0.6)
+    assert policy.provident_post_purchase_policy().cashflow_enabled is False
+    assert policy.provident_post_purchase_policy().strategy_mode == "auto"
+    assert policy.provident_monthly_repayment_withdrawal_supported("beijing_municipal") is False
+    assert policy.provident_semiannual_principal_offset_supported("beijing_municipal") is True
+    assert policy.provident_monthly_repayment_withdrawal_supported("national") is False
+    assert policy.provident_semiannual_principal_offset_supported("national") is True
+    assert calculator_module._policy_default_pf_account_strategy(rules) == "semiannual_principal_offset"
 
 
 def test_provident_center_uses_income_stage_at_purchase_month() -> None:
@@ -4450,7 +5294,7 @@ def test_auto_provident_strategy_can_switch_from_monthly_withdrawal_to_semiannua
         if event.plan_variant == plan.variant and event.category == "provident" and "切换" in event.title
     )
 
-    assert plan.post_purchase_pf_strategy_label.startswith("自动先按月提取")
+    assert plan.post_purchase_pf_strategy_label.startswith("自动先按月约定提取")
     assert monthly_row.monthly_repayment_withdrawal == pytest.approx(
         min(plan.provident_monthly_payment, monthly_row.total_deposit)
     )
@@ -5042,6 +5886,123 @@ def test_rent_service_fee_can_change_after_first_year_and_broker_fee_can_be_manu
     assert monthly_household_expense_at(household, as_of=date(2027, 7, 1)) == 13_250
 
 
+def test_broker_fee_default_comes_from_policy_interface_and_scenario_can_override() -> None:
+    from app.domain.housing import broker_fee_rate
+
+    base_rules = RulePackData()
+    rules = base_rules.model_copy(
+        update={"params": {**base_rules.params, "default_broker_fee_rate": 0.018}}
+    )
+    scenario_without_manual_rate = ScenarioData().model_construct(broker_fee_rate=None)
+    market_snapshot = MarketSnapshotData(default_broker_fee_rate=0.016)
+
+    assert broker_fee_rate(scenario_without_manual_rate, rules) == pytest.approx(0.018)
+    assert broker_fee_rate(ScenarioData(), rules) == pytest.approx(0.018)
+    assert broker_fee_rate(scenario_without_manual_rate, rules, market_snapshot) == pytest.approx(0.016)
+    assert broker_fee_rate(ScenarioData(), rules, market_snapshot) == pytest.approx(0.016)
+    assert broker_fee_rate(ScenarioData(broker_fee_rate=0.01), rules) == pytest.approx(0.01)
+    assert broker_fee_rate(ScenarioData(broker_fee_rate=0.01), rules, market_snapshot) == pytest.approx(0.01)
+
+
+def test_commercial_loan_rate_uses_market_quote_entrypoint() -> None:
+    from app.domain.housing import commercial_loan_rate
+
+    market_snapshot = MarketSnapshotData(commercial_loan_rate=0.032)
+
+    assert commercial_loan_rate(ScenarioData(commercial_rate=0.041)) == pytest.approx(0.041)
+    assert commercial_loan_rate(ScenarioData(), market_snapshot) == pytest.approx(0.032)
+    assert commercial_loan_rate(ScenarioData(commercial_rate=0.041), market_snapshot) == pytest.approx(0.041)
+    assert commercial_loan_rate(ScenarioData().model_construct(commercial_rate=None)) == pytest.approx(0.035)
+    assert commercial_loan_rate(ScenarioData().model_construct(commercial_rate=None), market_snapshot) == pytest.approx(0.032)
+    assert commercial_loan_rate(ScenarioData().model_construct(commercial_rate=0.35)) == pytest.approx(0.2)
+
+
+def test_market_snapshot_feeds_purchase_strategy_market_assumptions() -> None:
+    household = HouseholdData(
+        monthly_income=60_000,
+        monthly_expense=10_000,
+        cash_account_balance=1_200_000,
+        investments=100_000,
+        social_security_months=96,
+        borrower_age=30,
+    )
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        down_payment_amount=700_000,
+        commercial_loan_amount=800_000,
+        provident_loan_amount=500_000,
+    )
+    market_snapshot = MarketSnapshotData(commercial_loan_rate=0.032, default_broker_fee_rate=0.016)
+
+    result = calculate_affordability(household, scenario, RulePackData(), market_snapshot=market_snapshot)
+
+    assert result.purchase_plan_analyses
+    plan = result.purchase_plan_analyses[0]
+    assert plan.commercial_rate == pytest.approx(0.032)
+    assert plan.broker_fee_rate == pytest.approx(0.016)
+
+    manual_quote = scenario.model_copy(update={"commercial_rate": 0.041, "broker_fee_rate": 0.012})
+    manual_result = calculate_affordability(household, manual_quote, RulePackData(), market_snapshot=market_snapshot)
+    manual_plan = manual_result.purchase_plan_analyses[0]
+    assert manual_plan.commercial_rate == pytest.approx(0.041)
+    assert manual_plan.broker_fee_rate == pytest.approx(0.012)
+
+
+def test_seller_tax_pass_through_default_comes_from_policy_interface_and_scenario_can_override() -> None:
+    from app.calculation_context import build_purchase_cash_context
+    from app.domain.housing import seller_tax_pass_through_amount
+
+    base_rules = RulePackData()
+    rules = base_rules.model_copy(
+        update={"params": {**base_rules.params, "seller_tax_pass_through_default_rate": 0.012}}
+    )
+    scenario_without_manual_rate = ScenarioData(
+        total_price=2_000_000,
+        seller_tax_pass_through_enabled=True,
+        seller_tax_pass_through_rate=0,
+        seller_tax_pass_through_amount=0,
+    )
+    scenario_with_manual_rate = scenario_without_manual_rate.model_copy(
+        update={"seller_tax_pass_through_rate": 0.02}
+    )
+    scenario_with_manual_amount = scenario_without_manual_rate.model_copy(
+        update={"seller_tax_pass_through_amount": 18_000}
+    )
+    market_snapshot = MarketSnapshotData(seller_tax_pass_through_rate=0.015)
+
+    assert seller_tax_pass_through_amount(scenario_without_manual_rate, rules) == pytest.approx(24_000)
+    assert seller_tax_pass_through_amount(scenario_without_manual_rate, rules, market_snapshot) == pytest.approx(30_000)
+    assert seller_tax_pass_through_amount(scenario_with_manual_rate, rules) == pytest.approx(40_000)
+    assert seller_tax_pass_through_amount(scenario_with_manual_rate, rules, market_snapshot) == pytest.approx(40_000)
+    assert seller_tax_pass_through_amount(scenario_with_manual_amount, rules) == pytest.approx(18_000)
+    assert seller_tax_pass_through_amount(scenario_with_manual_amount, rules, market_snapshot) == pytest.approx(18_000)
+    assert seller_tax_pass_through_amount(
+        scenario_without_manual_rate.model_copy(update={"seller_tax_pass_through_enabled": False}),
+        rules,
+        market_snapshot,
+    ) == 0
+    assert seller_tax_pass_through_amount(
+        scenario_without_manual_rate.model_copy(update={"seller_tax_pass_through_enabled": False}),
+        rules,
+    ) == 0
+    purchase_cash_context = build_purchase_cash_context(
+        HouseholdData(),
+        scenario_without_manual_rate,
+        rules,
+        min_down_payment_ratio=0.3,
+    )
+    assert purchase_cash_context.seller_tax_pass_through == pytest.approx(24_000)
+    assert purchase_cash_context.taxes_and_fees >= 24_000
+    market_purchase_cash_context = build_purchase_cash_context(
+        HouseholdData(),
+        scenario_without_manual_rate,
+        rules,
+        min_down_payment_ratio=0.3,
+        market_snapshot=market_snapshot,
+    )
+    assert market_purchase_cash_context.seller_tax_pass_through == pytest.approx(30_000)
+
+
 def test_purchase_plan_happiness_scores_have_explainable_breakdown() -> None:
     household = HouseholdData(
         cash_account_balance=900_000,
@@ -5067,6 +6028,47 @@ def test_purchase_plan_happiness_scores_have_explainable_breakdown() -> None:
         assert sum(item.weight for item in plan.happiness_breakdown) == pytest.approx(1.0, abs=0.01)
         assert sum(item.weighted_score for item in plan.happiness_breakdown) == pytest.approx(plan.happiness_score, abs=0.05)
         assert all(0 <= item.score <= 10 for item in plan.happiness_breakdown)
+
+
+def test_purchase_happiness_weights_are_read_from_policy_interface() -> None:
+    base_rules = RulePackData()
+    rules = base_rules.model_copy(
+        update={
+            "params": {
+                **base_rules.params,
+                "purchase_happiness_weights": {
+                    "cash_shortfall": 99,
+                    "living_quality": 1,
+                },
+            }
+        }
+    )
+
+    weights = purchase_happiness_weights(rules, liquidity_priority_score=5)
+
+    assert weights["cash_shortfall"] > 0.9
+    assert weights["cash_shortfall"] > weights["living_quality"]
+    assert sum(weights.values()) == pytest.approx(1.0)
+
+
+def test_purchase_happiness_weight_defaults_stay_inside_policy_interface() -> None:
+    base_rules = RulePackData()
+    zero_rules = base_rules.model_copy(
+        update={
+            "params": {
+                **base_rules.params,
+                "purchase_happiness_weights": {
+                    key: 0
+                    for key in base_rules.params["purchase_happiness_weights"]
+                },
+            }
+        }
+    )
+
+    weights = purchase_happiness_weights(zero_rules, liquidity_priority_score=5)
+
+    assert weights
+    assert sum(weights.values()) == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -5385,6 +6387,110 @@ def test_child_plan_birth_range_generates_strategy_and_maternal_age_warning() ->
     assert 0 <= strategies[0].happiness_score <= 10
 
 
+def test_child_plan_strategy_consumes_planning_goal_snapshot_directly() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        members=[IncomeMember(name="样例成员B", sex="female", birth_month="1995-01")],
+        child_plans=[
+            ChildPlanData(
+                name="样例子女",
+                enabled=True,
+                planning_goal_id="child-goal-a",
+                timing_mode="manual_month",
+                planned_birth_month="2027-01",
+                monthly_pregnancy_cost=2000,
+                monthly_childcare_cost_before_kindergarten=3000,
+            )
+        ],
+    )
+    context = CalculationContextSnapshot(
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="child-goal-a",
+                goal_type="child",
+                name="样例子女",
+                priority=30,
+                sequence_index=1,
+                normalized_timing_mode="manual_month",
+                resolved_not_before_month=48,
+                resolved_window_start_month=48,
+                resolved_window_end_month=48,
+                explanation="按统一目标窗口安排出生月。",
+            )
+        ]
+    )
+
+    strategies = build_child_plan_strategies(
+        household,
+        rule,
+        as_of=date(2026, 7, 1),
+        calculation_context=context,
+    )
+
+    assert strategies[0].planning_goal_id == "child-goal-a"
+    assert strategies[0].source == "planning_goals"
+    assert strategies[0].timing_mode == "manual_month"
+    assert strategies[0].birth_month_label == "2030-07"
+    assert any("统一规划目标" in warning for warning in strategies[0].warnings)
+
+
+def test_child_plan_strategy_order_uses_resolved_planning_goal_sequence() -> None:
+    rule = _zero_contribution_rule()
+    household = HouseholdData(
+        members=[IncomeMember(name="样例成员B", sex="female", birth_month="1995-01")],
+        child_plans=[
+            ChildPlanData(
+                name="旧顺序靠前子女",
+                enabled=True,
+                planning_goal_id="child-goal-b",
+                timing_mode="manual_month",
+                planned_birth_month="2028-01",
+            ),
+            ChildPlanData(
+                name="目标顺序靠前子女",
+                enabled=True,
+                planning_goal_id="child-goal-a",
+                timing_mode="manual_month",
+                planned_birth_month="2028-01",
+            ),
+        ],
+    )
+    context = CalculationContextSnapshot(
+        planning_goals=[
+            CalculationContextGoalSnapshot(
+                id="child-goal-a",
+                goal_type="child",
+                name="目标顺序靠前子女",
+                priority=40,
+                sequence_index=1,
+                normalized_timing_mode="manual_month",
+                resolved_not_before_month=24,
+                resolved_window_start_month=24,
+            ),
+            CalculationContextGoalSnapshot(
+                id="child-goal-b",
+                goal_type="child",
+                name="旧顺序靠前子女",
+                priority=30,
+                sequence_index=2,
+                normalized_timing_mode="manual_month",
+                resolved_not_before_month=36,
+                resolved_window_start_month=36,
+            ),
+        ]
+    )
+
+    strategies = build_child_plan_strategies(
+        household,
+        rule,
+        as_of=date(2026, 7, 1),
+        calculation_context=context,
+    )
+
+    assert [item.child_name for item in strategies] == ["目标顺序靠前子女", "旧顺序靠前子女"]
+    assert [item.planning_goal_id for item in strategies] == ["child-goal-a", "child-goal-b"]
+
+
 def test_child_plan_after_home_uses_purchase_month_when_no_birth_range() -> None:
     rule = _zero_contribution_rule()
     household = HouseholdData(
@@ -5407,6 +6513,45 @@ def test_child_plan_after_home_uses_purchase_month_when_no_birth_range() -> None
     assert before_home == 0
     assert pregnancy_month == 2000
     assert birth_month == 93_000
+
+
+def test_child_planning_policy_controls_birth_delay_and_maternal_age_threshold() -> None:
+    base_rule = _zero_contribution_rule()
+    rule = base_rule.model_copy(
+        update={
+            "params": {
+                **base_rule.params,
+                "child_plan_birth_after_home_delay_months": 3,
+                "child_plan_advanced_maternal_age": 40,
+            }
+        }
+    )
+    household = HouseholdData(
+        members=[IncomeMember(name="样例成员B", sex="female", birth_month="1990-01")],
+        child_plans=[
+            ChildPlanData(
+                name="样例子女",
+                enabled=True,
+                timing_mode="after_first_home",
+                monthly_pregnancy_cost=2000,
+                monthly_childcare_cost_before_kindergarten=3000,
+            )
+        ],
+    )
+
+    pregnancy_month = monthly_household_expense_at(household, 5, as_of=date(2026, 7, 1), rules=rule, home_purchase_month=3)
+    birth_month = monthly_household_expense_at(household, 6, as_of=date(2026, 7, 1), rules=rule, home_purchase_month=3)
+    strategies = build_child_plan_strategies(
+        household,
+        rule,
+        as_of=date(2026, 7, 1),
+        home_purchase_month=3,
+    )
+
+    assert pregnancy_month == 2000
+    assert birth_month == 93_000
+    assert strategies[0].birth_month_label == "2027-01"
+    assert not any("高龄妊娠" in warning for warning in strategies[0].warnings)
 
 
 def test_personal_pension_deduction_is_capped_annually() -> None:
@@ -6027,6 +7172,40 @@ def test_retired_pension_account_pays_out_by_policy_months() -> None:
     assert second_retired_month.pension_balance_end == pytest.approx(800)
 
 
+def test_social_security_account_projection_uses_policy_interface() -> None:
+    rule = RulePackData().model_copy(
+        update={
+            "params": {
+                **RulePackData().params,
+                "pension_personal_account_annual_return": 0,
+                "medical_account_annual_interest_rate": 0,
+                "medical_account_retiree_monthly_transfer_under_70": 120,
+                "medical_account_retiree_large_mutual_aid_monthly": 5,
+                "pension_personal_account_months_by_retirement_category": {"male_60": 4},
+            }
+        }
+    )
+    household = HouseholdData(
+        members=[
+            IncomeMember(
+                name="retired_member",
+                birth_month="1963-07",
+                retirement_category="male_60",
+                pension_account_balance=400,
+                medical_account_balance=0,
+                income_stages=[],
+            )
+        ]
+    )
+
+    rows = build_social_security_visualization(household, rule, [_sample_purchase_plan()], None, horizon_months=1, as_of=date(2026, 7, 1))
+    retired_month = next(item for item in rows if item.month == 1)
+
+    assert retired_month.pension_account_payout == pytest.approx(100)
+    assert retired_month.medical_retiree_transfer == pytest.approx(120)
+    assert retired_month.medical_mutual_aid_outflow == pytest.approx(5)
+
+
 def test_retired_pension_account_stops_payout_after_balance_depleted() -> None:
     rule = RulePackData().model_copy(
         update={
@@ -6162,6 +7341,25 @@ def test_medical_account_payable_expense_reduces_cash_scheduled_expense() -> Non
     assert any(item.category == "medical_healthcare_outflow" and item.amount == pytest.approx(-500) for item in ledger_rows)
 
 
+def test_scheduled_expense_category_scopes_medical_account_payment() -> None:
+    general_expense = ScheduledExpenseData(
+        name="示例普通支出",
+        monthly_amount=500,
+        expense_category="general",
+        medical_account_payable=True,
+    )
+    legacy_medical_expense = ScheduledExpenseData(
+        name="示例医疗支出",
+        monthly_amount=500,
+        medical_account_payable=True,
+    )
+
+    assert general_expense.expense_category == "general"
+    assert general_expense.medical_account_payable is False
+    assert legacy_medical_expense.expense_category == "medical"
+    assert legacy_medical_expense.medical_account_payable is True
+
+
 def test_member_can_have_no_income_stage_without_top_level_income_fallback() -> None:
     household = HouseholdData(
         monthly_income=50_000,
@@ -6263,8 +7461,11 @@ def test_account_calibration_updates_backend_projection_and_events() -> None:
         account_calibrations=[
             {
                 "month": next_month,
+                "calibration_scope": "major_event",
                 "target": "cash",
                 "amount": 50_000,
+                "source_title": "示例重大事件",
+                "source_category": "home_purchase",
                 "note": "月度对账",
             },
             {
@@ -6307,6 +7508,10 @@ def test_account_calibration_updates_backend_projection_and_events() -> None:
     )
     assert any(
         event.title.startswith("手动校准") and event.plan_variant == plan_variant
+        for event in result.plan_events
+    )
+    assert any(
+        "示例重大事件" in event.title and "来源：示例重大事件" in event.detail
         for event in result.plan_events
     )
 

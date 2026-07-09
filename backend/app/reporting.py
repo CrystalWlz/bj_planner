@@ -2,12 +2,26 @@ from __future__ import annotations
 
 from datetime import date
 
+from .core_object_concepts import (
+    ACCOUNT_CONCEPT_DEFINITIONS,
+    CASH_ACCOUNT_CONCEPT,
+    CORE_OBJECT_GROUP_DEFINITIONS,
+    INVESTMENT_ACCOUNT_CONCEPT,
+    LIQUID_ASSET_ACCOUNT_CONCEPT,
+    MEDICAL_ACCOUNT_CONCEPT,
+    PENSION_ACCOUNT_CONCEPT,
+    SOCIAL_SECURITY_PERSONAL_ACCOUNTS_CONCEPT,
+    account_concept_code_for_core_object,
+)
 from .domain.time import month_after
 from .schemas import (
     AccountConceptSummary,
     AccountSnapshotPoint,
     AffordabilityResult,
     AnnualFinancialSummary,
+    CalculationContextCoreObjectSnapshot,
+    CalculationContextSnapshot,
+    CoreObjectGroupSummary,
     ExportSheet,
     ExportTextDocument,
     LoanVisualizationPoint,
@@ -440,79 +454,111 @@ def build_annual_financial_summaries(
     return summaries
 
 
-def build_account_concepts() -> list[AccountConceptSummary]:
-    return [
+def _core_object_totals(
+    core_objects: list[CalculationContextCoreObjectSnapshot],
+) -> dict[str, tuple[int, float, float]]:
+    groups: dict[str, tuple[int, float, float]] = {
+        definition.code: (0, 0.0, 0.0) for definition in ACCOUNT_CONCEPT_DEFINITIONS
+    }
+    for item in core_objects:
+        key = account_concept_code_for_core_object(item.object_type, item.category)
+        if key is None:
+            continue
+        count, balance, monthly_flow = groups[key]
+        groups[key] = (
+            count + 1,
+            balance + item.current_balance,
+            monthly_flow + item.monthly_flow,
+        )
+    cash = groups[CASH_ACCOUNT_CONCEPT]
+    investment = groups[INVESTMENT_ACCOUNT_CONCEPT]
+    groups[LIQUID_ASSET_ACCOUNT_CONCEPT] = (
+        cash[0] + investment[0],
+        cash[1] + investment[1],
+        cash[2] + investment[2],
+    )
+    pension = groups[PENSION_ACCOUNT_CONCEPT]
+    medical = groups[MEDICAL_ACCOUNT_CONCEPT]
+    groups[SOCIAL_SECURITY_PERSONAL_ACCOUNTS_CONCEPT] = (
+        pension[0] + medical[0],
+        pension[1] + medical[1],
+        pension[2] + medical[2],
+    )
+    return groups
+
+
+def _with_core_object_totals(
+    concept: AccountConceptSummary,
+    totals: dict[str, tuple[int, float, float]],
+) -> AccountConceptSummary:
+    count, balance, monthly_flow = totals.get(concept.code, (0, 0.0, 0.0))
+    return concept.model_copy(
+        update={
+            "core_object_count": count,
+            "current_balance": round(balance, 2),
+            "monthly_flow": round(monthly_flow, 2),
+        }
+    )
+
+
+def build_account_concepts_from_core_object_snapshots(
+    core_objects: list[CalculationContextCoreObjectSnapshot],
+) -> list[AccountConceptSummary]:
+    totals = _core_object_totals(core_objects)
+    concepts = [
         AccountConceptSummary(
-            code="cash_account",
-            name="现金账户",
-            category="cash",
-            description="由后端逐月推演的自由现金余额，只记录工资现金入账、日常支出、交易现金、车贷房贷现金还款、理财买卖资金等可以真实动用的现金。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="investment_account",
-            name="投资账户",
-            category="investment",
-            description="由后端根据定投策略、买入手续费、卖出手续费和月度收益复利推演，不直接等同于现金，交易月需要先变现再进入现金账户。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="liquid_asset_account",
-            name="流动资产",
-            category="account",
-            description="现金账户和投资账户的合计，用于观察可较快动用的资产规模；不包含公积金账户、固定资产和贷款。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="provident_account",
-            name="公积金账户",
-            category="provident",
-            description="按政策口径单独管理，个人和单位缴存、账户利息、租房季度提取、购房相关提取、按月抵月供和半年度冲本金都在后端逐月记账；默认不作为自由现金收入。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="social_security_personal_accounts",
-            name="养老与医保个人账户",
-            category="social_security",
-            description="后端按成员工资阶段和规则包逐月推演养老保险个人账户与医保个人账户。养老账户按个人缴费累积并在退休后按计发月数消耗；医保账户按个人医保缴费、退休后定额划入、医保可支付医疗支出和大额互助扣缴记账。这类账户受政策用途限制，不作为现金账户或流动资产。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="personal_pension_account",
-            name="个人养老金账户",
-            category="social_security",
-            description="由税务策略或用户手动决定是否开户、何时缴费和缴多少。缴费作为现金转出进入受限养老账户，年度限额内可税前扣除；账户收益单独累积，不计入流动资产。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="fixed_asset_account",
-            name="固定资产",
-            category="fixed_asset",
-            description="记录房产和车辆等不动产/耐用品估值，用于看家庭资产结构，不作为首付或应急现金来源。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="loan_account",
-            name="贷款账户",
-            category="loan",
-            description="统一管理商业房贷、公积金贷款、车贷和已有贷款余额及月供；前端只展示后端返回的逐月余额和还款现金流。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="net_worth",
-            name="净资产",
-            category="account",
-            description="总资产扣除贷款余额后的家庭净值。账户余额、固定资产估值和贷款余额本身不会为负，但净资产可能因为负债高于资产而为负。",
-            managed_by="backend",
-        ),
-        AccountConceptSummary(
-            code="policy_pack",
-            name="政策规则包",
-            category="policy",
-            description="税、公积金、购房资格、贷款上限、贷款年限、冲还贷月份等由政策规则包控制；用户只调整真实可选参数和情景假设。",
-            managed_by="policy",
-        ),
+            code=definition.code,
+            name=definition.name,
+            category=definition.category,  # type: ignore[arg-type]
+            description=definition.description,
+            managed_by=definition.managed_by,  # type: ignore[arg-type]
+        )
+        for definition in ACCOUNT_CONCEPT_DEFINITIONS
     ]
+    return [_with_core_object_totals(concept, totals) for concept in concepts]
+
+
+def build_account_concepts(calculation_context: CalculationContextSnapshot | None = None) -> list[AccountConceptSummary]:
+    return build_account_concepts_from_core_object_snapshots(
+        calculation_context.core_objects if calculation_context else []
+    )
+
+
+def build_core_object_group_summaries(
+    account_concepts: list[AccountConceptSummary],
+) -> list[CoreObjectGroupSummary]:
+    concept_by_code = {item.code: item for item in account_concepts}
+
+    def aggregate(codes: list[str]) -> tuple[int, float, float]:
+        count = 0
+        balance = 0.0
+        monthly_flow = 0.0
+        for code in codes:
+            concept = concept_by_code.get(code)
+            if concept is None:
+                continue
+            count += concept.core_object_count
+            balance += concept.current_balance
+            monthly_flow += concept.monthly_flow
+        return count, round(balance, 2), round(monthly_flow, 2)
+
+    groups: list[CoreObjectGroupSummary] = []
+    for definition in CORE_OBJECT_GROUP_DEFINITIONS:
+        concept_codes = list(definition.concept_codes)
+        count, balance, monthly_flow = aggregate(concept_codes)
+        groups.append(
+            CoreObjectGroupSummary(
+                code=definition.code,
+                name=definition.name,
+                category=definition.category,  # type: ignore[arg-type]
+                concept_codes=concept_codes,
+                description=definition.description,
+                core_object_count=count,
+                current_balance=balance,
+                monthly_flow=monthly_flow,
+            )
+        )
+    return groups
 
 
 def build_strategy_explanations(
@@ -653,7 +699,43 @@ def build_export_sheets(
                         ["房源/场景", scenario.name],
                         ["导出方案", plan_variant],
                         ["时间口径", "所有月份为从当前月份开始推演的真实年月；金额单位为元。"],
-                        ["数据来源", "后端 export_sheets，由月度账本、账户快照、贷款、公积金、养老医保和事件时间线生成。"],
+                        ["数据来源", "后端 export_sheets，由核心对象索引、月度账本、账户快照、贷款、公积金、养老医保和事件时间线生成。"],
+                    ],
+                ),
+                _sheet(
+                    plan_variant=plan_variant,
+                    title="核心对象与账户概念",
+                    headers=["概念编码", "名称", "类别", "核心对象数量", "当前余额/目标金额", "月流量", "管理方", "说明"],
+                    rows=[
+                        [
+                            row.code,
+                            row.name,
+                            row.category,
+                            row.core_object_count,
+                            row.current_balance,
+                            row.monthly_flow,
+                            row.managed_by,
+                            row.description,
+                        ]
+                        for row in result.account_concepts
+                    ],
+                ),
+                _sheet(
+                    plan_variant=plan_variant,
+                    title="核心对象分组摘要",
+                    headers=["分组编码", "名称", "类别", "包含概念", "核心对象数量", "当前余额/目标金额", "月流量", "说明"],
+                    rows=[
+                        [
+                            row.code,
+                            row.name,
+                            row.category,
+                            "、".join(row.concept_codes),
+                            row.core_object_count,
+                            row.current_balance,
+                            row.monthly_flow,
+                            row.description,
+                        ]
+                        for row in result.core_object_groups
                     ],
                 ),
                 _sheet(
@@ -993,6 +1075,17 @@ def build_export_sheets(
             rows=[
                 [row.code, row.name, row.category, row.managed_by, row.description]
                 for row in result.account_concepts
+            ],
+        )
+    )
+    sheets.append(
+        _sheet(
+            plan_variant="",
+            title="核心对象分组说明",
+            headers=["代码", "名称", "类别", "包含概念", "说明"],
+            rows=[
+                [row.code, row.name, row.category, "、".join(row.concept_codes), row.description]
+                for row in result.core_object_groups
             ],
         )
     )

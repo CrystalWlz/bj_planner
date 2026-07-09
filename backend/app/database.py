@@ -10,7 +10,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .core_objects import (
+    core_object_record_id as _core_object_record_id,
+    derive_core_objects_for_household as _derive_core_objects_for_household,
+    derive_core_objects_for_planning_goals as _derive_core_objects_for_planning_goals,
+)
+from .domain.planning_goals import resolve_planning_sequence
+from .generated_strategies import generated_strategy_rows
 from .storage.normalization import (
+    child_goal_from_plan as _child_goal_from_plan,
+    child_plan_from_goal as _child_plan_from_goal,
     home_goal_from_scenario as _home_goal_from_scenario,
     normalize_household as _normalize_household,
     normalize_market_snapshot as _normalize_market_snapshot,
@@ -23,11 +32,7 @@ from .storage.normalization import (
     vehicle_plan_from_goal as _vehicle_plan_from_goal,
 )
 from .storage.schema_version import CURRENT_SCHEMA_VERSION
-from .schemas import (
-    HouseholdData,
-    MarketSnapshotData,
-    RulePackData,
-)
+from .schemas import CacheLayerHashes, HouseholdData, MarketSnapshotData, PlanningGoalRecord, RulePackData
 
 
 def default_db_path() -> Path:
@@ -88,6 +93,25 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_planning_goals_type_priority
                 ON planning_goals(goal_type, json_extract(data, '$.priority'));
 
+            CREATE TABLE IF NOT EXISTS core_objects (
+                id TEXT PRIMARY KEY,
+                household_id TEXT,
+                object_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_core_objects_household_type
+                ON core_objects(household_id, object_type);
+
+            CREATE INDEX IF NOT EXISTS idx_core_objects_category
+                ON core_objects(category);
+
+            CREATE INDEX IF NOT EXISTS idx_core_objects_owner
+                ON core_objects(household_id, json_extract(data, '$.owner_key'), object_type, category);
+
             CREATE TABLE IF NOT EXISTS rule_packs (
                 id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
@@ -115,15 +139,26 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS calculation_cache (
                 cache_key TEXT PRIMARY KEY,
                 engine_fingerprint TEXT NOT NULL,
+                input_hash TEXT NOT NULL DEFAULT '',
+                strategy_hash TEXT NOT NULL DEFAULT '',
+                ledger_hash TEXT NOT NULL DEFAULT '',
+                visualization_hash TEXT NOT NULL DEFAULT '',
                 result TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_calculation_cache_layers
+                ON calculation_cache(engine_fingerprint, input_hash, strategy_hash, ledger_hash, visualization_hash);
+
             CREATE TABLE IF NOT EXISTS generated_strategies (
                 id TEXT PRIMARY KEY,
                 cache_key TEXT NOT NULL,
                 engine_fingerprint TEXT NOT NULL,
+                input_hash TEXT NOT NULL DEFAULT '',
+                strategy_hash TEXT NOT NULL DEFAULT '',
+                ledger_hash TEXT NOT NULL DEFAULT '',
+                visualization_hash TEXT NOT NULL DEFAULT '',
                 strategy_type TEXT NOT NULL,
                 owner_key TEXT NOT NULL,
                 strategy_key TEXT NOT NULL,
@@ -139,6 +174,12 @@ def initialize_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_generated_strategies_type
                 ON generated_strategies(strategy_type, owner_key);
+
+            CREATE INDEX IF NOT EXISTS idx_generated_strategies_layers
+                ON generated_strategies(engine_fingerprint, input_hash, strategy_hash, ledger_hash, visualization_hash, strategy_type);
+
+            CREATE INDEX IF NOT EXISTS idx_generated_strategies_owner
+                ON generated_strategies(strategy_type, owner_key, engine_fingerprint);
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -166,9 +207,47 @@ def _mark_migration(conn: sqlite3.Connection, version: int, description: str) ->
     )
 
 
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> bool:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    changed = False
+    for column_name, column_sql in columns.items():
+        if column_name in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_sql}")
+        changed = True
+    return changed
+
+
 def migrate_database(conn: sqlite3.Connection) -> None:
     previous_schema_history = _has_previous_schema_history(conn)
     changed = _normalize_current_records(conn)
+    cache_layer_columns = {
+        "input_hash": "TEXT NOT NULL DEFAULT ''",
+        "strategy_hash": "TEXT NOT NULL DEFAULT ''",
+        "ledger_hash": "TEXT NOT NULL DEFAULT ''",
+        "visualization_hash": "TEXT NOT NULL DEFAULT ''",
+    }
+    changed = _ensure_columns(conn, "calculation_cache", cache_layer_columns) or changed
+    changed = _ensure_columns(conn, "generated_strategies", cache_layer_columns) or changed
+    for row in conn.execute("SELECT id, data FROM households").fetchall():
+        household_id = str(row["id"])
+        household = _load_json(row["data"])
+        has_vehicle_goals = conn.execute(
+            "SELECT 1 FROM planning_goals WHERE household_id = ? AND goal_type = 'vehicle' LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        has_child_goals = conn.execute(
+            "SELECT 1 FROM planning_goals WHERE household_id = ? AND goal_type = 'child' LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        car_plan = household.get("car_plan") if isinstance(household.get("car_plan"), dict) else {}
+        has_vehicle_plan_source = bool(car_plan.get("vehicle_plans")) if isinstance(car_plan.get("vehicle_plans"), list) else False
+        has_child_plan_source = bool(household.get("child_plans")) if isinstance(household.get("child_plans"), list) else False
+        if has_vehicle_goals is None and has_vehicle_plan_source:
+            _sync_vehicle_goals_from_household(conn, household_id, household)
+        if has_child_goals is None and has_child_plan_source:
+            _sync_child_goals_from_household(conn, household_id, household)
+        _sync_core_objects_from_household(conn, household_id, household)
     if previous_schema_history or not _migration_applied(conn, CURRENT_SCHEMA_VERSION):
         conn.execute("DELETE FROM schema_migrations")
         _mark_migration(conn, CURRENT_SCHEMA_VERSION, "current schema baseline")
@@ -261,6 +340,38 @@ def _stable_vehicle_goal_id(household_id: str, index: int, vehicle: dict[str, An
     )
     return uuid.uuid5(uuid.NAMESPACE_URL, raw).hex
 
+
+def _stable_child_goal_id(household_id: str, index: int, child: dict[str, Any]) -> str:
+    existing = child.get("planning_goal_id")
+    if existing:
+        return str(existing)
+    raw = json.dumps(
+        {
+            "kind": "child_goal",
+            "household_id": household_id,
+            "index": index,
+            "name": child.get("name") or "",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid.uuid5(uuid.NAMESPACE_URL, raw).hex
+
+
+def _first_home_goal_id_for_household(conn: sqlite3.Connection, household_id: str) -> str:
+    row = conn.execute(
+        """
+        SELECT id FROM planning_goals
+        WHERE goal_type = 'home' AND (household_id = ? OR household_id IS NULL)
+        ORDER BY json_extract(data, '$.priority') ASC, created_at ASC, id ASC
+        LIMIT 1
+        """,
+        (household_id,),
+    ).fetchone()
+    return str(row["id"]) if row else ""
+
+
 def _insert_or_replace_planning_goal(
     conn: sqlite3.Connection,
     *,
@@ -293,6 +404,97 @@ def _insert_or_replace_planning_goal(
     )
 
 
+def _upsert_scenario_shadow_from_home_goal(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str,
+    household_id: str | None,
+    goal_data: dict[str, Any],
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> None:
+    timestamp = now_iso()
+    scenario = _scenario_from_home_goal(goal_id, goal_data)
+    conn.execute(
+        """
+        INSERT INTO scenarios (id, household_id, data, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            household_id = excluded.household_id,
+            data = excluded.data,
+            updated_at = excluded.updated_at
+        """,
+        (
+            goal_id,
+            household_id,
+            json.dumps(_normalize_scenario(scenario), ensure_ascii=False),
+            created_at or timestamp,
+            updated_at or timestamp,
+        ),
+    )
+
+
+def _planning_goal_records_for_core_objects(conn: sqlite3.Connection, household_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT * FROM planning_goals
+        WHERE household_id IS NULL OR household_id = ?
+        ORDER BY json_extract(data, '$.priority') ASC, created_at ASC, id ASC
+        """,
+        (household_id,),
+    ).fetchall()
+    return [_row_to_planning_goal_record(row) for row in rows]
+
+
+def _sync_core_objects_from_household(conn: sqlite3.Connection, household_id: str, household: dict[str, Any]) -> int:
+    conn.execute("DELETE FROM core_objects WHERE household_id = ?", (household_id,))
+    timestamp = now_iso()
+    changed = 0
+    payloads = [
+        *_derive_core_objects_for_household(household_id, household),
+        *_derive_core_objects_for_planning_goals(
+            household_id,
+            _planning_goal_records_for_core_objects(conn, household_id),
+        ),
+    ]
+    for payload in payloads:
+        record_id = _core_object_record_id(
+            household_id,
+            str(payload.get("object_type")),
+            str(payload.get("source")),
+            str(payload.get("reference_id")),
+            str(payload.get("category")),
+        )
+        conn.execute(
+            """
+            INSERT INTO core_objects (id, household_id, object_type, category, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                household_id,
+                payload["object_type"],
+                payload["category"],
+                json.dumps(payload, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+        changed += 1
+    return changed
+
+
+def _sync_core_objects_for_households_affected_by_goal(conn: sqlite3.Connection, household_id: str | None) -> int:
+    if household_id:
+        rows = conn.execute("SELECT id, data FROM households WHERE id = ?", (household_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT id, data FROM households").fetchall()
+    changed = 0
+    for row in rows:
+        changed += _sync_core_objects_from_household(conn, str(row["id"]), _load_json(row["data"]))
+    return changed
+
+
 def cleanup_database_storage(*, create_backup: bool = True) -> Path | None:
     backup_path: Path | None = None
     if create_backup and DB_PATH.exists():
@@ -302,6 +504,7 @@ def cleanup_database_storage(*, create_backup: bool = True) -> Path | None:
     with get_connection() as conn:
         migrate_database(conn)
         conn.execute("DELETE FROM calculation_cache")
+        conn.execute("DELETE FROM generated_strategies")
         conn.commit()
         conn.execute("VACUUM")
     return backup_path
@@ -354,6 +557,40 @@ def list_records(table: str) -> list[dict[str, Any]]:
     return [_row_to_record(row) for row in rows]
 
 
+def list_core_object_records(
+    *,
+    household_id: str | None = None,
+    object_type: str | None = None,
+    category: str | None = None,
+    owner_key: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if household_id is not None:
+        clauses.append("household_id = ?")
+        params.append(household_id)
+    if object_type is not None:
+        clauses.append("object_type = ?")
+        params.append(object_type)
+    if category is not None:
+        clauses.append("category = ?")
+        params.append(category)
+    if owner_key is not None:
+        clauses.append("json_extract(data, '$.owner_key') = ?")
+        params.append(owner_key)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM core_objects
+            {where}
+            ORDER BY object_type ASC, category ASC, json_extract(data, '$.name') ASC
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
 def get_record(table: str, record_id: str) -> dict[str, Any] | None:
     with get_connection() as conn:
         row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
@@ -371,6 +608,20 @@ def _row_to_planning_goal_record(row: sqlite3.Row) -> dict[str, Any]:
     record = dict(row)
     record["data"] = json.loads(record["data"])
     return record
+
+
+def _resolved_goal_sequence_index(
+    goals: list[dict[str, Any]],
+    *,
+    household_id: str | None = None,
+) -> dict[str, int]:
+    scoped_goals = [
+        goal
+        for goal in goals
+        if goal.get("household_id") in ({None, ""} if household_id is None else {None, household_id})
+    ]
+    sequence = resolve_planning_sequence([PlanningGoalRecord.model_validate(goal) for goal in scoped_goals])
+    return {goal.id: goal.sequence_index for goal in sequence.goals}
 
 
 def _planning_goal_rows(
@@ -392,7 +643,7 @@ def _planning_goal_rows(
             f"""
             SELECT * FROM planning_goals
             {where}
-            ORDER BY json_extract(data, '$.priority') ASC, created_at ASC
+            ORDER BY json_extract(data, '$.priority') ASC, created_at ASC, id ASC
             """,
             params,
         ).fetchall()
@@ -423,24 +674,74 @@ def insert_planning_goal_record(data: dict[str, Any], household_id: str | None =
             created_at=timestamp,
             updated_at=timestamp,
         )
+        if str(normalized.get("goal_type") or "home") == "home":
+            _upsert_scenario_shadow_from_home_goal(
+                conn,
+                goal_id=record_id,
+                household_id=household_id,
+                goal_data=normalized,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+        _sync_core_objects_for_households_affected_by_goal(conn, household_id)
+        conn.execute("DELETE FROM calculation_cache")
+        conn.execute("DELETE FROM generated_strategies")
     return get_planning_goal_record(record_id)
 
 
-def update_planning_goal_record(record_id: str, data: dict[str, Any], household_id: str | None = None) -> dict[str, Any] | None:
+def update_planning_goal_record(
+    record_id: str,
+    data: dict[str, Any],
+    household_id: str | None = None,
+    *,
+    preserve_household_when_omitted: bool = True,
+) -> dict[str, Any] | None:
     normalized = _normalize_planning_goal(data)
     with get_connection() as conn:
-        row = conn.execute("SELECT created_at FROM planning_goals WHERE id = ?", (record_id,)).fetchone()
+        row = conn.execute("SELECT household_id, goal_type, data, created_at FROM planning_goals WHERE id = ?", (record_id,)).fetchone()
         if row is None:
             return None
+        previous_household_id = str(row["household_id"] or "") or None
+        previous_goal_type = str(row["goal_type"] or "")
+        previous_goal_data = _load_json(row["data"])
+        effective_household_id = previous_household_id if preserve_household_when_omitted else household_id
+        next_goal_type = str(normalized.get("goal_type") or "home")
+        timestamp = now_iso()
+        if (
+            previous_household_id
+            and previous_goal_type in {"vehicle", "child"}
+            and (previous_goal_type != next_goal_type or previous_household_id != effective_household_id)
+        ):
+            _remove_deleted_planning_goal_from_household(
+                conn,
+                previous_household_id,
+                record_id,
+                previous_goal_type,
+                previous_goal_data,
+            )
         _insert_or_replace_planning_goal(
             conn,
             goal_id=record_id,
-            household_id=household_id,
-            goal_type=str(normalized.get("goal_type") or "home"),
+            household_id=effective_household_id,
+            goal_type=next_goal_type,
             data=normalized,
             created_at=row["created_at"],
-            updated_at=now_iso(),
+            updated_at=timestamp,
         )
+        if next_goal_type == "home":
+            _upsert_scenario_shadow_from_home_goal(
+                conn,
+                goal_id=record_id,
+                household_id=effective_household_id,
+                goal_data=normalized,
+                created_at=row["created_at"],
+                updated_at=timestamp,
+            )
+        elif previous_goal_type == "home":
+            conn.execute("DELETE FROM scenarios WHERE id = ?", (record_id,))
+        affected_household_ids = {previous_household_id, effective_household_id}
+        for affected_household_id in affected_household_ids:
+            _sync_core_objects_for_households_affected_by_goal(conn, affected_household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
     return get_planning_goal_record(record_id)
@@ -448,10 +749,98 @@ def update_planning_goal_record(record_id: str, data: dict[str, Any], household_
 
 def delete_planning_goal_record(record_id: str) -> bool:
     with get_connection() as conn:
+        row = conn.execute("SELECT household_id, goal_type, data FROM planning_goals WHERE id = ?", (record_id,)).fetchone()
         cursor = conn.execute("DELETE FROM planning_goals WHERE id = ?", (record_id,))
+        household_id = str(row["household_id"] or "") if row else ""
+        goal_type = str(row["goal_type"] or "") if row else ""
+        goal_data = _load_json(row["data"]) if row else {}
+        if cursor.rowcount > 0 and goal_type == "home":
+            conn.execute("DELETE FROM scenarios WHERE id = ?", (record_id,))
+        if cursor.rowcount > 0 and household_id and goal_type in {"vehicle", "child"}:
+            _remove_deleted_planning_goal_from_household(conn, household_id, record_id, goal_type, goal_data)
+        _sync_core_objects_for_households_affected_by_goal(conn, household_id or None)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
         return cursor.rowcount > 0
+
+
+def _remove_deleted_planning_goal_from_household(
+    conn: sqlite3.Connection,
+    household_id: str,
+    goal_id: str,
+    goal_type: str,
+    goal_data: dict[str, Any],
+) -> None:
+    row = conn.execute("SELECT data FROM households WHERE id = ?", (household_id,)).fetchone()
+    if row is None:
+        return
+    household = _load_json(row["data"])
+    changed = False
+    if goal_type == "vehicle":
+        car_plan = household.get("car_plan") if isinstance(household.get("car_plan"), dict) else {}
+        vehicles = car_plan.get("vehicle_plans") if isinstance(car_plan.get("vehicle_plans"), list) else []
+        next_vehicles = [
+            vehicle
+            for index, vehicle in enumerate(vehicles)
+            if not _household_vehicle_matches_deleted_goal(household_id, index, vehicle, goal_id, goal_data)
+        ]
+        if len(next_vehicles) != len(vehicles):
+            car_plan["vehicle_plans"] = next_vehicles
+            car_plan["enabled"] = any(bool(vehicle.get("enabled")) for vehicle in next_vehicles if isinstance(vehicle, dict))
+            household["car_plan"] = car_plan
+            changed = True
+    elif goal_type == "child":
+        child_plans = household.get("child_plans") if isinstance(household.get("child_plans"), list) else []
+        next_children = [
+            child
+            for index, child in enumerate(child_plans)
+            if not _household_child_matches_deleted_goal(household_id, index, child, goal_id, goal_data)
+        ]
+        if len(next_children) != len(child_plans):
+            household["child_plans"] = next_children
+            changed = True
+    if not changed:
+        return
+    conn.execute(
+        "UPDATE households SET data = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(_normalize_household(household), ensure_ascii=False), now_iso(), household_id),
+    )
+
+
+def _household_vehicle_matches_deleted_goal(
+    household_id: str,
+    index: int,
+    vehicle: object,
+    goal_id: str,
+    goal_data: dict[str, Any],
+) -> bool:
+    if not isinstance(vehicle, dict):
+        return False
+    if str(vehicle.get("planning_goal_id") or "") == goal_id:
+        return True
+    if _stable_vehicle_goal_id(household_id, index, vehicle) == goal_id:
+        return True
+    goal_name = str(goal_data.get("name") or "")
+    target = goal_data.get("target_params") if isinstance(goal_data.get("target_params"), dict) else {}
+    return bool(goal_name) and str(vehicle.get("name") or target.get("name") or "") == goal_name
+
+
+def _household_child_matches_deleted_goal(
+    household_id: str,
+    index: int,
+    child: object,
+    goal_id: str,
+    goal_data: dict[str, Any],
+) -> bool:
+    if not isinstance(child, dict):
+        return False
+    if str(child.get("planning_goal_id") or "") == goal_id:
+        return True
+    if _stable_child_goal_id(household_id, index, child) == goal_id:
+        return True
+    goal_name = str(goal_data.get("name") or "")
+    target = goal_data.get("target_params") if isinstance(goal_data.get("target_params"), dict) else {}
+    return bool(goal_name) and str(child.get("name") or target.get("name") or "") == goal_name
 
 
 def get_planning_goal_record(record_id: str) -> dict[str, Any] | None:
@@ -467,16 +856,36 @@ def _vehicle_goals_for_household(household_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _child_goals_for_household(household_id: str) -> list[dict[str, Any]]:
+    return [
+        _row_to_planning_goal_record(row)
+        for row in _planning_goal_rows(household_id=household_id, goal_type="child")
+    ]
+
+
 def _project_vehicle_goals_into_household(record: dict[str, Any]) -> dict[str, Any]:
     household_id = str(record["id"])
     data = deepcopy(record["data"])
     vehicle_goals = _vehicle_goals_for_household(household_id)
-    if vehicle_goals:
+    car_plan = data.get("car_plan") if isinstance(data.get("car_plan"), dict) else {}
+    has_goal_backed_vehicle_plans = any(
+        isinstance(vehicle, dict) and bool(vehicle.get("planning_goal_id"))
+        for vehicle in (car_plan.get("vehicle_plans") if isinstance(car_plan.get("vehicle_plans"), list) else [])
+    )
+    if vehicle_goals or has_goal_backed_vehicle_plans:
+        sequence_index_by_id = _resolved_goal_sequence_index(
+            list_planning_goal_records(),
+            household_id=household_id,
+        )
         vehicles = [
-            _vehicle_plan_from_goal(goal["data"], index)
+            _vehicle_plan_from_goal(
+                goal["id"],
+                goal["data"],
+                index,
+                sequence_index=sequence_index_by_id.get(str(goal["id"])),
+            )
             for index, goal in enumerate(vehicle_goals)
         ]
-        car_plan = data.setdefault("car_plan", {})
         if not isinstance(car_plan, dict):
             car_plan = {}
             data["car_plan"] = car_plan
@@ -487,12 +896,73 @@ def _project_vehicle_goals_into_household(record: dict[str, Any]) -> dict[str, A
     return record
 
 
-def _sync_vehicle_goals_from_household(conn: sqlite3.Connection, household_id: str, household: dict[str, Any]) -> int:
-    conn.execute("DELETE FROM planning_goals WHERE household_id = ? AND goal_type = 'vehicle'", (household_id,))
+def _project_child_goals_into_household(record: dict[str, Any]) -> dict[str, Any]:
+    household_id = str(record["id"])
+    data = deepcopy(record["data"])
+    child_goals = _child_goals_for_household(household_id)
+    has_goal_backed_child_plans = any(
+        isinstance(child, dict) and bool(child.get("planning_goal_id"))
+        for child in (data.get("child_plans") if isinstance(data.get("child_plans"), list) else [])
+    )
+    if child_goals or has_goal_backed_child_plans:
+        projected_children = [
+            _child_plan_from_goal(goal["id"], goal["data"], index)
+            for index, goal in enumerate(child_goals)
+        ]
+        data["child_plans"] = projected_children
+        data["child_count"] = sum(1 for child in projected_children if bool(child.get("enabled")))
+    record = deepcopy(record)
+    record["data"] = _normalize_household(data)
+    return record
+
+
+def _project_planning_goals_into_household(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    projected = _project_vehicle_goals_into_household(record)
+    return _project_child_goals_into_household(projected)
+
+
+def _vehicle_plan_items_from_household(household: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(household, dict):
+        return []
     car_plan = household.get("car_plan") if isinstance(household.get("car_plan"), dict) else {}
     vehicles = car_plan.get("vehicle_plans") if isinstance(car_plan.get("vehicle_plans"), list) else []
+    return [vehicle for vehicle in vehicles if isinstance(vehicle, dict)]
+
+
+def _child_plan_items_from_household(household: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(household, dict):
+        return []
+    children = household.get("child_plans") if isinstance(household.get("child_plans"), list) else []
+    return [child for child in children if isinstance(child, dict)]
+
+
+def _empty_shadow_list_is_stale(
+    current_items: list[dict[str, Any]],
+    previous_items: list[dict[str, Any]],
+    previous_household: dict[str, Any] | None,
+) -> bool:
+    return previous_household is not None and not current_items and not previous_items
+
+
+def _sync_vehicle_goals_from_household(
+    conn: sqlite3.Connection,
+    household_id: str,
+    household: dict[str, Any],
+    *,
+    previous_household: dict[str, Any] | None = None,
+) -> int:
+    vehicles = _vehicle_plan_items_from_household(household)
+    previous_vehicles = _vehicle_plan_items_from_household(previous_household)
+    if _empty_shadow_list_is_stale(vehicles, previous_vehicles, previous_household):
+        conn.execute("DELETE FROM calculation_cache")
+        conn.execute("DELETE FROM generated_strategies")
+        return 0
+
+    conn.execute("DELETE FROM planning_goals WHERE household_id = ? AND goal_type = 'vehicle'", (household_id,))
     changed = 0
-    for index, vehicle in enumerate(item for item in vehicles if isinstance(item, dict)):
+    for index, vehicle in enumerate(vehicles):
         goal_id = _stable_vehicle_goal_id(household_id, index, vehicle)
         goal_data = _vehicle_goal_from_plan(vehicle, household_id=household_id, index=index, goal_id=goal_id)
         _insert_or_replace_planning_goal(
@@ -508,33 +978,108 @@ def _sync_vehicle_goals_from_household(conn: sqlite3.Connection, household_id: s
     return changed
 
 
+def _sync_child_goals_from_household(
+    conn: sqlite3.Connection,
+    household_id: str,
+    household: dict[str, Any],
+    *,
+    previous_household: dict[str, Any] | None = None,
+) -> int:
+    children = _child_plan_items_from_household(household)
+    previous_children = _child_plan_items_from_household(previous_household)
+    if _empty_shadow_list_is_stale(children, previous_children, previous_household):
+        conn.execute("DELETE FROM calculation_cache")
+        conn.execute("DELETE FROM generated_strategies")
+        return 0
+
+    conn.execute("DELETE FROM planning_goals WHERE household_id = ? AND goal_type = 'child'", (household_id,))
+    first_home_goal_id = _first_home_goal_id_for_household(conn, household_id)
+    changed = 0
+    for index, child in enumerate(children):
+        goal_id = _stable_child_goal_id(household_id, index, child)
+        goal_data = _child_goal_from_plan(
+            child,
+            household_id=household_id,
+            index=index,
+            goal_id=goal_id,
+            first_home_goal_id=first_home_goal_id,
+        )
+        _insert_or_replace_planning_goal(
+            conn,
+            goal_id=goal_id,
+            household_id=household_id,
+            goal_type="child",
+            data=goal_data,
+        )
+        changed += 1
+    conn.execute("DELETE FROM calculation_cache")
+    conn.execute("DELETE FROM generated_strategies")
+    return changed
+
+
 def list_household_records() -> list[dict[str, Any]]:
-    return [_project_vehicle_goals_into_household(record) for record in list_records("households")]
+    return [
+        projected for record in list_records("households")
+        if (projected := _project_planning_goals_into_household(record)) is not None
+    ]
 
 
 def insert_household_record(data: dict[str, Any]) -> dict[str, Any]:
     record = insert_record("households", _normalize_household(data))
     with get_connection() as conn:
         _sync_vehicle_goals_from_household(conn, str(record["id"]), record["data"])
+        _sync_child_goals_from_household(conn, str(record["id"]), record["data"])
+        _sync_core_objects_from_household(conn, str(record["id"]), record["data"])
     saved = get_record("households", str(record["id"]))
-    return _project_vehicle_goals_into_household(saved)
+    return _project_planning_goals_into_household(saved)
 
 
 def update_household_record(record_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    previous_record = get_record("households", record_id)
+    previous_household = deepcopy(previous_record["data"]) if previous_record is not None else None
     normalized = _normalize_household(data)
     record = update_record("households", record_id, normalized)
     if record is None:
         return None
     with get_connection() as conn:
-        _sync_vehicle_goals_from_household(conn, record_id, normalized)
+        _sync_vehicle_goals_from_household(conn, record_id, normalized, previous_household=previous_household)
+        _sync_child_goals_from_household(conn, record_id, normalized, previous_household=previous_household)
+        _sync_core_objects_from_household(conn, record_id, normalized)
     saved = get_record("households", record_id)
-    return _project_vehicle_goals_into_household(saved)
+    return _project_planning_goals_into_household(saved)
 
 
-def list_scenario_records() -> list[dict[str, Any]]:
+def list_scenario_records(household_id: str | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for goal in list_planning_goal_records(goal_type="home"):
-        scenario = _scenario_from_home_goal(goal["id"], goal["data"])
+    all_goals = list_planning_goal_records()
+    goals = [
+        goal for goal in all_goals
+        if goal.get("goal_type") == "home"
+        and (household_id is None or goal.get("household_id") in {None, household_id})
+    ]
+    sequence_index_by_household: dict[str, dict[str, int]] = {}
+    scoped_sequence_index = (
+        _resolved_goal_sequence_index(all_goals, household_id=household_id)
+        if household_id is not None
+        else None
+    )
+    for goal in goals:
+        household_key = str(goal.get("household_id") or "")
+        if scoped_sequence_index is not None:
+            sequence_index = scoped_sequence_index.get(str(goal["id"]))
+        elif household_key not in sequence_index_by_household:
+            sequence_index_by_household[household_key] = _resolved_goal_sequence_index(
+                all_goals,
+                household_id=household_key or None,
+            )
+            sequence_index = sequence_index_by_household[household_key].get(str(goal["id"]))
+        else:
+            sequence_index = sequence_index_by_household[household_key].get(str(goal["id"]))
+        scenario = _scenario_from_home_goal(
+            goal["id"],
+            goal["data"],
+            sequence_index=sequence_index,
+        )
         records.append(
             {
                 "id": goal["id"],
@@ -566,6 +1111,7 @@ def insert_scenario_record(data: dict[str, Any], household_id: str | None = None
             "INSERT OR REPLACE INTO scenarios (id, household_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
             (record_id, household_id, json.dumps(normalized_scenario, ensure_ascii=False), timestamp, timestamp),
         )
+        _sync_core_objects_for_households_affected_by_goal(conn, household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
     return next(record for record in list_scenario_records() if record["id"] == record_id)
@@ -595,6 +1141,7 @@ def update_scenario_record(record_id: str, data: dict[str, Any]) -> dict[str, An
             "INSERT OR REPLACE INTO scenarios (id, household_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
             (record_id, household_id, json.dumps(normalized_scenario, ensure_ascii=False), created_at, timestamp),
         )
+        _sync_core_objects_for_households_affected_by_goal(conn, household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
     return next((record for record in list_scenario_records() if record["id"] == record_id), None)
@@ -604,6 +1151,7 @@ def delete_scenario_record(record_id: str) -> bool:
     with get_connection() as conn:
         goal_cursor = conn.execute("DELETE FROM planning_goals WHERE id = ? AND goal_type = 'home'", (record_id,))
         scenario_cursor = conn.execute("DELETE FROM scenarios WHERE id = ?", (record_id,))
+        _sync_core_objects_for_households_affected_by_goal(conn, None)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
         return goal_cursor.rowcount > 0 or scenario_cursor.rowcount > 0
@@ -632,20 +1180,42 @@ def get_calculation_cache_payload(cache_key: str) -> str | None:
     return payload if isinstance(payload, str) and payload.strip().startswith("{") else None
 
 
-def upsert_calculation_cache(cache_key: str, engine_fingerprint: str, result: dict[str, Any]) -> None:
+def upsert_calculation_cache(
+    cache_key: str,
+    engine_fingerprint: str,
+    cache_layers: CacheLayerHashes,
+    result: dict[str, Any],
+) -> None:
     timestamp = now_iso()
     payload = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO calculation_cache (cache_key, engine_fingerprint, result, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO calculation_cache (
+                cache_key, engine_fingerprint, input_hash, strategy_hash,
+                ledger_hash, visualization_hash, result, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
                 engine_fingerprint = excluded.engine_fingerprint,
+                input_hash = excluded.input_hash,
+                strategy_hash = excluded.strategy_hash,
+                ledger_hash = excluded.ledger_hash,
+                visualization_hash = excluded.visualization_hash,
                 result = excluded.result,
                 updated_at = excluded.updated_at
             """,
-            (cache_key, engine_fingerprint, payload, timestamp, timestamp),
+            (
+                cache_key,
+                engine_fingerprint,
+                cache_layers.input,
+                cache_layers.strategy,
+                cache_layers.ledger,
+                cache_layers.visualization,
+                payload,
+                timestamp,
+                timestamp,
+            ),
         )
 
 
@@ -664,75 +1234,13 @@ def _generated_strategy_id(cache_key: str, strategy_type: str, owner_key: str, v
     return uuid.uuid5(uuid.NAMESPACE_URL, raw).hex
 
 
-def _generated_strategy_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for item in result.get("purchase_plan_analyses", []):
-        if not isinstance(item, dict):
-            continue
-        variant = str(item.get("variant") or "")
-        if not variant:
-            continue
-        rows.append(
-            {
-                "strategy_type": "purchase",
-                "owner_key": str(item.get("scenario_name") or "selected_scenario"),
-                "strategy_key": variant,
-                "variant": variant,
-                "data": item,
-            }
-        )
-
-    for item in result.get("car_plan_analyses", []):
-        if not isinstance(item, dict):
-            continue
-        variant = str(item.get("variant") or "")
-        if not variant:
-            continue
-        vehicle_index = _safe_int(item.get("vehicle_index"), 0)
-        candidate_index = item.get("vehicle_candidate_index")
-        owner_key = f"vehicle:{vehicle_index}:candidate:{candidate_index if candidate_index is not None else 'target'}"
-        rows.append(
-            {
-                "strategy_type": "vehicle",
-                "owner_key": owner_key,
-                "strategy_key": str(item.get("strategy_key") or variant),
-                "variant": variant,
-                "data": item,
-            }
-        )
-
-    for item in result.get("investment_plan_recommendations", []):
-        if not isinstance(item, dict):
-            continue
-        variant = str(item.get("variant") or item.get("plan_name") or "")
-        if not variant:
-            continue
-        rows.append(
-            {
-                "strategy_type": "investment",
-                "owner_key": "household",
-                "strategy_key": variant,
-                "variant": variant,
-                "data": item,
-            }
-        )
-
-    career_shock_projection = result.get("career_shock_projection")
-    if isinstance(career_shock_projection, dict):
-        rows.append(
-            {
-                "strategy_type": "career_shock",
-                "owner_key": "household",
-                "strategy_key": "auto_projection",
-                "variant": "auto_projection",
-                "data": career_shock_projection,
-            }
-        )
-    return rows
-
-
-def upsert_generated_strategies(cache_key: str, engine_fingerprint: str, result: dict[str, Any]) -> None:
-    rows = _generated_strategy_rows(result)
+def upsert_generated_strategies(
+    cache_key: str,
+    engine_fingerprint: str,
+    cache_layers: CacheLayerHashes,
+    result: dict[str, Any],
+) -> None:
+    rows = generated_strategy_rows(result)
     timestamp = now_iso()
     with get_connection() as conn:
         conn.execute("DELETE FROM generated_strategies WHERE cache_key = ?", (cache_key,))
@@ -746,12 +1254,17 @@ def upsert_generated_strategies(cache_key: str, engine_fingerprint: str, result:
             conn.execute(
                 """
                 INSERT INTO generated_strategies (
-                    id, cache_key, engine_fingerprint, strategy_type, owner_key,
+                    id, cache_key, engine_fingerprint, input_hash, strategy_hash,
+                    ledger_hash, visualization_hash, strategy_type, owner_key,
                     strategy_key, variant, data, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key, strategy_type, owner_key, variant) DO UPDATE SET
                     engine_fingerprint = excluded.engine_fingerprint,
+                    input_hash = excluded.input_hash,
+                    strategy_hash = excluded.strategy_hash,
+                    ledger_hash = excluded.ledger_hash,
+                    visualization_hash = excluded.visualization_hash,
                     strategy_key = excluded.strategy_key,
                     data = excluded.data,
                     updated_at = excluded.updated_at
@@ -760,6 +1273,10 @@ def upsert_generated_strategies(cache_key: str, engine_fingerprint: str, result:
                     strategy_id,
                     cache_key,
                     engine_fingerprint,
+                    cache_layers.input,
+                    cache_layers.strategy,
+                    cache_layers.ledger,
+                    cache_layers.visualization,
                     row["strategy_type"],
                     row["owner_key"],
                     row["strategy_key"],
@@ -771,7 +1288,17 @@ def upsert_generated_strategies(cache_key: str, engine_fingerprint: str, result:
             )
 
 
-def list_generated_strategies(cache_key: str | None = None, strategy_type: str | None = None) -> list[dict[str, Any]]:
+def list_generated_strategies(
+    cache_key: str | None = None,
+    strategy_type: str | None = None,
+    owner_key: str | None = None,
+    *,
+    engine_fingerprint: str | None = None,
+    input_hash: str | None = None,
+    strategy_hash: str | None = None,
+    ledger_hash: str | None = None,
+    visualization_hash: str | None = None,
+) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[str] = []
     if cache_key:
@@ -780,6 +1307,24 @@ def list_generated_strategies(cache_key: str | None = None, strategy_type: str |
     if strategy_type:
         clauses.append("strategy_type = ?")
         params.append(strategy_type)
+    if owner_key:
+        clauses.append("owner_key = ?")
+        params.append(owner_key)
+    if engine_fingerprint:
+        clauses.append("engine_fingerprint = ?")
+        params.append(engine_fingerprint)
+    if input_hash:
+        clauses.append("input_hash = ?")
+        params.append(input_hash)
+    if strategy_hash:
+        clauses.append("strategy_hash = ?")
+        params.append(strategy_hash)
+    if ledger_hash:
+        clauses.append("ledger_hash = ?")
+        params.append(ledger_hash)
+    if visualization_hash:
+        clauses.append("visualization_hash = ?")
+        params.append(visualization_hash)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:
         rows = conn.execute(
@@ -790,12 +1335,87 @@ def list_generated_strategies(cache_key: str | None = None, strategy_type: str |
             """,
             params,
         ).fetchall()
+    return _generated_strategy_records_from_rows(rows)
+
+
+def _generated_strategy_records_from_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for row in rows:
         record = dict(row)
         record["data"] = json.loads(record["data"])
         records.append(record)
     return records
+
+
+def list_generated_strategies_for_cache_layers(
+    cache_layers: list[CacheLayerHashes],
+    strategy_type: str | None = None,
+    owner_key: str | None = None,
+    *,
+    engine_fingerprint: str | None = None,
+) -> list[dict[str, Any]]:
+    unique_layers = set()
+    for layers in cache_layers:
+        layer_engine = engine_fingerprint or layers.engine
+        if not (
+            layer_engine
+            and layers.input
+            and layers.strategy
+            and layers.ledger
+            and layers.visualization
+        ):
+            continue
+        unique_layers.add(
+            (
+                layer_engine,
+                layers.input,
+                layers.strategy,
+                layers.ledger,
+                layers.visualization,
+            )
+        )
+    if not unique_layers:
+        return []
+
+    clauses: list[str] = []
+    params: list[str] = []
+    if strategy_type:
+        clauses.append("strategy_type = ?")
+        params.append(strategy_type)
+    if owner_key:
+        clauses.append("owner_key = ?")
+        params.append(owner_key)
+
+    layer_clauses: list[str] = []
+    for layer_engine, input_hash, strategy_hash, ledger_hash, visualization_hash in sorted(unique_layers):
+        layer_clauses.append(
+            "(engine_fingerprint = ? AND input_hash = ? AND strategy_hash = ? AND ledger_hash = ? AND visualization_hash = ?)"
+        )
+        params.extend([layer_engine, input_hash, strategy_hash, ledger_hash, visualization_hash])
+    clauses.append(f"({' OR '.join(layer_clauses)})")
+    where = f"WHERE {' AND '.join(clauses)}"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM generated_strategies
+            {where}
+            ORDER BY strategy_type ASC, owner_key ASC, variant ASC
+            """,
+            params,
+        ).fetchall()
+    records_by_id = {
+        record["id"]: record
+        for record in _generated_strategy_records_from_rows(rows)
+    }
+    return sorted(
+        records_by_id.values(),
+        key=lambda item: (
+            str(item.get("strategy_type") or ""),
+            str(item.get("owner_key") or ""),
+            str(item.get("variant") or ""),
+        ),
+    )
 
 
 def latest_source_hash(url: str) -> str | None:
@@ -838,3 +1458,7 @@ def seed_database() -> None:
 
     if _count("market_snapshots") == 0:
         insert_record("market_snapshots", _normalize_market_snapshot(MarketSnapshotData().model_dump(mode="json")))
+
+    with get_connection() as conn:
+        for row in conn.execute("SELECT id, data FROM households").fetchall():
+            _sync_core_objects_from_household(conn, str(row["id"]), _load_json(row["data"]))

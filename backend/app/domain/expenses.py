@@ -199,9 +199,11 @@ def monthly_household_expense_breakdown_at(
     months_from_now: int = 0,
     *,
     as_of: date | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
     home_purchase_month: int | None = None,
 ) -> MonthlyHouseholdExpenseBreakdown:
+    if rules is None:
+        raise ValueError("monthly household expense calculation requires an explicit rule pack")
     current = as_of or date.today()
     target_month = month_after(current, max(0, months_from_now))
     stage = daily_expense_stage_at(household, months_from_now, as_of=current)
@@ -224,8 +226,6 @@ def monthly_household_expense_breakdown_at(
     )
     career_shock_self_payment = (
         career_shock_self_payment_at_month(household, rules, months_from_now, as_of=current)
-        if rules is not None
-        else 0.0
     )
     return MonthlyHouseholdExpenseBreakdown(
         base_living_expense=max(0.0, base_living_expense),
@@ -242,9 +242,11 @@ def monthly_household_expense_at(
     months_from_now: int = 0,
     *,
     as_of: date | None = None,
-    rules: RulePackData | None = None,
+    rules: RulePackData,
     home_purchase_month: int | None = None,
 ) -> float:
+    if rules is None:
+        raise ValueError("monthly household expense calculation requires an explicit rule pack")
     return monthly_household_expense_breakdown_at(
         household,
         months_from_now,

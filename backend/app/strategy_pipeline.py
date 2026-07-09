@@ -15,7 +15,9 @@ from .purchase_facade import (
     build_yield_sensitivity,
 )
 from .schemas import (
+    CalculationContextSnapshot,
     HouseholdData,
+    MarketSnapshotData,
     PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
@@ -41,6 +43,8 @@ def run_strategy_pipeline(
     base_month: date,
     stress_name: str | None,
     parallel_workers: int,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> StrategyPipelineResult:
     if stress_name is not None or not purchase_cash_context.has_purchase_target:
         return StrategyPipelineResult(
@@ -48,6 +52,7 @@ def run_strategy_pipeline(
                 household,
                 rules,
                 base_month=base_month,
+                calculation_context=calculation_context,
             )
         )
 
@@ -59,6 +64,8 @@ def run_strategy_pipeline(
         net_monthly_income=household_context.net_monthly_income,
         car_loan=vehicle_context.purchase_strategy_car_loan,
         taxes_and_fees=purchase_cash_context.taxes_and_fees,
+        calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )
     if parallel_workers > 1:
         with ThreadPoolExecutor(max_workers=min(2, parallel_workers)) as executor:
@@ -72,6 +79,7 @@ def run_strategy_pipeline(
                 car_loan=vehicle_context.purchase_strategy_car_loan,
                 taxes_and_fees=purchase_cash_context.taxes_and_fees,
                 parallel_workers=max(1, parallel_workers - 1),
+                market_snapshot=market_snapshot,
             )
             yield_sensitivity = yield_future.result()
     else:
@@ -82,9 +90,10 @@ def run_strategy_pipeline(
             tax_summaries=household_context.tax_summaries,
             net_monthly_income=household_context.net_monthly_income,
             car_loan=vehicle_context.purchase_strategy_car_loan,
-            taxes_and_fees=purchase_cash_context.taxes_and_fees,
-            parallel_workers=1,
-        )
+        taxes_and_fees=purchase_cash_context.taxes_and_fees,
+        parallel_workers=1,
+        market_snapshot=market_snapshot,
+    )
     return StrategyPipelineResult(
         purchase_plan_analyses=purchase_plans,
         yield_sensitivity=yield_sensitivity,
@@ -97,5 +106,7 @@ def run_strategy_pipeline(
             base_monthly_debt_payment=household_context.household.monthly_debt_payment,
             base_month=base_month,
             vehicle_states=vehicle_context.vehicle_states,
+            calculation_context=calculation_context,
+            market_snapshot=market_snapshot,
         ),
     )

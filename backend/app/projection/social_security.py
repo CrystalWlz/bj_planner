@@ -9,6 +9,7 @@ from ..domain.career import member_retirement_months_by_index
 from ..domain.expenses import scheduled_expense_occurs_in_month
 from ..domain.tax import ContributionDetails, beijing_contribution_details, income_stage_for_month
 from ..domain.time import month_after, month_distance, parse_year_month
+from ..policies import SocialSecurityAccountPolicy, get_policy
 from ..schemas import (
     HouseholdData,
     IncomeMember,
@@ -80,24 +81,9 @@ def age_at_month(member: IncomeMember, target_month: date) -> int | None:
     return max(0, age)
 
 
-def pension_account_months_for_member(member: IncomeMember, params: dict) -> int:
+def pension_account_months_for_member(member: IncomeMember, policy: SocialSecurityAccountPolicy) -> int:
     category = str(getattr(member, "retirement_category", "") or "")
-    configured = params.get("pension_personal_account_months_by_retirement_category")
-    if isinstance(configured, dict):
-        value = configured.get(category)
-        if value is not None:
-            try:
-                return max(1, int(value))
-            except (TypeError, ValueError):
-                pass
-    default_by_category = {
-        "female_50": 195,
-        "female_55": 170,
-        "male_60": 139,
-    }
-    if category in default_by_category:
-        return default_by_category[category]
-    return max(1, int(params.get("pension_personal_account_months", 139) or 139))
+    return policy.pension_account_months_for_category(category)
 
 
 def scheduled_medical_account_payable_expense_at(household: HouseholdData, target_month: tuple[int, int]) -> float:
@@ -134,33 +120,6 @@ def social_security_member_points(rows: list[dict[str, float | int | str | bool]
     return points
 
 
-def yearly_policy_rate(params: dict, table_key: str, fallback_key: str, year: int, fallback: float) -> float:
-    table = params.get(table_key)
-    if isinstance(table, dict):
-        value = table.get(str(year), table.get(year))
-        if value is not None:
-            try:
-                return max(0.0, float(value))
-            except (TypeError, ValueError):
-                pass
-    return max(0.0, float(params.get(fallback_key, fallback)))
-
-
-def credit_months_from_params(params: dict, key: str, fallback: list[int]) -> set[int]:
-    raw = params.get(key, fallback)
-    if not isinstance(raw, list):
-        return set(fallback)
-    months: set[int] = set()
-    for item in raw:
-        try:
-            month = int(item)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= month <= 12:
-            months.add(month)
-    return months or set(fallback)
-
-
 def build_social_security_projection(
     household: HouseholdData,
     rules: RulePackData,
@@ -173,16 +132,10 @@ def build_social_security_projection(
     if not household.members or not purchase_plans:
         return []
 
-    params = rules.params
-    pension_interest_credit_month = max(1, min(12, int(params.get("pension_personal_account_interest_credit_month", 12) or 12)))
-    medical_interest_credit_months = credit_months_from_params(params, "medical_account_interest_credit_months", [3, 6, 9, 12])
-    medical_transfer_rate = max(0.0, float(params.get("medical_account_employee_transfer_rate", 0.02)))
-    retiree_under_70 = max(0.0, float(params.get("medical_account_retiree_monthly_transfer_under_70", 100)))
-    retiree_70_plus = max(0.0, float(params.get("medical_account_retiree_monthly_transfer_70_plus", 110)))
-    retiree_medical_outflow = max(0.0, float(params.get("medical_account_retiree_large_mutual_aid_monthly", 3)))
+    account_policy = get_policy(rules).social_security_account_policy()
     base = as_of or date.today()
     base_month = date(base.year, base.month, 1)
-    retirement_months_by_member = member_retirement_months_by_index(household, as_of=base_month)
+    retirement_months_by_member = member_retirement_months_by_index(household, as_of=base_month, rules=rules)
 
     rows: list[SocialSecurityVisualizationPoint] = []
     for plan in purchase_plans:
@@ -217,21 +170,29 @@ def build_social_security_projection(
                     stage = income_stage_for_month(member, target_month.year, target_month.month)
                     details = beijing_contribution_details(stage, rules) if stage else ContributionDetails(0, 0, 0, 0, 0, 0, 0, 0, 0)
                     pension_contribution = details.employee_pension if pension_enabled else 0.0
-                    medical_contribution = details.social_base * medical_transfer_rate if medical_enabled else 0.0
+                    medical_contribution = (
+                        details.social_base * account_policy.medical_account_employee_transfer_rate
+                        if medical_enabled
+                        else 0.0
+                    )
                 elif month > 0 and retired:
                     if pension_enabled:
                         payout_monthly = account.pension_account_payout_monthly
                         if payout_monthly <= 0 and pension_start > 0:
-                            payout_months = pension_account_months_for_member(member, params)
+                            payout_months = pension_account_months_for_member(member, account_policy)
                             payout_monthly = pension_start / payout_months
                             account.pension_account_payout_monthly = payout_monthly
                         pension_account_payout = min(pension_start, payout_monthly)
                     if medical_enabled:
                         age = age_at_month(member, target_month)
-                        medical_retiree_transfer = retiree_70_plus if age is not None and age >= 70 else retiree_under_70
+                        medical_retiree_transfer = (
+                            account_policy.medical_account_retiree_monthly_transfer_70_plus
+                            if age is not None and age >= 70
+                            else account_policy.medical_account_retiree_monthly_transfer_under_70
+                        )
                         medical_mutual_aid_outflow = min(
                             medical_start + medical_retiree_transfer,
-                            retiree_medical_outflow,
+                            account_policy.medical_account_retiree_large_mutual_aid_monthly,
                         )
                 if month > 0 and medical_enabled and medical_expense_remaining > 0:
                     medical_available_for_healthcare = max(
@@ -247,23 +208,11 @@ def build_social_security_projection(
                     )
                     medical_expense_remaining = max(0.0, medical_expense_remaining - medical_healthcare_outflow)
                 medical_outflow = medical_healthcare_outflow + medical_mutual_aid_outflow
-                pension_rate = yearly_policy_rate(
-                    params,
-                    "pension_personal_account_annual_credit_rates",
-                    "pension_personal_account_annual_return",
-                    target_month.year,
-                    0.025,
-                )
-                medical_rate = yearly_policy_rate(
-                    params,
-                    "medical_account_annual_interest_rates",
-                    "medical_account_annual_interest_rate",
-                    target_month.year,
-                    0.0035,
-                )
+                pension_rate = account_policy.pension_credit_rate_for_year(target_month.year)
+                medical_rate = account_policy.medical_credit_rate_for_year(target_month.year)
                 pension_interest = (
                     max(0.0, pension_start + pension_contribution - pension_account_payout) * pension_rate
-                    if month > 0 and pension_enabled and target_month.month == pension_interest_credit_month
+                    if month > 0 and pension_enabled and target_month.month == account_policy.pension_account_interest_credit_month
                     else 0.0
                 )
                 medical_interest = (
@@ -276,7 +225,7 @@ def build_social_security_projection(
                     )
                     * medical_rate
                     / 4
-                    if month > 0 and medical_enabled and target_month.month in medical_interest_credit_months
+                    if month > 0 and medical_enabled and target_month.month in account_policy.medical_account_interest_credit_months
                     else 0.0
                 )
                 pension_end = max(0.0, pension_start + pension_contribution - pension_account_payout + pension_interest)

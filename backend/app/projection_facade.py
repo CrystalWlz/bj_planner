@@ -17,8 +17,10 @@ from .schemas import (
     AccountSnapshotPoint,
     CarLoanSummary,
     CarPlanData,
+    CalculationContextSnapshot,
     HouseholdData,
     LoanVisualizationPoint,
+    MarketSnapshotData,
     MonthlyCashflowPoint,
     MonthlyLedgerEntry,
     ProvidentVisualizationPoint,
@@ -39,13 +41,16 @@ def visualization_horizon_months(
     *,
     second_loan: CarLoanSummary | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
+    rules: RulePackData | None = None,
 ) -> int:
+    active_rules = rules or RulePackData()
     return build_visualization_horizon(
         household,
         purchase_plans,
         car_loan,
         second_loan=second_loan,
         vehicle_states=vehicle_states,
+        rules=active_rules,
     )
 
 
@@ -59,7 +64,10 @@ def loan_visualization(
     provident_visualization: list[ProvidentVisualizationPoint] | None = None,
     vehicle_states: list[VehicleLoanState] | None = None,
     rules: RulePackData | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[LoanVisualizationPoint]:
+    active_rules = rules or RulePackData()
     return build_loan_projection(
         household,
         scenario,
@@ -68,7 +76,9 @@ def loan_visualization(
         base_monthly_debt_payment=base_monthly_debt_payment,
         provident_projection=provident_visualization,
         vehicle_states=vehicle_states,
-        rules=rules,
+        rules=active_rules,
+        calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )
 
 
@@ -151,6 +161,7 @@ def monthly_ledger(
     social_security_visualization: list[SocialSecurityVisualizationPoint] | None = None,
     *,
     vehicle_states: list[VehicleLoanState] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ):
     return build_monthly_ledger_projection(
         household,
@@ -162,6 +173,7 @@ def monthly_ledger(
         provident_visualization,
         social_security_visualization,
         vehicle_states=vehicle_states,
+        calculation_context=calculation_context,
     )
 
 
@@ -176,6 +188,7 @@ def monthly_cashflow_visualization(
     social_security_visualization: list[SocialSecurityVisualizationPoint] | None = None,
     *,
     vehicle_states: list[VehicleLoanState] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> tuple[list[MonthlyCashflowPoint], list[AccountSnapshotPoint], list[MonthlyLedgerEntry]]:
     ledger_result = monthly_ledger(
         household,
@@ -187,6 +200,7 @@ def monthly_cashflow_visualization(
         provident_visualization,
         social_security_visualization,
         vehicle_states=vehicle_states,
+        calculation_context=calculation_context,
     )
     return (
         build_monthly_cashflow_points(ledger_result.projection_states, ledger_result.ledger_entries),
