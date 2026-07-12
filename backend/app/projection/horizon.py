@@ -32,7 +32,8 @@ def retirement_tail_months(
             retirement_age,
         )
         targets.append(max(0, months_between_months(current_month, retirement_month)))
-    return (max(targets) if targets else 0) + 120
+    # 至少覆盖最晚退休成员退休后 30 年，避免只看退休初期而漏掉长寿与晚年现金风险。
+    return (max(targets) if targets else 0) + 360
 
 
 def visualization_horizon_months(
@@ -68,4 +69,4 @@ def visualization_horizon_months(
     if second_loan and second_loan.enabled:
         second_vehicle_start = second_loan.months_to_down_payment if second_loan.months_to_down_payment is not None else second_loan.purchase_delay_months
         vehicle_horizons.append(second_vehicle_start + second_loan.total_months + 24)
-    return min(840, max(180, retirement_tail_months(household, rules=rules, as_of=as_of), *plan_horizons, *vehicle_horizons))
+    return min(960, max(180, retirement_tail_months(household, rules=rules, as_of=as_of), *plan_horizons, *vehicle_horizons))

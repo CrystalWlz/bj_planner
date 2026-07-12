@@ -23,7 +23,7 @@ def apply_purchase_month_investment_cash_state(
     investment_tax = max(0.0, investment_return) * investment_effective_tax_rate if investment_return else 0.0
     investment_balance_after_return = max(0.0, investment_balance + investment_return - investment_tax)
     withdrawal = withdrawal_provider(cash_balance + monthly_surplus, investment_balance_after_return)
-    cash_after = max(0.0, withdrawal.cash_after_transaction - vehicle_down_payment)
+    cash_after = withdrawal.cash_after_transaction - vehicle_down_payment
     investment_after = max(0.0, withdrawal.investment_after_transaction)
     return InvestmentCashState(
         cash_balance=cash_after,
@@ -93,7 +93,7 @@ def apply_regular_month_investment_cash_state(
     investment_buy_fee = investment_contribution * buy_fee_rate
     investment_fee += investment_buy_fee
     net_investment = max(0.0, investment_contribution - investment_buy_fee)
-    cash_after = max(0.0, cash_after_liquidity + monthly_surplus - investment_contribution - vehicle_down_payment)
+    cash_after = cash_after_liquidity + monthly_surplus - investment_contribution - vehicle_down_payment
     investment_after = max(0.0, investment_after_liquidity + net_investment)
     return InvestmentCashState(
         cash_balance=cash_after,

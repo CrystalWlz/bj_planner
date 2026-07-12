@@ -47,6 +47,10 @@ def calculation_profile(label: str) -> Iterator[CalculationProfile | None]:
         yield None
         return
 
+    # Enable this logger only for an explicitly requested profile run.  Let
+    # the application logging tree own handlers so test capture, Uvicorn and
+    # desktop runs observe the same profiling record.
+    LOGGER.setLevel(logging.INFO)
     profile = CalculationProfile(label=label)
     token = _CURRENT_PROFILE.set(profile)
     started_at = perf_counter()

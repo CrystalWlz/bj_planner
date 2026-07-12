@@ -45,6 +45,10 @@ from .schemas import (
     StrategyExplanationPoint,
 )
 from .vehicle_facade import vehicle_loan_states
+from .strategies.home_recommendations import (
+    enrich_purchase_plans_with_projection_risk,
+    with_purchase_plan_recommendations,
+)
 from .visualization import (
     build_annual_visualization_details,
     build_monthly_cashflow_points,
@@ -56,6 +60,7 @@ VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
 @dataclass
 class StrategyProjectionPipelineResult:
+    purchase_plan_analyses: list[PurchasePlanAnalysis] = field(default_factory=list)
     loan_visualization: list[LoanVisualizationPoint] = field(default_factory=list)
     provident_visualization: list[ProvidentVisualizationPoint] = field(default_factory=list)
     social_security_visualization: list[SocialSecurityVisualizationPoint] = field(default_factory=list)
@@ -164,7 +169,17 @@ def build_strategy_projection_pipeline(
         monthly_cashflow_rows = build_monthly_cashflow_points(
             ledger_result.projection_states,
             ledger_result.ledger_entries,
+            risk_by_plan=ledger_result.risk_by_plan,
         )
+    purchase_plans = with_purchase_plan_recommendations(
+        enrich_purchase_plans_with_projection_risk(
+            purchase_plans,
+            ledger_result.risk_by_plan,
+            household,
+        ),
+        scenario,
+        household,
+    )
     account_snapshots = ledger_result.account_snapshots
     monthly_ledger_entries = ledger_result.ledger_entries
     with profile_span("annual_reporting"):
@@ -207,16 +222,28 @@ def build_strategy_projection_pipeline(
             ),
             as_of=base_month,
             calculation_context=calculation_context,
+            market_snapshot=market_snapshot,
         )
     with profile_span("child_plan_strategies"):
+        lifecycle_plan = next(
+            (plan for plan in purchase_plans if plan.is_recommended),
+            next(
+                (plan for plan in purchase_plans if plan.variant == scenario.selected_purchase_plan_variant),
+                purchase_plans[0] if purchase_plans else None,
+            ),
+        )
         child_plan_strategies = build_child_plan_strategies(
             household,
             rules,
             home_purchase_month=selected_month,
             as_of=base_month,
             calculation_context=calculation_context,
+            lifecycle_cash_shortfall=lifecycle_plan.cash_shortfall if lifecycle_plan else 0.0,
+            lifecycle_insolvency_month=lifecycle_plan.insolvency_month if lifecycle_plan else None,
+            annual_investment_return=scenario.annual_investment_return,
         )
     return StrategyProjectionPipelineResult(
+        purchase_plan_analyses=purchase_plans,
         loan_visualization=loan_rows,
         provident_visualization=provident_rows,
         social_security_visualization=social_security_rows,
@@ -246,11 +273,13 @@ def empty_strategy_projection_pipeline(
     calculation_context: CalculationContextSnapshot | None = None,
 ) -> StrategyProjectionPipelineResult:
     return StrategyProjectionPipelineResult(
+        purchase_plan_analyses=[],
         child_plan_strategies=build_child_plan_strategies(
             household,
             rules,
             home_purchase_month=None,
             as_of=base_month,
             calculation_context=calculation_context,
+            annual_investment_return=0.025,
         )
     )

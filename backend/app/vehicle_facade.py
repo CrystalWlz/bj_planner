@@ -118,6 +118,9 @@ def build_car_plan_analyses(
     annual_investment_return: float = 0.0,
     rules: RulePackData | None = None,
     calculation_context: CalculationContextSnapshot | None = None,
+    income_at_month=None,
+    expense_at_month=None,
+    lifecycle_horizon_months: int = 480,
 ) -> list[CarPlanAnalysis]:
     effective_rules = rules or RulePackData()
     effective_monthly_expense = (
@@ -133,4 +136,7 @@ def build_car_plan_analyses(
         annual_investment_return=annual_investment_return,
         rules=effective_rules,
         calculation_context=calculation_context,
+        income_at_month=income_at_month,
+        expense_at_month=expense_at_month,
+        lifecycle_horizon_months=lifecycle_horizon_months,
     )

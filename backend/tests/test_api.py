@@ -51,6 +51,41 @@ def test_fetch_preview_does_not_change_rule_pack(tmp_path: Path, monkeypatch) ->
     assert before == after
 
 
+def test_personal_pension_return_refresh_persists_and_respects_due_date(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database, main
+    from app.schemas import PersonalPensionReturnSnapshotData
+
+    database.DB_PATH = database.default_db_path()
+
+    async def fake_refresh(sources, *, today, previous=None):
+        return PersonalPensionReturnSnapshotData(
+            snapshot_date=today.isoformat(),
+            pre_retirement_annual_return=0.028,
+            post_retirement_annual_return=0.016,
+            conservative_annual_return=0.008,
+            optimistic_annual_return=0.045,
+            observed_market_return=0.035,
+            source_count=3,
+            parsed_source_count=2,
+            next_due_date="2099-01-01",
+        )
+
+    monkeypatch.setattr(main, "refresh_personal_pension_return_snapshot", fake_refresh)
+
+    with TestClient(main.app) as client:
+        first = client.post("/api/personal-pension-returns/refresh", json={"force": False})
+        second = client.post("/api/personal-pension-returns/refresh", json={"force": False})
+        records = client.get("/api/personal-pension-returns")
+
+    assert first.status_code == 200
+    assert first.json()["refreshed"] is True
+    assert second.json()["refreshed"] is False
+    assert records.status_code == 200
+    assert records.json()[0]["data"]["pre_retirement_annual_return"] == pytest.approx(0.028)
+
+
 def test_household_update_is_persisted(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 
@@ -77,6 +112,96 @@ def test_household_update_is_persisted(tmp_path: Path, monkeypatch) -> None:
     assert persisted["cash_account_balance"] == 345_678
     assert persisted["investments"] == 0
     assert persisted["investment_plan_name"] == "稳健月度理财"
+
+
+def test_future_child_goal_does_not_change_current_child_count(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        payload = deepcopy(household["data"])
+        payload["child_count"] = 2
+        client.put(f"/api/households/{household['id']}", json={"data": payload})
+        child_goal = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "child",
+                    "name": "示例未来子女目标",
+                    "enabled": True,
+                    "timing_mode": "manual_month",
+                    "earliest_purchase_month": "2099-06",
+                    "target_params": {
+                        "name": "示例未来子女目标",
+                        "planned_birth_month": "2099-06",
+                    },
+                },
+            },
+        ).json()
+        projected = client.get("/api/households").json()[0]
+        client.delete(f"/api/planning-goals/{child_goal['id']}")
+        after_delete = client.get("/api/households").json()[0]
+
+    assert len(projected["data"]["child_plans"]) == 1
+    assert projected["data"]["child_count"] == 2
+    assert after_delete["data"]["child_count"] == 2
+
+
+def test_child_count_migration_repairs_only_legacy_projection_signature(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "child",
+                    "name": "示例未来子女目标",
+                    "enabled": True,
+                    "timing_mode": "manual_month",
+                    "earliest_purchase_month": "2099-06",
+                    "target_params": {"planned_birth_month": "2099-06"},
+                },
+            },
+        )
+
+    with database.get_connection() as conn:
+        raw = conn.execute("SELECT data FROM households WHERE id = ?", (household["id"],)).fetchone()
+        polluted = json.loads(raw["data"])
+        polluted["child_count"] = 1
+        conn.execute(
+            "UPDATE households SET data = ? WHERE id = ?",
+            (json.dumps(polluted, ensure_ascii=False), household["id"]),
+        )
+        assert database._migrate_child_count_to_current_birth_semantics(conn) is True
+        migrated = json.loads(
+            conn.execute("SELECT data FROM households WHERE id = ?", (household["id"],)).fetchone()["data"]
+        )
+        assert migrated["child_count"] == 0
+
+        migrated["child_count"] = 2
+        conn.execute(
+            "UPDATE households SET data = ? WHERE id = ?",
+            (json.dumps(migrated, ensure_ascii=False), household["id"]),
+        )
+        assert database._migrate_child_count_to_current_birth_semantics(conn) is False
+        preserved = json.loads(
+            conn.execute("SELECT data FROM households WHERE id = ?", (household["id"],)).fetchone()["data"]
+        )
+        assert preserved["child_count"] == 2
 
 
 def test_home_goal_financing_preferences_preserve_provident_repayment_switch() -> None:
@@ -108,6 +233,62 @@ def test_home_goal_financing_preferences_preserve_provident_repayment_switch() -
     assert restored["provident_account_repayment_switch_enabled"] is True
     assert restored["provident_account_repayment_switch_after_month"] == 18
     assert restored["provident_account_repayment_switch_to_strategy"] == "semiannual_principal_offset"
+
+
+def test_home_goal_normalization_moves_financing_preferences_out_of_target_params() -> None:
+    from app.storage.normalization import normalize_planning_goal, scenario_from_home_goal
+
+    normalized = normalize_planning_goal(
+        {
+            "goal_type": "home",
+            "target_params": {
+                "total_price": 3_000_000,
+                "commercial_prepayment_mode": "manual",
+                "commercial_prepayment_monthly_amount": 4_000,
+                "investment_withdrawal_mode": "manual_reserve",
+                "investment_min_balance_after_purchase": 50_000,
+            },
+        }
+    )
+    restored = scenario_from_home_goal("home-goal", normalized)
+
+    for key in (
+        "commercial_prepayment_mode",
+        "commercial_prepayment_monthly_amount",
+        "investment_withdrawal_mode",
+        "investment_min_balance_after_purchase",
+    ):
+        assert key not in normalized["target_params"]
+        assert key in normalized["financing_preferences"]
+        assert restored[key] == normalized["financing_preferences"][key]
+
+
+def test_vehicle_goal_normalization_partitions_financing_and_holding_costs() -> None:
+    from app.storage.normalization import normalize_planning_goal, vehicle_plan_from_goal
+
+    normalized = normalize_planning_goal(
+        {
+            "goal_type": "vehicle",
+            "target_params": {
+                "name": "示例车辆",
+                "total_price": 180_000,
+                "financing_options": [{"id": "cash_only", "financing_type": "cash_only"}],
+                "loan_prepayment_enabled": True,
+                "loan_prepayment_monthly_amount": 3_000,
+                "annual_maintenance_cost": 6_000,
+                "monthly_parking_cost": 500,
+            },
+        }
+    )
+    restored = vehicle_plan_from_goal("vehicle-goal", normalized, 0)
+
+    for key in ("financing_options", "loan_prepayment_monthly_amount"):
+        assert key not in normalized["target_params"]
+    assert restored["financing_options"][0]["id"] == "cash_only"
+    assert restored["loan_prepayment_monthly_amount"] == 3_000
+    for key in ("annual_maintenance_cost", "monthly_parking_cost"):
+        assert key not in normalized["target_params"]
+        assert restored[key] == normalized["holding_cost_params"][key]
 
 
 def test_member_pension_auto_setting_persists_without_global_switch(tmp_path: Path, monkeypatch) -> None:
@@ -206,6 +387,9 @@ def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkey
         planning_goal_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'planning_goals'"
         ).fetchone()
+        property_valuation_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'property_valuations'"
+        ).fetchone()
         indexes = {
             row["name"]
             for row in conn.execute(
@@ -214,10 +398,94 @@ def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkey
         }
     assert versions == [database.CURRENT_SCHEMA_VERSION]
     assert planning_goal_table is not None
+    assert property_valuation_table is not None
     assert "idx_core_objects_owner" in indexes
     assert "idx_calculation_cache_layers" in indexes
     assert "idx_generated_strategies_layers" in indexes
     assert "idx_generated_strategies_owner" in indexes
+    assert "idx_property_valuations_household_goal" in indexes
+
+
+def test_property_valuation_refresh_persists_history_and_respects_due_date(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    property_data = {
+        "planning_goal_id": "home-goal-a",
+        "name": "示例监测房产",
+        "district": "示例片区",
+        "ring_area": "三至四环",
+        "property_type": "二手房",
+        "building_age_years": 18,
+        "building_structure": "steel_concrete",
+        "total_price": 3_000_000,
+        "area_sqm": 80,
+        "valuation_monitoring_enabled": True,
+        "valuation_interval_months": 1,
+        "valuation_reference_date": "2025-07-01",
+        "valuation_reference_value": 3_000_000,
+        "valuation_comparable_unit_price": 38_000,
+    }
+    market_snapshot = {
+        "snapshot_date": "2026-07-01",
+        "source_name": "示例市场数据",
+        "source_type": "research",
+        "resale_price_mom": -0.003,
+        "resale_price_yoy": -0.025,
+        "long_term_anchor_growth_rate": 0.015,
+        "housing_data_quality_score": 0.8,
+        "housing_market_evidence": [
+            {
+                "source_name": "示例区级平台",
+                "source_type": "brokerage",
+                "published_date": "2026-06-20",
+                "scope_type": "district",
+                "scope_name": "示例片区",
+                "ring_scope": "三至四环",
+                "property_segment": "resale",
+                "price_yoy": -0.01,
+                "avg_unit_price": 39_000,
+                "sample_size": 200,
+                "credibility_score": 0.7,
+            }
+        ],
+    }
+    payload = {
+        "household_id": "household-a",
+        "planning_goal_id": "home-goal-a",
+        "property_data": property_data,
+        "market_snapshot_id": "market-a",
+        "market_snapshot": market_snapshot,
+        "force": False,
+    }
+
+    with TestClient(app) as client:
+        first = client.post("/api/property-valuations/refresh", json=payload)
+        second = client.post("/api/property-valuations/refresh", json=payload)
+        rows = client.get(
+            "/api/property-valuations",
+            params={"household_id": "household-a", "planning_goal_id": "home-goal-a"},
+        )
+
+    assert first.status_code == 200
+    assert first.json()["refreshed"] is True
+    assert second.status_code == 200
+    assert second.json()["refreshed"] is False
+    assert first.json()["record"]["id"] == second.json()["record"]["id"]
+    assert rows.status_code == 200
+    assert len(rows.json()) == 1
+    valuation = rows.json()[0]["data"]
+    assert valuation["lower_value"] < valuation["estimated_market_value"] < valuation["upper_value"]
+    assert valuation["net_realisable_value"] < valuation["estimated_market_value"]
+    assert valuation["projection"][0]["month"] == 0
+    assert valuation["projection"][-1]["month"] == 60
+    assert valuation["market_source_count"] == 2
+    assert valuation["matched_location_name"] == "示例片区"
+    assert valuation["matched_ring_area"] == "三至四环"
+    assert valuation["location_reference_unit_price"] == 39_000
 
 
 def test_affordability_cache_key_includes_stress_switch() -> None:
@@ -361,23 +629,19 @@ def test_performance_sample_uses_temp_database_and_cache_hit_run() -> None:
     assert "monthly_ledger_count" in source
 
 
-def test_architecture_closure_checklist_tracks_major_goal_areas() -> None:
+def test_architecture_tracks_major_goal_areas() -> None:
     architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
-    checklist = Path("docs/architecture_closure_checklist.md").read_text(encoding="utf-8")
-
-    assert "architecture_closure_checklist.md" in architecture
-    assert "总体结论" in checklist
-    assert "## 完成判定" in checklist
-    for heading in (
-        "## 1. 数据库核心对象表",
-        "## 2. 统一 planning_goals",
-        "## 3. 多目标顺序规划",
-        "## 4. 政策接口继续解耦",
-        "## 5. 缓存分层",
-        "## 7. 前端概念统一",
-        "## 11. 发布与验证",
+    for section in (
+        "## 数据库与迁移",
+        "## 重大消费目标模型",
+        "## 策略生成关系",
+        "## 前端页面关系",
+        "## 测试与验证",
+        "goal_tradeoffs.py",
+        "planning_goals",
+        "缓存分层",
     ):
-        assert heading in checklist
+        assert section in architecture
 
 
 def test_cache_layer_hashes_propagate_input_changes_downstream() -> None:
@@ -432,6 +696,58 @@ def test_execution_config_does_not_change_business_cache_layers() -> None:
     assert changed_policy_layers.strategy != serial_layers.strategy
     assert changed_policy_layers.ledger != serial_layers.ledger
     assert changed_policy_layers.visualization != serial_layers.visualization
+
+
+def test_rule_pack_display_metadata_does_not_invalidate_calculation_cache() -> None:
+    from app.cache import affordability_cache_layers
+    from app.schemas import AffordabilityRequest, HouseholdData, RulePackData, ScenarioData
+
+    base_rules = RulePackData()
+    renamed_rules = base_rules.model_copy(
+        update={
+            "name": "示例政策版本",
+            "category": "display-only",
+            "effective_date": "2030-01-01",
+            "source_url": "https://example.com/policy",
+            "status": "archived",
+            "notes": "只修改展示元数据",
+        }
+    )
+    base_layers = affordability_cache_layers(
+        AffordabilityRequest(household=HouseholdData(), scenario=ScenarioData(), rule_pack=base_rules)
+    )
+    renamed_layers = affordability_cache_layers(
+        AffordabilityRequest(household=HouseholdData(), scenario=ScenarioData(), rule_pack=renamed_rules)
+    )
+
+    assert renamed_layers == base_layers
+
+
+def test_identical_planning_goal_save_preserves_content_addressed_cache(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.schemas import CacheLayerHashes, PlanningGoalData
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    goal = database.insert_planning_goal_record(PlanningGoalData(name="示例目标").model_dump(mode="json"))
+    layers = CacheLayerHashes(
+        input="input-cache",
+        strategy="strategy-cache",
+        ledger="ledger-cache",
+        visualization="visualization-cache",
+        engine="engine-cache",
+    )
+    database.upsert_calculation_cache("cache-key", layers.engine, layers, {"status": "cached"})
+
+    updated = database.update_planning_goal_record(goal["id"], goal["data"])
+
+    with database.get_connection() as conn:
+        cache_count = conn.execute("SELECT COUNT(*) AS count FROM calculation_cache").fetchone()["count"]
+    assert updated is not None
+    assert updated["updated_at"] == goal["updated_at"]
+    assert cache_count == 1
 
 
 def test_cache_layer_file_fingerprint_recurses_into_subpackages(tmp_path: Path) -> None:
@@ -969,7 +1285,7 @@ def test_calculation_context_fingerprints_ignore_record_timestamps(tmp_path: Pat
         client.put(f"/api/planning-goals/{goal['id']}", json={"household_id": household["id"], "data": changed_goal_data})
         fourth_context = context_for(client, household["id"])
 
-    assert first_goal_updated_at != second_goal_updated_at
+    assert first_goal_updated_at == second_goal_updated_at
     assert first_core_updated_at != second_core_updated_at
     assert first_context.planning_goal_fingerprint == second_context.planning_goal_fingerprint
     assert first_context.core_object_fingerprint == second_context.core_object_fingerprint
@@ -1164,7 +1480,10 @@ def test_affordability_cache_hit_rehydrates_generated_strategies(tmp_path: Path,
         first_rows = client.get("/api/generated-strategies").json()
         with database.get_connection() as conn:
             cache_row = conn.execute("SELECT cache_key, result FROM calculation_cache LIMIT 1").fetchone()
-            stale_payload = json.loads(cache_row["result"])
+        cached_payload = database.get_calculation_cache_payload(cache_row["cache_key"])
+        assert cached_payload is not None
+        stale_payload = json.loads(cached_payload)
+        with database.get_connection() as conn:
             stale_payload.pop("cache_layers", None)
             conn.execute(
                 "UPDATE calculation_cache SET result = ? WHERE cache_key = ?",
@@ -1341,6 +1660,33 @@ def test_affordability_cache_without_monthly_details_is_rebuilt(tmp_path: Path, 
         item for item in result["monthly_visualization_details"] if item["cash_flow_items"]
     )
     assert any(item["kind"] == "income" for item in non_empty_detail["cash_flow_items"])
+
+
+def test_large_calculation_cache_payload_is_compressed_and_round_trips(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.schemas import CacheLayerHashes
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    payload = {"monthly_cashflow_visualization": [{"note": "sample" * 2000} for _ in range(20)]}
+    database.upsert_calculation_cache(
+        "large-cache",
+        "engine",
+        CacheLayerHashes(input="input", strategy="strategy", ledger="ledger", visualization="visualization"),
+        payload,
+    )
+
+    with database.get_connection() as conn:
+        stored = conn.execute(
+            "SELECT result FROM calculation_cache WHERE cache_key = ?",
+            ("large-cache",),
+        ).fetchone()["result"]
+
+    assert stored.startswith("zlib:")
+    assert len(stored) < len(json.dumps(payload)) / 4
+    assert json.loads(database.get_calculation_cache_payload("large-cache")) == payload
 
 
 def test_affordability_api_applies_planning_goal_purchase_window_to_strategy(tmp_path: Path, monkeypatch) -> None:
@@ -2368,7 +2714,7 @@ def test_planning_goal_crud_does_not_upsert_scenario_shadow() -> None:
     assert "INSERT INTO scenarios" not in update_match.group("body")
     assert "INSERT OR REPLACE INTO scenarios" not in update_match.group("body")
     assert "DELETE FROM scenarios" in update_match.group("body")
-    assert "INSERT OR REPLACE INTO scenarios" in scenario_insert_match.group("body")
+    assert "INSERT OR REPLACE INTO scenarios" not in scenario_insert_match.group("body")
 
 
 def test_changing_vehicle_planning_goal_to_home_cleans_old_household_projection(tmp_path: Path, monkeypatch) -> None:
@@ -3245,10 +3591,10 @@ def test_empty_household_shadow_lists_delete_shadow_planning_goals(tmp_path: Pat
         projected_household = client.get("/api/households").json()[0]
 
     assert response.status_code == 200
-    assert vehicle_goals == []
-    assert child_goals == []
-    assert projected_household["data"]["car_plan"]["vehicle_plans"] == []
-    assert projected_household["data"]["child_plans"] == []
+    assert len(vehicle_goals) == 1
+    assert len(child_goals) == 1
+    assert len(projected_household["data"]["car_plan"]["vehicle_plans"]) == 1
+    assert len(projected_household["data"]["child_plans"]) == 1
 
 
 def test_planning_goal_sequence_resolves_dependencies_and_parallel_goals(tmp_path: Path, monkeypatch) -> None:
@@ -3329,6 +3675,214 @@ def test_planning_goal_sequence_resolves_dependencies_and_parallel_goals(tmp_pat
     assert goals["示例改善房"]["resolved_not_before_month"] == 30
     assert goals["示例缺失依赖目标"]["normalized_timing_mode"] == "auto_sequence"
     assert sequence["warnings"]
+
+
+def test_home_candidates_share_one_sequence_node_and_dependencies_target_the_demand(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+
+    with TestClient(app) as client:
+        household = client.get("/api/households").json()[0]
+        home_candidates = []
+        for index, price in enumerate((2_800_000, 3_200_000, 3_600_000), start=1):
+            home_candidates.append(client.post(
+                "/api/planning-goals",
+                json={
+                    "household_id": household["id"],
+                    "data": {
+                        "goal_type": "home",
+                        "name": f"示例候选房源{index}",
+                        "priority": 1,
+                        "timing_mode": "auto_sequence",
+                        "earliest_purchase_delay_months": 6,
+                        "target_params": {
+                            "total_price": price,
+                            "commercial_loan_amount": price * 0.4,
+                        },
+                    },
+                },
+            ).json())
+        renovation = client.post(
+            "/api/planning-goals",
+            json={
+                "household_id": household["id"],
+                "data": {
+                    "goal_type": "renovation",
+                    "name": "示例装修目标",
+                    "priority": 2,
+                    "timing_mode": "after_goal",
+                    "depends_on_goal_id": home_candidates[-1]["id"],
+                    "delay_after_dependency_months": 3,
+                    "target_params": {"estimated_cost": 200_000},
+                },
+            },
+        ).json()
+        sequence = client.get("/api/planning-goals/sequence", params={"household_id": household["id"]}).json()
+        foundation = client.get("/api/planning-foundation", params={"household_id": household["id"]}).json()
+
+    homes = [goal for goal in sequence["goals"] if goal["goal_type"] == "home"]
+    resolved_renovation = next(goal for goal in sequence["goals"] if goal["id"] == renovation["id"])
+    canonical_home_id = home_candidates[0]["id"]
+
+    assert {goal["sequence_index"] for goal in homes} == {1}
+    assert {goal["planning_group_id"] for goal in homes} == {canonical_home_id}
+    assert {goal["planning_group_name"] for goal in homes} == {"第一套购房需求"}
+    assert {goal["planning_group_size"] for goal in homes} == {3}
+    assert all(goal["planning_group_member_ids"] == [candidate["id"] for candidate in home_candidates] for goal in homes)
+    assert resolved_renovation["sequence_index"] == 2
+    assert resolved_renovation["depends_on_goal_id"] == canonical_home_id
+    assert resolved_renovation["depends_on_goal_name"] == "第一套购房需求"
+    assert resolved_renovation["resolved_not_before_month"] == 9
+    property_objects = [
+        item for item in foundation["core_objects"]
+        if item["object_type"] == "asset" and item["category"] == "property_asset"
+    ]
+    fixed_assets = next(item for item in foundation["core_object_groups"] if item["code"] == "fixed_assets")
+    planned_mortgages = [
+        item for item in foundation["core_objects"]
+        if item["object_type"] == "loan" and item["category"] == "mortgage"
+    ]
+    loan_accounts = next(item for item in foundation["core_object_groups"] if item["code"] == "loan_accounts")
+    assert len(property_objects) == 1
+    assert property_objects[0]["data"]["name"] == "第一套购房需求"
+    assert property_objects[0]["data"]["current_balance"] == 2_800_000
+    assert property_objects[0]["data"]["metadata"]["candidate_count"] == 3
+    assert property_objects[0]["data"]["metadata"]["candidate_goal_ids"] == [candidate["id"] for candidate in home_candidates]
+    assert property_objects[0]["data"]["metadata"]["candidate_price_min"] == 2_800_000
+    assert property_objects[0]["data"]["metadata"]["candidate_price_max"] == 3_600_000
+    assert fixed_assets["core_object_count"] == 2
+    assert fixed_assets["current_balance"] == 3_000_000
+    assert len(planned_mortgages) == 1
+    assert planned_mortgages[0]["data"]["current_balance"] == 1_120_000
+    assert planned_mortgages[0]["data"]["metadata"]["candidate_count"] == 3
+    assert loan_accounts["core_object_count"] == 1
+    assert loan_accounts["current_balance"] == 1_120_000
+
+
+def test_renovation_goal_is_projected_to_home_calculation_without_persisting_on_scenario() -> None:
+    from app.planning_context import apply_planning_goal_constraints
+    from app.schemas import (
+        AffordabilityRequest,
+        CalculationContextGoalSnapshot,
+        CalculationContextSnapshot,
+        HouseholdData,
+        RulePackData,
+        ScenarioData,
+    )
+
+    constrained = apply_planning_goal_constraints(
+        AffordabilityRequest(
+            household=HouseholdData(),
+            scenario=ScenarioData(planning_goal_id="home-a"),
+            rule_pack=RulePackData(),
+            calculation_context=CalculationContextSnapshot(
+                planning_goals=[
+                    CalculationContextGoalSnapshot(
+                        id="home-a",
+                        goal_type="home",
+                        name="第一套购房需求",
+                        planning_group_id="home-a",
+                        planning_group_member_ids=["home-a", "home-b"],
+                        priority=1,
+                        sequence_index=1,
+                    ),
+                    CalculationContextGoalSnapshot(
+                        id="renovation-a",
+                        goal_type="renovation",
+                        name="装修目标",
+                        target_amount=250_000,
+                        funding_mode="cash_or_investment",
+                        priority=2,
+                        sequence_index=2,
+                        normalized_timing_mode="after_goal",
+                        depends_on_goal_id="home-a",
+                        delay_after_dependency_months=6,
+                    ),
+                ]
+            ),
+        )
+    )
+
+    assert constrained.scenario.renovation_cost == 250_000
+    assert constrained.scenario.renovation_funding_mode == "cash_or_investment"
+    assert constrained.scenario.renovation_goal_id == "renovation-a"
+    assert constrained.scenario.renovation_delay_after_purchase_months == 6
+    serialized = constrained.scenario.model_dump(mode="json")
+    assert "renovation_cost" not in serialized
+    assert "renovation_funding_mode" not in serialized
+
+
+def test_database_migrates_home_bound_renovation_to_single_planning_event(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    timestamp = database.now_iso()
+    home_ids = ["home-a", "home-b", "home-c"]
+    with database.get_connection() as conn:
+        conn.execute("DELETE FROM planning_goals")
+        for home_id in home_ids:
+            conn.execute(
+                "INSERT INTO planning_goals (id, household_id, goal_type, data, created_at, updated_at) VALUES (?, ?, 'home', ?, ?, ?)",
+                (
+                    home_id,
+                    "household-a",
+                    json.dumps(
+                        {
+                            "goal_type": "home",
+                            "name": home_id,
+                            "priority": 1,
+                            "target_params": {
+                                "total_price": 3_000_000,
+                                "renovation_cost": 100_000,
+                                "renovation_funding_mode": "after_purchase_saving",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO planning_goals (id, household_id, goal_type, data, created_at, updated_at) VALUES (?, ?, 'renovation', ?, ?, ?)",
+            (
+                "renovation-a",
+                "household-a",
+                json.dumps(
+                    {
+                        "goal_type": "renovation",
+                        "name": "装修目标",
+                        "priority": 4,
+                        "timing_mode": "auto_sequence",
+                        "target_params": {"estimated_cost": 250_000},
+                        "financing_preferences": {"funding_mode": "cash_or_investment"},
+                    },
+                    ensure_ascii=False,
+                ),
+                timestamp,
+                timestamp,
+            ),
+        )
+        database.migrate_database(conn)
+
+        rows = conn.execute("SELECT id, goal_type, data FROM planning_goals ORDER BY id").fetchall()
+
+    home_rows = [json.loads(row["data"]) for row in rows if row["goal_type"] == "home"]
+    renovation_rows = [json.loads(row["data"]) for row in rows if row["goal_type"] == "renovation"]
+    assert len(home_rows) == 3
+    assert all("renovation_cost" not in row["target_params"] for row in home_rows)
+    assert all("renovation_funding_mode" not in row["target_params"] for row in home_rows)
+    assert len(renovation_rows) == 1
+    assert renovation_rows[0]["target_params"]["estimated_cost"] == 250_000
+    assert renovation_rows[0]["timing_mode"] == "after_goal"
+    assert renovation_rows[0]["depends_on_goal_id"] == "home-a"
 
 
 def test_not_planned_goal_does_not_consume_sequence_index(tmp_path: Path, monkeypatch) -> None:
@@ -4212,6 +4766,58 @@ def test_generated_strategy_type_constants_match_frontend_helper() -> None:
     assert frontend_types == set(get_args(GeneratedStrategyType))
 
 
+def test_generated_investment_strategies_use_plan_name_as_stable_identity(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+    from app.cache import calculation_code_fingerprints
+    from app.main import app
+    from app.schemas import CacheLayerHashes
+
+    database.DB_PATH = database.default_db_path()
+    layers = CacheLayerHashes(
+        input="investment-input",
+        strategy="investment-strategy",
+        ledger="investment-ledger",
+        visualization="investment-visualization",
+        engine=calculation_code_fingerprints()["engine"],
+    )
+    result = {
+        "investment_plan_recommendations": [
+            {
+                "variant": "稳健定投",
+                "plan_name": "balanced_monthly_investment",
+                "monthly_investment": 1000,
+                "annual_return": 0.03,
+                "score": 70,
+                "reasons": [],
+            },
+            {
+                "variant": "稳健定投（更新）",
+                "plan_name": "balanced_monthly_investment",
+                "monthly_investment": 1200,
+                "annual_return": 0.03,
+                "score": 80,
+                "reasons": [],
+            },
+        ]
+    }
+
+    with TestClient(app):
+        database.upsert_generated_strategies("investment-cache", layers.engine, layers, result)
+        rows = database.list_generated_strategies(
+            cache_key="investment-cache",
+            strategy_type="investment",
+        )
+
+    assert len(rows) == 1
+    assert rows[0]["owner_key"] == "household"
+    assert rows[0]["strategy_key"] == "balanced_monthly_investment"
+    assert rows[0]["variant"] == "稳健定投（更新）"
+    assert rows[0]["data"]["variant"] == "稳健定投（更新）"
+    assert rows[0]["data"]["score"] == 80
+
+
 def test_generated_strategy_matching_stays_in_frontend_helper() -> None:
     app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
     helper_source = Path("frontend/src/generatedStrategies.ts").read_text(encoding="utf-8")
@@ -4224,6 +4830,8 @@ def test_generated_strategy_matching_stays_in_frontend_helper() -> None:
     assert "export function matchesPurchaseStrategyOwner" in helper_source
     assert "export function matchesVehicleStrategyOwner" in helper_source
     assert "export function matchesChildPlanStrategyOwner" in helper_source
+    assert "export function generatedInvestmentRecommendations" in helper_source
+    assert "recommendationsByPlanName" in helper_source
     assert "strategyType: GeneratedStrategyType" in helper_source
     assert "strategyType: string" not in helper_source
     assert "generatedStrategyTypeLabel(type: GeneratedStrategyType)" in helper_source
@@ -4233,7 +4841,7 @@ def test_generated_strategy_matching_stays_in_frontend_helper() -> None:
     assert "if (scenario?.data.planning_goal_id) return new Set([scenario.data.planning_goal_id]);" in helper_source
     assert "if (scenario?.id) return new Set([scenario.id]);" in helper_source
     assert "if (scenario?.data.name) return new Set([scenario.data.name]);" in helper_source
-    assert "} else if (child.name) {" in helper_source
+    assert "} else if (child.name) {" not in helper_source
 
 
 def test_frontend_generated_strategy_reads_use_cache_layer_batch_endpoint() -> None:
@@ -4247,12 +4855,73 @@ def test_frontend_generated_strategy_reads_use_cache_layer_batch_endpoint() -> N
     assert "`/api/generated-strategies" not in frontend_api
 
 
+def test_frontend_policy_switch_uses_completed_cache_and_stale_while_revalidate() -> None:
+    frontend_api = Path("frontend/src/api.ts").read_text(encoding="utf-8")
+    frontend_app = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert "completedCalculationResults" in frontend_api
+    assert "MAX_COMPLETED_CALCULATION_RESULTS" in frontend_api
+    assert "return Promise.resolve(completed)" in frontend_api
+    assert "if (!hasCurrentCalculation) return {};" not in frontend_app
+    assert "setScenarioResults(Object.fromEntries(calculated));" in frontend_app
+    assert "setGeneratedStrategies(Array.from(generatedRowsById.values()));" in frontend_app
+
+
+def test_investment_vehicle_and_child_strategy_switches_restore_completed_frontend_cache() -> None:
+    frontend_api = Path("frontend/src/api.ts").read_text(encoding="utf-8")
+    frontend_app = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    generated_strategy_helpers = Path("frontend/src/generatedStrategies.ts").read_text(encoding="utf-8")
+
+    assert "completedGeneratedStrategyResults" in frontend_api
+    assert "inFlightGeneratedStrategyRequests" in frontend_api
+    assert "peekCompletedAffordabilityResult" in frontend_api
+    assert "peekCompletedGeneratedStrategies" in frontend_api
+    assert "MAX_COMPLETED_GENERATED_STRATEGY_RESULTS" in frontend_api
+    assert "const primaryVehicleSelection" in frontend_api
+    assert "selected_strategy_variant: primaryVehicleSelection" in frontend_api
+    assert "const allCalculationsCached" in frontend_app
+    assert "setIsCalculating(!allCalculationsCached);" in frontend_app
+    assert "if (cachedGeneratedRows) return;" in frontend_app
+    assert "applyChildStrategyPatch(index, expenseStrategyPatch(child, index, mode))" in frontend_app
+    assert "expenseStrategyParametersRef" in frontend_app
+    assert "expenseStrategyPatch(child, index, mode)" in frontend_app
+    assert 'userFacingError("保存养娃策略", err)' in frontend_app
+    assert 'userFacingError("保存车辆策略", err)' in frontend_app
+    assert "setCalculationVersion((version) => version + 1);" in frontend_app
+    assert "preferredCacheLayers?: CacheLayerHashes | null" in generated_strategy_helpers
+    assert "matchesCacheLayers(record, preferredCacheLayers)" in generated_strategy_helpers
+    assert "generatedCarPlanAnalyses(generatedStrategies, vehiclePlans, result?.cache_layers)" in frontend_app
+    assert "generatedChildPlanStrategies(generatedStrategies, childPlans, result?.cache_layers)" in frontend_app
+
+
+def test_planning_goal_center_groups_home_candidates_into_one_purchase_demand() -> None:
+    frontend_app = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+    planning_goal_helpers = Path("frontend/src/planningGoals.ts").read_text(encoding="utf-8")
+
+    assert 'goal.goal_type === "home" ? `home:${Math.max(1, goal.data.priority)}` : goal.id' in frontend_app
+    assert "const visibleGoalGroups" in frontend_app
+    assert "group.goals.length} 个候选房源" in frontend_app
+    assert "homeCandidateSummary(group.goals)" in frontend_app
+    assert "selectedGoalGroupGoals.forEach" in frontend_app
+    assert "const timingPatch = unifiedTimingPatch(draftGoal)" in frontend_app
+    assert 'goal.goal_type !== "home" ? <button' in frontend_app
+    assert "purchase_demand_id" not in frontend_app
+    assert 'goal.planning_group_id || (goal.goal_type === "home" ? `home:${goal.priority}` : goal.id)' in planning_goal_helpers
+    assert "planning_group_member_ids" in planning_goal_helpers
+    assert "个候选房源" in planning_goal_helpers
+    assert "goal.member_ids.includes(goalId)" in planning_goal_helpers
+    assert "const groupedGoals" in frontend_app
+    assert "goal.planning_group_member_ids" in frontend_app
+    assert 'goal.goal_type !== "home" || goal.id === selectedHomeGoalId' in frontend_app
+    assert '当前采用 {selectedPurchasePlan.variant}' in frontend_app
+    assert '预计买入价 {money(selectedPurchasePlan.projected_purchase_price' in frontend_app
+
+
 def test_frontend_foundation_and_core_object_reads_are_household_scoped() -> None:
     frontend_api = Path("frontend/src/api.ts").read_text(encoding="utf-8")
     frontend_app = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
 
-    assert "fetchScenarios(householdId: string)" in frontend_api
-    assert "fetchScenarios(householdId?: string)" not in frontend_api
+    assert "fetchScenarios" not in frontend_api
     assert "fetchPlanningGoalSequence(householdId: string" in frontend_api
     assert "fetchPlanningGoalSequence(householdId?: string" not in frontend_api
     assert "fetchPlanningGoals(householdId: string" in frontend_api
@@ -4667,11 +5336,8 @@ def test_planning_goal_helpers_use_typed_timing_modes() -> None:
     assert "export function vehiclePlanningControlDefaults" in helper_source
     assert "export function vehiclePlanningTimingModeValue" in helper_source
     assert "export function planningTimingModeFromScenario" in helper_source
-    assert "vehiclePlanUsesDependencySelector(vehicle)" in app_source
     assert "vehiclePlanningControlDefaults(" in app_source
-    assert "vehiclePlanningTimingModeValue(vehicle)" in app_source
     assert "planningTimingModeFromScenario(" in app_source
-    assert '"auto_sequence"' not in app_source
     assert 'purchase_planning_mode === "parallel"' not in app_source
     assert "function resolveChildBirthMonth" not in app_source
     assert "function childEducationStageLabel" not in app_source
@@ -4730,12 +5396,13 @@ def test_account_calibration_page_uses_full_source_catalogs() -> None:
     assert page_match is not None
     page_body = page_match.group("body")
 
-    assert "选择账户概念来源" in page_body
-    assert "选择重大事件来源" in page_body
-    assert "选择策略事件来源" in page_body
-    assert "筛选账户概念" in page_body
-    assert "筛选重大事件" in page_body
-    assert "筛选策略事件" in page_body
+    assert "搜索账户概念" in page_body
+    assert "搜索重大事件" in page_body
+    assert "搜索策略方案" in page_body
+    assert 'sourceMode === "concept"' in page_body
+    assert 'sourceMode === "event"' in page_body
+    assert 'sourceMode === "strategy"' in page_body
+    assert "校准来源类型" in page_body
     assert "当前匹配" in page_body
     assert "filteredConceptCalibrationOptions" in page_body
     assert "filteredMajorEventCalibrationOptions" in page_body
@@ -4793,7 +5460,7 @@ def test_generated_strategy_owner_matching_prefers_planning_goal_ids() -> None:
 
     assert "if (child.planning_goal_id)" in source
     assert "goalOwnerKeys.add(child.planning_goal_id)" in source
-    assert "} else if (child.name)" in source
+    assert "} else if (child.name)" not in source
     assert "if (vehicle.planning_goal_id)" in source
     assert "ownerKeys.add(vehicle.planning_goal_id)" in source
     assert "if (scenario?.data.planning_goal_id) return new Set([scenario.data.planning_goal_id]);" in source
@@ -4817,7 +5484,7 @@ def test_vehicle_strategy_selection_persists_to_planning_goal() -> None:
     assert 'userFacingError("保存车辆策略", err)' in function_body
 
 
-def test_child_strategy_birth_month_adoption_updates_child_goal_config() -> None:
+def test_child_strategy_birth_month_is_display_only_outside_planning_goals() -> None:
     import re
 
     app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
@@ -4830,14 +5497,10 @@ def test_child_strategy_birth_month_adoption_updates_child_goal_config() -> None
     page_body = page_match.group("body")
 
     assert "childStrategyBirthMonthValue(strategy)" in page_body
-    assert 'inactiveLabel="采用策略出生月"' in page_body
-    assert 'activeLabel="已采用策略出生月"' in page_body
-    assert 'timing_mode: "manual_month"' in page_body
-    assert "planned_birth_month: strategyBirthMonth" in page_body
-    assert "planned_birth_start_month: strategyBirthMonth" in page_body
-    assert "planned_birth_end_month: strategyBirthMonth" in page_body
-    assert re.search(r"(?<!planned_)birth_month:\s*strategyBirthMonth", page_body) is None
-    assert "updateChildPlanPatch(index, {" in page_body
+    assert "策略建议出生月" in page_body
+    assert "如需采用这个出生月份，请到“规划目标”页" in page_body
+    assert 'inactiveLabel="采用策略出生月"' not in page_body
+    assert "planned_birth_month: strategyBirthMonth" not in page_body
 
 
 def test_child_goal_duplicate_uses_planning_goal_api() -> None:
@@ -5056,19 +5719,20 @@ def test_investment_strategy_adoption_updates_manual_strategy_config() -> None:
     assert function_match is not None
     function_body = function_match.group("body")
 
+    assert "investmentPlanParametersRef.current.get(plan.plan_name) ?? plan" in function_body
     assert "updateHouseholdPatch({" in function_body
     for field in (
-        "investment_plan_name: plan.plan_name",
-        "investment_risk_level: plan.risk_level",
-        "monthly_investment_amount: plan.monthly_investment",
-        "investment_cash_reserve_months: plan.cash_reserve_months",
-        "investment_equity_ratio: plan.equity_ratio",
-        "investment_bond_ratio: plan.bond_ratio",
-        "investment_cash_ratio: plan.cash_ratio",
+        "investment_plan_name: cachedPlan.plan_name",
+        "investment_risk_level: cachedPlan.risk_level",
+        "monthly_investment_amount: cachedPlan.monthly_investment",
+        "investment_cash_reserve_months: cachedPlan.cash_reserve_months",
+        "investment_equity_ratio: cachedPlan.equity_ratio",
+        "investment_bond_ratio: cachedPlan.bond_ratio",
+        "investment_cash_ratio: cachedPlan.cash_ratio",
         "investment_auto_rebalance: true",
     ):
         assert field in function_body
-    assert "updateInvestmentAnnualReturn(plan.annual_return)" in function_body
+    assert "updateInvestmentAnnualReturn(cachedPlan.annual_return)" in function_body
     assert "<AdoptStrategyButton active={active} onClick={() => applyInvestmentPlan(plan)} />" in page_body
     assert 'updateHouseholdPatch({ investment_plan_name: "manual_investment"' in page_body
 
@@ -5166,8 +5830,8 @@ def test_collapsible_default_profiles_are_centralized() -> None:
     assert "longList: false" in defaults_body
     assert 'profile = "core"' in app_source
     assert 'profile = "advanced"' in app_source
-    assert 'title="购房需求设定" profile="core"' in app_source
     assert 'title="车辆属性" profile="core"' in app_source
+    assert 'title="候选房源身份"' in app_source
     assert 'title="策略说明与影响预览"' in app_source
     assert 'profile="explanation"' in app_source
 
@@ -6847,11 +7511,14 @@ def test_affordability_calculation_is_cached_until_inputs_change(tmp_path: Path,
                 "scenario": scenario | {"total_price": scenario["total_price"] + 10_000},
             },
         )
+        switched_back = client.post("/api/calculations/affordability", json=payload)
 
     assert first.status_code == 200
     assert second.status_code == 200
     assert changed.status_code == 200
+    assert switched_back.status_code == 200
     assert first.json() == second.json()
+    assert switched_back.json() == first.json()
     assert calls["count"] == 2
 
 
@@ -6924,6 +7591,10 @@ def test_calculation_persists_generated_strategy_entities(tmp_path: Path, monkey
                 "name": "样例成员A",
                 "monthly_salary_gross": 50_000,
                 "annual_bonus": 0,
+                "personal_pension_account_enabled": True,
+                "personal_pension_participation_eligible": True,
+                "personal_pension_open_mode": "auto_tax_optimal",
+                "personal_pension_contribution_mode": "auto_tax_optimal",
             }
         ]
         household["car_plan"] = {

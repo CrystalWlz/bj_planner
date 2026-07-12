@@ -1,5 +1,6 @@
 import type {
   CarPlanAnalysis,
+  CacheLayerHashes,
   ChildPlanData,
   ChildPlanStrategyPoint,
   GeneratedStrategyRecord,
@@ -75,21 +76,17 @@ export function generatedStrategySummaryByOwner(records: GeneratedStrategyRecord
 
 export function childPlanStrategyOwnerKeys(childPlans: ChildPlanData[]) {
   const goalOwnerKeys = new Set<string>();
-  const legacyNameOwnerKeys = new Set<string>();
   for (const child of childPlans) {
     if (child.planning_goal_id) {
       goalOwnerKeys.add(child.planning_goal_id);
-    } else if (child.name) {
-      legacyNameOwnerKeys.add(child.name);
     }
   }
-  return { goalOwnerKeys, legacyNameOwnerKeys };
+  return goalOwnerKeys;
 }
 
 export function matchesChildPlanStrategyOwner(record: GeneratedStrategyRecord, childPlans: ChildPlanData[]) {
   if (!childPlans.length) return true;
-  const { goalOwnerKeys, legacyNameOwnerKeys } = childPlanStrategyOwnerKeys(childPlans);
-  return goalOwnerKeys.has(record.owner_key) || legacyNameOwnerKeys.has(record.owner_key);
+  return childPlanStrategyOwnerKeys(childPlans).has(record.owner_key);
 }
 
 export function vehicleStrategyOwnerKeys(vehiclePlans: VehiclePlanData[]) {
@@ -177,9 +174,17 @@ export function generatedTaxStrategyTimeline(records: GeneratedStrategyRecord[])
     .sort((a, b) => a.month - b.month || a.category.localeCompare(b.category) || a.title.localeCompare(b.title));
 }
 
-export function generatedChildPlanStrategies(records: GeneratedStrategyRecord[], childPlans: ChildPlanData[] = []): ChildPlanStrategyPoint[] {
-  return generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.childPlan)
-    .filter((record) => matchesChildPlanStrategyOwner(record, childPlans))
+export function generatedChildPlanStrategies(
+  records: GeneratedStrategyRecord[],
+  childPlans: ChildPlanData[] = [],
+  preferredCacheLayers?: CacheLayerHashes | null
+): ChildPlanStrategyPoint[] {
+  const childRecords = generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.childPlan)
+    .filter((record) => matchesChildPlanStrategyOwner(record, childPlans));
+  const preferredRecords = preferredCacheLayers
+    ? childRecords.filter((record) => matchesCacheLayers(record, preferredCacheLayers))
+    : [];
+  return (preferredRecords.length ? preferredRecords : childRecords)
     .map((record) => childPlanStrategyFromGeneratedData(record.data))
     .filter((item): item is ChildPlanStrategyPoint => item !== null)
     .sort((a, b) => (a.birth_month_index ?? Number.MAX_SAFE_INTEGER) - (b.birth_month_index ?? Number.MAX_SAFE_INTEGER) || a.child_name.localeCompare(b.child_name));
@@ -189,23 +194,53 @@ export function childPlanStrategyForChild(
   strategies: ChildPlanStrategyPoint[],
   child: Pick<ChildPlanData, "planning_goal_id" | "name">
 ) {
-  if (child.planning_goal_id) {
-    const strategy = strategies.find((item) => item.planning_goal_id === child.planning_goal_id);
-    if (strategy) return strategy;
-  }
-  return strategies.find((item) => item.child_name === child.name);
+  if (!child.planning_goal_id) return undefined;
+  return strategies.find((item) => item.planning_goal_id === child.planning_goal_id);
 }
 
-export function generatedInvestmentRecommendations(records: GeneratedStrategyRecord[]): InvestmentPlanRecommendation[] {
-  return generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.investment)
-    .map((record) => investmentRecommendationFromGeneratedData(record.data))
-    .filter((item): item is InvestmentPlanRecommendation => item !== null)
+function matchesCacheLayers(record: GeneratedStrategyRecord, cacheLayers: CacheLayerHashes) {
+  return record.engine_fingerprint === cacheLayers.engine
+    && record.input_hash === cacheLayers.input
+    && record.strategy_hash === cacheLayers.strategy
+    && record.ledger_hash === cacheLayers.ledger
+    && record.visualization_hash === cacheLayers.visualization;
+}
+
+export function generatedInvestmentRecommendations(
+  records: GeneratedStrategyRecord[],
+  preferredCacheLayers?: CacheLayerHashes | null
+): InvestmentPlanRecommendation[] {
+  const investmentRecords = generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.investment);
+  const preferredRecords = preferredCacheLayers
+    ? investmentRecords.filter((record) => matchesCacheLayers(record, preferredCacheLayers))
+    : [];
+  const sourceRecords = preferredRecords.length ? preferredRecords : investmentRecords;
+  const recommendationsByPlanName = new Map<string, InvestmentPlanRecommendation>();
+
+  for (const record of sourceRecords) {
+    const recommendation = investmentRecommendationFromGeneratedData(record.data);
+    if (!recommendation) continue;
+    const existing = recommendationsByPlanName.get(recommendation.plan_name);
+    if (!existing || recommendation.score > existing.score) {
+      recommendationsByPlanName.set(recommendation.plan_name, recommendation);
+    }
+  }
+
+  return Array.from(recommendationsByPlanName.values())
     .sort((a, b) => b.score - a.score || a.plan_name.localeCompare(b.plan_name));
 }
 
-export function generatedCarPlanAnalyses(records: GeneratedStrategyRecord[], vehiclePlans: VehiclePlanData[] = []): CarPlanAnalysis[] {
-  return generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.vehicle)
-    .filter((record) => matchesVehicleStrategyOwner(record, vehiclePlans))
+export function generatedCarPlanAnalyses(
+  records: GeneratedStrategyRecord[],
+  vehiclePlans: VehiclePlanData[] = [],
+  preferredCacheLayers?: CacheLayerHashes | null
+): CarPlanAnalysis[] {
+  const vehicleRecords = generatedStrategiesByType(records, GENERATED_STRATEGY_TYPES.vehicle)
+    .filter((record) => matchesVehicleStrategyOwner(record, vehiclePlans));
+  const preferredRecords = preferredCacheLayers
+    ? vehicleRecords.filter((record) => matchesCacheLayers(record, preferredCacheLayers))
+    : [];
+  return (preferredRecords.length ? preferredRecords : vehicleRecords)
     .map((record) => carPlanAnalysisFromGeneratedData(record.data))
     .filter((item): item is CarPlanAnalysis => item !== null)
     .sort((a, b) => {

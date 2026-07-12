@@ -141,6 +141,22 @@ def investment_effective_tax_rate(household: HouseholdData) -> float:
     return investment_tax_estimate(household).effective_rate
 
 
+def risk_adjusted_investment_return(
+    household: HouseholdData,
+    annual_return: float,
+    *,
+    risk_buffer: float = 0.01,
+) -> float:
+    """Return a conservative annual comparison rate for funding decisions.
+
+    This is deliberately not a forecast.  It removes estimated tax and a
+    volatility/estimation buffer before comparing a retained investment with a
+    certain loan cost.
+    """
+    after_tax_return = max(0.0, annual_return) * (1 - investment_effective_tax_rate(household))
+    return max(0.0, after_tax_return - max(0.0, risk_buffer))
+
+
 def investment_withdrawal_mode_label(mode: str) -> str:
     labels = {
         "auto": "自动优化提取",
@@ -164,6 +180,7 @@ def investment_withdrawal_at_purchase(
     required_liquidity_reserve: float,
     sell_fee_rate: float,
     investment_enabled: bool,
+    minimum_investment_balance_override: float | None = None,
 ) -> InvestmentWithdrawalResult:
     mode = investment_withdrawal_mode(scenario)
     cash_before = max(0.0, cash_before_transaction)
@@ -185,10 +202,12 @@ def investment_withdrawal_at_purchase(
     if mode == "full_liquidation":
         target_gross_sell = investment_before
     else:
+        configured_minimum = max(0.0, scenario.investment_min_balance_after_purchase)
+        candidate_minimum = max(0.0, minimum_investment_balance_override or 0.0)
         minimum_investment_balance = (
-            max(0.0, scenario.investment_min_balance_after_purchase)
+            max(configured_minimum, candidate_minimum)
             if mode == "manual_reserve"
-            else 0.0
+            else candidate_minimum
         )
         required_net_from_investment = max(
             0.0,

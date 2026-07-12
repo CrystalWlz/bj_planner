@@ -199,6 +199,7 @@ class HomeStrategyPolicy:
     micro_commercial_loan_ratio: float
     micro_commercial_loan_ratio_min: float
     micro_commercial_loan_ratio_max: float
+    default_auto_search_horizon_months: int
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,30 @@ class StressTestPolicy:
     rate_add: float
     income_factor: float
     price_factor: float
+    investment_return_factor: float
+    property_annual_price_growth_rate: float
+
+
+@dataclass(frozen=True)
+class PropertyTerminalValuePolicy:
+    """Long-horizon property value assumptions used for comparable net worth.
+
+    The value is intentionally a net realisable value, rather than a headline
+    listing price.  This keeps a self-occupied home from being treated as
+    instantly liquid when strategies are compared on terminal net worth.
+    """
+
+    annual_price_growth_rate: float
+    sale_cost_rate: float
+    liquidity_discount_rate: float
+
+
+@dataclass(frozen=True)
+class PersonalPensionReturnPolicy:
+    pre_retirement_annual_return: float
+    post_retirement_annual_return: float
+    snapshot_date: str
+    source_count: int
 
 
 class RegionalPolicy(Protocol):
@@ -230,7 +255,20 @@ class RegionalPolicy(Protocol):
     def stress_test_policy(self) -> StressTestPolicy:
         ...
 
+    def property_terminal_value_policy(self) -> PropertyTerminalValuePolicy:
+        ...
+
+    def personal_pension_return_policy(self) -> PersonalPensionReturnPolicy:
+        ...
+
     def stressed_interest_rate_rules(self, rate_add: float) -> RulePackData:
+        ...
+
+    def combined_stress_rules(
+        self,
+        rate_add: float,
+        property_annual_price_growth_rate: float,
+    ) -> RulePackData:
         ...
 
     def purchase_happiness_weights(self) -> dict[str, float]:
@@ -394,6 +432,10 @@ class BeijingPolicy:
             micro_commercial_loan_ratio=default_ratio,
             micro_commercial_loan_ratio_min=min_ratio,
             micro_commercial_loan_ratio_max=max_ratio,
+            default_auto_search_horizon_months=max(
+                12,
+                min(360, int(self.params.get("home_default_auto_search_horizon_months", 120))),
+            ),
         )
 
     def affordability_risk_policy(self) -> AffordabilityRiskPolicy:
@@ -405,11 +447,52 @@ class BeijingPolicy:
             danger_dti=danger_dti,
         )
 
+    def personal_pension_return_policy(self) -> PersonalPensionReturnPolicy:
+        return PersonalPensionReturnPolicy(
+            pre_retirement_annual_return=_clamp(
+                float(self.params.get("personal_pension_auto_pre_retirement_return", 0.025)),
+                -0.5,
+                0.5,
+            ),
+            post_retirement_annual_return=_clamp(
+                float(self.params.get("personal_pension_auto_post_retirement_return", 0.015)),
+                -0.5,
+                0.5,
+            ),
+            snapshot_date=str(self.params.get("personal_pension_return_snapshot_date", "") or ""),
+            source_count=max(0, int(self.params.get("personal_pension_return_source_count", 0) or 0)),
+        )
+
     def stress_test_policy(self) -> StressTestPolicy:
         return StressTestPolicy(
             rate_add=max(0.0, float(self.params.get("rate_stress_add", 0.005))),
             income_factor=_clamp(float(self.params.get("income_stress_factor", 0.90)), 0.0, 1.0),
             price_factor=max(0.0, float(self.params.get("price_stress_factor", 1.05))),
+            investment_return_factor=_clamp(
+                float(self.params.get("investment_return_stress_factor", 0.50)),
+                0.0,
+                1.0,
+            ),
+            property_annual_price_growth_rate=_clamp(
+                float(self.params.get("property_stress_annual_price_growth_rate", -0.02)),
+                -0.20,
+                0.20,
+            ),
+        )
+
+    def property_terminal_value_policy(self) -> PropertyTerminalValuePolicy:
+        return PropertyTerminalValuePolicy(
+            annual_price_growth_rate=_clamp(
+                float(self.params.get("property_annual_price_growth_rate", 0.0)),
+                -0.20,
+                0.20,
+            ),
+            sale_cost_rate=_clamp(float(self.params.get("property_sale_cost_rate", 0.03)), 0.0, 0.20),
+            liquidity_discount_rate=_clamp(
+                float(self.params.get("property_liquidity_discount_rate", 0.02)),
+                0.0,
+                0.20,
+            ),
         )
 
     def stressed_interest_rate_rules(self, rate_add: float) -> RulePackData:
@@ -424,6 +507,21 @@ class BeijingPolicy:
         for key in provident_rate_keys:
             stressed_rate_params[key] = float(stressed_rate_params.get(key, default_params.get(key, 0.0))) + rate_add
         return self.rules.model_copy(update={"params": stressed_rate_params})
+
+    def combined_stress_rules(
+        self,
+        rate_add: float,
+        property_annual_price_growth_rate: float,
+    ) -> RulePackData:
+        rate_rules = self.stressed_interest_rate_rules(rate_add)
+        return rate_rules.model_copy(
+            update={
+                "params": {
+                    **rate_rules.params,
+                    "property_annual_price_growth_rate": property_annual_price_growth_rate,
+                }
+            }
+        )
 
     def purchase_happiness_weights(self) -> dict[str, float]:
         raw_weights = self.params.get("purchase_happiness_weights", {})
@@ -473,7 +571,22 @@ class BeijingPolicy:
     def provident_loan_policy_cap(self, household: HouseholdData, scenario: ScenarioData, *, purchase_months: int = 0) -> tuple[float, float]:
         params = self.params
         amount_per_year = float(params.get("provident_loan_amount_per_deposit_year", 150_000))
-        effective_deposit_months = household.social_security_months + max(0, purchase_months)
+        has_future_provident_deposit = any(
+            member.provident_account_enabled
+            and (
+                member.monthly_salary_gross > 0
+                or member.monthly_housing_fund > 0
+                or any(
+                    stage.payroll_contributions_enabled
+                    and (stage.monthly_salary_gross > 0 or stage.monthly_housing_fund > 0)
+                    for stage in member.income_stages
+                )
+            )
+            for member in household.members
+        )
+        effective_deposit_months = household.social_security_months + (
+            max(0, purchase_months) if has_future_provident_deposit else 0
+        )
         deposit_years = (effective_deposit_months + 11) // 12 if effective_deposit_months > 0 else 0
         cap_by_deposit_years = amount_per_year * deposit_years
         if household.existing_home_count == 0:
@@ -1099,3 +1212,22 @@ def get_policy(rules: RulePackData) -> RegionalPolicy:
     if jurisdiction in {"北京", "beijing", "bj"}:
         return BeijingPolicy(rules)
     return BeijingPolicy(rules)
+
+
+def with_personal_pension_return_snapshot(
+    rules: RulePackData,
+    *,
+    pre_retirement_annual_return: float,
+    post_retirement_annual_return: float,
+    snapshot_date: str,
+    source_count: int,
+) -> RulePackData:
+    """Apply a monitored return snapshot without exposing policy params to the API layer."""
+    params = {
+        **rules.params,
+        "personal_pension_auto_pre_retirement_return": pre_retirement_annual_return,
+        "personal_pension_auto_post_retirement_return": post_retirement_annual_return,
+        "personal_pension_return_snapshot_date": snapshot_date,
+        "personal_pension_return_source_count": source_count,
+    }
+    return rules.model_copy(update={"params": params})

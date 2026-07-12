@@ -66,21 +66,25 @@ def generated_strategy_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
+    investment_rows_by_plan_name: dict[str, dict[str, Any]] = {}
     for item in result.get("investment_plan_recommendations", []):
         if not isinstance(item, dict):
             continue
-        variant = str(item.get("variant") or item.get("plan_name") or "")
-        if not variant:
+        plan_name = str(item.get("plan_name") or "")
+        variant = str(item.get("variant") or plan_name)
+        if not plan_name or not variant:
             continue
-        rows.append(
-            {
-                "strategy_type": GENERATED_STRATEGY_TYPE_INVESTMENT,
-                "owner_key": "household",
-                "strategy_key": variant,
-                "variant": variant,
-                "data": item,
-            }
-        )
+        existing = investment_rows_by_plan_name.get(plan_name)
+        if existing is not None and float(existing["data"].get("score") or 0) >= float(item.get("score") or 0):
+            continue
+        investment_rows_by_plan_name[plan_name] = {
+            "strategy_type": GENERATED_STRATEGY_TYPE_INVESTMENT,
+            "owner_key": "household",
+            "strategy_key": plan_name,
+            "variant": variant,
+            "data": item,
+        }
+    rows.extend(investment_rows_by_plan_name.values())
 
     for index, item in enumerate(result.get("child_plan_strategies", [])):
         if not isinstance(item, dict):

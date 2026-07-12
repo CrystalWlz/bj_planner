@@ -43,6 +43,7 @@ def choose_auto_commercial_prepayment(
     cash_after_purchase: float,
     minimum_cash_balance: float,
     commercial_repayment_method: str,
+    investment_effective_tax_rate: float = 0.0,
     investment_buy_fee_rate: float = 0.0,
     investment_sell_fee_rate: float = 0.0,
     market_snapshot: MarketSnapshotData | None = None,
@@ -57,6 +58,7 @@ def choose_auto_commercial_prepayment(
 
     hurdle_rate = prepayment_investment_hurdle_rate(
         scenario.annual_investment_return,
+        effective_tax_rate=investment_effective_tax_rate,
         buy_fee_rate=investment_buy_fee_rate,
         sell_fee_rate=investment_sell_fee_rate,
     )

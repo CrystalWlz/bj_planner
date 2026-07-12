@@ -39,8 +39,10 @@ from .ledger_models import (
     MonthlyLedgerEntryInputs,
     MonthlyLedgerResult,
     MonthlyProjectionState,
+    PersonalPensionMonthResultLike,
     ProjectionBalances,
     ProjectionOffsets,
+    ProjectionRiskSummary,
     VehicleLoanState,
 )
 from .vehicles import VehicleMonthProjection
@@ -66,9 +68,14 @@ def build_projected_monthly_ledger(
     regular_debt_payment_at: Callable[[HouseholdData, int], float],
     investment_effective_tax_rate: float,
     weighted_personal_pension_monthly_return: Callable[[Sequence[IncomeMember], float], float],
+    member_income_profiles_at: Callable[[int], list[tuple[int, str, MonthlyIncomeProfileLike]]] | None = None,
+    personal_pension_month_at: Callable[..., PersonalPensionMonthResultLike] | None = None,
     investment_withdrawal_at_purchase: Callable[..., InvestmentWithdrawalLike],
     investment_allocation_for_month: Callable[..., tuple[float, float]],
     monthly_happiness_score: Callable[..., float],
+    property_annual_price_growth_rate: float = 0.0,
+    property_sale_cost_rate: float = 0.0,
+    property_liquidity_discount_rate: float = 0.0,
 ) -> MonthlyLedgerResult:
     horizon = horizon_months
     loan_by_plan_month = {(row.plan_variant, row.month): row for row in loan_visualization}
@@ -84,6 +91,7 @@ def build_projected_monthly_ledger(
     projection_states: list[MonthlyProjectionState] = []
     snapshots: list[AccountSnapshotPoint] = []
     ledger: list[MonthlyLedgerEntry] = []
+    risk_by_plan: dict[str, ProjectionRiskSummary] = {}
     calibrations_by_month = account_calibrations_by_month(household, base_month)
     for plan in purchase_plans:
         plan_vehicle_states = plan_vehicle_states_at(plan, vehicle_states)
@@ -94,7 +102,7 @@ def build_projected_monthly_ledger(
                 vehicle_monthly_cache[month] = vehicle_month_projection_at(plan, plan_vehicle_states, month)
             return vehicle_monthly_cache[month]
 
-        cash_balance = max(0.0, household.cash_account_balance)
+        cash_balance = household.cash_account_balance
         investment_balance = max(0.0, household.investments)
         personal_pension_balance = sum(
             max(0.0, float(getattr(member, "personal_pension_account_balance", 0.0)))
@@ -103,12 +111,32 @@ def build_projected_monthly_ledger(
         )
         offsets = ProjectionOffsets()
         purchase_month = plan.months_to_buy if plan.months_to_buy is not None else 999999
+        renovation_month = (
+            purchase_month + plan.months_to_renovation
+            if plan.renovation_cost > 0 and plan.months_to_renovation is not None
+            else 999999
+        )
+        personal_pension_balances = {
+            index: max(0.0, float(member.personal_pension_account_balance))
+            for index, member in enumerate(household.members)
+            if member.personal_pension_account_enabled
+        }
+        pre_purchase_investment_horizon = (
+            purchase_month
+            if plan.months_to_buy is not None
+            else (12 if plan.source != "baseline" and scenario.enabled else 999999)
+        )
+        worst_cash_balance = cash_balance
+        insolvency_month: int | None = None
+        liquid_assets_exhausted_month: int | None = None
+        terminal_net_worth = 0.0
         for month in range(0, horizon + 1):
             entries: list[MonthlyLedgerEntry] = []
             cash_income = 0.0
             pension_income = 0.0
             living_expense = 0.0
             scheduled_expense = 0.0
+            renovation_expense = 0.0
             child_expense = 0.0
             career_shock_self_payment = 0.0
             debt_payment = 0.0
@@ -146,6 +174,10 @@ def build_projected_monthly_ledger(
             liquidity_sell_proceeds = 0.0
             personal_pension_contribution = 0.0
             personal_pension_return = 0.0
+            personal_pension_withdrawal = 0.0
+            personal_pension_redemption_fee = 0.0
+            personal_pension_withdrawal_tax = 0.0
+            personal_pension_suspended_contribution = 0.0
             pension_account_payout = 0.0
             medical_account_healthcare_payment = 0.0
             medical_account_mutual_aid_payment = 0.0
@@ -173,14 +205,47 @@ def build_projected_monthly_ledger(
             provident_house_payment_relief = 0.0
 
             if month == 0 and provident_cash_receipt:
-                cash_balance = max(0.0, cash_balance + provident_cash_receipt)
+                cash_balance += provident_cash_receipt
 
             if month > 0:
-                profile = income_at_month(month)
-                cash_income = profile.net_income
-                pension_income = profile.pension_income
-                personal_pension_contribution = profile.personal_pension_contribution
-                if personal_pension_balance > 0 or personal_pension_contribution > 0:
+                if member_income_profiles_at is not None and personal_pension_month_at is not None:
+                    member_profiles = member_income_profiles_at(month)
+                    if member_profiles:
+                        cash_income = sum(member_profile.net_income for _, _, member_profile in member_profiles)
+                        pension_income = sum(member_profile.pension_income for _, _, member_profile in member_profiles)
+                        for member_index, _, member_profile in member_profiles:
+                            if member_index >= len(household.members):
+                                continue
+                            member = household.members[member_index]
+                            result = personal_pension_month_at(
+                                member=member,
+                                member_index=member_index,
+                                months_from_now=month,
+                                balance_start=personal_pension_balances.get(member_index, 0.0),
+                                planned_contribution=member_profile.personal_pension_contribution,
+                                planned_tax_saving=member_profile.personal_pension_tax_saving,
+                                cash_balance=cash_balance,
+                                household_monthly_expense=household.monthly_expense,
+                            )
+                            personal_pension_balances[member_index] = result.balance_end
+                            personal_pension_contribution += result.cash_contribution
+                            personal_pension_suspended_contribution += result.suspended_contribution
+                            personal_pension_return += result.investment_return
+                            personal_pension_withdrawal += result.net_withdrawal
+                            personal_pension_redemption_fee += result.redemption_fee
+                            personal_pension_withdrawal_tax += result.withdrawal_tax
+                            cash_income -= result.lost_tax_saving
+                        personal_pension_balance = sum(personal_pension_balances.values())
+                    else:
+                        profile = income_at_month(month)
+                        cash_income = profile.net_income
+                        pension_income = profile.pension_income
+                else:
+                    profile = income_at_month(month)
+                    cash_income = profile.net_income
+                    pension_income = profile.pension_income
+                    personal_pension_contribution = profile.personal_pension_contribution
+                if personal_pension_month_at is None and (personal_pension_balance > 0 or personal_pension_contribution > 0):
                     personal_pension_monthly_return = weighted_personal_pension_monthly_return(
                         household.members,
                         personal_pension_balance,
@@ -206,6 +271,8 @@ def build_projected_monthly_ledger(
                 child_expense = household_expense.child_expense
                 career_shock_self_payment = household_expense.career_shock_self_payment
                 total_expense = household_expense.total_expense
+                if month == renovation_month:
+                    renovation_expense = max(0.0, plan.renovation_cost)
                 pension_account_payout = household_expense.pension_account_payout
                 medical_account_healthcare_payment = household_expense.medical_account_healthcare_payment
                 medical_account_mutual_aid_payment = household_expense.medical_account_mutual_aid_payment
@@ -260,10 +327,12 @@ def build_projected_monthly_ledger(
                     monthly_surplus = (
                         cash_income
                         - total_expense
+                        - renovation_expense
                         - personal_pension_contribution
                         - debt_payment
                         - vehicle_total
                         + provident_cash_receipt
+                        + personal_pension_withdrawal
                     )
                     investment_cash_state = apply_purchase_month_investment_cash_state(
                         cash_balance=cash_balance,
@@ -282,6 +351,7 @@ def build_projected_monthly_ledger(
                             required_liquidity_reserve=plan.required_liquidity_reserve,
                             sell_fee_rate=sell_fee_rate,
                             investment_enabled=investment_enabled,
+                            minimum_investment_balance_override=plan.investment_reserve_target,
                         ),
                     )
                     cash_balance = investment_cash_state.cash_balance
@@ -324,11 +394,13 @@ def build_projected_monthly_ledger(
                     monthly_surplus = (
                         cash_income
                         - total_expense
+                        - renovation_expense
                         - personal_pension_contribution
                         - debt_payment
                         - house_payment
                         - vehicle_total
                         + provident_cash_receipt
+                        + personal_pension_withdrawal
                     )
                     investment_cash_state = apply_regular_month_investment_cash_state(
                         cash_balance=cash_balance,
@@ -337,16 +409,32 @@ def build_projected_monthly_ledger(
                         vehicle_down_payment=vehicle_down_payment,
                         reserve_target=investment_reserve_target,
                         monthly_return=monthly_return,
-                        investment_enabled=investment_enabled,
+                        investment_enabled=(
+                            investment_enabled
+                            and not (
+                                renovation_expense > 0
+                                and plan.renovation_funding_mode == "cash_only"
+                            )
+                        ),
                         investment_auto_rebalance=household.investment_auto_rebalance,
                         investment_effective_tax_rate=investment_effective_tax_rate,
                         buy_fee_rate=buy_fee_rate,
                         sell_fee_rate=sell_fee_rate,
-                        allocation_provider=lambda investable_surplus, current_cash_balance, reserve_target: investment_allocation_for_month(
-                            monthly_surplus=investable_surplus,
-                            cash_balance=current_cash_balance,
-                            reserve_target=reserve_target,
-                            household=household,
+                        allocation_provider=lambda investable_surplus, current_cash_balance, reserve_target: tuple(
+                            value
+                            * (
+                                0.0
+                                if 0 <= pre_purchase_investment_horizon - month <= 12
+                                else 0.35
+                                if 12 < pre_purchase_investment_horizon - month <= 24
+                                else 1.0
+                            )
+                            for value in investment_allocation_for_month(
+                                monthly_surplus=investable_surplus,
+                                cash_balance=current_cash_balance,
+                                reserve_target=reserve_target,
+                                household=household,
+                            )
                         ),
                     )
                     cash_balance = investment_cash_state.cash_balance
@@ -361,6 +449,17 @@ def build_projected_monthly_ledger(
                     investment_contribution_base = investment_cash_state.investment_contribution_base
                     investment_contribution_cash_sweep = investment_cash_state.investment_contribution_cash_sweep
                     investment_contribution = investment_cash_state.investment_contribution
+                if renovation_expense:
+                    transaction_cash_out += renovation_expense
+                    entries.extend(
+                        build_monthly_ledger_entries(
+                            MonthlyLedgerEntryInputs(
+                                plan_variant=plan.variant,
+                                month=month,
+                                renovation_expense=renovation_expense,
+                            )
+                        )
+                    )
                 entries.extend(
                     build_monthly_ledger_entries(
                         MonthlyLedgerEntryInputs(
@@ -379,6 +478,10 @@ def build_projected_monthly_ledger(
                             vehicle_operating_cost=vehicle_operating_cost,
                             personal_pension_contribution=personal_pension_contribution,
                             personal_pension_return=personal_pension_return,
+                            personal_pension_withdrawal=personal_pension_withdrawal,
+                            personal_pension_redemption_fee=personal_pension_redemption_fee,
+                            personal_pension_withdrawal_tax=personal_pension_withdrawal_tax,
+                            personal_pension_suspended_contribution=personal_pension_suspended_contribution,
                             investment_contribution=investment_contribution,
                             investment_return=investment_return,
                             investment_tax=investment_tax,
@@ -406,7 +509,10 @@ def build_projected_monthly_ledger(
             fixed_asset_projection = fixed_asset_projection_from_values(
                 month=month,
                 purchase_month=purchase_month,
-                home_total_price=scenario.total_price,
+                home_total_price=(plan.projected_purchase_price or scenario.total_price),
+                property_annual_price_growth_rate=property_annual_price_growth_rate,
+                property_sale_cost_rate=property_sale_cost_rate,
+                property_liquidity_discount_rate=property_liquidity_discount_rate,
                 raw_first_vehicle_asset_value=vehicle_projection.first_asset_value,
                 raw_second_vehicle_asset_value=vehicle_projection.extra_asset_value,
                 raw_vehicle_asset_value=vehicle_projection.total_asset_value,
@@ -455,9 +561,16 @@ def build_projected_monthly_ledger(
             liquid_asset_value = cash_balance + investment_balance
             total_asset_value = cash_balance + investment_balance + provident_balance + personal_pension_balance + fixed_asset_value
             net_worth = total_asset_value - total_loan_balance
+            worst_cash_balance = min(worst_cash_balance, cash_balance)
+            if insolvency_month is None and cash_balance < 0:
+                insolvency_month = month
+            if liquid_assets_exhausted_month is None and cash_balance + investment_balance <= 0:
+                liquid_assets_exhausted_month = month
+            terminal_net_worth = net_worth
             monthly_cash_delta = (
                 cash_income
                 + provident_cash_receipt
+                + personal_pension_withdrawal
                 + (investment_sell_proceeds if month != purchase_month else 0.0)
                 + transaction_cash_in
                 - living_expense
@@ -477,7 +590,7 @@ def build_projected_monthly_ledger(
                 purchase_month=purchase_month if purchase_month < 999999 else None,
                 cash_balance=cash_balance,
                 monthly_cash_delta=monthly_cash_delta,
-                monthly_expense=(living_expense + scheduled_expense + child_expense + career_shock_self_payment + debt_payment + house_payment + vehicle_payment + vehicle_operating_cost),
+                monthly_expense=(living_expense + scheduled_expense + renovation_expense + child_expense + career_shock_self_payment + debt_payment + house_payment + vehicle_payment + vehicle_operating_cost),
                 cash_income=cash_income,
                 total_loan_balance=total_loan_balance,
                 vehicle_asset_value=vehicle_asset_value,
@@ -504,6 +617,7 @@ def build_projected_monthly_ledger(
                 pension_income=pension_income,
                 living_expense=living_expense,
                 scheduled_expense=scheduled_expense,
+                renovation_expense=renovation_expense,
                 child_expense=child_expense,
                 career_shock_self_payment=career_shock_self_payment,
                 debt_payment=debt_payment,
@@ -542,6 +656,10 @@ def build_projected_monthly_ledger(
                 personal_pension_contribution=personal_pension_contribution,
                 personal_pension_return=personal_pension_return,
                 personal_pension_balance=personal_pension_balance,
+                personal_pension_withdrawal=personal_pension_withdrawal,
+                personal_pension_redemption_fee=personal_pension_redemption_fee,
+                personal_pension_withdrawal_tax=personal_pension_withdrawal_tax,
+                personal_pension_suspended_contribution=personal_pension_suspended_contribution,
                 provident_deposit=provident_deposit,
                 provident_withdrawal=provident_cash_receipt,
                 transaction_cash_out=transaction_cash_out,
@@ -554,10 +672,18 @@ def build_projected_monthly_ledger(
             )
             projection_states.append(state)
             snapshots.append(account_snapshot_from_state(state))
+        risk_by_plan[plan.variant] = ProjectionRiskSummary(
+            cash_shortfall=round(max(0.0, -worst_cash_balance), 2),
+            insolvency_month=insolvency_month,
+            liquid_assets_exhausted_month=liquid_assets_exhausted_month,
+            worst_cash_balance=round(worst_cash_balance, 2),
+            terminal_net_worth=round(terminal_net_worth, 2),
+        )
     return MonthlyLedgerResult(
         projection_states=projection_states,
         account_snapshots=snapshots,
         ledger_entries=ledger,
+        risk_by_plan=risk_by_plan,
     )
 
 
@@ -581,9 +707,14 @@ def build_projected_monthly_ledger_from_context(
     regular_debt_payment_at: Callable[[HouseholdData, int], float],
     investment_effective_tax_rate: float,
     weighted_personal_pension_monthly_return: Callable[[Sequence[IncomeMember], float], float],
+    member_income_profiles_at: Callable[[int], list[tuple[int, str, MonthlyIncomeProfileLike]]] | None = None,
+    personal_pension_month_at: Callable[..., PersonalPensionMonthResultLike] | None = None,
     investment_withdrawal_at_purchase: Callable[..., InvestmentWithdrawalLike],
     investment_allocation_for_month: Callable[..., tuple[float, float]],
     monthly_happiness_score: Callable[..., float],
+    property_annual_price_growth_rate: float = 0.0,
+    property_sale_cost_rate: float = 0.0,
+    property_liquidity_discount_rate: float = 0.0,
 ) -> MonthlyLedgerResult:
     ledger_context = MonthlyLedgerProjectionContext(
         household=household,
@@ -595,6 +726,17 @@ def build_projected_monthly_ledger_from_context(
         vehicle_states_provider=vehicle_states_provider,
         vehicle_month_projection_provider=vehicle_month_projection_provider,
     )
+    member_profile_cache: dict[int, list[tuple[int, str, MonthlyIncomeProfileLike]]] = {}
+
+    def cached_member_income_profiles_at(
+        month: int,
+    ) -> list[tuple[int, str, MonthlyIncomeProfileLike]]:
+        if member_income_profiles_at is None:
+            return []
+        if month not in member_profile_cache:
+            member_profile_cache[month] = member_income_profiles_at(month)
+        return member_profile_cache[month]
+
     return build_projected_monthly_ledger(
         household,
         scenario,
@@ -614,7 +756,14 @@ def build_projected_monthly_ledger_from_context(
         regular_debt_payment_at=regular_debt_payment_at,
         investment_effective_tax_rate=investment_effective_tax_rate,
         weighted_personal_pension_monthly_return=weighted_personal_pension_monthly_return,
+        member_income_profiles_at=(
+            cached_member_income_profiles_at if member_income_profiles_at is not None else None
+        ),
+        personal_pension_month_at=personal_pension_month_at,
         investment_withdrawal_at_purchase=investment_withdrawal_at_purchase,
         investment_allocation_for_month=investment_allocation_for_month,
         monthly_happiness_score=monthly_happiness_score,
+        property_annual_price_growth_rate=property_annual_price_growth_rate,
+        property_sale_cost_rate=property_sale_cost_rate,
+        property_liquidity_discount_rate=property_liquidity_discount_rate,
     )

@@ -13,6 +13,7 @@ from ..domain.investments import (
     investment_effective_tax_rate,
     investment_withdrawal_at_purchase,
 )
+from ..domain.personal_pension import project_personal_pension_month
 from ..domain.scoring import monthly_happiness_score
 from ..domain.vehicles import calculate_car_loan_summary
 from ..schemas import (
@@ -32,6 +33,7 @@ from ..strategies.home_provident_strategy import (
     is_beijing_pf_offset_month,
     pf_strategy_active_mode,
 )
+from ..policies import get_policy
 from ..strategies.vehicle import vehicle_loan_states
 from ..tax_engine import (
     _weighted_personal_pension_monthly_return,
@@ -264,6 +266,7 @@ def build_monthly_ledger_projection(
         vehicle_states=base_vehicle_states,
         rules=rules,
     )
+    property_terminal_value_policy = get_policy(rules).property_terminal_value_policy()
     return build_projected_monthly_ledger_from_context(
         household,
         scenario,
@@ -276,7 +279,7 @@ def build_monthly_ledger_projection(
         base_month=base_month,
         horizon_months=horizon,
         initial_provident_balance=build_household_initial_provident_balance(household, rules),
-        income_provider=lambda month: household_monthly_income_profile_at(household, rules, month),
+        income_provider=lambda month: household_monthly_income_profile_at(household, rules, month, as_of=base_month),
         expense_provider=lambda month: monthly_household_expense_breakdown_at(
             household,
             month,
@@ -298,9 +301,23 @@ def build_monthly_ledger_projection(
         regular_debt_payment_at=regular_debt_payment_at,
         investment_effective_tax_rate=investment_effective_tax_rate(household),
         weighted_personal_pension_monthly_return=_weighted_personal_pension_monthly_return,
+        member_income_profiles_at=lambda month: member_monthly_income_profiles_at(
+            household,
+            rules,
+            month,
+            as_of=base_month,
+        ),
+        personal_pension_month_at=lambda **kwargs: project_personal_pension_month(
+            rules=rules,
+            base_month=base_month,
+            **kwargs,
+        ),
         investment_withdrawal_at_purchase=investment_withdrawal_at_purchase,
         investment_allocation_for_month=investment_allocation_for_month,
         monthly_happiness_score=monthly_happiness_score,
+        property_annual_price_growth_rate=property_terminal_value_policy.annual_price_growth_rate,
+        property_sale_cost_rate=property_terminal_value_policy.sale_cost_rate,
+        property_liquidity_discount_rate=property_terminal_value_policy.liquidity_discount_rate,
     )
 
 

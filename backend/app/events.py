@@ -12,6 +12,7 @@ from .schemas import (
     CalculationContextSnapshot,
     HouseholdData,
     IncomeStageData,
+    MarketSnapshotData,
     MonthlyCashflowPoint,
     PlanEventPoint,
     ProvidentVisualizationPoint,
@@ -20,6 +21,7 @@ from .schemas import (
     ScenarioData,
 )
 from .strategies.home_events import purchase_plan_events
+from .domain.property_valuation import estimate_property_value, projected_purchase_price
 from .strategies.vehicle import vehicle_events_for_plan
 
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
@@ -325,6 +327,10 @@ def planning_goal_constraint_events(
     }
     events: list[PlanEventPoint] = []
     for goal in calculation_context.planning_goals:
+        # 已启用装修目标由购房策略按真实买入月和资金可达月生成唯一事件，
+        # 避免这里再按静态约束月份生成一条重复装修事件。
+        if goal.goal_type == "renovation" and goal.normalized_timing_mode != "not_planned":
+            continue
         if goal.normalized_timing_mode == "not_planned":
             month = 0
             severity = "info"
@@ -370,6 +376,7 @@ def build_plan_events(
     retirement_window_end: int,
     vehicle_loan_states_for_plan: Callable[[PurchasePlanAnalysis], list[VehicleLoanState]],
     calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[PlanEventPoint]:
     monthly_by_plan_month = {(row.plan_variant, row.month): row for row in monthly_cashflow}
     provident_by_plan = {
@@ -436,6 +443,35 @@ def build_plan_events(
             events.append(retirement_event)
 
         if plan.source != "baseline":
+            if market_snapshot is not None and plan.property_price_forecast_applied:
+                valuation = estimate_property_value(scenario, market_snapshot, valuation_date=current_month)
+                forecast_end = plan.months_to_buy if plan.months_to_buy is not None else 60
+                forecast_months = sorted({0, forecast_end, *range(12, max(12, forecast_end) + 1, 12)})
+                for forecast_month in forecast_months:
+                    if forecast_month > forecast_end:
+                        continue
+                    expected_price, lower_price, upper_price = projected_purchase_price(
+                        valuation,
+                        asking_price=scenario.total_price,
+                        month=forecast_month,
+                    )
+                    change = expected_price - scenario.total_price
+                    events.append(
+                        PlanEventPoint(
+                            plan_variant=plan.variant,
+                            month=forecast_month,
+                            category="property_market",
+                            title="目标房源价格监测" if forecast_month == 0 else "目标房源价格预测更新",
+                            detail=(
+                                f"预计交易预算 {expected_price:,.0f} 元，区间 {lower_price:,.0f}—{upper_price:,.0f} 元，"
+                                f"相对当前目标报价 {'增加' if change >= 0 else '减少'} {abs(change):,.0f} 元。"
+                                "短期信号会逐步衰减，不按当前涨跌幅长期外推。"
+                            ),
+                            amount=expected_price,
+                            severity="warning" if expected_price > scenario.total_price * 1.05 else "info",
+                            source="property_valuation",
+                        )
+                    )
             purchase_point = (
                 monthly_by_plan_month.get((plan.variant, plan.months_to_buy))
                 if plan.months_to_buy is not None
@@ -456,6 +492,7 @@ def build_plan_events(
         "vehicle": 3,
         "child": 4,
         "home_purchase": 5,
+        "property_market": 5,
         "loan": 6,
         "provident": 7,
         "renovation": 8,
@@ -478,6 +515,7 @@ def build_plan_events_from_context(
     vehicle_loan_states_for_plan: Callable[[PurchasePlanAnalysis], list[VehicleLoanState]],
     as_of: date | None = None,
     calculation_context: CalculationContextSnapshot | None = None,
+    market_snapshot: MarketSnapshotData | None = None,
 ) -> list[PlanEventPoint]:
     base = as_of or date.today()
     current_month = date(base.year, base.month, 1)
@@ -493,4 +531,5 @@ def build_plan_events_from_context(
         retirement_window_end=retirement_window_end_provider(household, current_month),
         vehicle_loan_states_for_plan=vehicle_loan_states_for_plan,
         calculation_context=calculation_context,
+        market_snapshot=market_snapshot,
     )

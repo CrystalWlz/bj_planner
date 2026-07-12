@@ -10,7 +10,7 @@ from .domain.housing import (
     provident_repayment_method,
 )
 from .domain.loans import commercial_repayment_method, loan_summary
-from .schemas import CarLoanSummary, CarPlanData, HouseholdData, LoanSummary
+from .schemas import CarLoanSummary, CarPlanData, HouseholdData, LoanSummary, PurchasePlanAnalysis
 from .schemas import MarketSnapshotData, RulePackData, ScenarioData
 
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
@@ -34,6 +34,25 @@ class HomeLoanSummaryContext:
     commercial: LoanSummary | None
     provident: LoanSummary | None
     provident_year_reasons: list[str]
+
+
+def recommended_plan_status(plans: list[PurchasePlanAnalysis]) -> tuple[str, str]:
+    home_plans = [plan for plan in plans if plan.source != "baseline"]
+    recommended = next((plan for plan in home_plans if plan.is_recommended), None)
+    if recommended is None:
+        return (
+            "无可行方案",
+            "当前没有通过现金安全、长期偿付能力和流动资产耗尽检查的购房方案；建议延后买入、降低总价或保持不买房基线。",
+        )
+    if recommended.insolvency_month is not None or recommended.cash_shortfall > 0:
+        return "不可行", "推荐候选出现长期现金缺口，已被排除，不能作为执行方案。"
+    if recommended.liquid_assets_exhausted_month is not None:
+        return "不可行", "推荐候选会耗尽全部流动资产，不能作为执行方案。"
+    if not recommended.liquidity_ok or not recommended.cash_stress_ok:
+        return "不可行", "推荐候选未通过交易安全垫或买后现金压力检查。"
+    if recommended.emergency_reserve_coverage_months < 6:
+        return "谨慎可行", "推荐方案可执行，但交易后的应急金覆盖月数低于六个月。"
+    return "可行", "推荐方案已通过交易现金、长期现金流和流动资产安全检查。"
 
 
 def home_loan_summaries(

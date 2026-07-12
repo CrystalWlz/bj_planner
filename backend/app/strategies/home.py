@@ -15,15 +15,20 @@ from ..domain.housing import (
     provident_repayment_method as scenario_provident_repayment_method,
     is_new_home_property,
     is_second_hand_property,
+    seller_tax_pass_through_amount,
 )
+from ..domain.property_valuation import estimate_property_value, projected_purchase_price
 from ..domain.investments import (
     future_cash_value,
     future_cash_value_with_schedule,
+    investment_effective_tax_rate,
     investment_allocation_for_month,
-    investment_withdrawal_at_purchase,
     investment_withdrawal_mode,
+    risk_adjusted_investment_return,
+    investment_withdrawal_at_purchase,
     investment_withdrawal_mode_label,
 )
+from ..domain.goal_tradeoffs import resolve_goal_tradeoff_preference
 from ..domain.loans import (
     LoanComputation,
     calculate_loan,
@@ -48,6 +53,7 @@ from ..projection.provident import (
 )
 from ..policy_explanations import market_assumption_note, policy_source_note, user_config_note
 from ..policies import get_policy
+from ..profiling import profile_span
 from ..schemas import (
     CarLoanSummary,
     CarPlanData,
@@ -56,6 +62,7 @@ from ..schemas import (
     HouseholdData,
     LoanSummary,
     MarketSnapshotData,
+    PropertyValuationData,
     PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
@@ -64,7 +71,6 @@ from .home_commercial_prepayment import (
     build_commercial_prepayment_plan,
     choose_auto_commercial_prepayment,
 )
-from .home_recommendations import with_purchase_plan_recommendations
 
 from .home_provident_strategy import (
     effective_pf_account_strategy,
@@ -82,6 +88,7 @@ class MonthlyIncomeProfileLike(Protocol):
     net_income: float
     monthly_pf_deposit: float
     personal_pension_contribution: float
+    other_cash_outflow: float
 
 
 class TaxSummaryLike(Protocol):
@@ -97,6 +104,19 @@ class ProvidentRepaymentChoice:
     selected_payment: LoanComputation
     interest_saving_if_equal_principal: float
     equal_principal_extra_first_payment: float
+
+
+@dataclass(frozen=True)
+class LoanRepaymentCombinationChoice:
+    commercial_equal_installment: LoanComputation
+    commercial_equal_principal: LoanComputation
+    provident_equal_installment: LoanComputation
+    provident_equal_principal: LoanComputation
+    commercial_method: str
+    provident_method: str
+    commercial_payment: LoanComputation
+    provident_payment: LoanComputation
+    free_cash_flow_after_relief: float
 
 
 @dataclass(frozen=True)
@@ -119,12 +139,16 @@ class PurchaseVariantSpec:
 @dataclass(frozen=True)
 class PurchaseCandidate:
     purchase_month: int
+    purchase_price: float
+    purchase_price_lower: float
+    purchase_price_upper: float
     mix: tuple[float, float, float, float, float, float, float]
     pf_upfront_extractable: float
     family_pf_upfront_extractable: float
     pf_post_transaction_extractable: float
     cash_account_before_purchase: float
     investment_balance_before_purchase: float
+    investment_reserve_target: float
     investment_sell_gross_at_purchase: float
     investment_sell_proceeds_at_purchase: float
     investment_balance_after_purchase: float
@@ -172,10 +196,50 @@ class PurchasePlanningContext:
     cash_value_by_month: list[float] = field(default_factory=list)
     investment_value_by_month: list[float] = field(default_factory=list)
     pf_value_by_month: list[float] = field(default_factory=list)
+    property_valuation: PropertyValuationData | None = None
     _expense_cache: dict[int, float] = field(default_factory=dict)
     _income_cache: dict[int, MonthlyIncomeProfileLike] = field(default_factory=dict)
     _car_cost_cache: dict[int, float] = field(default_factory=dict)
     _car_down_payment_cache: dict[int, float] = field(default_factory=dict)
+    _scenario_by_month_cache: dict[int, ScenarioData] = field(default_factory=dict)
+    _transaction_cost_cache: dict[int, float] = field(default_factory=dict)
+
+    def property_price_at_month(self, month: int) -> tuple[float, float, float]:
+        if self.property_valuation is None:
+            price = max(0.0, self.scenario.total_price)
+            return price, price, price
+        return projected_purchase_price(
+            self.property_valuation,
+            asking_price=self.scenario.total_price,
+            month=month,
+        )
+
+    def scenario_at_month(self, month: int) -> ScenarioData:
+        safe_month = max(0, int(month))
+        if safe_month not in self._scenario_by_month_cache:
+            price, _, _ = self.property_price_at_month(safe_month)
+            self._scenario_by_month_cache[safe_month] = self.scenario.model_copy(update={"total_price": price})
+        return self._scenario_by_month_cache[safe_month]
+
+    def transaction_cost_at_month(self, month: int, fallback: float) -> float:
+        safe_month = max(0, int(month))
+        if self.property_valuation is None:
+            return max(0.0, fallback)
+        if safe_month not in self._transaction_cost_cache:
+            scenario = self.scenario_at_month(safe_month)
+            _, _, deed_tax, broker_fee = housing_transaction_rate_amounts(
+                self.household,
+                scenario,
+                self.rules,
+                self.market_snapshot,
+            )
+            self._transaction_cost_cache[safe_month] = (
+                deed_tax
+                + broker_fee
+                + seller_tax_pass_through_amount(scenario, self.rules, self.market_snapshot)
+                + scenario.moving_and_misc_cost
+            )
+        return self._transaction_cost_cache[safe_month]
 
     def expense_at_month(self, month: int, home_purchase_month: int | None = None) -> float:
         cache_key = (home_purchase_month if home_purchase_month is not None else -1) * 10000 + month
@@ -226,13 +290,14 @@ class PurchasePlanningContext:
         taxes_and_fees: float,
         target_commercial_loan: float | None = None,
     ) -> tuple[float, float, float, float, float, float, float]:
+        scenario = self.scenario_at_month(purchase_months)
         return purchase_financing_mix(
             household=self.household,
-            scenario=self.scenario,
+            scenario=scenario,
             rules=self.rules,
             variant_spec=variant_spec,
             purchase_months=purchase_months,
-            taxes_and_fees=taxes_and_fees,
+            taxes_and_fees=self.transaction_cost_at_month(purchase_months, taxes_and_fees),
             monthly_income_for_capacity=self.income_at_month(purchase_months).gross_income,
             target_commercial_loan=target_commercial_loan,
         )
@@ -241,7 +306,9 @@ class PurchasePlanningContext:
         self,
         candidate_month: int,
         mix: tuple[float, float, float, float, float, float, float],
+        minimum_investment_balance: float | None = None,
     ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
+        scenario = self.scenario_at_month(candidate_month)
         return purchase_cash_state_at_month(
             month=candidate_month,
             upfront_cash_required=mix[6],
@@ -254,15 +321,48 @@ class PurchasePlanningContext:
             monthly_pf_net_growth=self.monthly_pf_net_growth,
             monthly_pf_net_growth_at=self.monthly_pf_net_growth_at,
             annual_return=self.scenario.annual_investment_return,
-            property_price=self.scenario.total_price,
-            scenario=self.scenario,
+            property_price=scenario.total_price,
+            scenario=scenario,
             initial_provident_balance=self.initial_provident_balance,
             monthly_household_expense_at=self.expense_at_month,
             family_down_payment_upfront_support=self.family_down_payment_upfront_support,
             cash_value_by_month=self.cash_value_by_month,
             investment_value_by_month=self.investment_value_by_month,
             pf_value_by_month=self.pf_value_by_month,
+            minimum_investment_balance=minimum_investment_balance,
         )
+
+    def investment_reserve_targets(
+        self,
+        investment_before_purchase: float,
+        required_liquidity_reserve: float,
+    ) -> list[float]:
+        """Small, explicit reserve frontier for an otherwise automatic sale.
+
+        Retained investments are only considered when their conservative,
+        after-tax return clears the certain commercial-loan cost.  They still
+        must pass the same cash and long-horizon ledger gates as every other
+        candidate.
+        """
+        available = max(0.0, investment_before_purchase)
+        mode = investment_withdrawal_mode(self.scenario)
+        if available <= 0 or mode == "full_liquidation":
+            return [0.0]
+        if mode == "manual_reserve":
+            return [min(available, max(0.0, self.scenario.investment_min_balance_after_purchase))]
+        commercial_rate = commercial_loan_rate(self.scenario, self.market_snapshot)
+        conservative_return = risk_adjusted_investment_return(
+            self.household,
+            self.scenario.annual_investment_return,
+        )
+        if conservative_return <= commercial_rate + 0.005:
+            return [0.0]
+        targets = {
+            0.0,
+            min(available * 0.10, required_liquidity_reserve * 0.5),
+            min(available * 0.20, required_liquidity_reserve),
+        }
+        return sorted(target for target in targets if target >= 0.0)
 
     def cash_stress_for_mix(
         self,
@@ -280,7 +380,7 @@ class PurchasePlanningContext:
     ) -> tuple[float, int | None, bool]:
         return cash_stress_for_financing_mix(
             household=self.household,
-            scenario=self.scenario,
+            scenario=self.scenario_at_month(candidate_month),
             rules=self.rules,
             purchase_month=candidate_month,
             financing_mix=mix,
@@ -291,7 +391,7 @@ class PurchasePlanningContext:
             commercial_repayment_method=commercial_repayment_method,
             provident_repayment_method=provident_repayment_method,
             commercial_prepayment_mode=commercial_prepayment_mode,
-            expense_at_month=self.expense_at_month,
+            expense_at_month=lambda month: self.expense_at_month(month, candidate_month),
             income_at_month=self.income_at_month,
             car_monthly_cash_cost_at=self.car_monthly_cash_cost_at,
             car_down_payment_at=self.car_down_payment_at,
@@ -351,12 +451,21 @@ class PurchasePlanningContext:
             micro_ratio_candidates=micro_ratio_candidates,
             search_start_month=search_start_month,
             search_end_month=search_end_month,
-            price=self.scenario.total_price,
+            price_at_month=self.property_price_at_month,
             target_commercial_loan=target_commercial_loan,
             compute_mix_at=compute_mix_at,
             purchase_state_for_mix=self.purchase_state_for_mix,
+            investment_reserve_targets=self.investment_reserve_targets,
             cash_stress_for_mix=cash_stress_for_candidate,
             expense_at_month=self.expense_at_month,
+            timing_utility_weight=resolve_goal_tradeoff_preference(
+                self.household,
+                expected_investment_return=self.scenario.annual_investment_return,
+                urgency_months=search_start_month,
+                priority=self.scenario.purchase_sequence,
+                life_utility_score=self.scenario.happiness_score,
+                cash_reserve_gap=max(0.0, self.required_liquidity_reserve - self.initial_cash),
+            ).timing_weight,
         )
 
 
@@ -432,7 +541,7 @@ def build_purchase_funding_projection(
     monthly_cash_savings_at: Callable[[int], float],
     monthly_household_expense_at: Callable[[int], float],
     monthly_pf_net_growth_at: Callable[[int], float],
-    horizon_months: int = 360,
+    horizon_months: int = 60,
 ) -> tuple[list[float], list[float], list[float]]:
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
     sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
@@ -516,6 +625,11 @@ def build_purchase_planning_context(
         car_down_payment_provider=car_down_payment_provider,
         family_down_payment_upfront_support=family_down_payment_upfront_support,
         initial_provident_balance=initial_provident_balance,
+        property_valuation=(
+            estimate_property_value(scenario, market_snapshot)
+            if market_snapshot is not None and scenario.total_price > 0
+            else None
+        ),
     )
     context.current_monthly_expense = context.expense_at_month(0)
     context.required_liquidity_reserve = max(
@@ -546,6 +660,7 @@ def build_purchase_planning_context(
         monthly_cash_savings_at=context.monthly_cash_savings_at,
         monthly_household_expense_at=context.expense_at_month,
         monthly_pf_net_growth_at=context.monthly_pf_net_growth_at,
+        horizon_months=360,
     )
     return context
 
@@ -620,19 +735,34 @@ def cash_stress_for_financing_mix(
     car_down_payment_at: Callable[[int], float],
     strategy_preference: str,
     market_snapshot: MarketSnapshotData | None = None,
+    horizon_months: int = 360,
 ) -> tuple[float, int | None, bool]:
-    commercial_payment = calculate_loan(
-        financing_mix[4],
-        commercial_loan_rate(scenario, market_snapshot),
-        scenario.loan_years,
-        commercial_repayment_method,
+    post_purchase_income = income_at_month(purchase_month)
+    repayment_choice = choose_loan_repayment_combination(
+        household=household,
+        scenario=scenario,
+        rules=rules,
+        commercial_loan=financing_mix[4],
+        commercial_rate=commercial_loan_rate(scenario, market_snapshot),
+        provident_loan=financing_mix[5],
+        provident_rate=effective_provident_rate,
+        provident_loan_years=provident_loan_years,
+        use_manual_mix=scenario.loan_repayment_strategy_mode == "manual",
+        post_purchase_income_net=post_purchase_income.net_income,
+        post_purchase_pf_deposit=post_purchase_income.monthly_pf_deposit,
+        post_purchase_monthly_expense=expense_at_month(purchase_month),
+        post_purchase_car_cost=car_monthly_cash_cost_at(purchase_month),
+        immediate_commercial_prepayment=(
+            max(0.0, scenario.commercial_prepayment_monthly_amount)
+            if commercial_prepayment_mode == "manual" and financing_mix[4] > 0
+            else 0.0
+        ),
+        purchase_month=purchase_month,
+        starting_pf_balance=starting_pf_balance,
+        strategy_preference=strategy_preference,
     )
-    provident_payment = calculate_loan(
-        financing_mix[5],
-        effective_provident_rate,
-        provident_loan_years,
-        provident_repayment_method,
-    )
+    commercial_payment = repayment_choice.commercial_payment
+    provident_payment = repayment_choice.provident_payment
     commercial_prepayment_allowed_after_month = max(
         1,
         min(scenario.loan_years * 12, scenario.commercial_prepayment_allowed_after_month),
@@ -661,6 +791,11 @@ def cash_stress_for_financing_mix(
         extra_monthly_payment=commercial_prepayment,
         extra_payment_start_month=commercial_prepayment_start_month,
         strategy_preference=strategy_preference,
+        horizon_months=max(
+            horizon_months,
+            scenario.loan_years * 12,
+            provident_loan_years * 12,
+        ),
     )
 
 
@@ -752,22 +887,40 @@ def build_renovation_funding_plan(
     scenario: ScenarioData,
     *,
     cash_after_purchase: float,
+    investment_balance_after_purchase: float,
+    investment_reserve_target: float,
     required_liquidity_reserve: float,
     post_purchase_cash_flow: float,
 ) -> RenovationFundingPlan:
-    included_upfront = scenario.renovation_funding_mode == "upfront_cash"
+    included_upfront = False
     saving_months: int | None = 0
     monthly_saving = 0.0
-    if not included_upfront and scenario.renovation_cost > 0:
+    if scenario.renovation_cost > 0:
         monthly_saving = max(0.0, post_purchase_cash_flow)
-        immediate_renovation_cash = max(0.0, cash_after_purchase - required_liquidity_reserve)
-        renovation_remaining = max(0.0, scenario.renovation_cost - immediate_renovation_cash)
-        if renovation_remaining <= 0:
-            saving_months = 0
-        elif monthly_saving > 0:
-            saving_months = ceil(renovation_remaining / monthly_saving)
+        cash_available = max(0.0, cash_after_purchase - required_liquidity_reserve)
+        investment_available = max(0.0, investment_balance_after_purchase - investment_reserve_target)
+        if scenario.renovation_funding_mode == "cash_only":
+            immediate_available = cash_available
+        elif scenario.renovation_funding_mode == "after_goal_saving":
+            immediate_available = 0.0
         else:
+            immediate_available = cash_available + investment_available
+        renovation_remaining = max(0.0, scenario.renovation_cost - immediate_available)
+        if renovation_remaining <= 0:
+            funding_ready_months = 0
+        elif monthly_saving > 0:
+            funding_ready_months = ceil(renovation_remaining / monthly_saving)
+        else:
+            funding_ready_months = None
+        if funding_ready_months is None:
             saving_months = None
+        else:
+            # 独立装修事件最早发生在购房完成后的下一个月，并同时服从目标依赖等待期。
+            saving_months = max(
+                1,
+                scenario.renovation_delay_after_purchase_months,
+                funding_ready_months,
+            )
     return RenovationFundingPlan(
         included_upfront=included_upfront,
         saving_months=saving_months,
@@ -798,6 +951,32 @@ def provident_repayment_advice(
     return (
         f"等额本金可少付公积金利息约 {round(provident_interest_saving_if_equal_principal)}，"
         f"但首月现金压力增加约 {round(equal_principal_extra_first_payment)}，当前现金流不宜自动切换。"
+    )
+
+
+def commercial_repayment_advice(
+    *,
+    commercial_loan: float,
+    selected_method: str,
+    equal_principal_extra_first_payment: float,
+    interest_saving_if_equal_principal: float,
+    equal_principal_cash_flow: float,
+) -> str:
+    if commercial_loan <= 0:
+        return "本方案不使用商业贷款，无需比较商贷还款方式。"
+    if selected_method == "equal_principal":
+        return (
+            f"商贷已由策略选择等额本金；相比等额本息首月多付约 {round(equal_principal_extra_first_payment)}，"
+            f"预计少付总利息约 {round(interest_saving_if_equal_principal)}，本金下降更快。"
+        )
+    if equal_principal_cash_flow >= 0:
+        return (
+            f"商贷若改为等额本金，首月多付约 {round(equal_principal_extra_first_payment)}，"
+            f"预计少付利息约 {round(interest_saving_if_equal_principal)}；当前组合仍优先保留更稳定的月现金缓冲。"
+        )
+    return (
+        f"商贷等额本金预计可少付利息约 {round(interest_saving_if_equal_principal)}，"
+        f"但首月多付约 {round(equal_principal_extra_first_payment)}，会使自由现金流转负，因此采用等额本息。"
     )
 
 
@@ -990,12 +1169,10 @@ def build_purchase_happiness_breakdown(
                 "note": (
                     "未设置装修预算。"
                     if scenario.renovation_cost <= 0
-                    else "装修资金已计入交易现金。"
-                    if renovation_included_upfront
                     else (
                         "买后现金流暂不足以估算装修启动时间。"
                         if renovation_saving_months is None
-                        else f"预计买后 {renovation_saving_months} 个月可启动装修。"
+                        else f"独立装修事件预计在买后第 {renovation_saving_months} 个月执行。"
                     )
                 ),
             },
@@ -1022,103 +1199,265 @@ def find_purchase_candidate(
     micro_ratio_candidates: list[float],
     search_start_month: int,
     search_end_month: int | None,
-    price: float,
+    price_at_month: Callable[[int], tuple[float, float, float]],
     target_commercial_loan: float,
     compute_mix_at: Callable[[int, float], tuple[float, float, float, float, float, float, float]],
     purchase_state_for_mix: Callable[
-        [int, tuple[float, float, float, float, float, float, float]],
+        [int, tuple[float, float, float, float, float, float, float], float | None],
         tuple[float, float, float, float, float, float, float, float, float, float, float],
     ],
+    investment_reserve_targets: Callable[[float, float], list[float]],
     cash_stress_for_mix: Callable[
         [int, tuple[float, float, float, float, float, float, float], float, float],
         tuple[float, int | None, bool],
     ],
     expense_at_month: Callable[[int], float],
+    timing_utility_weight: float = 0.5,
     horizon_months: int = 360,
 ) -> PurchaseCandidateSearchResult:
     best_failed_result: PurchaseCandidate | None = None
     best_failed_rank: tuple[float, int, float] | None = None
-    selected_candidate: PurchaseCandidate | None = None
+    transaction_candidates: list[PurchaseCandidate] = []
     effective_horizon_months = min(horizon_months, max(0, search_end_month)) if search_end_month is not None else horizon_months
     fallback_month = max(0, min(max(search_start_month, 0), effective_horizon_months))
 
-    for candidate_month in range(search_start_month, effective_horizon_months + 1):
-        required_liquidity_reserve = max(
-            0.0,
-            expense_at_month(candidate_month) * household.required_liquidity_months,
-        )
-        candidate_targets = (
-            [price * ratio for ratio in micro_ratio_candidates]
-            if variant_spec.use_micro_strategy
-            else [target_commercial_loan]
-        )
-        for commercial_target in candidate_targets:
-            candidate_mix = compute_mix_at(candidate_month, commercial_target)
-            (
-                candidate_pf_upfront,
-                candidate_family_pf_upfront,
-                candidate_pf_post,
-                candidate_cash_before_purchase,
-                candidate_investment_before_purchase,
-                candidate_investment_sell_gross,
-                candidate_investment_sell_proceeds,
-                candidate_investment_after_purchase,
-                candidate_cash_after_transaction,
-                candidate_cash_after_purchase,
-                candidate_pf_after_extract,
-            ) = purchase_state_for_mix(candidate_month, candidate_mix)
-            transaction_shortfall = max(0.0, required_liquidity_reserve - candidate_cash_after_transaction)
-            if transaction_shortfall > 0:
-                candidate_minimum_cash_balance = min(candidate_cash_after_transaction, candidate_cash_after_purchase)
-                candidate_minimum_cash_balance_month = candidate_month
-                candidate_cash_stress_ok = False
-            else:
-                (
-                    candidate_minimum_cash_balance,
-                    candidate_minimum_cash_balance_month,
-                    candidate_cash_stress_ok,
-                ) = cash_stress_for_mix(
+    with profile_span(f"candidate_enumeration:{variant_spec.name}"):
+        for candidate_month in range(search_start_month, effective_horizon_months + 1):
+            candidate_price, candidate_price_lower, candidate_price_upper = price_at_month(candidate_month)
+            required_liquidity_reserve = max(
+                0.0,
+                expense_at_month(candidate_month) * household.required_liquidity_months,
+            )
+            candidate_targets = (
+                [candidate_price * ratio for ratio in micro_ratio_candidates]
+                if variant_spec.use_micro_strategy
+                else [target_commercial_loan]
+            )
+            for commercial_target in candidate_targets:
+                candidate_mix = compute_mix_at(candidate_month, commercial_target)
+                base_state = purchase_state_for_mix(candidate_month, candidate_mix, 0.0)
+                for investment_reserve_target in investment_reserve_targets(base_state[4], required_liquidity_reserve):
+                    (
+                        candidate_pf_upfront,
+                        candidate_family_pf_upfront,
+                        candidate_pf_post,
+                        candidate_cash_before_purchase,
+                        candidate_investment_before_purchase,
+                        candidate_investment_sell_gross,
+                        candidate_investment_sell_proceeds,
+                        candidate_investment_after_purchase,
+                        candidate_cash_after_transaction,
+                        candidate_cash_after_purchase,
+                        candidate_pf_after_extract,
+                    ) = (
+                        base_state
+                        if investment_reserve_target <= 0
+                        else purchase_state_for_mix(candidate_month, candidate_mix, investment_reserve_target)
+                    )
+                    transaction_shortfall = max(0.0, required_liquidity_reserve - candidate_cash_after_transaction)
+                    candidate_minimum_cash_balance = min(candidate_cash_after_transaction, candidate_cash_after_purchase)
+                    candidate_minimum_cash_balance_month = candidate_month
+                    candidate_cash_stress_ok = transaction_shortfall <= 0
+                    candidate = PurchaseCandidate(
+                    purchase_month=candidate_month,
+                    purchase_price=candidate_price,
+                    purchase_price_lower=candidate_price_lower,
+                    purchase_price_upper=candidate_price_upper,
+                    mix=candidate_mix,
+                    pf_upfront_extractable=candidate_pf_upfront,
+                    family_pf_upfront_extractable=candidate_family_pf_upfront,
+                    pf_post_transaction_extractable=candidate_pf_post,
+                    cash_account_before_purchase=candidate_cash_before_purchase,
+                    investment_balance_before_purchase=candidate_investment_before_purchase,
+                    investment_reserve_target=investment_reserve_target,
+                    investment_sell_gross_at_purchase=candidate_investment_sell_gross,
+                    investment_sell_proceeds_at_purchase=candidate_investment_sell_proceeds,
+                    investment_balance_after_purchase=candidate_investment_after_purchase,
+                    cash_after_transaction=candidate_cash_after_transaction,
+                    cash_after_purchase=candidate_cash_after_purchase,
+                    pf_after_extract=candidate_pf_after_extract,
+                    minimum_cash_balance=candidate_minimum_cash_balance,
+                    minimum_cash_balance_month=candidate_minimum_cash_balance_month,
+                    cash_stress_ok=candidate_cash_stress_ok,
+                    cash_stress_shortfall=max(transaction_shortfall, -candidate_minimum_cash_balance, 0.0),
+                    )
+                    if candidate.cash_stress_ok:
+                    # Every month, financing mix and investment reserve target
+                    # participates in the transaction frontier.  Only its
+                    # non-dominated representatives need the expensive stress run.
+                        transaction_candidates.append(candidate)
+                        continue
+                    candidate_rank = (
+                    candidate.cash_stress_shortfall,
                     candidate_month,
-                    candidate_mix,
-                    candidate_cash_after_purchase,
-                    candidate_pf_after_extract,
+                    candidate.mix[4],
+                    )
+                    if best_failed_rank is None or candidate_rank < best_failed_rank:
+                        best_failed_rank = candidate_rank
+                        best_failed_result = candidate
+    if transaction_candidates:
+        def dominates(left: PurchaseCandidate, right: PurchaseCandidate) -> bool:
+            left_values = (
+                left.cash_after_transaction,
+                left.investment_balance_after_purchase * 0.75,
+                -left.mix[4],
+            )
+            right_values = (
+                right.cash_after_transaction,
+                right.investment_balance_after_purchase * 0.75,
+                -right.mix[4],
+            )
+            return all(a >= b for a, b in zip(left_values, right_values)) and any(
+                a > b for a, b in zip(left_values, right_values)
+            )
+
+        # The old all-pairs comparison was quadratic and dominated the micro
+        # commercial-loan search once financing and investment-reserve
+        # candidates were combined.  With cash sorted descending, a Fenwick
+        # tree answers whether a prior candidate has both at least as much
+        # retained investment and no more commercial debt in O(log n).
+        investment_levels = sorted(
+            {candidate.investment_balance_after_purchase * 0.75 for candidate in transaction_candidates},
+            reverse=True,
+        )
+        investment_index = {value: index + 1 for index, value in enumerate(investment_levels)}
+        maximum_debt_advantage = [float("-inf")] * (len(investment_levels) + 1)
+
+        def update_frontier(index: int, debt_advantage: float) -> None:
+            while index < len(maximum_debt_advantage):
+                maximum_debt_advantage[index] = max(maximum_debt_advantage[index], debt_advantage)
+                index += index & -index
+
+        def frontier_debt_advantage(index: int) -> float:
+            result = float("-inf")
+            while index > 0:
+                result = max(result, maximum_debt_advantage[index])
+                index -= index & -index
+            return result
+
+        pareto_candidates: list[PurchaseCandidate] = []
+        with profile_span(f"candidate_frontier:{variant_spec.name}"):
+            ordered_candidates = sorted(
+            transaction_candidates,
+            key=lambda item: (
+                item.cash_after_transaction,
+                item.investment_balance_after_purchase * 0.75,
+                -item.mix[4],
+            ),
+                reverse=True,
+            )
+            for candidate in ordered_candidates:
+                retained_investment = candidate.investment_balance_after_purchase * 0.75
+                debt_advantage = -candidate.mix[4]
+                index = investment_index[retained_investment]
+                if frontier_debt_advantage(index) >= debt_advantage:
+                    continue
+                pareto_candidates.append(candidate)
+                update_frontier(index, debt_advantage)
+        earliest_transaction_candidate = min(
+            transaction_candidates,
+            key=lambda candidate: candidate.purchase_month,
+        )
+        if earliest_transaction_candidate not in pareto_candidates:
+            pareto_candidates.append(earliest_transaction_candidate)
+        # Preserve timing alternatives across the whole planning window while
+        # bounding the expensive stress simulation.  The final selected plan
+        # is always re-checked by the full long-horizon ledger.
+        max_stress_candidates = 6
+        if len(pareto_candidates) > max_stress_candidates:
+            ordered = sorted(pareto_candidates, key=lambda candidate: candidate.purchase_month)
+            indexes = {
+                round(index * (len(ordered) - 1) / (max_stress_candidates - 1))
+                for index in range(max_stress_candidates)
+            }
+            pareto_candidates = [candidate for index, candidate in enumerate(ordered) if index in indexes]
+        feasible_candidates: list[PurchaseCandidate] = []
+        with profile_span(f"candidate_stress:{variant_spec.name}"):
+            for candidate in pareto_candidates:
+                minimum_cash, minimum_cash_month, cash_stress_ok = cash_stress_for_mix(
+                candidate.purchase_month,
+                candidate.mix,
+                candidate.cash_after_purchase,
+                candidate.pf_after_extract,
                 )
-            candidate = PurchaseCandidate(
-                purchase_month=candidate_month,
-                mix=candidate_mix,
-                pf_upfront_extractable=candidate_pf_upfront,
-                family_pf_upfront_extractable=candidate_family_pf_upfront,
-                pf_post_transaction_extractable=candidate_pf_post,
-                cash_account_before_purchase=candidate_cash_before_purchase,
-                investment_balance_before_purchase=candidate_investment_before_purchase,
-                investment_sell_gross_at_purchase=candidate_investment_sell_gross,
-                investment_sell_proceeds_at_purchase=candidate_investment_sell_proceeds,
-                investment_balance_after_purchase=candidate_investment_after_purchase,
-                cash_after_transaction=candidate_cash_after_transaction,
-                cash_after_purchase=candidate_cash_after_purchase,
-                pf_after_extract=candidate_pf_after_extract,
-                minimum_cash_balance=candidate_minimum_cash_balance,
-                minimum_cash_balance_month=candidate_minimum_cash_balance_month,
-                cash_stress_ok=candidate_cash_stress_ok and transaction_shortfall <= 0,
-                cash_stress_shortfall=max(transaction_shortfall, -candidate_minimum_cash_balance, 0.0),
-            )
-            if candidate.cash_stress_ok:
-                selected_candidate = candidate
-                break
-            candidate_rank = (
-                candidate.cash_stress_shortfall,
-                candidate_month,
-                candidate.mix[4],
-            )
-            if best_failed_rank is None or candidate_rank < best_failed_rank:
-                best_failed_rank = candidate_rank
-                best_failed_result = candidate
-        if selected_candidate is not None:
+                stressed_candidate = PurchaseCandidate(
+                **{
+                    **candidate.__dict__,
+                    "minimum_cash_balance": minimum_cash,
+                    "minimum_cash_balance_month": minimum_cash_month,
+                    "cash_stress_ok": cash_stress_ok,
+                    "cash_stress_shortfall": max(0.0, -minimum_cash),
+                }
+                )
+                if stressed_candidate.cash_stress_ok:
+                    feasible_candidates.append(stressed_candidate)
+                else:
+                    candidate_rank = (
+                    stressed_candidate.cash_stress_shortfall,
+                    stressed_candidate.purchase_month,
+                    stressed_candidate.mix[4],
+                    )
+                    if best_failed_rank is None or candidate_rank < best_failed_rank:
+                        best_failed_rank = candidate_rank
+                        best_failed_result = stressed_candidate
+        if not feasible_candidates:
             return PurchaseCandidateSearchResult(
-                months=selected_candidate.purchase_month,
-                candidate=selected_candidate,
-                required_liquidity_reserve=required_liquidity_reserve,
+                months=None,
+                candidate=best_failed_result or pareto_candidates[0],
+                required_liquidity_reserve=max(
+                    0.0,
+                    expense_at_month((best_failed_result or pareto_candidates[0]).purchase_month)
+                    * household.required_liquidity_months,
+                ),
             )
+        earliest_month = min(candidate.purchase_month for candidate in feasible_candidates)
+        latest_month = max(candidate.purchase_month for candidate in feasible_candidates)
+        wealth_proxies = [
+            candidate.cash_after_transaction
+            + candidate.investment_balance_after_purchase * 0.75
+            - candidate.mix[4] * 0.05
+            for candidate in feasible_candidates
+        ]
+        min_wealth_proxy = min(wealth_proxies)
+        max_wealth_proxy = max(wealth_proxies)
+        timing_weight = _clamp(timing_utility_weight, 0.05, 0.95)
+
+        def candidate_tradeoff_score(candidate: PurchaseCandidate) -> tuple[float, float, float, float]:
+            speed_score = (
+                1.0
+                if latest_month <= earliest_month
+                else (latest_month - candidate.purchase_month) / (latest_month - earliest_month)
+            )
+            wealth_proxy = (
+                candidate.cash_after_transaction
+                + candidate.investment_balance_after_purchase * 0.75
+                - candidate.mix[4] * 0.05
+            )
+            wealth_score = (
+                1.0
+                if max_wealth_proxy <= min_wealth_proxy
+                else (wealth_proxy - min_wealth_proxy) / (max_wealth_proxy - min_wealth_proxy)
+            )
+            liquidity_coverage = min(
+                2.0,
+                candidate.cash_after_transaction
+                / max(1.0, expense_at_month(candidate.purchase_month) * household.required_liquidity_months),
+            ) / 2
+            tradeoff_score = speed_score * timing_weight + wealth_score * (1 - timing_weight)
+            return tradeoff_score, liquidity_coverage, wealth_score, speed_score
+
+        selected_candidate = max(
+            feasible_candidates,
+            key=candidate_tradeoff_score,
+        )
+        return PurchaseCandidateSearchResult(
+            months=selected_candidate.purchase_month,
+            candidate=selected_candidate,
+            required_liquidity_reserve=max(
+                0.0,
+                expense_at_month(selected_candidate.purchase_month) * household.required_liquidity_months,
+            ),
+        )
 
     if best_failed_result is not None:
         return PurchaseCandidateSearchResult(
@@ -1130,7 +1469,8 @@ def find_purchase_candidate(
             ),
         )
 
-    fallback_target = price * micro_ratio_candidates[-1] if variant_spec.use_micro_strategy else target_commercial_loan
+    fallback_price, fallback_price_lower, fallback_price_upper = price_at_month(fallback_month)
+    fallback_target = fallback_price * micro_ratio_candidates[-1] if variant_spec.use_micro_strategy else target_commercial_loan
     fallback_mix = compute_mix_at(fallback_month, fallback_target)
     (
         pf_upfront_extractable,
@@ -1144,7 +1484,7 @@ def find_purchase_candidate(
         cash_after_transaction,
         cash_after_purchase,
         pf_after_extract,
-    ) = purchase_state_for_mix(fallback_month, fallback_mix)
+    ) = purchase_state_for_mix(fallback_month, fallback_mix, 0.0)
     required_liquidity_reserve = max(
         0.0,
         expense_at_month(fallback_month) * household.required_liquidity_months,
@@ -1160,12 +1500,16 @@ def find_purchase_candidate(
         required_liquidity_reserve=required_liquidity_reserve,
         candidate=PurchaseCandidate(
             purchase_month=fallback_month,
+            purchase_price=fallback_price,
+            purchase_price_lower=fallback_price_lower,
+            purchase_price_upper=fallback_price_upper,
             mix=fallback_mix,
             pf_upfront_extractable=pf_upfront_extractable,
             family_pf_upfront_extractable=family_pf_upfront_extractable,
             pf_post_transaction_extractable=pf_post_transaction_extractable,
             cash_account_before_purchase=cash_account_before_purchase,
             investment_balance_before_purchase=investment_balance_before_purchase,
+            investment_reserve_target=0.0,
             investment_sell_gross_at_purchase=investment_sell_gross_at_purchase,
             investment_sell_proceeds_at_purchase=investment_sell_proceeds_at_purchase,
             investment_balance_after_purchase=investment_balance_after_purchase,
@@ -1181,6 +1525,98 @@ def find_purchase_candidate(
                 -minimum_cash_balance,
             ),
         ),
+    )
+
+
+def choose_loan_repayment_combination(
+    *,
+    household: HouseholdData,
+    scenario: ScenarioData,
+    rules: RulePackData,
+    commercial_loan: float,
+    commercial_rate: float,
+    provident_loan: float,
+    provident_rate: float,
+    provident_loan_years: int,
+    use_manual_mix: bool,
+    post_purchase_income_net: float,
+    post_purchase_pf_deposit: float,
+    post_purchase_monthly_expense: float,
+    post_purchase_car_cost: float,
+    immediate_commercial_prepayment: float,
+    purchase_month: int,
+    starting_pf_balance: float,
+    strategy_preference: str,
+) -> LoanRepaymentCombinationChoice:
+    commercial_payments = {
+        method: calculate_loan(commercial_loan, commercial_rate, scenario.loan_years, method)
+        for method in ("equal_installment", "equal_principal")
+    }
+    provident_payments = {
+        method: calculate_loan(provident_loan, provident_rate, provident_loan_years, method)
+        for method in ("equal_installment", "equal_principal")
+    }
+    manual_mode = scenario.loan_repayment_strategy_mode == "manual"
+    candidate_methods = (
+        [(scenario_commercial_repayment_method(scenario), scenario_provident_repayment_method(scenario))]
+        if manual_mode
+        else [
+            (commercial_method, provident_method)
+            for commercial_method in ("equal_installment", "equal_principal")
+            for provident_method in ("equal_installment", "equal_principal")
+        ]
+    )
+    evaluated: list[tuple[bool, float, float, str, str, LoanComputation, LoanComputation]] = []
+    minimum_monthly_buffer = max(0.0, post_purchase_monthly_expense * 0.05)
+    for commercial_method, provident_method in candidate_methods:
+        commercial_payment = commercial_payments[commercial_method]
+        provident_payment = provident_payments[provident_method]
+        total_payment = commercial_payment.first_month_payment + provident_payment.first_month_payment
+        free_cash_flow = (
+            post_purchase_income_net
+            - post_purchase_monthly_expense
+            - household.monthly_debt_payment
+            - post_purchase_car_cost
+            - total_payment
+            - immediate_commercial_prepayment
+        )
+        pf_relief, _ = post_purchase_pf_strategy(
+            household=household,
+            purchase_month=purchase_month,
+            starting_pf_balance=starting_pf_balance,
+            free_cash_flow=free_cash_flow,
+            monthly_pf_deposit=post_purchase_pf_deposit,
+            provident_monthly_payment=provident_payment.first_month_payment,
+            total_monthly_payment=total_payment,
+            post_purchase_monthly_expense=post_purchase_monthly_expense,
+            rules=rules,
+            strategy_preference=strategy_preference,
+        )
+        free_cash_flow_after_relief = free_cash_flow + pf_relief
+        total_interest = commercial_payment.total_interest + provident_payment.total_interest
+        evaluated.append(
+            (
+                free_cash_flow_after_relief >= minimum_monthly_buffer,
+                total_interest,
+                -free_cash_flow_after_relief,
+                commercial_method,
+                provident_method,
+                commercial_payment,
+                provident_payment,
+            )
+        )
+    feasible = [item for item in evaluated if item[0]]
+    selected = min(feasible or evaluated, key=lambda item: (item[1], item[2]))
+    return LoanRepaymentCombinationChoice(
+        commercial_equal_installment=commercial_payments["equal_installment"],
+        commercial_equal_principal=commercial_payments["equal_principal"],
+        provident_equal_installment=provident_payments["equal_installment"],
+        provident_equal_principal=provident_payments["equal_principal"],
+        commercial_method=selected[3],
+        provident_method=selected[4],
+        commercial_payment=selected[5],
+        provident_payment=selected[6],
+        free_cash_flow_after_relief=-selected[2],
     )
 
 
@@ -1248,6 +1684,7 @@ def purchase_cash_state_at_month(
     cash_value_by_month: list[float] | None = None,
     investment_value_by_month: list[float] | None = None,
     pf_value_by_month: list[float] | None = None,
+    minimum_investment_balance: float | None = None,
 ) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
     buy_fee_rate = _clamp(household.investment_buy_fee_rate, 0.0, 0.05)
     sell_fee_rate = _clamp(household.investment_sell_fee_rate, 0.0, 0.05)
@@ -1301,6 +1738,7 @@ def purchase_cash_state_at_month(
         required_liquidity_reserve=monthly_household_expense_at(month) * household.required_liquidity_months,
         sell_fee_rate=sell_fee_rate,
         investment_enabled=household.investment_plan_name != "cash_only",
+        minimum_investment_balance_override=minimum_investment_balance,
     )
     cash_after_transaction = withdrawal.cash_after_transaction
     pf_after_upfront_extract = max(0, pf_available - pf_upfront_extractable)
@@ -1358,8 +1796,10 @@ def build_purchase_plan_analyses(
     planning_window_delay_provider: Callable[[str], int | None] | None = None,
     calculation_context: CalculationContextSnapshot | None = None,
     market_snapshot: MarketSnapshotData | None = None,
+    variant_names: set[str] | None = None,
 ) -> list[PurchasePlanAnalysis]:
     price = scenario.total_price
+    home_strategy_policy = get_policy(rules).home_strategy_policy()
     pf_account_strategy_preference = effective_pf_account_strategy(scenario, rules, household)
     selected_provident_loan_years, provident_year_reasons = policy_provident_loan_years(household, scenario, rules)
     effective_provident_rate = policy_provident_loan_rate(household, scenario, rules, selected_provident_loan_years)
@@ -1370,22 +1810,23 @@ def build_purchase_plan_analyses(
         market_snapshot,
     )
     micro_ratio_candidates = micro_commercial_ratio_candidates(scenario, rules)
-    planning_context = build_purchase_planning_context(
-        household=household,
-        scenario=scenario,
-        rules=rules,
-        market_snapshot=market_snapshot,
-        tax_summaries=tax_summaries,
-        income_profile_provider=income_profile_provider,
-        expense_provider=expense_provider,
-        rent_withdrawal_before_purchase=rent_withdrawal_before_purchase,
-        quarterly_rent_withdrawal_before_purchase_at=quarterly_rent_withdrawal_before_purchase_at,
-        vehicle_states_provider=vehicle_states_provider,
-        car_monthly_cash_cost_provider=car_monthly_cash_cost_provider,
-        car_down_payment_provider=car_down_payment_provider,
-        family_down_payment_upfront_support=family_down_payment_upfront_support_provider,
-        initial_provident_balance=initial_provident_balance,
-    )
+    with profile_span("purchase_planning_context"):
+        planning_context = build_purchase_planning_context(
+            household=household,
+            scenario=scenario,
+            rules=rules,
+            market_snapshot=market_snapshot,
+            tax_summaries=tax_summaries,
+            income_profile_provider=income_profile_provider,
+            expense_provider=expense_provider,
+            rent_withdrawal_before_purchase=rent_withdrawal_before_purchase,
+            quarterly_rent_withdrawal_before_purchase_at=quarterly_rent_withdrawal_before_purchase_at,
+            vehicle_states_provider=vehicle_states_provider,
+            car_monthly_cash_cost_provider=car_monthly_cash_cost_provider,
+            car_down_payment_provider=car_down_payment_provider,
+            family_down_payment_upfront_support=family_down_payment_upfront_support_provider,
+            initial_provident_balance=initial_provident_balance,
+        )
     required_liquidity_reserve = planning_context.required_liquidity_reserve
     vehicle_states = planning_context.vehicle_states
     expense_at_month = planning_context.expense_at_month
@@ -1394,6 +1835,8 @@ def build_purchase_plan_analyses(
     car_down_payment_at = planning_context.car_down_payment_at
 
     variant_specs = purchase_variant_specs(scenario, rules)
+    if variant_names is not None:
+        variant_specs = [spec for spec in variant_specs if spec.name in variant_names]
     home_goal = _home_goal_snapshot_for_scenario(scenario, calculation_context)
 
     scenario_prepayment_mode = scenario_commercial_prepayment_mode(scenario)
@@ -1404,7 +1847,7 @@ def build_purchase_plan_analyses(
         description = "；".join(
             [
                 policy_source_note("北京首付、公积金贷款额度、契税和贷后公积金处理由政策包计算。"),
-                user_config_note("目标总价、房源性质、装修预算、手动贷款比例和公积金还贷模式来自当前购房目标。"),
+                user_config_note("目标总价、房源性质、手动贷款比例和公积金还贷模式来自当前购房目标；装修预算来自独立装修规划事件。"),
                 market_assumption_note("商贷利率、中介费率和房价交易假设来自当前市场快照或手动报价。"),
                 variant_spec.description,
             ]
@@ -1461,22 +1904,36 @@ def build_purchase_plan_analyses(
                 goal_not_before_delay,
             ),
         )
-        candidate_search = planning_context.find_candidate(
-            variant_spec=variant_spec,
-            micro_ratio_candidates=micro_ratio_candidates,
-            search_start_month=search_start_month,
-            search_end_month=search_end_month,
-            target_commercial_loan=target_commercial,
-            taxes_and_fees=taxes_and_fees,
-            effective_provident_rate=effective_provident_rate,
-            provident_loan_years=selected_provident_loan_years,
-            commercial_repayment_method=scenario_commercial_repayment_method(scenario),
-            provident_repayment_method=scenario_provident_repayment_method(scenario),
-            commercial_prepayment_mode=scenario_prepayment_mode,
-            strategy_preference=pf_account_strategy_preference,
-        )
+        if search_end_month is None:
+            search_end_month = max(
+                search_start_month,
+                home_strategy_policy.default_auto_search_horizon_months,
+            )
+        with profile_span(f"purchase_candidate:{name}"):
+            candidate_search = planning_context.find_candidate(
+                variant_spec=variant_spec,
+                micro_ratio_candidates=micro_ratio_candidates,
+                search_start_month=search_start_month,
+                search_end_month=search_end_month,
+                target_commercial_loan=target_commercial,
+                taxes_and_fees=taxes_and_fees,
+                effective_provident_rate=effective_provident_rate,
+                provident_loan_years=selected_provident_loan_years,
+                commercial_repayment_method=scenario_commercial_repayment_method(scenario),
+                provident_repayment_method=scenario_provident_repayment_method(scenario),
+                commercial_prepayment_mode=scenario_prepayment_mode,
+                strategy_preference=pf_account_strategy_preference,
+            )
         candidate_result = candidate_search.candidate
         months = candidate_search.months
+        price = candidate_result.purchase_price
+        purchase_scenario = planning_context.scenario_at_month(candidate_result.purchase_month)
+        deed_tax_rate, broker_fee_rate, deed_tax_amount, broker_fee_amount = housing_transaction_rate_amounts(
+            household,
+            purchase_scenario,
+            rules,
+            market_snapshot,
+        )
         required_liquidity_reserve = candidate_search.required_liquidity_reserve
         (
             provident_cap,
@@ -1492,6 +1949,7 @@ def build_purchase_plan_analyses(
         pf_post_transaction_extractable = candidate_result.pf_post_transaction_extractable
         cash_account_before_purchase = candidate_result.cash_account_before_purchase
         investment_balance_before_purchase = candidate_result.investment_balance_before_purchase
+        investment_reserve_target = candidate_result.investment_reserve_target
         investment_sell_gross_at_purchase = candidate_result.investment_sell_gross_at_purchase
         investment_sell_proceeds_at_purchase = candidate_result.investment_sell_proceeds_at_purchase
         investment_balance_after_purchase = candidate_result.investment_balance_after_purchase
@@ -1505,10 +1963,40 @@ def build_purchase_plan_analyses(
         pf_extractable = pf_upfront_extractable + family_pf_upfront_extractable + pf_post_transaction_extractable
 
         selected_commercial_prepayment_mode = scenario_prepayment_mode
+        post_purchase_month = months if months is not None else 360
+        post_purchase_monthly_expense = expense_at_month(post_purchase_month)
+        post_purchase_income = income_at_month(post_purchase_month)
+        post_purchase_car_cost = car_monthly_cash_cost_at(post_purchase_month)
+        configured_immediate_commercial_prepayment = (
+            max(0.0, scenario.commercial_prepayment_monthly_amount)
+            if selected_commercial_prepayment_mode == "manual" and commercial_loan > 0
+            else 0.0
+        )
+        repayment_choice = choose_loan_repayment_combination(
+            household=household,
+            scenario=scenario,
+            rules=rules,
+            commercial_loan=commercial_loan,
+            commercial_rate=commercial_loan_rate(scenario, market_snapshot),
+            provident_loan=provident_loan,
+            provident_rate=effective_provident_rate,
+            provident_loan_years=selected_provident_loan_years,
+            use_manual_mix=use_manual_mix,
+            post_purchase_income_net=post_purchase_income.net_income,
+            post_purchase_pf_deposit=post_purchase_income.monthly_pf_deposit,
+            post_purchase_monthly_expense=post_purchase_monthly_expense,
+            post_purchase_car_cost=post_purchase_car_cost,
+            immediate_commercial_prepayment=configured_immediate_commercial_prepayment,
+            purchase_month=post_purchase_month,
+            starting_pf_balance=pf_after_extract,
+            strategy_preference=pf_account_strategy_preference,
+        )
+        selected_commercial_repayment_method = repayment_choice.commercial_method
+        selected_provident_repayment_method = repayment_choice.provident_method
         commercial_prepayment_plan = build_commercial_prepayment_plan(
             scenario,
             commercial_loan=commercial_loan,
-            commercial_repayment_method=scenario_commercial_repayment_method(scenario),
+            commercial_repayment_method=selected_commercial_repayment_method,
             commercial_prepayment_mode=selected_commercial_prepayment_mode,
             market_snapshot=market_snapshot,
         )
@@ -1519,32 +2007,11 @@ def build_purchase_plan_analyses(
         immediate_commercial_prepayment = commercial_prepayment_plan.immediate_monthly_amount
         commercial_projection = commercial_prepayment_plan.projection
         commercial_interest = commercial_prepayment_plan.interest
-        post_purchase_month = months if months is not None else 360
-        post_purchase_monthly_expense = expense_at_month(post_purchase_month)
-        post_purchase_income = income_at_month(post_purchase_month)
-        post_purchase_car_cost = car_monthly_cash_cost_at(post_purchase_month)
-        provident_repayment_choice = choose_provident_repayment_choice(
-            household=household,
-            rules=rules,
-            provident_loan=provident_loan,
-            effective_provident_rate=effective_provident_rate,
-            provident_loan_years=selected_provident_loan_years,
-            default_repayment_method=scenario_provident_repayment_method(scenario),
-            use_manual_mix=use_manual_mix,
-            commercial_first_month_payment=commercial_payment.first_month_payment,
-            post_purchase_income_net=post_purchase_income.net_income,
-            post_purchase_pf_deposit=post_purchase_income.monthly_pf_deposit,
-            post_purchase_monthly_expense=post_purchase_monthly_expense,
-            post_purchase_car_cost=post_purchase_car_cost,
-            immediate_commercial_prepayment=immediate_commercial_prepayment,
-            purchase_month=post_purchase_month,
-            starting_pf_balance=pf_after_extract,
-            strategy_preference=pf_account_strategy_preference,
-        )
-        provident_equal_installment_payment = provident_repayment_choice.equal_installment_payment
-        provident_equal_principal_payment = provident_repayment_choice.equal_principal_payment
-        selected_provident_repayment_method = provident_repayment_choice.selected_method
-        provident_payment = provident_repayment_choice.selected_payment
+        commercial_equal_installment_payment = repayment_choice.commercial_equal_installment
+        commercial_equal_principal_payment = repayment_choice.commercial_equal_principal
+        provident_equal_installment_payment = repayment_choice.provident_equal_installment
+        provident_equal_principal_payment = repayment_choice.provident_equal_principal
+        provident_payment = repayment_choice.provident_payment
         total_monthly_payment = commercial_payment.first_month_payment + provident_payment.first_month_payment
         post_purchase_cash_flow = (
             post_purchase_income.net_income
@@ -1582,7 +2049,8 @@ def build_purchase_plan_analyses(
                 required_liquidity_reserve=required_liquidity_reserve,
                 cash_after_purchase=cash_after_purchase,
                 minimum_cash_balance=minimum_cash_balance,
-                commercial_repayment_method=scenario_commercial_repayment_method(scenario),
+                commercial_repayment_method=selected_commercial_repayment_method,
+                investment_effective_tax_rate=investment_effective_tax_rate(household),
                 investment_buy_fee_rate=household.investment_buy_fee_rate,
                 investment_sell_fee_rate=household.investment_sell_fee_rate,
                 market_snapshot=market_snapshot,
@@ -1592,7 +2060,7 @@ def build_purchase_plan_analyses(
             commercial_prepayment_plan = build_commercial_prepayment_plan(
                 scenario,
                 commercial_loan=commercial_loan,
-                commercial_repayment_method=scenario_commercial_repayment_method(scenario),
+                commercial_repayment_method=selected_commercial_repayment_method,
                 commercial_prepayment_mode=selected_commercial_prepayment_mode,
                 prepayment_monthly_amount=commercial_prepayment_monthly,
                 prepayment_start_month=commercial_prepayment_start_month,
@@ -1614,7 +2082,7 @@ def build_purchase_plan_analyses(
                     starting_pf_balance=pf_after_extract,
                     total_monthly_payment=total_monthly_payment,
                     provident_monthly_payment=provident_payment.first_month_payment,
-                    expense_at_month=expense_at_month,
+                    expense_at_month=lambda month: expense_at_month(month, post_purchase_month),
                     income_at_month=income_at_month,
                     car_monthly_cash_cost_at=car_monthly_cash_cost_at,
                     car_down_payment_at=car_down_payment_at,
@@ -1627,8 +2095,22 @@ def build_purchase_plan_analyses(
                     required_liquidity_reserve - cash_after_transaction,
                     -minimum_cash_balance,
                 )
-        provident_interest_saving_if_equal_principal = provident_repayment_choice.interest_saving_if_equal_principal
-        equal_principal_extra_first_payment = provident_repayment_choice.equal_principal_extra_first_payment
+        commercial_interest_saving_if_equal_principal = max(
+            0.0,
+            commercial_equal_installment_payment.total_interest - commercial_equal_principal_payment.total_interest,
+        )
+        commercial_equal_principal_extra_first_payment = max(
+            0.0,
+            commercial_equal_principal_payment.first_month_payment - commercial_equal_installment_payment.first_month_payment,
+        )
+        provident_interest_saving_if_equal_principal = max(
+            0.0,
+            provident_equal_installment_payment.total_interest - provident_equal_principal_payment.total_interest,
+        )
+        equal_principal_extra_first_payment = max(
+            0.0,
+            provident_equal_principal_payment.first_month_payment - provident_equal_installment_payment.first_month_payment,
+        )
         equal_principal_cash_flow = (
             post_purchase_income.net_income
             - post_purchase_monthly_expense
@@ -1646,9 +2128,28 @@ def build_purchase_plan_analyses(
             provident_interest_saving_if_equal_principal=provident_interest_saving_if_equal_principal,
             equal_principal_cash_flow=equal_principal_cash_flow,
         )
+        commercial_equal_principal_cash_flow = (
+            post_purchase_income.net_income
+            - post_purchase_monthly_expense
+            - household.monthly_debt_payment
+            - post_purchase_car_cost
+            - commercial_equal_principal_payment.first_month_payment
+            - provident_payment.first_month_payment
+            - immediate_commercial_prepayment
+            + monthly_pf_withdrawal
+        )
+        commercial_repayment_advice_text = commercial_repayment_advice(
+            commercial_loan=commercial_loan,
+            selected_method=selected_commercial_repayment_method,
+            equal_principal_extra_first_payment=commercial_equal_principal_extra_first_payment,
+            interest_saving_if_equal_principal=commercial_interest_saving_if_equal_principal,
+            equal_principal_cash_flow=commercial_equal_principal_cash_flow,
+        )
         renovation_plan = build_renovation_funding_plan(
             scenario,
             cash_after_purchase=cash_after_purchase,
+            investment_balance_after_purchase=investment_balance_after_purchase,
+            investment_reserve_target=investment_reserve_target,
             required_liquidity_reserve=required_liquidity_reserve,
             post_purchase_cash_flow=post_purchase_cash_flow,
         )
@@ -1705,6 +2206,22 @@ def build_purchase_plan_analyses(
                 source="planning_goals" if home_goal else "scenario",
                 months_to_buy=months,
                 years_to_buy=round(months / 12, 1) if months is not None else None,
+                original_target_price=round(scenario.total_price, 2),
+                projected_purchase_price=round(candidate_result.purchase_price, 2),
+                projected_purchase_price_lower=round(candidate_result.purchase_price_lower, 2),
+                projected_purchase_price_upper=round(candidate_result.purchase_price_upper, 2),
+                projected_price_change=round(candidate_result.purchase_price - scenario.total_price, 2),
+                property_price_forecast_applied=planning_context.property_valuation is not None,
+                property_price_forecast_confidence=(
+                    planning_context.property_valuation.confidence_score
+                    if planning_context.property_valuation is not None
+                    else 0.0
+                ),
+                property_price_forecast_note=(
+                    "买入月预算采用目标报价与模型估值中的较高值，并让短期周期信号在 18 个月内衰减至长期锚。"
+                    if planning_context.property_valuation is not None
+                    else "未提供市场快照，策略沿用目标房源当前报价。"
+                ),
                 minimum_down_payment=round(min_down_payment, 2),
                 planned_down_payment=round(planned_down, 2),
                 provident_fund_extractable=pf_extractable,
@@ -1737,10 +2254,14 @@ def build_purchase_plan_analyses(
                 commercial_loan_years=scenario.loan_years,
                 provident_loan_years=selected_provident_loan_years,
                 provident_loan_year_limit_reasons=provident_year_reasons,
-                commercial_repayment_method=scenario_commercial_repayment_method(scenario),  # type: ignore[arg-type]
+                commercial_repayment_method=selected_commercial_repayment_method,  # type: ignore[arg-type]
                 provident_repayment_method=selected_provident_repayment_method,  # type: ignore[arg-type]
                 commercial_monthly_payment=round(commercial_payment.first_month_payment, 2),
                 provident_monthly_payment=round(provident_payment.first_month_payment, 2),
+                commercial_interest_saving_if_equal_principal=round(commercial_interest_saving_if_equal_principal, 2),
+                commercial_equal_principal_first_payment=round(commercial_equal_principal_payment.first_month_payment, 2),
+                commercial_equal_installment_payment=round(commercial_equal_installment_payment.first_month_payment, 2),
+                commercial_repayment_advice=commercial_repayment_advice_text,
                 commercial_prepayment_mode=selected_commercial_prepayment_mode,  # type: ignore[arg-type]
                 commercial_prepayment_enabled=commercial_prepayment_monthly > 0,
                 commercial_prepayment_start_month=commercial_prepayment_start_month,
@@ -1769,6 +2290,7 @@ def build_purchase_plan_analyses(
                 ),
                 cash_account_before_purchase=round(cash_account_before_purchase, 2),
                 investment_balance_before_purchase=round(investment_balance_before_purchase, 2),
+                investment_reserve_target=round(investment_reserve_target, 2),
                 investment_sell_gross_at_purchase=round(investment_sell_gross_at_purchase, 2),
                 investment_sell_proceeds_at_purchase=round(investment_sell_proceeds_at_purchase, 2),
                 investment_balance_after_purchase=round(investment_balance_after_purchase, 2),
@@ -1795,4 +2317,6 @@ def build_purchase_plan_analyses(
                 happiness_breakdown=happiness_breakdown,
             )
         )
-    return with_purchase_plan_recommendations(analyses, scenario)
+    # Long-horizon ledger risk is required before a plan can be recommended.
+    # Recommendation is therefore applied in the projection pipeline.
+    return analyses

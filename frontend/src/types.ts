@@ -7,7 +7,12 @@ export type FreelanceTaxMode = "labor_remuneration" | "business_income" | "other
 export type GreenBuildingLevel = "none" | "two_star" | "three_star";
 export type PrefabBuildingLevel = "none" | "A" | "AA" | "AAA";
 export type BuildingStructure = "unknown" | "brick_mixed" | "steel_concrete";
-export type RenovationFundingMode = "after_purchase_saving" | "upfront_cash";
+export type RenovationFundingMode =
+  | "cash_or_investment"
+  | "cash_only"
+  | "after_goal_saving"
+  | "after_purchase_saving"
+  | "upfront_cash";
 export type CommercialPrepaymentMode = "auto" | "manual" | "none";
 export type ProvidentAccountRepaymentStrategy =
   | "auto"
@@ -19,6 +24,11 @@ export type ProvidentAccountRepaymentSwitchTarget =
   | "semiannual_principal_offset";
 export type PersonalPensionContributionMode = "none" | "auto_tax_optimal" | "fixed_monthly" | "fixed_annual";
 export type PersonalPensionOpenMode = "auto_tax_optimal" | "manual" | "none";
+export type PersonalPensionReturnMode = "auto_lifecycle" | "manual";
+export type PersonalPensionWithdrawalMode = "auto_safe" | "monthly_annuity" | "fixed_monthly" | "lump_sum";
+export type PersonalPensionTaxDeductionMode = "monthly_withholding" | "annual_settlement";
+export type PersonalPensionEarlyWithdrawalReason = "none" | "total_disability" | "settled_abroad" | "major_medical_expense" | "long_unemployment" | "minimum_living_allowance";
+export type PersonalPensionProductLiquidityMode = "daily_liquid" | "periodic" | "locked_until_maturity";
 
 export interface IncomeMember {
   name: string;
@@ -45,16 +55,33 @@ export interface IncomeMember {
   medical_account_enabled: boolean;
   medical_account_open_month: string;
   personal_pension_account_enabled: boolean;
+  personal_pension_participation_eligible: boolean;
   personal_pension_account_balance: number;
   personal_pension_open_mode: PersonalPensionOpenMode;
   personal_pension_account_open_month: string;
   personal_pension_contribution_mode: PersonalPensionContributionMode;
+  personal_pension_tax_deduction_mode: PersonalPensionTaxDeductionMode;
   personal_pension_monthly_contribution: number;
   personal_pension_annual_contribution_target: number;
+  personal_pension_auto_annual_contribution_schedule?: Record<string, number>;
   personal_pension_contribution_month: number;
   personal_pension_contribution_start_month: string;
   personal_pension_contribution_end_month: string | null;
+  personal_pension_auto_suspend_for_cash_safety: boolean;
+  personal_pension_cash_reserve_months: number;
+  personal_pension_return_mode: PersonalPensionReturnMode;
   personal_pension_annual_return: number;
+  personal_pension_post_retirement_annual_return: number;
+  personal_pension_withdrawal_mode: PersonalPensionWithdrawalMode;
+  personal_pension_withdrawal_start_month: string;
+  personal_pension_early_withdrawal_reason: PersonalPensionEarlyWithdrawalReason;
+  personal_pension_early_withdrawal_month: string;
+  personal_pension_withdrawal_years: number;
+  personal_pension_fixed_monthly_withdrawal: number;
+  personal_pension_product_liquidity_mode: PersonalPensionProductLiquidityMode;
+  personal_pension_redemption_delay_months: number;
+  personal_pension_monthly_redeemable_ratio: number;
+  personal_pension_redemption_fee_rate: number;
   monthly_salary_gross: number;
   annual_bonus: number;
   monthly_social_insurance: number;
@@ -76,11 +103,11 @@ export interface IncomeStageData {
   end_date: string | null;
   provident_account_management_center: "beijing_municipal" | "national";
   monthly_salary_gross: number;
-  annual_bonus: number;
+  annual_bonus_months: number;
   annual_bonus_payout_mode: AnnualBonusPayoutMode;
   annual_bonus_payout_month: number;
-  annual_bonus_earning_start_month: string;
-  annual_bonus_earning_end_month: string;
+  annual_bonus_earning_start_month: number | null;
+  annual_bonus_earning_end_month: number | null;
   monthly_freelance_income: number;
   freelance_tax_mode: FreelanceTaxMode;
   monthly_non_taxable_income: number;
@@ -168,11 +195,40 @@ export interface InvestmentPlanRecommendation {
   description: string;
   monthly_investment: number;
   annual_return: number;
+  after_tax_annual_return?: number;
+  risk_adjusted_annual_return?: number;
   cash_reserve_months: number;
+  liquidity_horizon_months?: number | null;
+  goal_liquidity_target?: number;
+  goal_liquidity_gap?: number;
+  monthly_goal_saving?: number;
   equity_ratio: number;
   bond_ratio: number;
   cash_ratio: number;
+  lifecycle_cash_shortfall?: number;
+  lifecycle_insolvency_month?: number | null;
+  lifecycle_liquid_assets_exhausted_month?: number | null;
+  lifecycle_required_monthly_relief?: number;
+  lifecycle_feasible?: boolean;
+  lifecycle_risk_note?: string;
   score: number;
+  reasons: string[];
+}
+
+export interface PortfolioStrategyRecommendation {
+  plan_name: string;
+  title: string;
+  status: "feasible" | "adjustment_required" | "high_risk";
+  description: string;
+  actions: string[];
+  cash_shortfall: number;
+  insolvency_month: number | null;
+  liquid_assets_exhausted_month: number | null;
+  terminal_net_worth: number;
+  required_monthly_relief: number;
+  feasible: boolean;
+  score: number;
+  is_recommended: boolean;
   reasons: string[];
 }
 
@@ -447,6 +503,16 @@ export interface SpecialDeductionItemData {
   notes: string;
 }
 
+export interface PersonalPensionAnnualOptimizationPoint {
+  year: number;
+  annual_contribution: number;
+  estimated_tax_saving: number;
+  pension_net_value_at_withdrawal: number;
+  alternative_investment_value_at_withdrawal: number;
+  tax_saving_future_value: number;
+  net_advantage_at_withdrawal: number;
+}
+
 export interface TaxStrategyItem {
   deduction_type: SpecialDeductionItemData["deduction_type"];
   title: string;
@@ -457,7 +523,27 @@ export interface TaxStrategyItem {
   estimated_tax_saving: number;
   cash_contribution: number;
   account_return_rate: number;
+  post_retirement_return_rate: number;
   withdrawal_tax_rate: number;
+  withdrawal_mode: PersonalPensionWithdrawalMode | null;
+  withdrawal_start_month: string;
+  withdrawal_years: number;
+  estimated_retirement_balance: number;
+  estimated_monthly_withdrawal: number;
+  cumulative_contribution: number;
+  cumulative_estimated_tax_saving: number;
+  pension_net_value_at_withdrawal: number;
+  alternative_investment_value_at_withdrawal: number;
+  forgone_investment_earnings: number;
+  tax_saving_future_value: number;
+  net_advantage_at_withdrawal: number;
+  full_cap_annual_tax_saving: number;
+  full_cap_net_advantage_at_withdrawal: number;
+  personal_pension_annual_plan: PersonalPensionAnnualOptimizationPoint[];
+  cash_safety_rule: string;
+  contribution_end_reason: string;
+  long_term_cash_risk_month: string;
+  recommended_action: string;
   start_month: string;
   end_month: string | null;
   reason: string;
@@ -539,6 +625,8 @@ export interface HouseholdData {
   family_provident_initial_balance: number;
   family_provident_monthly_salary: number;
   family_provident_total_rate: number;
+  major_goal_tradeoff_mode: "auto" | "manual";
+  major_goal_timing_preference: number;
   investment_plan_name: string;
   investment_risk_level: string;
   monthly_investment_amount: number;
@@ -667,6 +755,12 @@ export interface ResolvedPlanningGoal {
   household_id: string | null;
   goal_type: PlanningGoalType;
   name: string;
+  planning_group_id: string;
+  planning_group_name: string;
+  planning_group_size: number;
+  planning_group_member_ids: string[];
+  target_amount: number;
+  funding_mode: string;
   enabled: boolean;
   priority: number;
   sequence_index: number;
@@ -697,12 +791,19 @@ export interface CalculationContextGoalSnapshot {
   id: string;
   goal_type: PlanningGoalType;
   name: string;
+  planning_group_id: string;
+  planning_group_name: string;
+  planning_group_size: number;
+  planning_group_member_ids: string[];
+  target_amount: number;
+  funding_mode: string;
   enabled: boolean;
   priority: number;
   sequence_index: number;
   normalized_timing_mode: PlanningTimingMode;
   depends_on_goal_id: string;
   depends_on_goal_name: string;
+  delay_after_dependency_months: number;
   resolved_not_before_month: number;
   resolved_window_start_month: number;
   resolved_window_end_month: number | null;
@@ -773,6 +874,7 @@ export interface ScenarioData {
   provident_rate?: number;
   loan_years: number;
   repayment_method: RepaymentMethod;
+  loan_repayment_strategy_mode: "auto" | "manual";
   commercial_repayment_method: RepaymentMethod;
   provident_repayment_method: RepaymentMethod;
   commercial_prepayment_mode: CommercialPrepaymentMode;
@@ -789,8 +891,6 @@ export interface ScenarioData {
   seller_tax_pass_through_enabled: boolean;
   seller_tax_pass_through_rate: number;
   seller_tax_pass_through_amount: number;
-  renovation_cost: number;
-  renovation_funding_mode: RenovationFundingMode;
   moving_and_misc_cost: number;
   annual_investment_return: number;
   investment_withdrawal_mode: "auto" | "full_liquidation" | "manual_reserve";
@@ -801,6 +901,13 @@ export interface ScenarioData {
   liquidity_priority_score: number;
   notes: string;
   selected_purchase_plan_variant: string;
+  valuation_monitoring_enabled: boolean;
+  valuation_asset_status: "planned" | "owned";
+  valuation_interval_months: number;
+  valuation_reference_date: string;
+  valuation_reference_value: number;
+  valuation_comparable_unit_price: number;
+  valuation_district_adjustment_rate: number;
 }
 
 export interface RulePackData {
@@ -820,13 +927,95 @@ export interface MarketSnapshotData {
   snapshot_date: string;
   source_name: string;
   source_url: string;
+  source_type: "government" | "research" | "agency" | "brokerage" | "media" | "other";
   commercial_loan_rate: number | null;
   default_broker_fee_rate: number | null;
   seller_tax_pass_through_rate: number | null;
   avg_unit_price: number | null;
   transaction_count: number | null;
   listing_count: number | null;
+  resale_price_mom: number | null;
+  resale_price_yoy: number | null;
+  new_home_price_mom: number | null;
+  new_home_price_yoy: number | null;
+  long_term_anchor_growth_rate: number;
+  housing_data_quality_score: number;
+  housing_market_evidence: HousingMarketEvidenceData[];
   notes: string;
+}
+
+export interface HousingMarketEvidenceData {
+  source_name: string;
+  source_url: string;
+  source_type: "government" | "research" | "agency" | "brokerage" | "media" | "other";
+  published_date: string;
+  scope_type: "city" | "district" | "community";
+  scope_name: string;
+  ring_scope: "all" | "二环内" | "二至三环" | "三至四环" | "四至五环" | "五至六环" | "六环外";
+  property_segment: "all" | "resale" | "new_home";
+  price_mom: number | null;
+  price_yoy: number | null;
+  avg_unit_price: number | null;
+  sample_size: number | null;
+  credibility_score: number;
+  notes: string;
+}
+
+export interface PropertyValuationProjectionPoint {
+  month: number;
+  label: string;
+  estimated_value: number;
+  lower_value: number;
+  upper_value: number;
+}
+
+export interface PropertyValuationData {
+  schema_version: number;
+  property_name: string;
+  valuation_date: string;
+  reference_date: string;
+  reference_value: number;
+  estimated_market_value: number;
+  estimated_unit_price: number;
+  lower_value: number;
+  upper_value: number;
+  net_realisable_value: number;
+  confidence_score: number;
+  market_signal_rate: number;
+  near_term_annual_rate: number;
+  long_term_annual_rate: number;
+  structural_rate_adjustment: number;
+  location_rate_adjustment: number;
+  building_age_rate_adjustment: number;
+  location_reference_unit_price: number;
+  sale_cost_rate: number;
+  liquidity_discount_rate: number;
+  market_snapshot_date: string;
+  market_source_name: string;
+  market_source_names: string[];
+  market_source_count: number;
+  matched_location_name: string;
+  matched_ring_area: string;
+  next_due_date: string;
+  drivers: string[];
+  warnings: string[];
+  projection: PropertyValuationProjectionPoint[];
+}
+
+export interface PropertyValuationRecord {
+  id: string;
+  household_id: string;
+  planning_goal_id: string;
+  valuation_date: string;
+  market_snapshot_id: string;
+  data: PropertyValuationData;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PropertyValuationRefreshResponse {
+  record: PropertyValuationRecord;
+  refreshed: boolean;
 }
 
 export interface RecordEnvelope<T> {
@@ -941,6 +1130,7 @@ export interface CarPlanAnalysis {
   interest_saved_by_prepayment: number;
   total_interest: number;
   required_cash_at_purchase: number;
+  required_liquidity_reserve?: number;
   cash_after_purchase: number;
   monthly_cash_flow_after_car: number;
   operating_cost: number;
@@ -951,6 +1141,12 @@ export interface CarPlanAnalysis {
   monthly_cash_operating_cost: number;
   monthly_depreciation_cost: number;
   monthly_total_ownership_cost: number;
+  lifecycle_cash_shortfall: number;
+  lifecycle_insolvency_month: number | null;
+  lifecycle_worst_liquid_balance: number;
+  lifecycle_terminal_liquid_balance: number;
+  lifecycle_feasible: boolean;
+  lifecycle_risk_note: string;
   happiness_score: number;
   notes: string[];
 }
@@ -980,6 +1176,12 @@ export interface StressResult {
   post_purchase_cash_flow: number;
   debt_to_income_ratio: number;
   emergency_months: number;
+  feasible: boolean;
+  reason: string;
+  cash_shortfall: number;
+  worst_cash_balance: number;
+  insolvency_month: number | null;
+  liquid_assets_exhausted_month: number | null;
 }
 
 export interface TaxMemberSummary {
@@ -1077,6 +1279,14 @@ export interface PurchasePlanAnalysis {
   source: string;
   months_to_buy: number | null;
   years_to_buy: number | null;
+  original_target_price: number;
+  projected_purchase_price: number;
+  projected_purchase_price_lower: number;
+  projected_purchase_price_upper: number;
+  projected_price_change: number;
+  property_price_forecast_applied: boolean;
+  property_price_forecast_confidence: number;
+  property_price_forecast_note: string;
   minimum_down_payment: number;
   planned_down_payment: number;
   provident_fund_extractable: number;
@@ -1105,6 +1315,10 @@ export interface PurchasePlanAnalysis {
   provident_repayment_method: RepaymentMethod;
   commercial_monthly_payment: number;
   provident_monthly_payment: number;
+  commercial_interest_saving_if_equal_principal: number;
+  commercial_equal_principal_first_payment: number;
+  commercial_equal_installment_payment: number;
+  commercial_repayment_advice: string;
   commercial_prepayment_mode: CommercialPrepaymentMode;
   commercial_prepayment_enabled: boolean;
   commercial_prepayment_start_month: number;
@@ -1129,6 +1343,7 @@ export interface PurchasePlanAnalysis {
   investment_withdrawal_mode_label?: string;
   cash_account_before_purchase?: number;
   investment_balance_before_purchase?: number;
+  investment_reserve_target?: number;
   investment_sell_gross_at_purchase?: number;
   investment_sell_proceeds_at_purchase?: number;
   investment_balance_after_purchase?: number;
@@ -1141,6 +1356,14 @@ export interface PurchasePlanAnalysis {
   minimum_cash_balance_month?: number | null;
   cash_stress_ok?: boolean;
   cash_stress_shortfall?: number;
+  cash_shortfall?: number;
+  insolvency_month?: number | null;
+  liquid_assets_exhausted_month?: number | null;
+  worst_cash_balance?: number;
+  terminal_net_worth?: number;
+  emergency_reserve_coverage_months?: number;
+  pareto_efficient?: boolean;
+  feasibility_recommendation?: string;
   post_purchase_cash_flow: number;
   post_purchase_pf_strategy: string;
   post_purchase_pf_strategy_label: string;
@@ -1325,10 +1548,14 @@ export interface MonthlyCashflowPoint {
   net_worth: number;
   happiness_score: number;
   monthly_cash_delta: number;
+  cash_shortfall: number;
+  insolvency_month: number | null;
+  liquid_assets_exhausted_month: number | null;
   cash_income: number;
   pension_income: number;
   living_expense: number;
   scheduled_expense: number;
+  renovation_expense: number;
   child_expense: number;
   career_shock_self_payment: number;
   debt_payment: number;
@@ -1366,6 +1593,10 @@ export interface MonthlyCashflowPoint {
   investment_sell_proceeds: number;
   personal_pension_contribution: number;
   personal_pension_return: number;
+  personal_pension_withdrawal: number;
+  personal_pension_redemption_fee: number;
+  personal_pension_withdrawal_tax: number;
+  personal_pension_suspended_contribution: number;
   personal_pension_balance: number;
   provident_deposit: number;
   provident_withdrawal: number;
@@ -1446,6 +1677,12 @@ export interface ChildPlanStrategyPoint {
   monthly_cost_now: number;
   first_year_cash_need: number;
   total_to_age_18: number;
+  lifecycle_cash_shortfall: number;
+  lifecycle_insolvency_month: number | null;
+  lifecycle_feasible: boolean;
+  recommended_budget_factor: number;
+  recommended_delay_months: number;
+  lifecycle_risk_note: string;
   stages: Array<{ name: string; month_index: number | null; month_label: string; amount: number; frequency: string }>;
   explanation: string;
 }
@@ -1496,6 +1733,7 @@ export interface PlanEventPoint {
     | "income"
     | "investment"
     | "home_purchase"
+    | "property_market"
     | "loan"
     | "provident"
     | "vehicle"
@@ -1517,6 +1755,7 @@ export interface AnnualFinancialSummary {
   pension_income: number;
   living_expense: number;
   scheduled_expense: number;
+  renovation_expense: number;
   child_expense: number;
   career_shock_self_payment: number;
   debt_payment: number;
@@ -1530,6 +1769,10 @@ export interface AnnualFinancialSummary {
   investment_sell_proceeds: number;
   personal_pension_contribution: number;
   personal_pension_return: number;
+  personal_pension_withdrawal: number;
+  personal_pension_redemption_fee: number;
+  personal_pension_withdrawal_tax: number;
+  personal_pension_suspended_contribution: number;
   personal_pension_balance_end: number;
   provident_deposit: number;
   provident_withdrawal: number;
@@ -1648,6 +1891,10 @@ export interface AffordabilityResult {
   post_purchase_cash_flow: number;
   debt_to_income_ratio: number;
   emergency_months: number;
+  immediate_purchase_status: string;
+  immediate_purchase_reason: string;
+  recommended_plan_status: string;
+  recommended_plan_reason: string;
   commercial_loan: LoanSummary | null;
   provident_loan: LoanSummary | null;
   tax_summaries: TaxMemberSummary[];
@@ -1658,6 +1905,7 @@ export interface AffordabilityResult {
   tax_strategy_timeline: TaxStrategyTimelinePoint[];
   career_shock_projection: CareerShockProjection | null;
   investment_plan_recommendations: InvestmentPlanRecommendation[];
+  portfolio_strategy_recommendations: PortfolioStrategyRecommendation[];
   current_investment_allocation: InvestmentAllocationSummary | null;
   child_plan_strategies: ChildPlanStrategyPoint[];
   annual_financial_summaries: AnnualFinancialSummary[];
@@ -1691,4 +1939,44 @@ export interface SourceDocumentRecord {
   status: string;
   summary: string;
   changed_from_previous: boolean;
+}
+
+export interface PersonalPensionReturnEvidenceData {
+  source_name: string;
+  source_url: string;
+  source_type: string;
+  product_type: string;
+  fetched_at: string;
+  observed_annual_return: number | null;
+  sample_count: number;
+  status: "parsed" | "no_rate" | "fetch_failed";
+  note: string;
+}
+
+export interface PersonalPensionReturnSnapshotData {
+  snapshot_date: string;
+  pre_retirement_annual_return: number;
+  post_retirement_annual_return: number;
+  conservative_annual_return: number;
+  optimistic_annual_return: number;
+  observed_market_return: number | null;
+  source_count: number;
+  parsed_source_count: number;
+  next_due_date: string;
+  evidence: PersonalPensionReturnEvidenceData[];
+  drivers: string[];
+  warnings: string[];
+}
+
+export interface PersonalPensionReturnSnapshotRecord {
+  id: string;
+  snapshot_date: string;
+  data: PersonalPensionReturnSnapshotData;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PersonalPensionReturnRefreshResponse {
+  record: PersonalPensionReturnSnapshotRecord;
+  refreshed: boolean;
 }

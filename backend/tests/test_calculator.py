@@ -25,11 +25,18 @@ from app.calculator import (
     summarize_phased_loans,
 )
 from app.domain.scoring import purchase_happiness_weights
+from app.domain.loans import prepayment_investment_hurdle_rate
+from app.domain.investments import investment_withdrawal_at_purchase
+from app.domain.property_valuation import estimate_property_value, projected_purchase_price
 from app.engine_config import parallel_worker_count
 from app.domain.time import month_after
 from app.projection.horizon import visualization_horizon_months
+from app.projection.ledger_cashflows import fixed_asset_projection_from_values
+from app.projection.ledger_models import ProjectionOffsets
 from app.schemas import CareerShockData, CareerShockMemberSetting, CalculationContextGoalSnapshot, CalculationContextSnapshot, CarPlanData, ChildPlanData, DailyExpenseStageData, ElderlyDependentData, HouseholdData, IncomeMember, IncomeStageData, InvestmentTaxProfileData, MarketSnapshotData, RentExpenseStageData, RulePackData, ScenarioData, ScheduledExpenseData, SpecialDeductionItemData, PhasedLoanData, VehicleFinancingOptionData
 from app.strategies.vehicle import vehicle_candidate_plans
+from app.strategies.investment import build_investment_plan_recommendations
+from app.strategies.home_commercial_prepayment import choose_auto_commercial_prepayment
 
 
 def _zero_contribution_rule() -> RulePackData:
@@ -50,6 +57,218 @@ def _zero_contribution_rule() -> RulePackData:
             }
         }
     )
+
+
+def test_property_valuation_short_term_drop_decays_instead_of_becoming_permanent_forecast() -> None:
+    scenario = ScenarioData(
+        name="示例房产",
+        property_type="二手房",
+        total_price=3_000_000,
+        area_sqm=80,
+        valuation_reference_date="2026-07-01",
+        valuation_reference_value=3_000_000,
+    )
+    snapshot = MarketSnapshotData(
+        snapshot_date="2026-07-01",
+        resale_price_mom=-0.02,
+        resale_price_yoy=-0.08,
+        long_term_anchor_growth_rate=0.015,
+        housing_data_quality_score=0.8,
+    )
+
+    valuation = estimate_property_value(scenario, snapshot, valuation_date=date(2026, 7, 1))
+
+    assert valuation.near_term_annual_rate < 0
+    assert valuation.long_term_annual_rate == pytest.approx(0.015)
+    assert valuation.projection[-1].estimated_value > valuation.estimated_market_value
+    assert any("18 个月" in warning for warning in valuation.warnings)
+
+
+def test_target_property_purchase_price_uses_asking_floor_and_decaying_cycle() -> None:
+    scenario = ScenarioData(
+        name="示例目标房源",
+        property_type="二手房",
+        total_price=3_000_000,
+        area_sqm=80,
+        valuation_reference_date="2026-07-01",
+        valuation_reference_value=2_700_000,
+    )
+    valuation = estimate_property_value(
+        scenario,
+        MarketSnapshotData(
+            snapshot_date="2026-07-01",
+            resale_price_yoy=-0.08,
+            long_term_anchor_growth_rate=0.02,
+        ),
+        valuation_date=date(2026, 7, 1),
+    )
+
+    current, current_lower, current_upper = projected_purchase_price(
+        valuation,
+        asking_price=scenario.total_price,
+        month=0,
+    )
+    year_one, _, _ = projected_purchase_price(valuation, asking_price=scenario.total_price, month=12)
+    year_ten, _, _ = projected_purchase_price(valuation, asking_price=scenario.total_price, month=120)
+
+    assert current == scenario.total_price
+    assert current_lower <= current <= current_upper
+    assert year_one < current
+    assert year_ten > year_one
+
+
+def test_property_valuation_applies_house_characteristics_to_long_term_risk() -> None:
+    snapshot = MarketSnapshotData(
+        snapshot_date="2026-07-01",
+        resale_price_yoy=0,
+        new_home_price_yoy=0,
+        long_term_anchor_growth_rate=0.015,
+    )
+    newer = estimate_property_value(
+        ScenarioData(
+            property_type="新房",
+            total_price=3_000_000,
+            area_sqm=80,
+            valuation_reference_value=3_000_000,
+            green_building_level="two_star",
+        ),
+        snapshot,
+        valuation_date=date(2026, 7, 1),
+    )
+    older = estimate_property_value(
+        ScenarioData(
+            property_type="二手房",
+            total_price=3_000_000,
+            area_sqm=150,
+            valuation_reference_value=3_000_000,
+            building_age_years=35,
+            building_structure="brick_mixed",
+            remaining_land_use_years=30,
+        ),
+        snapshot,
+        valuation_date=date(2026, 7, 1),
+    )
+
+    assert older.long_term_annual_rate < newer.long_term_annual_rate
+    assert older.liquidity_discount_rate > newer.liquidity_discount_rate
+    assert older.net_realisable_value < newer.net_realisable_value
+
+
+def test_property_valuation_blends_third_party_sources_and_matches_district_location() -> None:
+    from app.schemas import HousingMarketEvidenceData
+
+    snapshot = MarketSnapshotData(
+        snapshot_date="2026-07-01",
+        source_name="示例政府统计",
+        source_type="government",
+        resale_price_yoy=-0.03,
+        avg_unit_price=50_000,
+        housing_data_quality_score=0.85,
+        housing_market_evidence=[
+            HousingMarketEvidenceData(
+                source_name="示例研究机构",
+                source_type="research",
+                published_date="2026-06-20",
+                scope_type="district",
+                scope_name="朝阳区",
+                ring_scope="四至五环",
+                property_segment="resale",
+                price_yoy=0.01,
+                avg_unit_price=70_000,
+                sample_size=800,
+                credibility_score=0.85,
+            ),
+            HousingMarketEvidenceData(
+                source_name="示例经纪平台",
+                source_type="brokerage",
+                published_date="2026-06-25",
+                scope_type="district",
+                scope_name="朝阳",
+                ring_scope="六环外",
+                property_segment="resale",
+                price_yoy=0,
+                avg_unit_price=45_000,
+                sample_size=1200,
+                credibility_score=0.72,
+            ),
+            HousingMarketEvidenceData(
+                source_name="示例新闻",
+                source_type="media",
+                published_date="2026-06-28",
+                scope_type="city",
+                scope_name="北京",
+                property_segment="resale",
+                price_yoy=-0.10,
+                credibility_score=0.5,
+            ),
+        ],
+    )
+    matched = estimate_property_value(
+        ScenarioData(
+            name="示例朝阳房产",
+            district="朝阳区",
+            ring_area="四至五环",
+            property_type="二手房",
+            total_price=3_000_000,
+            area_sqm=80,
+            valuation_reference_value=3_000_000,
+            building_age_years=12,
+        ),
+        snapshot,
+        valuation_date=date(2026, 7, 1),
+    )
+    unmatched = estimate_property_value(
+        ScenarioData(
+            name="示例朝阳外环房产",
+            district="朝阳区",
+            ring_area="六环外",
+            property_type="二手房",
+            total_price=3_000_000,
+            area_sqm=80,
+            valuation_reference_value=3_000_000,
+            building_age_years=12,
+        ),
+        snapshot,
+        valuation_date=date(2026, 7, 1),
+    )
+
+    assert matched.market_source_count == 3
+    assert matched.matched_location_name == "朝阳区"
+    assert matched.matched_ring_area == "四至五环"
+    assert matched.location_reference_unit_price == 70_000
+    assert unmatched.matched_ring_area == "六环外"
+    assert unmatched.location_reference_unit_price == 45_000
+    assert matched.location_rate_adjustment > 0
+    assert matched.estimated_market_value > unmatched.estimated_market_value
+    assert any("研究机构" in item for item in matched.drivers)
+    assert any("经纪/平台" in item for item in unmatched.drivers)
+
+
+def test_property_valuation_treats_news_as_low_weight_near_term_evidence() -> None:
+    valuation = estimate_property_value(
+        ScenarioData(
+            name="示例新闻信号房产",
+            district="示例区",
+            property_type="二手房",
+            total_price=3_000_000,
+            area_sqm=80,
+            valuation_reference_value=3_000_000,
+        ),
+        MarketSnapshotData(
+            snapshot_date="2026-07-01",
+            source_name="示例新闻来源",
+            source_type="media",
+            resale_price_mom=-0.02,
+            resale_price_yoy=-0.12,
+            long_term_anchor_growth_rate=0.015,
+            housing_data_quality_score=0.5,
+        ),
+        valuation_date=date(2026, 7, 1),
+    )
+
+    assert valuation.near_term_annual_rate < 0
+    assert valuation.long_term_annual_rate == pytest.approx(0.015)
+    assert any("媒体新闻" in warning for warning in valuation.warnings)
 
 
 def test_domain_projection_and_strategy_layers_do_not_construct_default_rule_pack() -> None:
@@ -168,7 +387,8 @@ def test_affordability_marks_cash_gap_as_not_viable() -> None:
         }
     )
     result = calculate_affordability(household, scenario, rules)
-    assert result.status == "不可行"
+    assert result.immediate_purchase_status == "不可行"
+    assert result.status == "无可行方案"
     assert result.funding_gap > 0
 
 
@@ -185,7 +405,7 @@ def test_affordability_risk_thresholds_are_read_from_policy_interface() -> None:
         }
     )
     household = HouseholdData(
-        cash_account_balance=2_000_000,
+        cash_account_balance=5_000_000,
         monthly_expense=8_000,
         members=[IncomeMember(name="样例成员A", monthly_salary_gross=60_000, annual_bonus=0)],
     )
@@ -195,9 +415,9 @@ def test_affordability_risk_thresholds_are_read_from_policy_interface() -> None:
     strict = calculate_affordability(household, scenario, strict_rules)
 
     assert baseline.status in {"可行", "谨慎可行"}
-    assert strict.status == "谨慎可行"
+    assert strict.immediate_purchase_status == "谨慎可行"
     assert strict.debt_to_income_ratio > 0.01
-    assert strict.status_reason == "资金可覆盖购房，但现金流或应急金低于推荐安全垫。"
+    assert strict.immediate_purchase_reason == "资金可覆盖购房，但现金流或应急金低于推荐安全垫。"
 
 
 def test_affordability_skips_stress_tests_by_default() -> None:
@@ -247,6 +467,10 @@ def test_no_child_or_vehicle_plan_still_projects_baseline_visualization() -> Non
     assert result.monthly_ledger
     assert result.account_snapshots
     assert result.annual_financial_summaries
+    assert any(
+        item.title == "家庭总策略" and item.section == "household"
+        for item in result.strategy_explanations
+    )
     assert {row.plan_variant for row in result.monthly_cashflow_visualization} == {
         result.purchase_plan_analyses[0].variant
     }
@@ -254,8 +478,11 @@ def test_no_child_or_vehicle_plan_still_projects_baseline_visualization() -> Non
 
 def test_affordability_builds_stress_tests_when_requested() -> None:
     result = calculate_affordability(HouseholdData(), ScenarioData(), RulePackData(), include_stress_tests=True)
-    assert len(result.stress_tests) == 3
+    assert len(result.stress_tests) == 4
+    assert any(item.name == "联合压力（收入、利率、房价、理财）" for item in result.stress_tests)
     assert all(item.name for item in result.stress_tests)
+    assert all(isinstance(item.feasible, bool) for item in result.stress_tests)
+    assert all(item.reason for item in result.stress_tests)
 
 
 def test_stress_test_assumptions_are_read_from_policy_interface() -> None:
@@ -316,8 +543,8 @@ def test_visualization_horizon_retirement_tail_uses_current_policy_rules() -> No
         rules=delayed_rules,
     )
 
-    assert baseline == 324
-    assert delayed == 408
+    assert baseline == 564
+    assert delayed == 648
     assert delayed - baseline == 84
 
 
@@ -1228,7 +1455,9 @@ def test_affordability_exposes_backend_investment_recommendations() -> None:
     result = calculate_affordability(household, ScenarioData(total_price=0), RulePackData())
 
     assert result.investment_plan_recommendations
+    assert result.portfolio_strategy_recommendations
     assert result.investment_plan_recommendations[0].plan_name in {
+        "goal_liquidity_first",
         "cash_reserve_first",
         "balanced_monthly_investment",
         "growth_monthly_investment",
@@ -1236,6 +1465,131 @@ def test_affordability_exposes_backend_investment_recommendations() -> None:
     assert result.current_investment_allocation is not None
     assert result.current_investment_allocation.reserve_target == pytest.approx(60_000)
     assert result.current_investment_allocation.total_investment >= 0
+
+
+def test_investment_strategy_prioritizes_near_term_home_funding() -> None:
+    household = HouseholdData(
+        cash_account_balance=100_000,
+        investments=200_000,
+        monthly_expense=10_000,
+        monthly_investment_amount=5_000,
+        investment_cash_reserve_months=6,
+        investment_auto_rebalance=True,
+    )
+    car_loan = calculate_car_loan(CarPlanData(enabled=False))
+
+    recommendations = build_investment_plan_recommendations(
+        household,
+        ScenarioData(annual_investment_return=0.06),
+        net_monthly_income=30_000,
+        current_monthly_expense=10_000,
+        effective_monthly_debt_payment=0,
+        car_loan=car_loan,
+        home_purchase_month=6,
+        home_required_cash=500_000,
+        home_required_reserve=60_000,
+    )
+
+    recommended = recommendations[0]
+    assert recommended.plan_name == "goal_liquidity_first"
+    assert recommended.monthly_investment == 0
+    assert recommended.cash_ratio >= 0.75
+    assert recommended.goal_liquidity_gap > 0
+    assert recommended.risk_adjusted_annual_return < recommended.after_tax_annual_return
+
+
+def test_investment_strategy_does_not_force_far_home_cash_into_near_vehicle_deadline() -> None:
+    household = HouseholdData(
+        cash_account_balance=24_000,
+        investments=80_000,
+        monthly_expense=10_000,
+        investment_cash_reserve_months=6,
+    )
+    car_loan = calculate_car_loan(
+        CarPlanData(
+            enabled=True,
+            total_price=200_000,
+            down_payment_ratio=0.2,
+            purchase_delay_months=10,
+        )
+    )
+
+    recommendations = build_investment_plan_recommendations(
+        household,
+        ScenarioData(annual_investment_return=0.05),
+        net_monthly_income=30_000,
+        current_monthly_expense=10_000,
+        effective_monthly_debt_payment=0,
+        car_loan=car_loan,
+        home_purchase_month=120,
+        home_required_cash=1_700_000,
+        home_required_reserve=60_000,
+        vehicle_purchase_month=10,
+    )
+
+    balanced = next(item for item in recommendations if item.plan_name == "balanced_monthly_investment")
+    assert balanced.goal_liquidity_target == pytest.approx(car_loan.down_payment)
+    assert balanced.monthly_goal_saving < 10_000
+    assert balanced.monthly_investment > 0
+
+
+def test_selected_auto_investment_strategy_controls_actual_ledger_contribution() -> None:
+    household = HouseholdData(
+        cash_account_balance=100_000,
+        investments=50_000,
+        monthly_expense=8_000,
+        investment_plan_name="balanced_monthly_investment",
+        monthly_investment_amount=0,
+        members=[IncomeMember(name="样例成员A", monthly_salary_gross=30_000, annual_bonus=0)],
+    )
+
+    result = calculate_affordability(
+        household,
+        ScenarioData(total_price=0, enabled=False, annual_investment_return=0.04),
+        _zero_contribution_rule(),
+    )
+    baseline = result.purchase_plan_analyses[0]
+    rows = [item for item in result.monthly_cashflow_visualization if item.plan_variant == baseline.variant]
+    balanced = next(
+        item for item in result.investment_plan_recommendations
+        if item.plan_name == "balanced_monthly_investment"
+    )
+
+    assert balanced.monthly_investment > 0
+    assert result.current_investment_allocation is not None
+    assert result.current_investment_allocation.total_investment > 0
+    assert any(item.investment_contribution > 0 for item in rows[:12])
+
+
+def test_investment_strategy_generates_cashflow_recovery_before_growth_when_lifecycle_is_insolvent() -> None:
+    household = HouseholdData(
+        cash_account_balance=100_000,
+        investments=200_000,
+        monthly_expense=10_000,
+        monthly_investment_amount=5_000,
+        investment_cash_reserve_months=6,
+        investment_auto_rebalance=True,
+    )
+
+    recommendations = build_investment_plan_recommendations(
+        household,
+        ScenarioData(annual_investment_return=0.06),
+        net_monthly_income=30_000,
+        current_monthly_expense=10_000,
+        effective_monthly_debt_payment=0,
+        car_loan=calculate_car_loan(CarPlanData(enabled=False)),
+        lifecycle_cash_shortfall=360_000,
+        lifecycle_insolvency_month=120,
+        lifecycle_liquid_assets_exhausted_month=120,
+    )
+
+    recovery = recommendations[0]
+    growth = next(item for item in recommendations if item.plan_name == "growth_monthly_investment")
+    assert recovery.plan_name == "lifecycle_cashflow_recovery"
+    assert recovery.monthly_investment == 0
+    assert recovery.lifecycle_required_monthly_relief == pytest.approx(3_300)
+    assert not growth.lifecycle_feasible
+    assert growth.score < recovery.score
 
 
 def test_career_shock_uses_birth_month_for_layoff_timing() -> None:
@@ -2587,7 +2941,7 @@ def test_account_balances_are_non_negative_but_net_worth_can_be_negative() -> No
     assert first_row.net_worth < 0
 
 
-def test_investment_strategy_sweeps_excess_cash_toward_cash_reserve() -> None:
+def test_investment_strategy_keeps_excess_cash_when_major_goal_is_unfunded() -> None:
     household = HouseholdData(
         cash_account_balance=500_000,
         investments=0,
@@ -2608,17 +2962,34 @@ def test_investment_strategy_sweeps_excess_cash_toward_cash_reserve() -> None:
     purchase_reserve = household.monthly_expense * household.required_liquidity_months
 
     assert plan.months_to_buy is None or plan.months_to_buy > 24
-    assert first_year[12].cash_balance < first_year[0].cash_balance
-    assert first_year[12].investment_balance > first_year[0].investment_balance
-    assert sum(item.investment_contribution for item in first_year[1:13]) > household.monthly_investment_amount * 12
-    assert sum(item.investment_contribution_cash_sweep for item in first_year[1:13]) > 0
+    assert first_year[12].cash_balance > first_year[0].cash_balance
+    assert first_year[12].investment_balance == first_year[0].investment_balance
+    assert sum(item.investment_contribution for item in first_year[1:13]) == 0
+    assert sum(item.investment_contribution_cash_sweep for item in first_year[1:13]) == 0
     assert all(
         item.investment_contribution
         == pytest.approx(item.investment_contribution_base + item.investment_contribution_cash_sweep)
         for item in first_year[1:13]
     )
-    assert min(item.cash_balance for item in rows[:25]) >= investment_reserve - 1
-    assert min(item.cash_balance for item in rows[:25]) < purchase_reserve
+    assert min(item.cash_balance for item in rows[:25]) >= purchase_reserve
+
+
+def test_property_terminal_value_uses_net_realisable_value() -> None:
+    projection = fixed_asset_projection_from_values(
+        month=12,
+        purchase_month=0,
+        home_total_price=1_000_000,
+        property_annual_price_growth_rate=0.03,
+        property_sale_cost_rate=0.03,
+        property_liquidity_discount_rate=0.02,
+        raw_first_vehicle_asset_value=0,
+        raw_second_vehicle_asset_value=0,
+        raw_vehicle_asset_value=0,
+        total_loan_balance_base=0,
+        offsets=ProjectionOffsets(),
+    )
+
+    assert projection.property_asset_value == pytest.approx(978_500)
 
 
 def test_investment_strategy_redeems_to_protect_cash_reserve() -> None:
@@ -2742,6 +3113,37 @@ def test_affordability_generates_multiple_car_purchase_strategies() -> None:
     assert len({item.happiness_score for item in plans.values()}) > 1
 
 
+def test_car_strategy_generation_uses_future_cash_pressure_and_searches_later_months() -> None:
+    household = HouseholdData(
+        cash_account_balance=160_000,
+        monthly_expense=10_000,
+        required_liquidity_months=6,
+        car_plan=CarPlanData(
+            enabled=True,
+            total_price=100_000,
+            down_payment_ratio=0.30,
+            total_months=36,
+            later_annual_rate=0.03,
+        ),
+    )
+
+    strategies = calculator_module._vehicle_facade.build_car_plan_analyses(
+        household,
+        net_monthly_income=30_000,
+        current_monthly_expense=10_000,
+        rules=RulePackData(),
+        income_at_month=lambda month: 30_000,
+        expense_at_month=lambda month: 510_000 if month == 18 else 10_000,
+        lifecycle_horizon_months=120,
+    )
+    plans = {item.strategy_key: item for item in strategies}
+
+    assert not plans["target"].lifecycle_feasible
+    assert plans["target"].lifecycle_insolvency_month == 18
+    assert plans["delay_purchase"].purchase_delay_months >= 24
+    assert plans["delay_purchase"].lifecycle_feasible
+
+
 def test_car_strategy_generation_deduplicates_equivalent_cash_plans() -> None:
     result = calculate_affordability(
         HouseholdData(
@@ -2834,7 +3236,8 @@ def test_selected_car_strategy_changes_home_purchase_strategy() -> None:
     assert low_down_result.car_plan_analyses
     assert low_down_plan.months_to_buy is not None
     assert cash_plan.months_to_buy is not None
-    assert low_down_plan.months_to_buy < cash_plan.months_to_buy
+    assert low_down_plan.months_to_buy <= cash_plan.months_to_buy
+    assert low_down_result.car_loan.down_payment < cash_result.car_loan.down_payment
     assert low_down_plan.cash_after_transaction > cash_plan.cash_after_transaction
 
 
@@ -3504,7 +3907,8 @@ def test_affordability_returns_multiple_purchase_plan_analyses() -> None:
     assert all(plan.minimum_cash_balance >= 0 for plan in plans.values())
     assert all(0 <= plan.recommendation_score <= 100 for plan in plans.values())
     assert all(plan.recommendation_reasons for plan in plans.values())
-    assert sum(1 for plan in plans.values() if plan.is_recommended) == 1
+    assert sum(1 for plan in plans.values() if plan.is_recommended) == 0
+    assert all(plan.feasibility_recommendation for plan in plans.values())
     assert plans["0商贷"].commercial_loan_amount == 0
 
 
@@ -4005,6 +4409,7 @@ def test_borrower_age_limits_provident_loan_years() -> None:
 def test_purchase_plan_uses_separate_commercial_and_provident_repayment_methods() -> None:
     scenario = ScenarioData(
         total_price=3_000_000,
+        loan_repayment_strategy_mode="manual",
         commercial_repayment_method="equal_principal",
         provident_repayment_method="equal_installment",
         renovation_cost=0,
@@ -4119,7 +4524,8 @@ def test_micro_commercial_strategy_auto_selects_ratio_within_bounds() -> None:
     assert home_policy.micro_commercial_loan_ratio_max == pytest.approx(0.12)
     assert scenario.total_price * 0.02 <= micro_plan.commercial_loan_amount <= scenario.total_price * 0.12
     assert micro_plan.months_to_buy is not None
-    assert zero_commercial.months_to_buy is None or micro_plan.months_to_buy <= zero_commercial.months_to_buy
+    assert micro_plan.months_to_buy <= home_policy.default_auto_search_horizon_months
+    assert zero_commercial.months_to_buy is None or zero_commercial.months_to_buy <= home_policy.default_auto_search_horizon_months
 
 
 def test_micro_commercial_strategy_avoids_negative_cash_for_400w_new_home() -> None:
@@ -4168,10 +4574,10 @@ def test_micro_commercial_strategy_avoids_negative_cash_for_400w_new_home() -> N
     result = calculate_affordability(household, scenario, rules)
     micro_plan = next(item for item in result.purchase_plan_analyses if item.variant == "微量商贷")
 
-    assert micro_plan.months_to_buy is not None
-    assert micro_plan.cash_stress_ok is True
-    assert micro_plan.cash_stress_shortfall == 0
-    assert micro_plan.minimum_cash_balance >= 0
+    assert micro_plan.months_to_buy is None
+    assert micro_plan.cash_stress_ok is False
+    assert micro_plan.cash_stress_shortfall > 0
+    assert not micro_plan.is_recommended
     assert scenario.total_price * 0.02 <= micro_plan.commercial_loan_amount <= scenario.total_price * 0.12
 
 
@@ -4438,9 +4844,10 @@ def test_family_provident_support_can_make_400w_new_home_micro_plan_cash_safe() 
     result = calculate_affordability(household, scenario, rules)
     micro_plan = next(item for item in result.purchase_plan_analyses if item.variant == "微量商贷")
 
-    assert micro_plan.months_to_buy is not None
-    assert micro_plan.cash_stress_ok is True
-    assert micro_plan.cash_stress_shortfall == 0
+    assert micro_plan.months_to_buy is None
+    assert micro_plan.cash_stress_ok is False
+    assert micro_plan.cash_stress_shortfall > 0
+    assert not micro_plan.is_recommended
     assert micro_plan.family_provident_upfront_extractable > 0
 
 
@@ -4559,13 +4966,15 @@ def test_purchase_plan_analysis_has_visualization_ready_cash_flow_fields() -> No
         assert 0 <= plan.happiness_score <= 10
 
 
-def test_renovation_budget_defaults_to_after_purchase_saving() -> None:
+def test_legacy_home_renovation_fields_are_internal_only_and_never_enter_purchase_cash() -> None:
     scenario_after = ScenarioData(
         total_price=3_000_000,
         deed_tax_rate=0,
         broker_fee_rate=0,
         moving_and_misc_cost=0,
         renovation_cost=300_000,
+        renovation_funding_mode="cash_or_investment",
+        renovation_delay_after_purchase_months=3,
     )
     scenario_upfront = scenario_after.model_copy(update={"renovation_funding_mode": "upfront_cash"})
     household = HouseholdData(
@@ -4580,14 +4989,57 @@ def test_renovation_budget_defaults_to_after_purchase_saving() -> None:
     after_plan = {item.variant: item for item in after_result.purchase_plan_analyses}["较多商贷"]
     upfront_plan = {item.variant: item for item in upfront_result.purchase_plan_analyses}["较多商贷"]
 
-    assert scenario_after.renovation_funding_mode == "after_purchase_saving"
+    serialized = scenario_after.model_dump(mode="json")
+    assert "renovation_cost" not in serialized
+    assert "renovation_funding_mode" not in serialized
     assert after_plan.renovation_included_in_upfront_cash is False
-    assert after_plan.upfront_cash_required + scenario_after.renovation_cost == pytest.approx(
-        upfront_plan.upfront_cash_required
+    assert upfront_plan.renovation_included_in_upfront_cash is False
+    assert after_plan.upfront_cash_required == pytest.approx(upfront_plan.upfront_cash_required)
+    assert after_plan.months_to_renovation is None or after_plan.months_to_renovation >= 3
+    assert upfront_plan.months_to_renovation is None or upfront_plan.months_to_renovation >= 3
+
+
+def test_renovation_planning_event_enters_ledger_once_after_purchase() -> None:
+    household = HouseholdData(
+        cash_account_balance=2_000_000,
+        investments=300_000,
+        monthly_expense=10_000,
+        required_liquidity_months=3,
+        members=[IncomeMember(name="样例成员", monthly_salary_gross=60_000)],
     )
-    assert after_plan.months_to_renovation is None or after_plan.months_to_renovation >= 0
-    assert upfront_plan.renovation_included_in_upfront_cash is True
-    assert upfront_plan.months_to_renovation == 0
+    scenario = ScenarioData(
+        total_price=2_000_000,
+        broker_fee_rate=0,
+        seller_tax_pass_through_enabled=False,
+        moving_and_misc_cost=0,
+        renovation_cost=120_000,
+        renovation_funding_mode="cash_or_investment",
+        renovation_goal_id="renovation-goal-a",
+        renovation_delay_after_purchase_months=2,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = next(item for item in result.purchase_plan_analyses if item.months_to_buy is not None)
+    assert plan.months_to_renovation is not None
+    assert plan.months_to_renovation >= 2
+    renovation_month = plan.months_to_buy + plan.months_to_renovation
+    renovation_entries = [
+        item
+        for item in result.monthly_ledger
+        if item.plan_variant == plan.variant and item.category == "renovation"
+    ]
+    renovation_events = [
+        item
+        for item in result.plan_events
+        if item.plan_variant == plan.variant and item.category == "renovation"
+    ]
+
+    assert len(renovation_entries) == 1
+    assert renovation_entries[0].month == renovation_month
+    assert renovation_entries[0].amount == pytest.approx(-120_000)
+    assert len(renovation_events) == 1
+    assert renovation_events[0].month == renovation_month
+    assert renovation_events[0].source == "planning_goals"
 
 
 def test_purchase_plan_treats_provident_extract_as_post_transaction_cash_by_default() -> None:
@@ -4705,11 +5157,66 @@ def test_auto_purchase_investment_withdrawal_preserves_unneeded_investments() ->
         if item.plan_variant == plan.variant and item.month == plan.months_to_buy
     )
 
-    assert plan.investment_sell_gross_at_purchase > 0
-    assert plan.investment_sell_gross_at_purchase < plan.investment_balance_before_purchase
+    # Hard cash-stress gating may prefer a later safe month that does not need
+    # a sale at all.  In either case auto mode must never force a full sale
+    # when there are investments left after the transaction.
+    assert plan.investment_sell_gross_at_purchase <= plan.investment_balance_before_purchase
     assert plan.investment_balance_after_purchase > 0
     assert purchase_row.investment_sell_proceeds == pytest.approx(plan.investment_sell_proceeds_at_purchase)
     assert purchase_row.investment_balance == pytest.approx(plan.investment_balance_after_purchase)
+
+
+def test_purchase_withdrawal_candidate_reserve_is_not_treated_as_cash() -> None:
+    withdrawal = investment_withdrawal_at_purchase(
+        scenario=ScenarioData(investment_withdrawal_mode="auto"),
+        cash_before_transaction=80_000,
+        investment_before_transaction=300_000,
+        required_cash_after_pf=220_000,
+        required_liquidity_reserve=60_000,
+        sell_fee_rate=0.005,
+        investment_enabled=True,
+        minimum_investment_balance_override=100_000,
+    )
+
+    assert withdrawal.investment_after_transaction == pytest.approx(100_000)
+    assert withdrawal.cash_after_transaction < 60_000
+
+
+def test_vehicle_prepayment_hurdle_uses_after_tax_investment_return() -> None:
+    before_tax = prepayment_investment_hurdle_rate(0.06, effective_tax_rate=0)
+    after_tax = prepayment_investment_hurdle_rate(0.06, effective_tax_rate=0.25)
+
+    assert after_tax < before_tax
+
+
+def test_commercial_prepayment_uses_after_tax_investment_hurdle() -> None:
+    scenario = ScenarioData(commercial_rate=0.05, annual_investment_return=0.06, loan_years=30)
+    regular_payment = calculate_loan(1_000_000, 0.05, 30, "equal_installment")
+    common = {
+        "commercial_loan": 1_000_000,
+        "regular_payment": regular_payment,
+        "post_purchase_cash_flow_with_pf": 12_000,
+        "post_purchase_monthly_expense": 5_000,
+        "required_liquidity_reserve": 30_000,
+        "cash_after_purchase": 200_000,
+        "minimum_cash_balance": 200_000,
+        "commercial_repayment_method": "equal_installment",
+    }
+
+    before_tax = choose_auto_commercial_prepayment(
+        scenario,
+        investment_effective_tax_rate=0,
+        **common,
+    )
+    after_tax = choose_auto_commercial_prepayment(
+        scenario,
+        investment_effective_tax_rate=0.25,
+        **common,
+    )
+
+    assert before_tax[0] is False
+    assert after_tax[0] is True
+    assert after_tax[3] > 0
 
 
 def test_purchase_planning_window_start_delays_all_purchase_strategies() -> None:
@@ -5300,7 +5807,7 @@ def test_provident_center_uses_income_stage_at_purchase_month() -> None:
 
 def test_auto_provident_strategy_can_switch_from_monthly_withdrawal_to_semiannual_offset() -> None:
     household = HouseholdData(
-        cash_account_balance=900_000,
+        cash_account_balance=2_000_000,
         monthly_expense=18_000,
         members=[
                 IncomeMember(
@@ -5311,7 +5818,7 @@ def test_auto_provident_strategy_can_switch_from_monthly_withdrawal_to_semiannua
                     income_stages=[
                     IncomeStageData(
                         name="当前收入",
-                        monthly_salary_gross=28_000,
+                            monthly_salary_gross=28_000,
                         monthly_housing_fund=3_360,
                         housing_fund_personal_rate=0.12,
                         housing_fund_employer_rate=0.12,
@@ -5839,6 +6346,40 @@ def test_purchase_plan_explains_repayment_method_interest_tradeoff() -> None:
     assert "等额本金" in plan.provident_repayment_advice
 
 
+def test_purchase_strategy_jointly_optimizes_commercial_and_provident_repayment_methods() -> None:
+    household = HouseholdData(
+        cash_account_balance=2_000_000,
+        monthly_expense=8_000,
+        required_liquidity_months=6,
+        social_security_months=180,
+        members=[
+            IncomeMember(name="样例成员A", monthly_salary_gross=80_000, annual_bonus=0),
+            IncomeMember(name="样例成员B", monthly_salary_gross=60_000, annual_bonus=0),
+        ],
+    )
+    scenario = ScenarioData(
+        total_price=3_000_000,
+        loan_repayment_strategy_mode="auto",
+        commercial_repayment_method="equal_installment",
+        provident_repayment_method="equal_installment",
+        renovation_cost=0,
+        moving_and_misc_cost=0,
+        deed_tax_rate=0,
+        broker_fee_rate=0,
+    )
+
+    result = calculate_affordability(household, scenario, RulePackData())
+    plan = {item.variant: item for item in result.purchase_plan_analyses}["较多商贷"]
+
+    assert plan.commercial_loan_amount > 0
+    assert plan.provident_loan_amount > 0
+    assert plan.commercial_interest_saving_if_equal_principal > 0
+    assert plan.commercial_equal_principal_first_payment > plan.commercial_equal_installment_payment
+    assert plan.commercial_repayment_method == "equal_principal"
+    assert plan.provident_repayment_method == "equal_principal"
+    assert "策略选择等额本金" in plan.commercial_repayment_advice
+
+
 def test_existing_home_family_does_not_continue_rent_withdrawal_before_purchase() -> None:
     scenario = ScenarioData(total_price=3_000_000, renovation_cost=0, moving_and_misc_cost=0)
     household_with_home = HouseholdData(
@@ -6007,6 +6548,10 @@ def test_market_snapshot_feeds_purchase_strategy_market_assumptions() -> None:
     plan = result.purchase_plan_analyses[0]
     assert plan.commercial_rate == pytest.approx(0.032)
     assert plan.broker_fee_rate == pytest.approx(0.016)
+    assert plan.property_price_forecast_applied is True
+    assert plan.projected_purchase_price >= scenario.total_price
+    assert plan.projected_purchase_price_lower <= plan.projected_purchase_price <= plan.projected_purchase_price_upper
+    assert any(event.category == "property_market" for event in result.plan_events)
 
     manual_quote = scenario.model_copy(update={"commercial_rate": 0.041, "broker_fee_rate": 0.012})
     manual_result = calculate_affordability(household, manual_quote, RulePackData(), market_snapshot=market_snapshot)
@@ -6214,7 +6759,7 @@ def test_extreme_car_prepayment_is_capped_without_negative_interest_or_balance()
     assert loan.interest_saved_by_prepayment >= 0
 
 
-def test_extreme_negative_monthly_cashflow_keeps_account_balances_non_negative() -> None:
+def test_extreme_negative_monthly_cashflow_reports_shortfall_without_clamping_cash() -> None:
     household = HouseholdData(
         cash_account_balance=0,
         investments=0,
@@ -6241,10 +6786,18 @@ def test_extreme_negative_monthly_cashflow_keeps_account_balances_non_negative()
     assert result.purchase_plan_analyses
     assert result.monthly_cashflow_visualization
     assert any(item.monthly_cash_delta < 0 for item in result.monthly_cashflow_visualization)
-    assert all(item.cash_balance >= 0 for item in result.monthly_cashflow_visualization)
+    assert any(item.cash_balance < 0 for item in result.monthly_cashflow_visualization)
+    assert any(item.cash_shortfall > 0 for item in result.monthly_cashflow_visualization)
+    assert any(item.insolvency_month is not None for item in result.monthly_cashflow_visualization)
     assert all(item.investment_balance >= 0 for item in result.monthly_cashflow_visualization)
     assert all(item.provident_balance >= 0 for item in result.monthly_cashflow_visualization)
     assert all(item.total_loan_balance >= 0 for item in result.monthly_cashflow_visualization)
+    portfolio = result.portfolio_strategy_recommendations[0]
+    assert portfolio.plan_name == "lifecycle_cashflow_recovery"
+    assert portfolio.is_recommended
+    assert not portfolio.feasible
+    assert portfolio.required_monthly_relief > 0
+    assert any("组合底线" in action for action in portfolio.actions)
 
 
 def test_structured_child_and_housing_deductions_reduce_tax_with_rent_mortgage_exclusive() -> None:
@@ -6632,6 +7185,8 @@ def test_personal_pension_deduction_is_capped_annually() -> None:
                 annual_bonus=0,
                 monthly_special_additional_deduction=0,
                 personal_pension_account_enabled=True,
+                personal_pension_participation_eligible=True,
+                personal_pension_open_mode="auto_tax_optimal",
                 personal_pension_contribution_mode="fixed_annual",
                 personal_pension_annual_contribution_target=30_000,
                 personal_pension_contribution_start_month="2027-01",
@@ -6665,6 +7220,8 @@ def test_personal_pension_auto_strategy_applies_only_with_taxable_work_income() 
         monthly_salary_gross=30_000,
         annual_bonus=0,
         personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=True,
+        personal_pension_open_mode="auto_tax_optimal",
         personal_pension_contribution_mode="auto_tax_optimal",
         income_stages=[
             IncomeStageData(
@@ -6702,6 +7259,100 @@ def test_personal_pension_auto_strategy_applies_only_with_taxable_work_income() 
     assert pension_profile.other_cash_outflow == 0
 
 
+def test_personal_pension_actual_contribution_never_exceeds_annual_policy_cap() -> None:
+    rule = _zero_contribution_rule().model_copy(
+        update={"params": {**_zero_contribution_rule().params, "personal_pension_deduction_annual_cap": 12_000}}
+    )
+    member = IncomeMember(
+        name="样例成员A",
+        personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=True,
+        personal_pension_open_mode="auto_tax_optimal",
+        personal_pension_contribution_mode="fixed_monthly",
+        personal_pension_monthly_contribution=5_000,
+        income_stages=[IncomeStageData(name="工资阶段", stage_kind="salary", start_date="2027-01-01", monthly_salary_gross=30_000)],
+    )
+    household = HouseholdData(members=[member])
+
+    contributions = [
+        household_monthly_income_profile_at(household, rule, as_of=date(2027, month, 1)).personal_pension_contribution
+        for month in range(1, 5)
+    ]
+
+    assert contributions == pytest.approx([5_000, 5_000, 2_000, 0])
+    assert sum(contributions) == pytest.approx(12_000)
+
+
+def test_personal_pension_requires_basic_pension_participation_eligibility() -> None:
+    rule = _zero_contribution_rule()
+    member = IncomeMember(
+        name="样例成员A",
+        pension_account_enabled=True,
+        personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=False,
+        personal_pension_open_mode="auto_tax_optimal",
+        personal_pension_contribution_mode="auto_tax_optimal",
+        income_stages=[IncomeStageData(name="工资阶段", stage_kind="salary", start_date="2027-01-01", monthly_salary_gross=30_000)],
+    )
+
+    profile = household_monthly_income_profile_at(HouseholdData(members=[member]), rule, as_of=date(2027, 1, 1))
+
+    assert profile.personal_pension_contribution == 0
+
+
+def test_personal_pension_fixed_annual_deduction_is_not_spread_before_payment() -> None:
+    rule = _zero_contribution_rule().model_copy(
+        update={"params": {**_zero_contribution_rule().params, "personal_pension_deduction_annual_cap": 12_000}}
+    )
+    member = IncomeMember(
+        name="样例成员A",
+        personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=True,
+        personal_pension_open_mode="auto_tax_optimal",
+        personal_pension_contribution_mode="fixed_annual",
+        personal_pension_annual_contribution_target=12_000,
+        personal_pension_contribution_month=12,
+        income_stages=[IncomeStageData(name="工资阶段", stage_kind="salary", start_date="2027-01-01", monthly_salary_gross=30_000)],
+    )
+    household = HouseholdData(members=[member])
+    without = HouseholdData(members=[member.model_copy(update={"personal_pension_account_enabled": False})])
+
+    january = household_monthly_income_profile_at(household, rule, as_of=date(2027, 1, 1))
+    january_without = household_monthly_income_profile_at(without, rule, as_of=date(2027, 1, 1))
+    december = household_monthly_income_profile_at(household, rule, as_of=date(2027, 12, 1))
+
+    assert january.personal_pension_contribution == 0
+    assert january.income_tax == january_without.income_tax
+    assert december.personal_pension_contribution == 12_000
+
+
+def test_personal_pension_annual_settlement_does_not_reduce_monthly_withholding() -> None:
+    rule = _zero_contribution_rule()
+    member = IncomeMember(
+        name="样例成员A",
+        personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=True,
+        personal_pension_open_mode="auto_tax_optimal",
+        personal_pension_contribution_mode="auto_tax_optimal",
+        personal_pension_tax_deduction_mode="annual_settlement",
+        income_stages=[IncomeStageData(name="工资阶段", stage_kind="salary", start_date="2027-01-01", monthly_salary_gross=30_000)],
+    )
+    household = HouseholdData(members=[member], income_projection_year=2027)
+    without = HouseholdData(
+        members=[member.model_copy(update={"personal_pension_account_enabled": False})],
+        income_projection_year=2027,
+    )
+
+    january = household_monthly_income_profile_at(household, rule, as_of=date(2027, 1, 1))
+    january_without = household_monthly_income_profile_at(without, rule, as_of=date(2027, 1, 1))
+    annual = calculate_household_tax_for_year(household, rule, 2027).summaries[0]
+    annual_without = calculate_household_tax_for_year(without, rule, 2027).summaries[0]
+
+    assert january.personal_pension_contribution == 1_000
+    assert january.income_tax == january_without.income_tax
+    assert annual.taxable_income == pytest.approx(annual_without.taxable_income - 12_000)
+
+
 def test_personal_pension_auto_strategy_recommends_open_month_from_taxable_income() -> None:
     rule = _zero_contribution_rule()
     member = IncomeMember(
@@ -6709,6 +7360,7 @@ def test_personal_pension_auto_strategy_recommends_open_month_from_taxable_incom
         monthly_salary_gross=0,
         annual_bonus=0,
         personal_pension_account_enabled=True,
+        personal_pension_participation_eligible=True,
         personal_pension_open_mode="auto_tax_optimal",
         personal_pension_contribution_mode="auto_tax_optimal",
         income_stages=[
@@ -6734,7 +7386,7 @@ def test_personal_pension_auto_strategy_recommends_open_month_from_taxable_incom
 
     assert june.personal_pension_contribution == 0
     assert july.personal_pension_contribution == pytest.approx(1000)
-    assert strategy.status == "auto_enabled"
+    assert strategy.status == "available"
     assert strategy.start_month == "2027-07"
     assert strategy.cash_contribution == pytest.approx(12_000)
     assert strategy.estimated_tax_saving > 0
@@ -6760,6 +7412,8 @@ def test_personal_pension_contribution_enters_cashflow_and_account_projection() 
             IncomeMember(
                 name="样例成员A",
                 personal_pension_account_enabled=True,
+                personal_pension_participation_eligible=True,
+                personal_pension_open_mode="auto_tax_optimal",
                 personal_pension_account_balance=12_000,
                 personal_pension_contribution_mode="auto_tax_optimal",
                 personal_pension_annual_return=0.12,
@@ -6816,13 +7470,38 @@ def test_removed_top_level_personal_pension_accounts_are_discarded() -> None:
 
     member = normalized["members"][0]
     assert "personal_pension_accounts" not in normalized
-    assert member["personal_pension_account_enabled"] is True
+    assert member["personal_pension_account_enabled"] is False
+    assert member["personal_pension_participation_eligible"] is False
     assert member["personal_pension_account_balance"] == 0
-    assert member["personal_pension_open_mode"] == "auto_tax_optimal"
-    assert member["personal_pension_contribution_mode"] == "auto_tax_optimal"
+    assert member["personal_pension_open_mode"] == "none"
+    assert member["personal_pension_contribution_mode"] == "none"
     assert member["personal_pension_annual_contribution_target"] == 0
     assert member["personal_pension_contribution_start_month"] == ""
     assert member["personal_pension_contribution_end_month"] is None
+
+
+def test_existing_enabled_personal_pension_account_preserves_policy_eligibility_on_normalization() -> None:
+    from app.database import normalize_household_data
+
+    normalized = normalize_household_data(
+        {
+            "members": [
+                {
+                    "name": "样例成员A",
+                    "pension_account_enabled": True,
+                    "personal_pension_account_enabled": True,
+                    "personal_pension_open_mode": "auto_tax_optimal",
+                    "personal_pension_contribution_mode": "auto_tax_optimal",
+                    "income_stages": [],
+                }
+            ]
+        }
+    )
+
+    member = normalized["members"][0]
+    assert member["personal_pension_account_enabled"] is True
+    assert member["personal_pension_participation_eligible"] is True
+    assert member["personal_pension_contribution_mode"] == "auto_tax_optimal"
 
 
 def test_annual_bonus_separate_tax_defaults_to_continue_after_2028() -> None:
@@ -6871,8 +7550,8 @@ def test_annual_bonus_earning_period_prorates_cross_year_bonus() -> None:
                         monthly_salary_gross=20_000,
                         annual_bonus=120_000,
                         annual_bonus_payout_month=4,
-                        annual_bonus_earning_start_month="2026-07",
-                        annual_bonus_earning_end_month="2027-01",
+                        annual_bonus_earning_start_month=7,
+                        annual_bonus_earning_end_month=1,
                         bonus_tax_method="merged",
                     )
                 ],
@@ -6883,6 +7562,67 @@ def test_annual_bonus_earning_period_prorates_cross_year_bonus() -> None:
     summary = calculate_household_tax_for_year(household, rule, 2027).summaries[0]
 
     assert summary.gross_annual_income == pytest.approx(20_000 * 12 + 120_000 * 7 / 12)
+
+
+def test_annual_bonus_salary_months_use_latest_completed_cross_year_cycle() -> None:
+    from app.domain.tax import stage_bonus_payout_amount
+
+    stage = IncomeStageData(
+        name="样例收入阶段",
+        start_date="2026-07-01",
+        monthly_salary_gross=30_000,
+        annual_bonus_months=3.0,
+        annual_bonus_payout_month=3,
+        annual_bonus_earning_start_month=2,
+        annual_bonus_earning_end_month=1,
+    )
+
+    assert stage_bonus_payout_amount(stage, 2027, 3) == pytest.approx(52_500)
+
+
+def test_annual_bonus_salary_months_support_one_decimal_place() -> None:
+    from app.domain.tax import stage_bonus_payout_amount
+
+    stage = IncomeStageData(
+        start_date="2026-02-01",
+        monthly_salary_gross=30_000,
+        annual_bonus_months=2.5,
+        annual_bonus_payout_month=3,
+        annual_bonus_earning_start_month=2,
+        annual_bonus_earning_end_month=1,
+    )
+
+    assert stage_bonus_payout_amount(stage, 2027, 3) == pytest.approx(75_000)
+
+
+def test_old_bonus_earning_year_month_is_migrated_to_month_of_year() -> None:
+    from app.database import normalize_household_data
+
+    normalized = normalize_household_data(
+        {
+            "members": [
+                {
+                    "name": "样例成员A",
+                    "income_stages": [
+                        {
+                            "name": "工资阶段",
+                            "start_date": "2026-01-01",
+                            "monthly_salary_gross": 20_000,
+                            "annual_bonus": 60_000,
+                            "annual_bonus_earning_start_month": "2026-07",
+                            "annual_bonus_earning_end_month": "2027-01",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    stage = normalized["members"][0]["income_stages"][0]
+    assert stage["annual_bonus_earning_start_month"] == 7
+    assert stage["annual_bonus_earning_end_month"] == 1
+    assert stage["annual_bonus_months"] == 3.0
+    assert "annual_bonus" not in stage
 
 
 def test_investment_tax_profile_reduces_backend_investment_return() -> None:

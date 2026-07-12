@@ -56,6 +56,7 @@ LAYER_CODE_PATHS: dict[str, tuple[str, ...]] = {
     ),
 }
 ENGINE_CODE_PATHS: tuple[str, ...] = ("cache.py", "generated_strategies.py")
+RULE_PACK_CALCULATION_FIELDS: tuple[str, ...] = ("jurisdiction", "params")
 
 
 def _hash_json(payload: Any) -> str:
@@ -121,15 +122,18 @@ def affordability_input_payload(payload: AffordabilityRequest) -> dict[str, Any]
 def _business_rule_pack_payload(rule_pack: dict[str, Any]) -> dict[str, Any]:
     params = rule_pack.get("params")
     if not isinstance(params, dict):
-        return rule_pack
-    return {
-        **rule_pack,
-        "params": {
-            key: value
-            for key, value in params.items()
-            if key not in EXECUTION_CONFIG_PARAM_KEYS
-        },
+        params = {}
+    business_payload = {
+        key: rule_pack.get(key)
+        for key in RULE_PACK_CALCULATION_FIELDS
+        if key != "params"
     }
+    business_payload["params"] = {
+        key: value
+        for key, value in params.items()
+        if key not in EXECUTION_CONFIG_PARAM_KEYS
+    }
+    return business_payload
 
 
 def affordability_cache_layers(payload: AffordabilityRequest) -> CacheLayerHashes:

@@ -29,6 +29,7 @@ from .schemas import (
     ElderlyDependentData,
     HouseholdData,
     IncomeMember,
+    PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
     TaxEventPoint,
@@ -40,9 +41,11 @@ from .schemas import (
     TaxYearSummary,
 )
 from .strategies.tax import (
+    PersonalPensionOptimizationDecision,
     build_tax_events as _strategy_build_tax_events,
     build_tax_strategy_items as _strategy_build_tax_strategy_items,
     build_tax_strategy_timeline as _strategy_build_tax_strategy_timeline,
+    optimize_personal_pension_strategies as _strategy_optimize_personal_pension_strategies,
 )
 
 
@@ -59,6 +62,7 @@ class MonthlyIncomeProfile:
     non_taxable_income: float = 0.0
     pension_income: float = 0.0
     personal_pension_contribution: float = 0.0
+    personal_pension_tax_saving: float = 0.0
     other_cash_outflow: float = 0.0
 
     @property
@@ -143,47 +147,54 @@ def _personal_pension_deduction_for_member_at(
     member_name: str,
     target_month: date,
     rules: RulePackData,
+    *,
+    include_annual_settlement: bool = False,
 ) -> float:
     if household is None:
         return 0.0
-    cap = get_policy(rules).tax_benefit_policy().personal_pension_deduction_annual_cap
     member = next((item for item in household.members if item.name == member_name), None)
-    if member is None or not bool(getattr(member, "personal_pension_account_enabled", False)):
+    if member is None:
         return 0.0
-    open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
+    deduction_mode = str(
+        getattr(member, "personal_pension_tax_deduction_mode", "monthly_withholding")
+        or "monthly_withholding"
+    )
+    if deduction_mode == "annual_settlement" and not include_annual_settlement:
+        return 0.0
+    if deduction_mode != "annual_settlement" and include_annual_settlement:
+        # 年度汇总仍需累计当年已经在预扣预缴中享受的实际缴费扣除。
+        pass
+    return _personal_pension_cash_contribution_for_member_at(member, target_month, rules)
+
+
+def _personal_pension_member_eligible(member: IncomeMember) -> bool:
+    return bool(
+        member.personal_pension_account_enabled
+        and member.personal_pension_participation_eligible
+        and member.pension_account_enabled
+    )
+
+
+def _personal_pension_contribution_active_at(member: IncomeMember, target_month: date) -> bool:
+    if not _personal_pension_member_eligible(member):
+        return False
+    open_mode = str(member.personal_pension_open_mode or "none")
     if open_mode == "none":
-        return 0.0
-    open_month = _parse_year_month(getattr(member, "personal_pension_account_open_month", ""))
+        return False
+    open_month = _parse_year_month(member.personal_pension_account_open_month)
     target = (target_month.year, target_month.month)
     if open_mode == "manual" and open_month is not None and _month_distance(open_month, target) < 0:
-        return 0.0
-    mode = str(getattr(member, "personal_pension_contribution_mode", "none") or "none")
+        return False
+    mode = str(member.personal_pension_contribution_mode or "none")
     if mode == "none":
-        return 0.0
-    start = _parse_year_month(getattr(member, "personal_pension_contribution_start_month", ""))
-    end = _parse_year_month(getattr(member, "personal_pension_contribution_end_month", "") or "")
+        return False
+    start = _parse_year_month(member.personal_pension_contribution_start_month)
+    end = _parse_year_month(member.personal_pension_contribution_end_month or "")
     if start is not None and _month_distance(start, target) < 0:
-        return 0.0
+        return False
     if end is not None and _month_distance(target, end) < 0:
-        return 0.0
-    if mode == "auto_tax_optimal":
-        stage = _income_stage_for_month(member, target_month.year, target_month.month)
-        if stage is None or stage.stage_kind in {"pension", "unemployment"}:
-            return 0.0
-        taxable_cash_income = (
-            stage.monthly_salary_gross
-            + stage.monthly_freelance_income
-            + stage.other_annual_taxable_income / 12
-            + _stage_bonus_cash_amount(stage, target_month.year, target_month.month)
-        )
-        if taxable_cash_income <= 0:
-            return 0.0
-        annual_target = cap
-    elif mode == "fixed_monthly":
-        annual_target = max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0))) * 12
-    else:
-        annual_target = max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0)))
-    return min(annual_target, cap) / 12 if cap else annual_target / 12
+        return False
+    return True
 
 
 def _personal_pension_cash_contribution_for_member_at(
@@ -191,26 +202,21 @@ def _personal_pension_cash_contribution_for_member_at(
     target_month: date,
     rules: RulePackData,
 ) -> float:
-    if not bool(getattr(member, "personal_pension_account_enabled", False)):
-        return 0.0
-    open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
-    if open_mode == "none":
-        return 0.0
-    open_month = _parse_year_month(getattr(member, "personal_pension_account_open_month", ""))
-    target = (target_month.year, target_month.month)
-    if open_mode == "manual" and open_month is not None and _month_distance(open_month, target) < 0:
+    if not _personal_pension_contribution_active_at(member, target_month):
         return 0.0
     mode = str(getattr(member, "personal_pension_contribution_mode", "none") or "none")
-    if mode == "none":
-        return 0.0
-    start = _parse_year_month(getattr(member, "personal_pension_contribution_start_month", ""))
-    end = _parse_year_month(getattr(member, "personal_pension_contribution_end_month", "") or "")
-    if start is not None and _month_distance(start, target) < 0:
-        return 0.0
-    if end is not None and _month_distance(target, end) < 0:
-        return 0.0
     cap = get_policy(rules).tax_benefit_policy().personal_pension_deduction_annual_cap
+    if cap <= 0:
+        return 0.0
     if mode == "auto_tax_optimal":
+        auto_schedule = member.personal_pension_auto_annual_contribution_schedule or {}
+        annual_target = (
+            min(cap, max(0.0, float(auto_schedule.get(str(target_month.year), 0.0))))
+            if auto_schedule
+            else cap
+        )
+        if annual_target <= 0:
+            return 0.0
         stage = _income_stage_for_month(member, target_month.year, target_month.month)
         if stage is None or stage.stage_kind in {"pension", "unemployment"}:
             return 0.0
@@ -222,14 +228,38 @@ def _personal_pension_cash_contribution_for_member_at(
         )
         if taxable_cash_income <= 0:
             return 0.0
-        return cap / 12 if cap else 0.0
+        if not auto_schedule:
+            return cap / 12
+        eligible_months = 0
+        for month_number in range(1, 13):
+            month = date(target_month.year, month_number, 1)
+            if not _personal_pension_contribution_active_at(member, month):
+                continue
+            month_stage = _income_stage_for_month(member, month.year, month.month)
+            if month_stage is None or month_stage.stage_kind in {"pension", "unemployment"}:
+                continue
+            month_taxable_income = (
+                month_stage.monthly_salary_gross
+                + month_stage.monthly_freelance_income
+                + month_stage.other_annual_taxable_income / 12
+                + _stage_bonus_cash_amount(month_stage, month.year, month.month)
+            )
+            if month_taxable_income > 0:
+                eligible_months += 1
+        return annual_target / max(1, eligible_months)
     if mode == "fixed_monthly":
-        return max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0)))
+        configured = max(0.0, float(member.personal_pension_monthly_contribution))
+        contributed_before = 0.0
+        for month_number in range(1, target_month.month):
+            prior_month = date(target_month.year, month_number, 1)
+            if _personal_pension_contribution_active_at(member, prior_month):
+                contributed_before = min(cap, contributed_before + configured)
+        return min(configured, max(0.0, cap - contributed_before))
     if mode == "fixed_annual":
         contribution_month = max(1, min(12, int(getattr(member, "personal_pension_contribution_month", 12) or 12)))
         if target_month.month != contribution_month:
             return 0.0
-        return max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0)))
+        return min(cap, max(0.0, float(member.personal_pension_annual_contribution_target)))
     return 0.0
 
 
@@ -371,7 +401,13 @@ def _structured_special_deduction_for_member_at(
         _elderly_care_deduction_for_member_at(household, member_name, target_month)
         + _auto_child_special_deduction_for_member_at(household, member_name, target_month, rules)
         + _auto_housing_special_deduction_for_member_at(household, member_name, target_month, rules)
-        + _personal_pension_deduction_for_member_at(household, member_name, target_month, rules)
+        + _personal_pension_deduction_for_member_at(
+            household,
+            member_name,
+            target_month,
+            rules,
+            include_annual_settlement=include_annual_settlement,
+        )
         + _configured_special_deduction_for_member_at(
             household,
             member_name,
@@ -512,6 +548,38 @@ def _member_monthly_income_profile(
     gross_income = taxable_cash_income + stage.monthly_non_taxable_income
     income_tax = salary_tax + bonus_tax_due
     personal_pension_contribution = _personal_pension_cash_contribution_for_member_at(member, target_month, rules)
+    personal_pension_tax_saving = 0.0
+    if personal_pension_contribution > 0:
+        member_without_personal_pension = member.model_copy(
+            update={
+                "personal_pension_account_enabled": False,
+                "personal_pension_open_mode": "none",
+                "personal_pension_contribution_mode": "none",
+            }
+        )
+        household_without_personal_pension = (
+            household.model_copy(
+                update={
+                    "members": [
+                        member_without_personal_pension if item.name == member.name else item
+                        for item in household.members
+                    ]
+                }
+            )
+            if household is not None
+            else None
+        )
+        previous_without, cumulative_without = _member_cumulative_salary_tax_pair(
+            member_without_personal_pension,
+            rules,
+            target_month.year,
+            target_month.month,
+            household_without_personal_pension,
+        )
+        personal_pension_tax_saving = max(
+            0.0,
+            cumulative_without - previous_without - salary_tax,
+        )
     net_income = gross_income - personal_social - personal_housing_fund - income_tax
     return MonthlyIncomeProfile(
         gross_income=round(gross_income, 2),
@@ -525,6 +593,7 @@ def _member_monthly_income_profile(
         non_taxable_income=round(stage.monthly_non_taxable_income, 2),
         pension_income=round(pension_income, 2),
         personal_pension_contribution=round(personal_pension_contribution, 2),
+        personal_pension_tax_saving=round(personal_pension_tax_saving, 2),
         other_cash_outflow=0.0,
     )
 
@@ -582,6 +651,7 @@ def household_monthly_income_profile_at(
         non_taxable_income=round(sum(item.non_taxable_income for item in member_profiles), 2),
         pension_income=round(sum(item.pension_income for item in member_profiles), 2),
         personal_pension_contribution=round(sum(item.personal_pension_contribution for item in member_profiles), 2),
+        personal_pension_tax_saving=round(sum(item.personal_pension_tax_saving for item in member_profiles), 2),
         other_cash_outflow=round(sum(item.other_cash_outflow for item in member_profiles), 2),
     )
 
@@ -924,8 +994,30 @@ def _estimate_personal_pension_tax_saving(
     member: IncomeMember,
     rules: RulePackData,
     projection_year: int,
+    annual_contribution: float,
 ) -> float:
-    summary_with = _member_tax_summary(member, rules, household=household, projection_year=projection_year)
+    member_with = member.model_copy(
+        update={
+            "personal_pension_account_enabled": True,
+            "personal_pension_open_mode": "manual",
+            "personal_pension_contribution_mode": "fixed_annual",
+            "personal_pension_annual_contribution_target": max(0.0, annual_contribution),
+            "personal_pension_contribution_month": 12,
+            "personal_pension_contribution_start_month": f"{projection_year:04d}-01",
+            "personal_pension_contribution_end_month": f"{projection_year:04d}-12",
+        }
+    )
+    household_with = household.model_copy(
+        update={
+            "members": [member_with if item.name == member.name else item for item in household.members]
+        }
+    )
+    summary_with = _member_tax_summary(
+        member_with,
+        rules,
+        household=household_with,
+        projection_year=projection_year,
+    )
     member_without = member.model_copy(
         update={
             "personal_pension_account_enabled": False,
@@ -950,6 +1042,22 @@ def _estimate_personal_pension_tax_saving(
     return max(0.0, summary_without.total_tax - summary_with.total_tax)
 
 
+def optimize_personal_pension_strategies(
+    household: HouseholdData,
+    scenario: ScenarioData,
+    rules: RulePackData,
+    *,
+    base_date: date,
+) -> tuple[HouseholdData, dict[int, PersonalPensionOptimizationDecision]]:
+    return _strategy_optimize_personal_pension_strategies(
+        household,
+        scenario,
+        rules,
+        base_date=base_date,
+        personal_pension_tax_saving_estimator=_estimate_personal_pension_tax_saving,
+    )
+
+
 def build_tax_strategy_items(
     household: HouseholdData,
     scenario: ScenarioData,
@@ -958,6 +1066,10 @@ def build_tax_strategy_items(
     base_date: date | None = None,
     horizon_months: int = 840,
     selected_purchase_month: int | None = None,
+    selected_purchase_plan: PurchasePlanAnalysis | None = None,
+    auto_suspended_personal_pension_member_indexes: set[int] | None = None,
+    personal_pension_original_insolvency_month: int | None = None,
+    personal_pension_optimization_decisions: dict[int, PersonalPensionOptimizationDecision] | None = None,
 ) -> list[TaxStrategyItem]:
     return _strategy_build_tax_strategy_items(
         household,
@@ -966,6 +1078,10 @@ def build_tax_strategy_items(
         base_date=base_date,
         horizon_months=horizon_months,
         selected_purchase_month=selected_purchase_month,
+        selected_purchase_plan=selected_purchase_plan,
+        auto_suspended_personal_pension_member_indexes=auto_suspended_personal_pension_member_indexes,
+        personal_pension_original_insolvency_month=personal_pension_original_insolvency_month,
+        personal_pension_optimization_decisions=personal_pension_optimization_decisions,
         personal_pension_tax_saving_estimator=_estimate_personal_pension_tax_saving,
     )
 

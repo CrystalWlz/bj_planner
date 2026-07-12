@@ -9,6 +9,10 @@ import type {
   GeneratedStrategyRecord,
   HouseholdData,
   MarketSnapshotData,
+  PropertyValuationRecord,
+  PropertyValuationRefreshResponse,
+  PersonalPensionReturnRefreshResponse,
+  PersonalPensionReturnSnapshotRecord,
   PlanningGoalData,
   PlanningFoundationSummary,
   PlanningGoalRecord,
@@ -22,6 +26,33 @@ import type {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 const inFlightCalculationRequests = new Map<string, Promise<AffordabilityResult>>();
+const completedCalculationResults = new Map<string, AffordabilityResult>();
+const inFlightGeneratedStrategyRequests = new Map<string, Promise<GeneratedStrategyRecord[]>>();
+const completedGeneratedStrategyResults = new Map<string, GeneratedStrategyRecord[]>();
+const MAX_COMPLETED_CALCULATION_RESULTS = 48;
+const MAX_COMPLETED_GENERATED_STRATEGY_RESULTS = 48;
+
+function rememberCalculationResult(key: string, result: AffordabilityResult) {
+  completedCalculationResults.delete(key);
+  completedCalculationResults.set(key, result);
+  while (completedCalculationResults.size > MAX_COMPLETED_CALCULATION_RESULTS) {
+    const oldestKey = completedCalculationResults.keys().next().value;
+    if (typeof oldestKey !== "string") break;
+    completedCalculationResults.delete(oldestKey);
+  }
+  return result;
+}
+
+function rememberGeneratedStrategyResult(key: string, result: GeneratedStrategyRecord[]) {
+  completedGeneratedStrategyResults.delete(key);
+  completedGeneratedStrategyResults.set(key, result);
+  while (completedGeneratedStrategyResults.size > MAX_COMPLETED_GENERATED_STRATEGY_RESULTS) {
+    const oldestKey = completedGeneratedStrategyResults.keys().next().value;
+    if (typeof oldestKey !== "string") break;
+    completedGeneratedStrategyResults.delete(oldestKey);
+  }
+  return result;
+}
 
 function assertCompleteAffordabilityResult(result: AffordabilityResult): AffordabilityResult {
   const layers = result.cache_layers;
@@ -54,23 +85,54 @@ export async function loadInitialData() {
     request<RecordEnvelope<RulePackData>[]>("/api/rule-packs"),
     request<RecordEnvelope<MarketSnapshotData>[]>("/api/market-snapshots")
   ]);
-  const scenarioRecords = householdRecords[0]?.id ? await fetchScenarios(householdRecords[0].id) : [];
-  return [householdRecords, scenarioRecords, ruleRecords, marketSnapshotRecords] as const;
+  const homeGoals = householdRecords[0]?.id ? await fetchPlanningGoals(householdRecords[0].id, "home") : [];
+  return [householdRecords, homeGoals, ruleRecords, marketSnapshotRecords] as const;
 }
 
 export function fetchHouseholds() {
   return request<RecordEnvelope<HouseholdData>[]>("/api/households");
 }
 
-export function fetchScenarios(householdId: string) {
-  const params = new URLSearchParams();
-  params.set("household_id", householdId);
-  const query = params.toString();
-  return request<RecordEnvelope<ScenarioData>[]>(`/api/scenarios${query ? `?${query}` : ""}`);
-}
-
 export function fetchMarketSnapshots() {
   return request<RecordEnvelope<MarketSnapshotData>[]>("/api/market-snapshots");
+}
+
+export function createMarketSnapshot(data: MarketSnapshotData) {
+  return request<RecordEnvelope<MarketSnapshotData>>("/api/market-snapshots", {
+    method: "POST",
+    body: JSON.stringify({ data })
+  });
+}
+
+export function fetchPropertyValuations(householdId: string, planningGoalId?: string) {
+  const params = new URLSearchParams({ household_id: householdId });
+  if (planningGoalId) params.set("planning_goal_id", planningGoalId);
+  return request<PropertyValuationRecord[]>(`/api/property-valuations?${params.toString()}`);
+}
+
+export function refreshPropertyValuation(payload: {
+  household_id: string;
+  planning_goal_id: string;
+  property_data: ScenarioData;
+  market_snapshot_id: string;
+  market_snapshot: MarketSnapshotData;
+  force?: boolean;
+}) {
+  return request<PropertyValuationRefreshResponse>("/api/property-valuations/refresh", {
+    method: "POST",
+    body: JSON.stringify({ ...payload, force: payload.force ?? false })
+  });
+}
+
+export function fetchPersonalPensionReturnSnapshots() {
+  return request<PersonalPensionReturnSnapshotRecord[]>("/api/personal-pension-returns");
+}
+
+export function refreshPersonalPensionReturns(force = false) {
+  return request<PersonalPensionReturnRefreshResponse>("/api/personal-pension-returns/refresh", {
+    method: "POST",
+    body: JSON.stringify({ force, sources: [] })
+  });
 }
 
 export function fetchPlanningGoalSequence(householdId: string, goalType?: PlanningGoalType) {
@@ -142,11 +204,98 @@ export function fetchPlanningFoundation(householdId: string) {
   return request<PlanningFoundationSummary>(`/api/planning-foundation${query ? `?${query}` : ""}`);
 }
 
+function generatedStrategyRequestKey(payload: GeneratedStrategyBatchRequest) {
+  const cacheLayers = [...payload.cache_layers].sort((left, right) => (
+    `${left.engine}:${left.input}:${left.strategy}:${left.ledger}:${left.visualization}`
+      .localeCompare(`${right.engine}:${right.input}:${right.strategy}:${right.ledger}:${right.visualization}`)
+  ));
+  return JSON.stringify({ ...payload, cache_layers: cacheLayers });
+}
+
+export function peekCompletedGeneratedStrategies(payload: GeneratedStrategyBatchRequest) {
+  const key = generatedStrategyRequestKey(payload);
+  const completed = completedGeneratedStrategyResults.get(key);
+  if (!completed) return null;
+  completedGeneratedStrategyResults.delete(key);
+  completedGeneratedStrategyResults.set(key, completed);
+  return completed;
+}
+
 export function fetchGeneratedStrategiesByCacheLayers(payload: GeneratedStrategyBatchRequest) {
-  return request<GeneratedStrategyRecord[]>("/api/generated-strategies/by-cache-layers", {
+  const key = generatedStrategyRequestKey(payload);
+  const completed = completedGeneratedStrategyResults.get(key);
+  if (completed) {
+    completedGeneratedStrategyResults.delete(key);
+    completedGeneratedStrategyResults.set(key, completed);
+    return Promise.resolve(completed);
+  }
+  const inFlight = inFlightGeneratedStrategyRequests.get(key);
+  if (inFlight) return inFlight;
+  const promise = request<GeneratedStrategyRecord[]>("/api/generated-strategies/by-cache-layers", {
     method: "POST",
     body: JSON.stringify(payload)
+  }).then((result) => rememberGeneratedStrategyResult(key, result)).finally(() => {
+    inFlightGeneratedStrategyRequests.delete(key);
   });
+  inFlightGeneratedStrategyRequests.set(key, promise);
+  return promise;
+}
+
+function affordabilityRequestBody(
+  householdId: string,
+  scenarioId: string,
+  household: HouseholdData,
+  scenario: ScenarioData,
+  rulePack: RulePackData,
+  marketSnapshot?: MarketSnapshotData | null,
+  includeStressTests = false
+) {
+  const vehiclePlans = household.car_plan.vehicle_plans ?? [];
+  const primaryVehicleSelection = vehiclePlans.find((vehicle) => vehicle.enabled !== false)?.selected_strategy_variant
+    ?? vehiclePlans[0]?.selected_strategy_variant;
+  const normalizedHousehold = primaryVehicleSelection && household.car_plan.selected_strategy_variant !== primaryVehicleSelection
+    ? {
+        ...household,
+        car_plan: {
+          ...household.car_plan,
+          selected_strategy_variant: primaryVehicleSelection
+        }
+      }
+    : household;
+  return JSON.stringify({
+    household_id: householdId,
+    scenario_id: scenarioId,
+    household: normalizedHousehold,
+    scenario,
+    rule_pack: rulePack,
+    market_snapshot: marketSnapshot ?? null,
+    include_stress_tests: includeStressTests
+  });
+}
+
+export function peekCompletedAffordabilityResult(
+  householdId: string,
+  scenarioId: string,
+  household: HouseholdData,
+  scenario: ScenarioData,
+  rulePack: RulePackData,
+  marketSnapshot?: MarketSnapshotData | null,
+  includeStressTests = false
+) {
+  const key = affordabilityRequestBody(
+    householdId,
+    scenarioId,
+    household,
+    scenario,
+    rulePack,
+    marketSnapshot,
+    includeStressTests
+  );
+  const completed = completedCalculationResults.get(key);
+  if (!completed) return null;
+  completedCalculationResults.delete(key);
+  completedCalculationResults.set(key, completed);
+  return completed;
 }
 
 export function calculateAffordability(
@@ -158,21 +307,27 @@ export function calculateAffordability(
   marketSnapshot?: MarketSnapshotData | null,
   includeStressTests = false
 ) {
-  const body = JSON.stringify({
-    household_id: householdId,
-    scenario_id: scenarioId,
+  const body = affordabilityRequestBody(
+    householdId,
+    scenarioId,
     household,
     scenario,
-    rule_pack: rulePack,
-    market_snapshot: marketSnapshot ?? null,
-    include_stress_tests: includeStressTests
-  });
+    rulePack,
+    marketSnapshot,
+    includeStressTests
+  );
+  const completed = completedCalculationResults.get(body);
+  if (completed) {
+    completedCalculationResults.delete(body);
+    completedCalculationResults.set(body, completed);
+    return Promise.resolve(completed);
+  }
   const cached = inFlightCalculationRequests.get(body);
   if (cached) return cached;
   const promise = request<AffordabilityResult>("/api/calculations/affordability", {
     method: "POST",
     body
-  }).then(assertCompleteAffordabilityResult).finally(() => {
+  }).then(assertCompleteAffordabilityResult).then((result) => rememberCalculationResult(body, result)).finally(() => {
     inFlightCalculationRequests.delete(body);
   });
   inFlightCalculationRequests.set(body, promise);
@@ -183,26 +338,6 @@ export function saveHousehold(id: string, household: HouseholdData) {
   return request<RecordEnvelope<HouseholdData>>(`/api/households/${id}`, {
     method: "PUT",
     body: JSON.stringify({ data: household })
-  });
-}
-
-export function saveScenario(id: string, scenario: ScenarioData) {
-  return request<RecordEnvelope<ScenarioData>>(`/api/scenarios/${id}`, {
-    method: "PUT",
-    body: JSON.stringify({ data: scenario })
-  });
-}
-
-export function createScenario(scenario: ScenarioData, householdId?: string | null) {
-  return request<RecordEnvelope<ScenarioData>>("/api/scenarios", {
-    method: "POST",
-    body: JSON.stringify({ household_id: householdId ?? null, data: scenario })
-  });
-}
-
-export function deleteScenario(id: string) {
-  return request<{ deleted: boolean }>(`/api/scenarios/${id}`, {
-    method: "DELETE"
   });
 }
 

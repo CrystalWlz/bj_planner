@@ -12,6 +12,16 @@ class MonthlyLedgerResult:
     projection_states: list[MonthlyProjectionState]
     account_snapshots: list[AccountSnapshotPoint]
     ledger_entries: list[MonthlyLedgerEntry]
+    risk_by_plan: dict[str, "ProjectionRiskSummary"]
+
+
+@dataclass(frozen=True)
+class ProjectionRiskSummary:
+    cash_shortfall: float = 0.0
+    insolvency_month: int | None = None
+    liquid_assets_exhausted_month: int | None = None
+    worst_cash_balance: float = 0.0
+    terminal_net_worth: float = 0.0
 
 
 VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
@@ -21,6 +31,19 @@ class MonthlyIncomeProfileLike(Protocol):
     net_income: float
     pension_income: float
     personal_pension_contribution: float
+    personal_pension_tax_saving: float
+
+
+class PersonalPensionMonthResultLike(Protocol):
+    cash_contribution: float
+    suspended_contribution: float
+    lost_tax_saving: float
+    investment_return: float
+    gross_withdrawal: float
+    redemption_fee: float
+    withdrawal_tax: float
+    net_withdrawal: float
+    balance_end: float
 
 
 class MonthlyHouseholdExpenseBreakdownLike(Protocol):
@@ -150,6 +173,7 @@ class MonthlyLedgerEntryInputs:
     vehicle_plate_rental_payment: float = 0.0
     include_home_purchase_entries: bool = False
     home_purchase_cash_out: float = 0.0
+    renovation_expense: float = 0.0
     investment_sell_proceeds: float = 0.0
     cash_income: float = 0.0
     pension_income: float = 0.0
@@ -164,6 +188,10 @@ class MonthlyLedgerEntryInputs:
     vehicle_operating_cost: float = 0.0
     personal_pension_contribution: float = 0.0
     personal_pension_return: float = 0.0
+    personal_pension_withdrawal: float = 0.0
+    personal_pension_redemption_fee: float = 0.0
+    personal_pension_withdrawal_tax: float = 0.0
+    personal_pension_suspended_contribution: float = 0.0
     investment_contribution: float = 0.0
     investment_return: float = 0.0
     investment_tax: float = 0.0
@@ -197,6 +225,7 @@ class MonthlyProjectionState:
     pension_income: float
     living_expense: float
     scheduled_expense: float
+    renovation_expense: float
     child_expense: float
     career_shock_self_payment: float
     debt_payment: float
@@ -235,6 +264,10 @@ class MonthlyProjectionState:
     personal_pension_contribution: float
     personal_pension_return: float
     personal_pension_balance: float
+    personal_pension_withdrawal: float
+    personal_pension_redemption_fee: float
+    personal_pension_withdrawal_tax: float
+    personal_pension_suspended_contribution: float
     provident_deposit: float
     provident_withdrawal: float
     transaction_cash_out: float

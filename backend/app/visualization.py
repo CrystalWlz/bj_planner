@@ -35,10 +35,12 @@ def monthly_cashflow_point_from_state(
         net_worth=round(state.net_worth, 2),
         happiness_score=state.happiness_score,
         monthly_cash_delta=round(state.monthly_cash_delta, 2),
+        cash_shortfall=round(max(0.0, -state.cash_balance), 2),
         cash_income=round(state.cash_income, 2),
         pension_income=round(state.pension_income, 2),
         living_expense=round(state.living_expense, 2),
         scheduled_expense=round(state.scheduled_expense, 2),
+        renovation_expense=round(state.renovation_expense, 2),
         child_expense=round(state.child_expense, 2),
         career_shock_self_payment=round(state.career_shock_self_payment, 2),
         debt_payment=round(state.debt_payment, 2),
@@ -76,6 +78,10 @@ def monthly_cashflow_point_from_state(
         investment_sell_proceeds=round(state.investment_sell_proceeds, 2),
         personal_pension_contribution=round(state.personal_pension_contribution, 2),
         personal_pension_return=round(state.personal_pension_return, 2),
+        personal_pension_withdrawal=round(state.personal_pension_withdrawal, 2),
+        personal_pension_redemption_fee=round(state.personal_pension_redemption_fee, 2),
+        personal_pension_withdrawal_tax=round(state.personal_pension_withdrawal_tax, 2),
+        personal_pension_suspended_contribution=round(state.personal_pension_suspended_contribution, 2),
         personal_pension_balance=round(state.personal_pension_balance, 2),
         provident_deposit=round(state.provident_deposit, 2),
         provident_withdrawal=round(state.provident_withdrawal, 2),
@@ -93,17 +99,27 @@ def monthly_cashflow_point_from_state(
 def build_monthly_cashflow_points(
     states: list[MonthlyProjectionState],
     ledger_entries: list[MonthlyLedgerEntry],
+    *,
+    risk_by_plan: dict[str, object] | None = None,
 ) -> list[MonthlyCashflowPoint]:
     entries_by_month: dict[tuple[str, int], list[MonthlyLedgerEntry]] = {}
     for entry in ledger_entries:
         entries_by_month.setdefault((entry.plan_variant, entry.month), []).append(entry)
-    return [
-        monthly_cashflow_point_from_state(
-            state,
-            entries_by_month.get((state.plan_variant, state.month), []),
+    rows: list[MonthlyCashflowPoint] = []
+    for state in states:
+        risk = (risk_by_plan or {}).get(state.plan_variant)
+        rows.append(
+            monthly_cashflow_point_from_state(
+                state,
+                entries_by_month.get((state.plan_variant, state.month), []),
+            ).model_copy(
+                update={
+                    "insolvency_month": getattr(risk, "insolvency_month", None),
+                    "liquid_assets_exhausted_month": getattr(risk, "liquid_assets_exhausted_month", None),
+                }
+            )
         )
-        for state in states
-    ]
+    return rows
 
 
 def _breakdown_item(
@@ -146,6 +162,7 @@ def monthly_visualization_detail_from_inputs(
         [
             _breakdown_item("工资与其他现金收入", row.cash_income, kind="income"),
             _breakdown_item("养老金领取", row.pension_income, kind="income"),
+            _breakdown_item("个人养老金领取净到账", row.personal_pension_withdrawal, kind="income"),
             _breakdown_item("公积金现金到账", provident_cash_receipt, kind="income"),
             _breakdown_item("投资卖出到账", row.investment_sell_proceeds, kind="income"),
             _breakdown_item("交易现金流入", row.transaction_cash_in, kind="income"),
@@ -157,6 +174,7 @@ def monthly_visualization_detail_from_inputs(
         [
             _breakdown_item("基础生活支出", row.living_expense, kind="expense"),
             _breakdown_item("阶段性与定时支出", row.scheduled_expense, kind="expense"),
+            _breakdown_item("装修规划事件", row.renovation_expense, kind="expense"),
             _breakdown_item("养娃计划支出", row.child_expense, kind="expense"),
             _breakdown_item("灵活就业自缴社保公积金", row.career_shock_self_payment, kind="expense"),
             _breakdown_item("已有固定还款", row.regular_debt_payment, kind="expense"),
@@ -230,6 +248,8 @@ def monthly_visualization_detail_from_inputs(
     )
     social_security_outflow_pie = _compact_items(
         [
+            _breakdown_item("个人养老金赎回或退保费用", row.personal_pension_redemption_fee, kind="expense"),
+            _breakdown_item("个人养老金领取税", row.personal_pension_withdrawal_tax, kind="expense"),
             *[
                 _breakdown_item(entry.label, abs(entry.amount), kind="expense")
                 for entry in social_security_ledger_outflows
@@ -240,17 +260,19 @@ def monthly_visualization_detail_from_inputs(
         [
             _breakdown_item("现金收入", row.cash_income, kind="income", amount=row.cash_income),
             _breakdown_item("养老金领取", row.pension_income, kind="income", amount=row.pension_income),
+            _breakdown_item("个人养老金领取净到账", row.personal_pension_withdrawal, kind="income", amount=row.personal_pension_withdrawal),
             _breakdown_item("公积金现金到账", provident_cash_receipt, kind="income", amount=provident_cash_receipt),
             _breakdown_item("投资卖出到账", row.investment_sell_proceeds, kind="income", amount=row.investment_sell_proceeds),
             _breakdown_item("基础生活支出", row.living_expense, kind="expense", amount=-row.living_expense),
             _breakdown_item("阶段性与定时支出", row.scheduled_expense, kind="expense", amount=-row.scheduled_expense),
+            _breakdown_item("装修规划事件", row.renovation_expense, kind="expense", amount=-row.renovation_expense),
             _breakdown_item("养娃计划支出", row.child_expense, kind="expense", amount=-row.child_expense),
             _breakdown_item("债务还款", row.debt_payment, kind="expense", amount=-row.debt_payment),
             _breakdown_item("房贷现金还款", row.house_payment, kind="expense", amount=-row.house_payment),
             _breakdown_item("通勤/用车成本", row.vehicle_payment + row.vehicle_operating_cost + row.no_car_commute_cost, kind="expense", amount=-(row.vehicle_payment + row.vehicle_operating_cost + row.no_car_commute_cost)),
             _breakdown_item("理财买入净额", max(0.0, row.investment_contribution - row.investment_fee), kind="asset", amount=-max(0.0, row.investment_contribution - row.investment_fee)),
             _breakdown_item("个人养老金缴费", row.personal_pension_contribution, kind="asset", amount=-row.personal_pension_contribution),
-            _breakdown_item("交易现金净额", abs(row.transaction_cash_in - row.transaction_cash_out), kind="expense", amount=row.transaction_cash_in - row.transaction_cash_out),
+            _breakdown_item("其它交易现金净额", abs(row.transaction_cash_in - max(0.0, row.transaction_cash_out - row.renovation_expense)), kind="expense", amount=row.transaction_cash_in - max(0.0, row.transaction_cash_out - row.renovation_expense)),
             _breakdown_item("当月现金净流入", abs(row.monthly_cash_delta), kind="result", amount=row.monthly_cash_delta),
         ]
     )
@@ -318,6 +340,7 @@ def annual_visualization_detail_from_summary(row: AnnualFinancialSummary) -> Ann
         [
             _breakdown_item("工资及其他现金收入", max(0.0, row.cash_income - row.pension_income), kind="income"),
             _breakdown_item("养老金领取", row.pension_income, kind="income"),
+            _breakdown_item("个人养老金领取净到账", row.personal_pension_withdrawal, kind="income"),
             _breakdown_item("公积金现金提取", row.provident_withdrawal, kind="income"),
             _breakdown_item("投资卖出到账", row.investment_sell_proceeds, kind="income"),
             _breakdown_item("交易现金流入", row.transaction_cash_in, kind="income"),
@@ -327,6 +350,7 @@ def annual_visualization_detail_from_summary(row: AnnualFinancialSummary) -> Ann
         [
             _breakdown_item("基础生活支出", row.living_expense, kind="expense"),
             _breakdown_item("计划支出", row.scheduled_expense, kind="expense"),
+            _breakdown_item("装修规划事件", row.renovation_expense, kind="expense"),
             _breakdown_item("养娃计划支出", row.child_expense, kind="expense"),
             _breakdown_item("灵活就业自缴社保公积金", row.career_shock_self_payment, kind="expense"),
             _breakdown_item("已有贷款还款", row.debt_payment, kind="expense"),
@@ -336,7 +360,8 @@ def annual_visualization_detail_from_summary(row: AnnualFinancialSummary) -> Ann
             _breakdown_item("理财买入", row.investment_contribution, kind="asset"),
             _breakdown_item("理财收益税", row.investment_tax, kind="expense"),
             _breakdown_item("理财手续费", row.investment_fee, kind="expense"),
-            _breakdown_item("交易现金流出", row.transaction_cash_out, kind="expense"),
+            _breakdown_item("个人养老金缴费", row.personal_pension_contribution, kind="asset"),
+            _breakdown_item("其它交易现金流出", max(0.0, row.transaction_cash_out - row.renovation_expense), kind="expense"),
         ]
     )
     return AnnualVisualizationDetail(
@@ -398,6 +423,8 @@ def annual_visualization_detail_from_summary(row: AnnualFinancialSummary) -> Ann
                 _breakdown_item("养老计发支出", row.pension_account_payout, kind="expense"),
                 _breakdown_item("医保医疗支付", row.medical_account_healthcare_outflow, kind="expense"),
                 _breakdown_item("医保互助扣缴", row.medical_account_mutual_aid_outflow, kind="expense"),
+                _breakdown_item("个人养老金赎回或退保费用", row.personal_pension_redemption_fee, kind="expense"),
+                _breakdown_item("个人养老金领取税", row.personal_pension_withdrawal_tax, kind="expense"),
             ]
         ),
         social_security_balance_pie=_compact_items(

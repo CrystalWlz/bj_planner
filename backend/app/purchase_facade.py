@@ -43,6 +43,7 @@ def build_purchase_plan_analyses(
     taxes_and_fees: float,
     calculation_context: CalculationContextSnapshot | None = None,
     market_snapshot: MarketSnapshotData | None = None,
+    variant_names: set[str] | None = None,
 ) -> list[PurchasePlanAnalysis]:
     return strategy_build_purchase_plan_analyses(
         household,
@@ -85,6 +86,7 @@ def build_purchase_plan_analyses(
         planning_window_delay_provider=planning_window_delay_months,
         calculation_context=calculation_context,
         market_snapshot=market_snapshot,
+        variant_names=variant_names,
     )
 
 
@@ -100,6 +102,7 @@ def build_yield_sensitivity(
     parallel_workers: int = 1,
     market_snapshot: MarketSnapshotData | None = None,
     baseline_analyses: list[PurchasePlanAnalysis] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[YieldSensitivityPoint]:
     return strategy_build_yield_sensitivity(
         household,
@@ -113,6 +116,7 @@ def build_yield_sensitivity(
         parallel_workers=parallel_workers,
         market_snapshot=market_snapshot,
         baseline_analyses=baseline_analyses,
+        calculation_context=calculation_context,
     )
 
 

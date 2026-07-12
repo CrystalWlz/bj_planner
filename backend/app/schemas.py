@@ -16,7 +16,13 @@ FreelanceTaxMode = Literal["labor_remuneration", "business_income", "other"]
 GreenBuildingLevel = Literal["none", "two_star", "three_star"]
 PrefabBuildingLevel = Literal["none", "A", "AA", "AAA"]
 BuildingStructure = Literal["unknown", "brick_mixed", "steel_concrete"]
-RenovationFundingMode = Literal["after_purchase_saving", "upfront_cash"]
+RenovationFundingMode = Literal[
+    "cash_or_investment",
+    "cash_only",
+    "after_goal_saving",
+    "after_purchase_saving",
+    "upfront_cash",
+]
 InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
 MemberSex = Literal["female", "male", "unspecified"]
@@ -89,6 +95,18 @@ SpecialDeductionType = Literal[
 SpecialDeductionSettlementMode = Literal["monthly_withholding", "annual_settlement"]
 PersonalPensionContributionMode = Literal["none", "auto_tax_optimal", "fixed_monthly", "fixed_annual"]
 PersonalPensionOpenMode = Literal["auto_tax_optimal", "manual", "none"]
+PersonalPensionReturnMode = Literal["auto_lifecycle", "manual"]
+PersonalPensionWithdrawalMode = Literal["auto_safe", "monthly_annuity", "fixed_monthly", "lump_sum"]
+PersonalPensionTaxDeductionMode = Literal["monthly_withholding", "annual_settlement"]
+PersonalPensionEarlyWithdrawalReason = Literal[
+    "none",
+    "total_disability",
+    "settled_abroad",
+    "major_medical_expense",
+    "long_unemployment",
+    "minimum_living_allowance",
+]
+PersonalPensionProductLiquidityMode = Literal["daily_liquid", "periodic", "locked_until_maturity"]
 TaxStrategyStatus = Literal["auto_enabled", "manual_enabled", "available", "not_applicable", "conflict"]
 TaxStrategySource = Literal["backend_auto", "strategy_auto", "manual", "event"]
 TaxStrategyTimelineCategory = Literal[
@@ -148,17 +166,34 @@ class IncomeMember(BaseModel):
     medical_account_balance: float = Field(0, ge=0)
     medical_account_enabled: bool = True
     medical_account_open_month: str = ""
-    personal_pension_account_enabled: bool = True
+    personal_pension_account_enabled: bool = False
+    personal_pension_participation_eligible: bool = False
     personal_pension_account_balance: float = Field(0, ge=0)
-    personal_pension_open_mode: PersonalPensionOpenMode = "auto_tax_optimal"
+    personal_pension_open_mode: PersonalPensionOpenMode = "none"
     personal_pension_account_open_month: str = ""
-    personal_pension_contribution_mode: PersonalPensionContributionMode = "auto_tax_optimal"
+    personal_pension_contribution_mode: PersonalPensionContributionMode = "none"
+    personal_pension_tax_deduction_mode: PersonalPensionTaxDeductionMode = "monthly_withholding"
     personal_pension_monthly_contribution: float = Field(0, ge=0)
     personal_pension_annual_contribution_target: float = Field(0, ge=0)
+    personal_pension_auto_annual_contribution_schedule: dict[str, float] = Field(default_factory=dict)
     personal_pension_contribution_month: int = Field(12, ge=1, le=12)
     personal_pension_contribution_start_month: str = ""
     personal_pension_contribution_end_month: str | None = None
+    personal_pension_auto_suspend_for_cash_safety: bool = True
+    personal_pension_cash_reserve_months: int = Field(6, ge=0, le=36)
+    personal_pension_return_mode: PersonalPensionReturnMode = "auto_lifecycle"
     personal_pension_annual_return: float = Field(0.025, ge=-0.5, le=0.5)
+    personal_pension_post_retirement_annual_return: float = Field(0.015, ge=-0.5, le=0.5)
+    personal_pension_withdrawal_mode: PersonalPensionWithdrawalMode = "auto_safe"
+    personal_pension_withdrawal_start_month: str = ""
+    personal_pension_early_withdrawal_reason: PersonalPensionEarlyWithdrawalReason = "none"
+    personal_pension_early_withdrawal_month: str = ""
+    personal_pension_withdrawal_years: int = Field(20, ge=1, le=40)
+    personal_pension_fixed_monthly_withdrawal: float = Field(0, ge=0)
+    personal_pension_product_liquidity_mode: PersonalPensionProductLiquidityMode = "daily_liquid"
+    personal_pension_redemption_delay_months: int = Field(0, ge=0, le=120)
+    personal_pension_monthly_redeemable_ratio: float = Field(1, ge=0, le=1)
+    personal_pension_redemption_fee_rate: float = Field(0, ge=0, le=0.5)
     monthly_salary_gross: float = Field(0, ge=0)
     annual_bonus: float = Field(0, ge=0)
     monthly_non_taxable_income: float = Field(0, ge=0)
@@ -220,11 +255,11 @@ class IncomeStageData(BaseModel):
     end_date: str | None = None
     provident_account_management_center: ProvidentAccountManagementCenter = "beijing_municipal"
     monthly_salary_gross: float = Field(0, ge=0)
-    annual_bonus: float = Field(0, ge=0)
+    annual_bonus_months: float = Field(0, ge=0, le=60)
     annual_bonus_payout_mode: AnnualBonusPayoutMode = "lump_sum"
     annual_bonus_payout_month: int = Field(4, ge=1, le=12)
-    annual_bonus_earning_start_month: str = ""
-    annual_bonus_earning_end_month: str = ""
+    annual_bonus_earning_start_month: int | None = Field(None, ge=1, le=12)
+    annual_bonus_earning_end_month: int | None = Field(None, ge=1, le=12)
     monthly_freelance_income: float = Field(0, ge=0)
     freelance_tax_mode: FreelanceTaxMode = "labor_remuneration"
     monthly_non_taxable_income: float = Field(0, ge=0)
@@ -238,6 +273,32 @@ class IncomeStageData(BaseModel):
     other_annual_taxable_income: float = Field(0, ge=0)
     bonus_tax_method: BonusTaxMethod = "best"
     payroll_contributions_enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_bonus_amount_to_salary_months(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if normalized.get("annual_bonus_months") is None:
+            try:
+                salary = max(0.0, float(normalized.get("monthly_salary_gross") or 0))
+                amount = max(0.0, float(normalized.get("annual_bonus") or 0))
+            except (TypeError, ValueError):
+                salary = 0.0
+                amount = 0.0
+            normalized["annual_bonus_months"] = round(amount / salary, 1) if salary > 0 else 0.0
+        else:
+            try:
+                normalized["annual_bonus_months"] = round(max(0.0, float(normalized["annual_bonus_months"])), 1)
+            except (TypeError, ValueError):
+                normalized["annual_bonus_months"] = 0.0
+        normalized.pop("annual_bonus", None)
+        return normalized
+
+    @property
+    def annual_bonus(self) -> float:
+        return self.monthly_salary_gross * self.annual_bonus_months
 
 
 class CareerShockMemberSetting(BaseModel):
@@ -417,7 +478,7 @@ class PropertyPurchaseGoalData(BaseModel):
 
 
 class PlanningGoalData(BaseModel):
-    schema_version: int = Field(34, ge=1)
+    schema_version: int = Field(55, ge=1)
     goal_type: PlanningGoalType = "home"
     name: str = "规划目标"
     enabled: bool = True
@@ -457,6 +518,12 @@ class ResolvedPlanningGoal(BaseModel):
     household_id: str | None = None
     goal_type: PlanningGoalType
     name: str
+    planning_group_id: str = ""
+    planning_group_name: str = ""
+    planning_group_size: int = Field(1, ge=1)
+    planning_group_member_ids: list[str] = Field(default_factory=list)
+    target_amount: float = 0.0
+    funding_mode: str = ""
     enabled: bool = True
     priority: int
     sequence_index: int
@@ -487,12 +554,19 @@ class CalculationContextGoalSnapshot(BaseModel):
     id: str
     goal_type: PlanningGoalType
     name: str
+    planning_group_id: str = ""
+    planning_group_name: str = ""
+    planning_group_size: int = Field(1, ge=1)
+    planning_group_member_ids: list[str] = Field(default_factory=list)
+    target_amount: float = 0.0
+    funding_mode: str = ""
     enabled: bool = True
     priority: int
     sequence_index: int
     normalized_timing_mode: PlanningTimingMode = "auto_sequence"
     depends_on_goal_id: str = ""
     depends_on_goal_name: str = ""
+    delay_after_dependency_months: int = 0
     resolved_not_before_month: int = 0
     resolved_window_start_month: int = 0
     resolved_window_end_month: int | None = None
@@ -752,6 +826,8 @@ class HouseholdData(BaseModel):
     family_provident_initial_balance: float = Field(0, ge=0)
     family_provident_monthly_salary: float = Field(0, ge=0)
     family_provident_total_rate: float = Field(0.24, ge=0, le=0.5)
+    major_goal_tradeoff_mode: Literal["auto", "manual"] = "auto"
+    major_goal_timing_preference: float = Field(0.5, ge=0, le=1)
     investment_plan_name: str = "conservative_monthly_investment"
     investment_risk_level: str = "conservative"
     monthly_investment_amount: float = Field(0, ge=0)
@@ -784,7 +860,12 @@ class HouseholdData(BaseModel):
     existing_mortgage_count: int = Field(0, ge=0, le=10)
     has_beijing_hukou: bool = True
     social_security_months: int = Field(0, ge=0)
-    child_count: int = Field(0, ge=0, le=10)
+    child_count: int = Field(
+        0,
+        ge=0,
+        le=10,
+        description="截至当前月份已经出生的子女数；未来养娃规划目标不计入当前家庭资格参数。",
+    )
     provident_fund_balance: float = Field(0, ge=0)
     provident_fund_monthly_deposit: float = Field(0, ge=0)
     members: list[IncomeMember] = Field(
@@ -837,6 +918,7 @@ class ScenarioData(BaseModel):
     commercial_rate: float = Field(0.035, ge=0, le=0.2)
     loan_years: int = Field(25, ge=1, le=30)
     repayment_method: RepaymentMethod = "equal_installment"
+    loan_repayment_strategy_mode: Literal["auto", "manual"] = "auto"
     commercial_repayment_method: RepaymentMethod = "equal_installment"
     provident_repayment_method: RepaymentMethod = "equal_installment"
     commercial_prepayment_mode: CommercialPrepaymentMode = "auto"
@@ -852,8 +934,19 @@ class ScenarioData(BaseModel):
     seller_tax_pass_through_enabled: bool = False
     seller_tax_pass_through_rate: float = Field(0, ge=0, le=0.2)
     seller_tax_pass_through_amount: float = Field(0, ge=0)
-    renovation_cost: float = Field(250000, ge=0)
-    renovation_funding_mode: RenovationFundingMode = "after_purchase_saving"
+    renovation_cost: float = Field(
+        0,
+        ge=0,
+        exclude=True,
+        description="由装修规划目标投影的计算期内部字段，不属于房源持久化数据",
+    )
+    renovation_funding_mode: RenovationFundingMode = Field(
+        "after_goal_saving",
+        exclude=True,
+        description="由装修规划目标投影的计算期内部字段",
+    )
+    renovation_goal_id: str = Field("", exclude=True)
+    renovation_delay_after_purchase_months: int = Field(0, ge=0, le=240, exclude=True)
     moving_and_misc_cost: float = Field(50000, ge=0)
     annual_investment_return: float = Field(0.025, ge=-0.5, le=0.5)
     investment_withdrawal_mode: InvestmentWithdrawalMode = "auto"
@@ -864,6 +957,13 @@ class ScenarioData(BaseModel):
     liquidity_priority_score: float = Field(7.0, ge=0, le=10)
     notes: str = ""
     selected_purchase_plan_variant: str = ""
+    valuation_monitoring_enabled: bool = False
+    valuation_asset_status: Literal["planned", "owned"] = "planned"
+    valuation_interval_months: int = Field(1, ge=1, le=24)
+    valuation_reference_date: str = ""
+    valuation_reference_value: float = Field(0, ge=0)
+    valuation_comparable_unit_price: float = Field(0, ge=0)
+    valuation_district_adjustment_rate: float = Field(0, ge=-0.3, le=0.3)
 
     @model_validator(mode="after")
     def normalize_property_specific_fields(self) -> "ScenarioData":
@@ -969,6 +1069,11 @@ class RulePackData(BaseModel):
             "deed_tax_second_home_large_rate": 0.02,
             "default_broker_fee_rate": 0.022,
             "seller_tax_pass_through_default_rate": 0.0,
+            "property_annual_price_growth_rate": 0.0,
+            "property_sale_cost_rate": 0.03,
+            "property_liquidity_discount_rate": 0.02,
+            "property_stress_annual_price_growth_rate": -0.02,
+            "investment_return_stress_factor": 0.50,
             "vehicle_purchase_tax_rate": 0.10,
             "vehicle_purchase_tax_taxable_price_ratio": 1 / 1.13,
             "new_energy_vehicle_purchase_tax_exempt_until": "2025-12",
@@ -1120,18 +1225,51 @@ class RulePackCreate(BaseModel):
     data: RulePackData
 
 
+class HousingMarketEvidenceData(BaseModel):
+    source_name: str = ""
+    source_url: str = ""
+    source_type: Literal["government", "research", "agency", "brokerage", "media", "other"] = "other"
+    published_date: str = ""
+    scope_type: Literal["city", "district", "community"] = "city"
+    scope_name: str = "北京"
+    ring_scope: Literal[
+        "all",
+        "二环内",
+        "二至三环",
+        "三至四环",
+        "四至五环",
+        "五至六环",
+        "六环外",
+    ] = "all"
+    property_segment: Literal["all", "resale", "new_home"] = "all"
+    price_mom: float | None = Field(default=None, ge=-0.2, le=0.2)
+    price_yoy: float | None = Field(default=None, ge=-0.5, le=0.5)
+    avg_unit_price: float | None = Field(default=None, ge=0)
+    sample_size: int | None = Field(default=None, ge=0)
+    credibility_score: float = Field(0.6, ge=0, le=1)
+    notes: str = ""
+
+
 class MarketSnapshotData(BaseModel):
-    schema_version: int = Field(34, ge=1)
+    schema_version: int = Field(54, ge=1)
     region: str = "北京"
     snapshot_date: str = "2026-06-29"
     source_name: str = "手动录入"
     source_url: str = "https://zjw.beijing.gov.cn/bjjs/fwgl/fdcjy/index.shtml"
+    source_type: Literal["government", "research", "agency", "brokerage", "media", "other"] = "government"
     commercial_loan_rate: float | None = Field(default=None, ge=0, le=0.2)
     default_broker_fee_rate: float | None = Field(default=None, ge=0, le=0.2)
     seller_tax_pass_through_rate: float | None = Field(default=None, ge=0, le=0.2)
     avg_unit_price: float | None = None
     transaction_count: int | None = None
     listing_count: int | None = None
+    resale_price_mom: float | None = Field(default=None, ge=-0.2, le=0.2)
+    resale_price_yoy: float | None = Field(default=None, ge=-0.5, le=0.5)
+    new_home_price_mom: float | None = Field(default=None, ge=-0.2, le=0.2)
+    new_home_price_yoy: float | None = Field(default=None, ge=-0.5, le=0.5)
+    long_term_anchor_growth_rate: float = Field(0.015, ge=-0.05, le=0.08)
+    housing_data_quality_score: float = Field(0.6, ge=0, le=1)
+    housing_market_evidence: list[HousingMarketEvidenceData] = Field(default_factory=list, max_length=50)
     notes: str = ""
 
 
@@ -1144,6 +1282,126 @@ class MarketSnapshotRecord(BaseModel):
 
 class MarketSnapshotCreate(BaseModel):
     data: MarketSnapshotData
+
+
+class PropertyValuationProjectionPoint(BaseModel):
+    month: int = Field(ge=0, le=600)
+    label: str
+    estimated_value: float = Field(ge=0)
+    lower_value: float = Field(ge=0)
+    upper_value: float = Field(ge=0)
+
+
+class PropertyValuationData(BaseModel):
+    schema_version: int = Field(54, ge=1)
+    property_name: str
+    valuation_date: str
+    reference_date: str
+    reference_value: float = Field(ge=0)
+    estimated_market_value: float = Field(ge=0)
+    estimated_unit_price: float = Field(ge=0)
+    lower_value: float = Field(ge=0)
+    upper_value: float = Field(ge=0)
+    net_realisable_value: float = Field(ge=0)
+    confidence_score: float = Field(ge=0, le=1)
+    market_signal_rate: float = Field(ge=-0.5, le=0.5)
+    near_term_annual_rate: float = Field(ge=-0.5, le=0.5)
+    long_term_annual_rate: float = Field(ge=-0.5, le=0.5)
+    structural_rate_adjustment: float = Field(ge=-0.2, le=0.2)
+    location_rate_adjustment: float = Field(0, ge=-0.2, le=0.2)
+    building_age_rate_adjustment: float = Field(0, ge=-0.2, le=0.2)
+    location_reference_unit_price: float = Field(0, ge=0)
+    sale_cost_rate: float = Field(ge=0, le=0.5)
+    liquidity_discount_rate: float = Field(ge=0, le=0.5)
+    market_snapshot_date: str
+    market_source_name: str
+    market_source_names: list[str] = Field(default_factory=list)
+    market_source_count: int = Field(0, ge=0)
+    matched_location_name: str = ""
+    matched_ring_area: str = ""
+    next_due_date: str
+    drivers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    projection: list[PropertyValuationProjectionPoint] = Field(default_factory=list)
+
+
+class PropertyValuationRecord(BaseModel):
+    id: str
+    household_id: str
+    planning_goal_id: str
+    valuation_date: str
+    market_snapshot_id: str = ""
+    data: PropertyValuationData
+    created_at: datetime
+    updated_at: datetime
+
+
+class PropertyValuationRefreshRequest(BaseModel):
+    household_id: str
+    planning_goal_id: str
+    property_data: ScenarioData
+    market_snapshot_id: str = ""
+    market_snapshot: MarketSnapshotData
+    force: bool = False
+
+
+class PropertyValuationRefreshResponse(BaseModel):
+    record: PropertyValuationRecord
+    refreshed: bool
+
+
+class PersonalPensionReturnSourceData(BaseModel):
+    name: str
+    url: HttpUrl
+    source_type: Literal["government", "registry", "index_provider", "institution", "media", "other"] = "other"
+    product_type: Literal["deposit", "wealth", "fund", "insurance", "mixed"] = "mixed"
+    credibility_score: float = Field(0.7, ge=0, le=1)
+    parser: Literal["html_context", "eastmoney_fof_rank"] = "html_context"
+
+
+class PersonalPensionReturnEvidenceData(BaseModel):
+    source_name: str
+    source_url: str
+    source_type: str
+    product_type: str
+    fetched_at: str
+    observed_annual_return: float | None = Field(None, ge=-0.5, le=0.5)
+    sample_count: int = Field(0, ge=0)
+    status: Literal["parsed", "no_rate", "fetch_failed"] = "no_rate"
+    note: str = ""
+
+
+class PersonalPensionReturnSnapshotData(BaseModel):
+    snapshot_date: str
+    pre_retirement_annual_return: float = Field(0.025, ge=-0.5, le=0.5)
+    post_retirement_annual_return: float = Field(0.015, ge=-0.5, le=0.5)
+    conservative_annual_return: float = Field(0.01, ge=-0.5, le=0.5)
+    optimistic_annual_return: float = Field(0.04, ge=-0.5, le=0.5)
+    observed_market_return: float | None = Field(None, ge=-0.5, le=0.5)
+    source_count: int = Field(0, ge=0)
+    parsed_source_count: int = Field(0, ge=0)
+    next_due_date: str
+    evidence: list[PersonalPensionReturnEvidenceData] = Field(default_factory=list)
+    drivers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class PersonalPensionReturnSnapshotRecord(BaseModel):
+    id: str
+    snapshot_date: str
+    data: PersonalPensionReturnSnapshotData
+    created_at: datetime
+    updated_at: datetime
+
+
+class PersonalPensionReturnRefreshRequest(BaseModel):
+    force: bool = False
+    sources: list[PersonalPensionReturnSourceData] = Field(default_factory=list)
+
+
+class PersonalPensionReturnRefreshResponse(BaseModel):
+    record: PersonalPensionReturnSnapshotRecord
+    refreshed: bool
 
 
 class SourceFetchRequest(BaseModel):
@@ -1272,6 +1530,7 @@ class CarPlanAnalysis(BaseModel):
     interest_saved_by_prepayment: float = 0.0
     total_interest: float
     required_cash_at_purchase: float
+    required_liquidity_reserve: float = 0.0
     cash_after_purchase: float
     monthly_cash_flow_after_car: float
     operating_cost: float
@@ -1282,6 +1541,12 @@ class CarPlanAnalysis(BaseModel):
     monthly_cash_operating_cost: float
     monthly_depreciation_cost: float
     monthly_total_ownership_cost: float
+    lifecycle_cash_shortfall: float = 0.0
+    lifecycle_insolvency_month: int | None = None
+    lifecycle_worst_liquid_balance: float = 0.0
+    lifecycle_terminal_liquid_balance: float = 0.0
+    lifecycle_feasible: bool = True
+    lifecycle_risk_note: str = ""
     happiness_score: float
     notes: list[str]
 
@@ -1303,6 +1568,14 @@ class PurchasePlanAnalysis(BaseModel):
     source: str = "scenario"
     months_to_buy: int | None
     years_to_buy: float | None
+    original_target_price: float = 0.0
+    projected_purchase_price: float = 0.0
+    projected_purchase_price_lower: float = 0.0
+    projected_purchase_price_upper: float = 0.0
+    projected_price_change: float = 0.0
+    property_price_forecast_applied: bool = False
+    property_price_forecast_confidence: float = 0.0
+    property_price_forecast_note: str = ""
     minimum_down_payment: float
     planned_down_payment: float
     provident_fund_extractable: float
@@ -1331,6 +1604,10 @@ class PurchasePlanAnalysis(BaseModel):
     provident_repayment_method: RepaymentMethod
     commercial_monthly_payment: float
     provident_monthly_payment: float
+    commercial_interest_saving_if_equal_principal: float = 0.0
+    commercial_equal_principal_first_payment: float = 0.0
+    commercial_equal_installment_payment: float = 0.0
+    commercial_repayment_advice: str = ""
     commercial_prepayment_mode: CommercialPrepaymentMode = "none"
     commercial_prepayment_enabled: bool = False
     commercial_prepayment_start_month: int = 1
@@ -1355,6 +1632,7 @@ class PurchasePlanAnalysis(BaseModel):
     investment_withdrawal_mode_label: str = "自动优化提取"
     cash_account_before_purchase: float = 0.0
     investment_balance_before_purchase: float = 0.0
+    investment_reserve_target: float = 0.0
     investment_sell_gross_at_purchase: float = 0.0
     investment_sell_proceeds_at_purchase: float = 0.0
     investment_balance_after_purchase: float = 0.0
@@ -1367,6 +1645,14 @@ class PurchasePlanAnalysis(BaseModel):
     minimum_cash_balance_month: int | None = None
     cash_stress_ok: bool = True
     cash_stress_shortfall: float = 0.0
+    cash_shortfall: float = 0.0
+    insolvency_month: int | None = None
+    liquid_assets_exhausted_month: int | None = None
+    worst_cash_balance: float = 0.0
+    terminal_net_worth: float = 0.0
+    emergency_reserve_coverage_months: float = 0.0
+    pareto_efficient: bool = False
+    feasibility_recommendation: str = ""
     post_purchase_cash_flow: float
     post_purchase_pf_strategy: str = "keep_in_account"
     post_purchase_pf_strategy_label: str = "留存在公积金账户"
@@ -1525,6 +1811,12 @@ class ChildPlanStrategyPoint(BaseModel):
     monthly_cost_now: float = 0.0
     first_year_cash_need: float = 0.0
     total_to_age_18: float = 0.0
+    lifecycle_cash_shortfall: float = 0.0
+    lifecycle_insolvency_month: int | None = None
+    lifecycle_feasible: bool = True
+    recommended_budget_factor: float = 1.0
+    recommended_delay_months: int = 0
+    lifecycle_risk_note: str = ""
     stages: list[dict[str, Any]] = Field(default_factory=list)
     explanation: str = ""
 
@@ -1566,10 +1858,14 @@ class MonthlyCashflowPoint(BaseModel):
     net_worth: float
     happiness_score: float = 0.0
     monthly_cash_delta: float
+    cash_shortfall: float = 0.0
+    insolvency_month: int | None = None
+    liquid_assets_exhausted_month: int | None = None
     cash_income: float
     pension_income: float = 0.0
     living_expense: float
     scheduled_expense: float
+    renovation_expense: float = 0.0
     child_expense: float = 0.0
     career_shock_self_payment: float = 0.0
     debt_payment: float
@@ -1607,6 +1903,10 @@ class MonthlyCashflowPoint(BaseModel):
     investment_sell_proceeds: float = 0.0
     personal_pension_contribution: float = 0.0
     personal_pension_return: float = 0.0
+    personal_pension_withdrawal: float = 0.0
+    personal_pension_redemption_fee: float = 0.0
+    personal_pension_withdrawal_tax: float = 0.0
+    personal_pension_suspended_contribution: float = 0.0
     personal_pension_balance: float = 0.0
     provident_deposit: float
     provident_withdrawal: float
@@ -1721,6 +2021,7 @@ class PlanEventPoint(BaseModel):
         "income",
         "investment",
         "home_purchase",
+        "property_market",
         "loan",
         "provident",
         "vehicle",
@@ -1832,6 +2133,16 @@ class TaxEventPoint(BaseModel):
     source: str = "backend"
 
 
+class PersonalPensionAnnualOptimizationPoint(BaseModel):
+    year: int
+    annual_contribution: float = 0.0
+    estimated_tax_saving: float = 0.0
+    pension_net_value_at_withdrawal: float = 0.0
+    alternative_investment_value_at_withdrawal: float = 0.0
+    tax_saving_future_value: float = 0.0
+    net_advantage_at_withdrawal: float = 0.0
+
+
 class TaxStrategyItem(BaseModel):
     deduction_type: SpecialDeductionType
     title: str
@@ -1842,7 +2153,27 @@ class TaxStrategyItem(BaseModel):
     estimated_tax_saving: float = 0.0
     cash_contribution: float = 0.0
     account_return_rate: float = 0.0
+    post_retirement_return_rate: float = 0.0
     withdrawal_tax_rate: float = 0.0
+    withdrawal_mode: PersonalPensionWithdrawalMode | None = None
+    withdrawal_start_month: str = ""
+    withdrawal_years: int = 0
+    estimated_retirement_balance: float = 0.0
+    estimated_monthly_withdrawal: float = 0.0
+    cumulative_contribution: float = 0.0
+    cumulative_estimated_tax_saving: float = 0.0
+    pension_net_value_at_withdrawal: float = 0.0
+    alternative_investment_value_at_withdrawal: float = 0.0
+    forgone_investment_earnings: float = 0.0
+    tax_saving_future_value: float = 0.0
+    net_advantage_at_withdrawal: float = 0.0
+    full_cap_annual_tax_saving: float = 0.0
+    full_cap_net_advantage_at_withdrawal: float = 0.0
+    personal_pension_annual_plan: list[PersonalPensionAnnualOptimizationPoint] = Field(default_factory=list)
+    cash_safety_rule: str = ""
+    contribution_end_reason: str = ""
+    long_term_cash_risk_month: str = ""
+    recommended_action: str = ""
     start_month: str = ""
     end_month: str | None = None
     reason: str = ""
@@ -1916,11 +2247,40 @@ class InvestmentPlanRecommendation(BaseModel):
     description: str
     monthly_investment: float = 0.0
     annual_return: float = 0.0
+    after_tax_annual_return: float = 0.0
+    risk_adjusted_annual_return: float = 0.0
     cash_reserve_months: float = 0.0
+    liquidity_horizon_months: int | None = None
+    goal_liquidity_target: float = 0.0
+    goal_liquidity_gap: float = 0.0
+    monthly_goal_saving: float = 0.0
     equity_ratio: float = 0.0
     bond_ratio: float = 0.0
     cash_ratio: float = 0.0
+    lifecycle_cash_shortfall: float = 0.0
+    lifecycle_insolvency_month: int | None = None
+    lifecycle_liquid_assets_exhausted_month: int | None = None
+    lifecycle_required_monthly_relief: float = 0.0
+    lifecycle_feasible: bool = True
+    lifecycle_risk_note: str = ""
     score: int = Field(0, ge=0, le=100)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class PortfolioStrategyRecommendation(BaseModel):
+    plan_name: str
+    title: str
+    status: Literal["feasible", "adjustment_required", "high_risk"]
+    description: str
+    actions: list[str] = Field(default_factory=list)
+    cash_shortfall: float = 0.0
+    insolvency_month: int | None = None
+    liquid_assets_exhausted_month: int | None = None
+    terminal_net_worth: float = 0.0
+    required_monthly_relief: float = 0.0
+    feasible: bool = False
+    score: int = Field(0, ge=0, le=100)
+    is_recommended: bool = False
     reasons: list[str] = Field(default_factory=list)
 
 
@@ -1932,6 +2292,7 @@ class AnnualFinancialSummary(BaseModel):
     pension_income: float = 0.0
     living_expense: float = 0.0
     scheduled_expense: float = 0.0
+    renovation_expense: float = 0.0
     child_expense: float = 0.0
     career_shock_self_payment: float = 0.0
     debt_payment: float = 0.0
@@ -1945,6 +2306,10 @@ class AnnualFinancialSummary(BaseModel):
     investment_sell_proceeds: float = 0.0
     personal_pension_contribution: float = 0.0
     personal_pension_return: float = 0.0
+    personal_pension_withdrawal: float = 0.0
+    personal_pension_redemption_fee: float = 0.0
+    personal_pension_withdrawal_tax: float = 0.0
+    personal_pension_suspended_contribution: float = 0.0
     personal_pension_balance_end: float = 0.0
     provident_deposit: float = 0.0
     provident_withdrawal: float = 0.0
@@ -2011,6 +2376,12 @@ class StressResult(BaseModel):
     post_purchase_cash_flow: float
     debt_to_income_ratio: float
     emergency_months: float
+    feasible: bool = False
+    reason: str = ""
+    cash_shortfall: float = 0.0
+    worst_cash_balance: float = 0.0
+    insolvency_month: int | None = None
+    liquid_assets_exhausted_month: int | None = None
 
 
 class AffordabilityRequest(BaseModel):
@@ -2064,6 +2435,10 @@ class AffordabilityResult(BaseModel):
     post_purchase_cash_flow: float
     debt_to_income_ratio: float
     emergency_months: float
+    immediate_purchase_status: str = ""
+    immediate_purchase_reason: str = ""
+    recommended_plan_status: str = ""
+    recommended_plan_reason: str = ""
     commercial_loan: LoanSummary | None
     provident_loan: LoanSummary | None
     tax_summaries: list[TaxMemberSummary]
@@ -2074,6 +2449,7 @@ class AffordabilityResult(BaseModel):
     tax_strategy_timeline: list[TaxStrategyTimelinePoint] = []
     career_shock_projection: CareerShockProjection | None = None
     investment_plan_recommendations: list[InvestmentPlanRecommendation] = Field(default_factory=list)
+    portfolio_strategy_recommendations: list[PortfolioStrategyRecommendation] = Field(default_factory=list)
     current_investment_allocation: InvestmentAllocationSummary | None = None
     child_plan_strategies: list[ChildPlanStrategyPoint] = Field(default_factory=list)
     annual_financial_summaries: list[AnnualFinancialSummary] = Field(default_factory=list)

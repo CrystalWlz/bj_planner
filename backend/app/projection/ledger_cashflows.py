@@ -114,13 +114,26 @@ def fixed_asset_projection_from_values(
     month: int,
     purchase_month: int,
     home_total_price: float,
+    property_annual_price_growth_rate: float = 0.0,
+    property_sale_cost_rate: float = 0.0,
+    property_liquidity_discount_rate: float = 0.0,
     raw_first_vehicle_asset_value: float,
     raw_second_vehicle_asset_value: float,
     raw_vehicle_asset_value: float,
     total_loan_balance_base: float,
     offsets: ProjectionOffsets,
 ) -> FixedAssetProjection:
-    property_asset_value = home_total_price if month >= purchase_month else 0.0
+    if month >= purchase_month and home_total_price > 0:
+        holding_years = max(0.0, month - purchase_month) / 12
+        growth_factor = (1 + max(-0.99, property_annual_price_growth_rate)) ** holding_years
+        gross_property_value = home_total_price * growth_factor
+        net_sale_rate = min(
+            0.90,
+            max(0.0, property_sale_cost_rate) + max(0.0, property_liquidity_discount_rate),
+        )
+        property_asset_value = gross_property_value * (1 - net_sale_rate)
+    else:
+        property_asset_value = 0.0
     property_asset_value = max(0.0, property_asset_value + offsets.property_asset)
     vehicle_asset_value = max(0.0, raw_vehicle_asset_value + offsets.vehicle_asset)
     if raw_vehicle_asset_value > 0:

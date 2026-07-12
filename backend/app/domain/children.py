@@ -4,6 +4,7 @@ from datetime import date
 from typing import Any
 
 from ..policies import get_policy
+from .goal_tradeoffs import resolve_goal_tradeoff_preference
 from ..schemas import CalculationContextGoalSnapshot, CalculationContextSnapshot, ChildPlanStrategyPoint, HouseholdData, IncomeMember, RulePackData
 from .time import (
     format_year_month_tuple,
@@ -257,6 +258,9 @@ def build_child_plan_strategies(
     home_purchase_month: int | None = None,
     as_of: date | None = None,
     calculation_context: CalculationContextSnapshot | None = None,
+    lifecycle_cash_shortfall: float = 0.0,
+    lifecycle_insolvency_month: int | None = None,
+    annual_investment_return: float = 0.025,
 ) -> list[ChildPlanStrategyPoint]:
     current = date((as_of or date.today()).year, (as_of or date.today()).month, 1)
     mother = _child_mother_member(household)
@@ -387,10 +391,51 @@ def build_child_plan_strategies(
             mother_age=mother_age,
             rules=rules,
         )
+        tradeoff = resolve_goal_tradeoff_preference(
+            household,
+            expected_investment_return=annual_investment_return,
+            urgency_months=birth_index,
+            priority=goal.priority if goal is not None else 30 + child_index,
+            life_utility_score=happiness_score,
+            cash_reserve_gap=max(
+                0.0,
+                household.monthly_expense * household.required_liquidity_months - household.cash_account_balance,
+            ),
+        )
+        lifecycle_at_risk = lifecycle_cash_shortfall > 0 or lifecycle_insolvency_month is not None
+        child_cost_base = max(first_year_cash_need, total_to_age_18, 1.0)
+        recommended_budget_factor = (
+            max(0.60, min(1.0, 1.0 - lifecycle_cash_shortfall / child_cost_base))
+            if lifecycle_at_risk
+            else 1.0
+        )
+        recommended_delay_months = 0
+        if (
+            lifecycle_at_risk
+            and birth_index is not None
+            and lifecycle_insolvency_month is not None
+            and lifecycle_insolvency_month <= birth_index + 36
+            and (mother_age is None or mother_age + 1 < advanced_age)
+        ):
+            recommended_delay_months = 12
+        lifecycle_risk_note = ""
+        if lifecycle_at_risk:
+            if recommended_delay_months > 0:
+                lifecycle_risk_note = (
+                    f"当前整体规划长期现金缺口约 {_money_text(lifecycle_cash_shortfall)}；"
+                    "建议先比较延后 12 个月与降低非核心养育预算的组合，重新跑完整账本后再采用。"
+                )
+            else:
+                lifecycle_risk_note = (
+                    f"当前整体规划长期现金缺口约 {_money_text(lifecycle_cash_shortfall)}；"
+                    "不机械延后生育，应优先降低住房、车辆等可调整目标，并把养育预算压到保守档重新测算。"
+                )
+            warnings.append(lifecycle_risk_note)
         explanation = (
             f"策略按{format_year_month_tuple(birth_month) or '待定'}作为出生月推演；"
             f"首年现金需求约 {_money_text(first_year_cash_need)}，18岁前口径累计约 {_money_text(total_to_age_18)}。"
             f"幸福指数综合时间可控性、现金流压力、长期教育支出和母亲生产年龄风险，当前为 {happiness_score}/10。"
+            f"{tradeoff.explanation}养娃时间效用同时考虑母亲年龄与出生时间段，财富侧考虑养育现金流和放弃的理财复利。"
         )
         points.append(
             ChildPlanStrategyPoint(
@@ -412,6 +457,12 @@ def build_child_plan_strategies(
                 monthly_cost_now=round(monthly_now, 2),
                 first_year_cash_need=round(first_year_cash_need, 2),
                 total_to_age_18=round(total_to_age_18, 2),
+                lifecycle_cash_shortfall=round(max(0.0, lifecycle_cash_shortfall), 2),
+                lifecycle_insolvency_month=lifecycle_insolvency_month,
+                lifecycle_feasible=not lifecycle_at_risk,
+                recommended_budget_factor=round(recommended_budget_factor, 4),
+                recommended_delay_months=recommended_delay_months,
+                lifecycle_risk_note=lifecycle_risk_note,
                 stages=stages,
                 explanation=explanation,
             )

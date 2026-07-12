@@ -78,6 +78,7 @@ def build_annual_financial_summaries_from_ledger(
         "pension_income",
         "living_expense",
         "scheduled_expense",
+        "renovation_expense",
         "child_expense",
         "career_shock_self_payment",
         "debt_payment",
@@ -91,6 +92,10 @@ def build_annual_financial_summaries_from_ledger(
         "investment_sell_proceeds",
         "personal_pension_contribution",
         "personal_pension_return",
+        "personal_pension_withdrawal",
+        "personal_pension_redemption_fee",
+        "personal_pension_withdrawal_tax",
+        "personal_pension_suspended_contribution",
         "provident_deposit",
         "provident_withdrawal",
         "pension_account_contribution",
@@ -218,6 +223,9 @@ def build_annual_financial_summaries_from_ledger(
             group["living_expense"] = float(group["living_expense"]) + outflow
         elif category == "scheduled_expense":
             group["scheduled_expense"] = float(group["scheduled_expense"]) + outflow
+        elif category == "renovation":
+            group["renovation_expense"] = float(group["renovation_expense"]) + outflow
+            group["transaction_cash_out"] = float(group["transaction_cash_out"]) + outflow
         elif category == "child_expense":
             group["child_expense"] = float(group["child_expense"]) + outflow
         elif category == "career_shock_self_payment":
@@ -245,6 +253,14 @@ def build_annual_financial_summaries_from_ledger(
             group["personal_pension_contribution"] = float(group["personal_pension_contribution"]) + outflow
         elif category == "personal_pension_return":
             group["personal_pension_return"] = float(group["personal_pension_return"]) + amount
+        elif category == "personal_pension_withdrawal":
+            group["personal_pension_withdrawal"] = float(group["personal_pension_withdrawal"]) + amount
+        elif category == "personal_pension_withdrawal_tax":
+            group["personal_pension_withdrawal_tax"] = float(group["personal_pension_withdrawal_tax"]) + outflow
+        elif category == "personal_pension_redemption_fee":
+            group["personal_pension_redemption_fee"] = float(group["personal_pension_redemption_fee"]) + outflow
+        elif category == "personal_pension_suspended_contribution":
+            group["personal_pension_suspended_contribution"] = float(group["personal_pension_suspended_contribution"]) + amount
         elif category == "provident_deposit":
             group["provident_deposit"] = float(group["provident_deposit"]) + amount
         elif category == "provident_withdrawal":
@@ -318,6 +334,7 @@ def build_annual_financial_summaries(
         "pension_income",
         "living_expense",
         "scheduled_expense",
+        "renovation_expense",
         "child_expense",
         "career_shock_self_payment",
         "debt_payment",
@@ -331,6 +348,10 @@ def build_annual_financial_summaries(
         "investment_sell_proceeds",
         "personal_pension_contribution",
         "personal_pension_return",
+        "personal_pension_withdrawal",
+        "personal_pension_redemption_fee",
+        "personal_pension_withdrawal_tax",
+        "personal_pension_suspended_contribution",
         "provident_deposit",
         "provident_withdrawal",
         "pension_account_contribution",
@@ -586,6 +607,28 @@ def build_strategy_explanations(
     loan_accounts_text = group_summary("loan_accounts", "贷款账户按房贷、车贷和已有贷款合计")
     provident_account_text = concept_summary("provident_account", "公积金账户单独作为受限账户展示")
     for plan in purchase_plans:
+        if plan.months_to_buy is None or plan.cash_shortfall > 0 or plan.insolvency_month is not None:
+            household_strategy_body = (
+                "家庭总策略以安全约束优先：当前组合目标在完整账本中存在现金缺口或无法找到安全执行月份。"
+                "先补足应急金、延后低优先级重大消费或降低目标总价，再重新比较融资与理财配置；"
+                "不把局部看似可行的购车、购房或提前还款方案单独推荐。"
+            )
+        else:
+            household_strategy_body = (
+                f"家庭总策略以第 {plan.months_to_buy} 个月的购房执行点为锚："
+                "购车持有成本、已有贷款、税务、公积金、理财资金动用和后续支出均进入同一长期账本。"
+                "推荐仅在现金不穿底、流动资产未耗尽且终值采用房产净可变现估值时成立；"
+                "任何单项策略变更都应触发整套组合重新计算。"
+            )
+        rows.append(
+            StrategyExplanationPoint(
+                plan_variant=plan.variant,
+                section="household",
+                title="家庭总策略",
+                body=household_strategy_body,
+                priority=0,
+            )
+        )
         if plan.months_to_buy is None:
             status_body = (
                 f"当前方案在 30 年内没有找到现金安全的执行月份；压力情景短缺约 {money_text(plan.cash_stress_shortfall)}。"
@@ -914,6 +957,10 @@ def build_export_sheets(
                         "投资卖出到账",
                         "个人养老金缴费",
                         "个人养老金收益",
+                        "个人养老金领取净到账",
+                        "个人养老金赎回或退保费用",
+                        "个人养老金领取税",
+                        "因现金安全暂停缴费",
                         "公积金缴存",
                         "公积金现金提取",
                         "交易现金支出",
@@ -942,6 +989,10 @@ def build_export_sheets(
                             row.investment_sell_proceeds,
                             row.personal_pension_contribution,
                             row.personal_pension_return,
+                            row.personal_pension_withdrawal,
+                            row.personal_pension_redemption_fee,
+                            row.personal_pension_withdrawal_tax,
+                            row.personal_pension_suspended_contribution,
                             row.provident_deposit,
                             row.provident_withdrawal,
                             row.transaction_cash_out,

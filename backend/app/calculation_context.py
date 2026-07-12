@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from functools import lru_cache
 
 from .domain.career import build_career_shock_projection
 from .domain.expenses import (
@@ -101,7 +102,6 @@ class PurchaseCashContext:
     deed_tax: float
     broker_fee: float
     seller_tax_pass_through: float
-    upfront_renovation_cost: float
     taxes_and_fees: float
 
 
@@ -197,12 +197,45 @@ def build_vehicle_planning_context(
     calculation_context: CalculationContextSnapshot | None = None,
 ) -> VehiclePlanningContext:
     cashflow_household = household_context.cashflow_household
+    lifecycle_horizon_months = min(
+        840,
+        max(
+            360,
+            retirement_tail_months(
+                cashflow_household,
+                as_of=household_context.base_month,
+                rules=rules,
+            ),
+        ),
+    )
+
+    @lru_cache(maxsize=None)
+    def lifecycle_income_at(month: int) -> float:
+        return household_monthly_income_profile_at(
+            cashflow_household,
+            rules,
+            month,
+            as_of=household_context.base_month,
+        ).net_income
+
+    @lru_cache(maxsize=None)
+    def lifecycle_expense_at(month: int) -> float:
+        return monthly_household_expense_at(
+            cashflow_household,
+            month,
+            as_of=household_context.base_month,
+            rules=rules,
+        )
+
     car_plan_analyses = build_car_plan_analyses(
         cashflow_household,
         net_monthly_income=household_context.net_monthly_income,
         annual_investment_return=scenario.annual_investment_return,
         rules=rules,
         calculation_context=calculation_context,
+        income_at_month=lifecycle_income_at,
+        expense_at_month=lifecycle_expense_at,
+        lifecycle_horizon_months=lifecycle_horizon_months,
     )
     effective_car_plan = car_plan_with_selected_strategies(cashflow_household.car_plan, car_plan_analyses)
     cashflow_household = cashflow_household.model_copy(update={"car_plan": effective_car_plan})
@@ -295,11 +328,6 @@ def build_purchase_cash_context(
         )
     else:
         deed_tax_rate = broker_fee_rate = deed_tax = broker_fee = 0.0
-    upfront_renovation_cost = (
-        scenario.renovation_cost
-        if has_purchase_target and scenario.renovation_funding_mode == "upfront_cash"
-        else 0.0
-    )
     seller_tax_pass_through = (
         seller_tax_pass_through_amount(scenario, rules, market_snapshot)
         if has_purchase_target
@@ -310,7 +338,6 @@ def build_purchase_cash_context(
         + broker_fee
         + seller_tax_pass_through
         + (scenario.moving_and_misc_cost if has_purchase_target else 0.0)
-        + upfront_renovation_cost
     )
     return PurchaseCashContext(
         has_purchase_target=has_purchase_target,
@@ -321,6 +348,5 @@ def build_purchase_cash_context(
         deed_tax=deed_tax,
         broker_fee=broker_fee,
         seller_tax_pass_through=seller_tax_pass_through,
-        upfront_renovation_cost=upfront_renovation_cost,
         taxes_and_fees=taxes_and_fees,
     )

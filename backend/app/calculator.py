@@ -12,6 +12,7 @@ from .domain.time import (
     add_months as _add_months,
     end_of_previous_month as _end_of_previous_month,
     month_distance as _month_distance,
+    months_between_months as _months_between_months,
     month_start_for_age as _month_start_for_age,
     month_tuple_to_date as _month_tuple_to_date,
     parse_year_month as _parse_year_month,
@@ -45,6 +46,7 @@ from .domain.investments import (
     investment_withdrawal_mode as _domain_investment_withdrawal_mode,
     investment_withdrawal_mode_label as _domain_investment_withdrawal_mode_label,
 )
+from .domain.personal_pension import personal_pension_withdrawal_start_month
 from .domain.scoring import (
     clamp_score as _clamp_score,
 )
@@ -58,9 +60,10 @@ from .tax_engine import (
     calculate_household_tax,
     calculate_household_tax_for_year,
     household_monthly_income_profile_at,
+    optimize_personal_pension_strategies,
 )
 from .result_assembly import AffordabilityResultInputs, build_affordability_result
-from .planning_summary import affordability_status, home_loan_summaries
+from .planning_summary import affordability_status, home_loan_summaries, recommended_plan_status
 from .policies import get_policy
 from .profiling import profile_span
 from .strategies.home import (
@@ -72,6 +75,8 @@ from .strategies.home_provident_strategy import (
     semiannual_loan_offset_monthly_equivalent as _strategy_semiannual_loan_offset_monthly_equivalent,
 )
 from .strategies.stress import build_stress_tests as _strategy_build_stress_tests
+from .strategies.investment import build_investment_plan_recommendations
+from .strategies.portfolio import build_portfolio_strategy_recommendations
 from .projection.horizon import retirement_tail_months as _retirement_tail_months
 from . import projection_facade as _projection_facade
 from . import purchase_facade as _purchase_facade
@@ -90,6 +95,7 @@ from .schemas import (
     CarPlanData,
     HouseholdData,
     IncomeMember,
+    InvestmentPlanRecommendation,
     LoanSummary,
     MarketSnapshotData,
     MonthlyCashflowPoint,
@@ -108,6 +114,134 @@ VehicleLoanState = tuple[int, CarPlanData, CarLoanSummary, int | None]
 
 
 _visualization_horizon_months = _projection_facade.visualization_horizon_months
+
+
+def _selected_lifecycle_purchase_plan(
+    purchase_plans: list[PurchasePlanAnalysis],
+    scenario: ScenarioData,
+) -> PurchasePlanAnalysis | None:
+    recommended = next((plan for plan in purchase_plans if plan.is_recommended), None)
+    if recommended is not None:
+        return recommended
+    selected = next(
+        (plan for plan in purchase_plans if plan.variant == scenario.selected_purchase_plan_variant),
+        None,
+    )
+    if selected is not None:
+        return selected
+    timed = min(
+        (plan for plan in purchase_plans if plan.months_to_buy is not None),
+        key=lambda plan: (
+            plan.cash_shortfall,
+            plan.insolvency_month is not None,
+            plan.months_to_buy or 0,
+        ),
+        default=None,
+    )
+    return timed or next((plan for plan in purchase_plans if plan.source == "baseline"), None)
+
+
+def _lifecycle_plan_is_feasible(plan: PurchasePlanAnalysis | None) -> bool:
+    return bool(
+        plan is not None
+        and (plan.months_to_buy is not None or plan.source == "baseline")
+        and plan.cash_shortfall <= 0
+        and plan.cash_stress_shortfall <= 0
+        and plan.insolvency_month is None
+        and plan.liquid_assets_exhausted_month is None
+        and plan.liquidity_ok
+        and plan.cash_stress_ok
+    )
+
+
+def _auto_personal_pension_contribution_indexes(household: HouseholdData) -> set[int]:
+    return {
+        index
+        for index, member in enumerate(household.members)
+        if member.personal_pension_account_enabled
+        and member.personal_pension_participation_eligible
+        and member.pension_account_enabled
+        and member.personal_pension_contribution_mode == "auto_tax_optimal"
+        and member.personal_pension_auto_suspend_for_cash_safety
+    }
+
+
+def _personal_pension_risk_precedes_withdrawal(
+    household: HouseholdData,
+    rules: RulePackData,
+    plan: PurchasePlanAnalysis | None,
+    *,
+    base_month: date,
+    member_indexes: set[int],
+) -> bool:
+    if plan is None or plan.insolvency_month is None or not member_indexes:
+        return False
+    return any(
+        plan.insolvency_month
+        < _months_between_months(
+            base_month,
+            personal_pension_withdrawal_start_month(
+                household.members[index],
+                index,
+                rules,
+                base_month=base_month,
+            ),
+        )
+        for index in member_indexes
+    )
+
+
+def _personal_pension_counterfactual_improves_risk(
+    current_plan: PurchasePlanAnalysis | None,
+    suspended_plan: PurchasePlanAnalysis | None,
+) -> bool:
+    if current_plan is None or suspended_plan is None or current_plan.insolvency_month is None:
+        return False
+    if suspended_plan.insolvency_month is None:
+        return True
+    current_shortfall = max(current_plan.cash_shortfall, current_plan.cash_stress_shortfall)
+    suspended_shortfall = max(suspended_plan.cash_shortfall, suspended_plan.cash_stress_shortfall)
+    return (
+        suspended_plan.insolvency_month > current_plan.insolvency_month
+        and suspended_shortfall + 1 < current_shortfall
+    )
+
+
+_AUTO_INVESTMENT_PLAN_ALIASES = {
+    "balanced_monthly_investment": "balanced_monthly_investment",
+    "growth_monthly_investment": "growth_monthly_investment",
+    "goal_liquidity_first": "goal_liquidity_first",
+    "cash_reserve_first": "cash_reserve_first",
+    "lifecycle_cashflow_recovery": "lifecycle_cashflow_recovery",
+}
+
+
+def _household_with_selected_auto_investment_plan(
+    household: HouseholdData,
+    recommendations: list[InvestmentPlanRecommendation],
+) -> HouseholdData | None:
+    selected_plan_name = _AUTO_INVESTMENT_PLAN_ALIASES.get(household.investment_plan_name)
+    if selected_plan_name is None:
+        return None
+    recommendation = next(
+        (item for item in recommendations if item.plan_name == selected_plan_name),
+        None,
+    )
+    if recommendation is None:
+        return None
+    update = {
+        "investment_plan_name": recommendation.plan_name,
+        "investment_risk_level": recommendation.risk_level,
+        "monthly_investment_amount": recommendation.monthly_investment,
+        "investment_cash_reserve_months": recommendation.cash_reserve_months,
+        "investment_equity_ratio": recommendation.equity_ratio,
+        "investment_bond_ratio": recommendation.bond_ratio,
+        "investment_cash_ratio": recommendation.cash_ratio,
+        "investment_auto_rebalance": True,
+    }
+    if all(getattr(household, key) == value for key, value in update.items()):
+        return None
+    return household.model_copy(update=update)
 
 
 def monthly_household_expense_at(
@@ -461,8 +595,17 @@ def calculate_affordability(
 ) -> AffordabilityResult:
     base_date = date.today()
     base_month = date(base_date.year, base_date.month, 1)
+    configured_tax_strategy_household = household
+    with profile_span("personal_pension_economic_optimization"):
+        household, personal_pension_optimization_decisions = optimize_personal_pension_strategies(
+            household,
+            scenario,
+            rules,
+            base_date=base_month,
+        )
     parallel_workers = 1 if stress_name else _parallel_worker_count(rules, 4)
     risk_policy = get_policy(rules).affordability_risk_policy()
+    property_terminal_value_policy = get_policy(rules).property_terminal_value_policy()
     min_down_payment_ratio = max(
         _policy_minimum_down_payment_ratio(household, False, rules),
         _policy_minimum_down_payment_ratio(household, True, rules),
@@ -508,6 +651,227 @@ def calculate_affordability(
             calculation_context=calculation_context,
             market_snapshot=market_snapshot,
         )
+    auto_suspended_personal_pension_member_indexes: set[int] = set()
+    personal_pension_original_insolvency_month: int | None = None
+    auto_personal_pension_member_indexes = _auto_personal_pension_contribution_indexes(strategy_household)
+    initial_selected_plan = _selected_lifecycle_purchase_plan(
+        strategy_pipeline.purchase_plan_analyses,
+        scenario,
+    )
+    if _personal_pension_risk_precedes_withdrawal(
+        strategy_household,
+        rules,
+        initial_selected_plan,
+        base_month=base_month,
+        member_indexes=auto_personal_pension_member_indexes,
+    ):
+        with profile_span("personal_pension_counterfactual"):
+            suspended_input_household = household.model_copy(
+                update={
+                    "members": [
+                        member.model_copy(update={"personal_pension_contribution_mode": "none"})
+                        if index in auto_personal_pension_member_indexes
+                        else member
+                        for index, member in enumerate(household.members)
+                    ]
+                }
+            )
+            suspended_household_context = prepare_household_context(
+                suspended_input_household,
+                scenario,
+                rules,
+                base_month=base_month,
+            )
+            suspended_vehicle_context = build_vehicle_planning_context(
+                suspended_household_context,
+                scenario,
+                rules,
+                calculation_context=calculation_context,
+            )
+            suspended_purchase_cash_context = build_purchase_cash_context(
+                suspended_vehicle_context.strategy_household,
+                scenario,
+                rules,
+                min_down_payment_ratio=min_down_payment_ratio,
+                market_snapshot=market_snapshot,
+            )
+            suspended_strategy_pipeline = run_strategy_pipeline(
+                suspended_vehicle_context.strategy_household,
+                scenario,
+                rules,
+                household_context=suspended_household_context,
+                vehicle_context=suspended_vehicle_context,
+                purchase_cash_context=suspended_purchase_cash_context,
+                base_month=base_month,
+                stress_name=stress_name,
+                parallel_workers=parallel_workers,
+                calculation_context=calculation_context,
+                market_snapshot=market_snapshot,
+            )
+            suspended_selected_plan = _selected_lifecycle_purchase_plan(
+                suspended_strategy_pipeline.purchase_plan_analyses,
+                scenario,
+            )
+        if _personal_pension_counterfactual_improves_risk(
+            initial_selected_plan,
+            suspended_selected_plan,
+        ):
+            auto_suspended_personal_pension_member_indexes = auto_personal_pension_member_indexes
+            personal_pension_original_insolvency_month = initial_selected_plan.insolvency_month
+            household_context = suspended_household_context
+            household = suspended_household_context.household
+            cashflow_household = suspended_vehicle_context.cashflow_household
+            vehicle_context = suspended_vehicle_context
+            strategy_household = suspended_vehicle_context.strategy_household
+            purchase_cash_context = suspended_purchase_cash_context
+            strategy_pipeline = suspended_strategy_pipeline
+
+    initial_investment_selected_plan = _selected_lifecycle_purchase_plan(
+        strategy_pipeline.purchase_plan_analyses,
+        scenario,
+    )
+    initial_investment_home_month = (
+        initial_investment_selected_plan.months_to_buy
+        if initial_investment_selected_plan
+        else (12 if purchase_cash_context.has_purchase_target else None)
+    )
+    initial_investment_vehicle_month = (
+        vehicle_context.car_loan.purchase_delay_months
+        if vehicle_context.car_loan.enabled and vehicle_context.car_loan.purchase_delay_months > 0
+        else None
+    )
+    initial_investment_recommendations = build_investment_plan_recommendations(
+        cashflow_household,
+        scenario,
+        net_monthly_income=household_context.net_monthly_income,
+        current_monthly_expense=household_context.current_monthly_expense,
+        effective_monthly_debt_payment=household_context.effective_monthly_debt_payment,
+        car_loan=vehicle_context.car_loan,
+        home_purchase_month=initial_investment_home_month,
+        home_required_cash=(
+            initial_investment_selected_plan.required_cash_after_pf_extract
+            if initial_investment_selected_plan
+            else purchase_cash_context.stated_down_payment + purchase_cash_context.taxes_and_fees
+        ),
+        home_required_reserve=(
+            initial_investment_selected_plan.required_liquidity_reserve
+            if initial_investment_selected_plan
+            else household_context.current_monthly_expense * cashflow_household.required_liquidity_months
+        ),
+        vehicle_purchase_month=initial_investment_vehicle_month,
+        lifecycle_cash_shortfall=(
+            max(initial_investment_selected_plan.cash_shortfall, initial_investment_selected_plan.cash_stress_shortfall)
+            if initial_investment_selected_plan
+            else 0.0
+        ),
+        lifecycle_insolvency_month=(
+            initial_investment_selected_plan.insolvency_month if initial_investment_selected_plan else None
+        ),
+        lifecycle_liquid_assets_exhausted_month=(
+            initial_investment_selected_plan.liquid_assets_exhausted_month if initial_investment_selected_plan else None
+        ),
+    )
+    auto_investment_household = _household_with_selected_auto_investment_plan(
+        household,
+        initial_investment_recommendations,
+    )
+    auto_investment_monthly_cap: float | None = None
+    if auto_investment_household is not None:
+        baseline_investment_state = (
+            household_context,
+            household,
+            cashflow_household,
+            vehicle_context,
+            strategy_household,
+            purchase_cash_context,
+            strategy_pipeline,
+        )
+
+        def project_auto_investment_household(target_household: HouseholdData):
+            target_household_context = prepare_household_context(
+                target_household,
+                scenario,
+                rules,
+                base_month=base_month,
+            )
+            target_vehicle_context = build_vehicle_planning_context(
+                target_household_context,
+                scenario,
+                rules,
+                calculation_context=calculation_context,
+            )
+            target_purchase_cash_context = build_purchase_cash_context(
+                target_vehicle_context.strategy_household,
+                scenario,
+                rules,
+                min_down_payment_ratio=min_down_payment_ratio,
+                market_snapshot=market_snapshot,
+            )
+            target_strategy_pipeline = run_strategy_pipeline(
+                target_vehicle_context.strategy_household,
+                scenario,
+                rules,
+                household_context=target_household_context,
+                vehicle_context=target_vehicle_context,
+                purchase_cash_context=target_purchase_cash_context,
+                base_month=base_month,
+                stress_name=stress_name,
+                parallel_workers=parallel_workers,
+                calculation_context=calculation_context,
+                market_snapshot=market_snapshot,
+            )
+            return (
+                target_household_context,
+                target_household_context.household,
+                target_vehicle_context.cashflow_household,
+                target_vehicle_context,
+                target_vehicle_context.strategy_household,
+                target_purchase_cash_context,
+                target_strategy_pipeline,
+            )
+
+        with profile_span("auto_investment_strategy_projection"):
+            full_investment_state = project_auto_investment_household(auto_investment_household)
+        full_plan = _selected_lifecycle_purchase_plan(full_investment_state[-1].purchase_plan_analyses, scenario)
+        selected_investment_state = full_investment_state
+        selected_monthly_investment = auto_investment_household.monthly_investment_amount
+        if not _lifecycle_plan_is_feasible(full_plan):
+            baseline_plan = _selected_lifecycle_purchase_plan(
+                baseline_investment_state[-1].purchase_plan_analyses,
+                scenario,
+            )
+            selected_investment_state = baseline_investment_state
+            selected_monthly_investment = 0.0
+            lower = 0.0
+            upper = auto_investment_household.monthly_investment_amount
+            if _lifecycle_plan_is_feasible(baseline_plan) and upper > 0:
+                with profile_span("auto_investment_safe_amount_search"):
+                    for _ in range(3):
+                        trial_amount = (lower + upper) / 2
+                        trial_household = auto_investment_household.model_copy(
+                            update={"monthly_investment_amount": trial_amount}
+                        )
+                        trial_state = project_auto_investment_household(trial_household)
+                        trial_plan = _selected_lifecycle_purchase_plan(
+                            trial_state[-1].purchase_plan_analyses,
+                            scenario,
+                        )
+                        if _lifecycle_plan_is_feasible(trial_plan):
+                            lower = trial_amount
+                            selected_monthly_investment = trial_amount
+                            selected_investment_state = trial_state
+                        else:
+                            upper = trial_amount
+        auto_investment_monthly_cap = round(max(0.0, selected_monthly_investment), 2)
+        (
+            household_context,
+            household,
+            cashflow_household,
+            vehicle_context,
+            strategy_household,
+            purchase_cash_context,
+            strategy_pipeline,
+        ) = selected_investment_state
     purchase_plan_analyses = strategy_pipeline.purchase_plan_analyses
     yield_sensitivity = strategy_pipeline.yield_sensitivity
     projection_pipeline = strategy_pipeline.projection
@@ -526,22 +890,69 @@ def calculate_affordability(
     plan_events = projection_pipeline.plan_events
     selected_home_purchase_month = projection_pipeline.selected_home_purchase_month
     child_plan_strategies = projection_pipeline.child_plan_strategies
+    selected_purchase_plan = _selected_lifecycle_purchase_plan(purchase_plan_analyses, scenario)
+    investment_home_month = (
+        selected_purchase_plan.months_to_buy
+        if selected_purchase_plan
+        else (12 if purchase_cash_context.has_purchase_target else None)
+    )
+    investment_vehicle_month = (
+        vehicle_context.car_loan.purchase_delay_months
+        if vehicle_context.car_loan.enabled and vehicle_context.car_loan.purchase_delay_months > 0
+        else None
+    )
+    current_investment_allocation = vehicle_context.current_investment_allocation
+    investment_plan_recommendations = build_investment_plan_recommendations(
+        cashflow_household,
+        scenario,
+        net_monthly_income=household_context.net_monthly_income,
+        current_monthly_expense=household_context.current_monthly_expense,
+        effective_monthly_debt_payment=household_context.effective_monthly_debt_payment,
+        car_loan=vehicle_context.car_loan,
+        home_purchase_month=investment_home_month,
+        home_required_cash=selected_purchase_plan.required_cash_after_pf_extract if selected_purchase_plan else purchase_cash_context.stated_down_payment + purchase_cash_context.taxes_and_fees,
+        home_required_reserve=selected_purchase_plan.required_liquidity_reserve if selected_purchase_plan else household_context.current_monthly_expense * cashflow_household.required_liquidity_months,
+        vehicle_purchase_month=investment_vehicle_month,
+        lifecycle_cash_shortfall=(
+            max(selected_purchase_plan.cash_shortfall, selected_purchase_plan.cash_stress_shortfall)
+            if selected_purchase_plan
+            else 0.0
+        ),
+        lifecycle_insolvency_month=selected_purchase_plan.insolvency_month if selected_purchase_plan else None,
+        lifecycle_liquid_assets_exhausted_month=(
+            selected_purchase_plan.liquid_assets_exhausted_month if selected_purchase_plan else None
+        ),
+        maximum_monthly_investment=auto_investment_monthly_cap,
+    )
     with profile_span("tax_strategy"):
         tax_strategy_items = build_tax_strategy_items(
-            household,
+            configured_tax_strategy_household,
             scenario,
             rules,
             base_date=base_month,
             horizon_months=household_context.tax_horizon_months,
             selected_purchase_month=selected_home_purchase_month,
+            selected_purchase_plan=selected_purchase_plan,
+            auto_suspended_personal_pension_member_indexes=auto_suspended_personal_pension_member_indexes,
+            personal_pension_original_insolvency_month=personal_pension_original_insolvency_month,
+            personal_pension_optimization_decisions=personal_pension_optimization_decisions,
         )
         tax_strategy_timeline = build_tax_strategy_timeline(
-            household,
+            configured_tax_strategy_household,
             rules,
             tax_strategy_items,
             base_date=base_month,
             horizon_months=household_context.tax_horizon_months,
             tax_events=household_context.tax_events,
+        )
+    with profile_span("portfolio_strategy"):
+        portfolio_strategy_recommendations = build_portfolio_strategy_recommendations(
+            purchase_plans=purchase_plan_analyses,
+            car_plans=vehicle_context.car_plan_analyses,
+            investment_plans=investment_plan_recommendations,
+            child_plans=child_plan_strategies,
+            tax_strategy_items=tax_strategy_items,
+            scenario=scenario,
         )
     with profile_span("home_loan_summary"):
         home_loan_context = home_loan_summaries(
@@ -583,10 +994,15 @@ def calculate_affordability(
         )
 
     with profile_span("result_assembly"):
+        recommended_status, recommended_reason = recommended_plan_status(purchase_plan_analyses)
         result = build_affordability_result(
         AffordabilityResultInputs(
-            status=affordability.status,
-            status_reason=affordability.status_reason,
+            status=recommended_status if purchase_cash_context.has_purchase_target else affordability.status,
+            status_reason=recommended_reason if purchase_cash_context.has_purchase_target else affordability.status_reason,
+            immediate_purchase_status=affordability.status,
+            immediate_purchase_reason=affordability.status_reason,
+            recommended_plan_status=recommended_status if purchase_cash_context.has_purchase_target else affordability.status,
+            recommended_plan_reason=recommended_reason if purchase_cash_context.has_purchase_target else affordability.status_reason,
             eligible=eligible,
             eligibility_notes=eligibility_notes,
             total_required_cash=affordability.total_required_cash,
@@ -617,8 +1033,9 @@ def calculate_affordability(
             tax_strategy_items=tax_strategy_items,
             tax_strategy_timeline=tax_strategy_timeline,
             career_shock_projection=household_context.career_shock_projection,
-            investment_plan_recommendations=vehicle_context.investment_plan_recommendations,
-            current_investment_allocation=vehicle_context.current_investment_allocation,
+            investment_plan_recommendations=investment_plan_recommendations,
+            portfolio_strategy_recommendations=portfolio_strategy_recommendations,
+            current_investment_allocation=current_investment_allocation,
             child_plan_strategies=child_plan_strategies,
             annual_financial_summaries=annual_financial_summaries,
             purchase_plan_analyses=purchase_plan_analyses,
@@ -636,6 +1053,13 @@ def calculate_affordability(
             strategy_explanations=strategy_explanations,
             plan_events=plan_events,
             property_goal_assumption=vehicle_context.property_goal_assumption,
+            property_terminal_value_assumption=(
+                "房产终值按可变现净值估算："
+                f"年价格变化假设 {property_terminal_value_policy.annual_price_growth_rate:.1%}，"
+                f"出售成本 {property_terminal_value_policy.sale_cost_rate:.1%}，"
+                f"流动性折价 {property_terminal_value_policy.liquidity_discount_rate:.1%}；"
+                "不把挂牌价或买入总价直接当作可立即动用的资产。"
+            ),
             provident_year_reasons=home_loan_context.provident_year_reasons,
             scenario=scenario,
             base_month=base_month,
@@ -652,6 +1076,28 @@ def calculate_affordability(
                 market_snapshot=market_snapshot,
                 parallel_workers=min(parallel_workers, 3),
             )
+        from .strategies.home_recommendations import with_stress_test_recommendation_gate
+
+        result.purchase_plan_analyses = with_stress_test_recommendation_gate(
+            result.purchase_plan_analyses,
+            result.stress_tests,
+        )
+        failed_stress_names = [item.name for item in result.stress_tests if not item.feasible]
+        if failed_stress_names:
+            stress_reason = (
+                f"压力测试未通过（{'、'.join(failed_stress_names)}）："
+                "没有方案同时满足现金安全和长期偿付能力，不推荐立即执行。"
+            )
+            result.status = "无可行方案"
+            result.status_reason = stress_reason
+            result.recommended_plan_status = "无可行方案"
+            result.recommended_plan_reason = stress_reason
+        else:
+            recommended_status, recommended_reason = recommended_plan_status(result.purchase_plan_analyses)
+            result.status = recommended_status
+            result.status_reason = recommended_reason
+            result.recommended_plan_status = recommended_status
+            result.recommended_plan_reason = recommended_reason
     return result
 
 

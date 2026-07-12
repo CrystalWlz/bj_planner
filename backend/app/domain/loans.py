@@ -121,13 +121,15 @@ def amortized_monthly_payment(principal: float, annual_rate: float, months: int,
 def prepayment_investment_hurdle_rate(
     annual_investment_return: float,
     *,
+    effective_tax_rate: float = 0.0,
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     risk_buffer: float = 0.003,
     fee_amortization_years: float = 3.0,
 ) -> float:
     fee_drag = (max(0.0, buy_fee_rate) + max(0.0, sell_fee_rate)) / max(1.0, fee_amortization_years)
-    net_investment_return = max(0.0, annual_investment_return - fee_drag)
+    after_tax_return = max(0.0, annual_investment_return) * (1 - max(0.0, min(1.0, effective_tax_rate)))
+    net_investment_return = max(0.0, after_tax_return - fee_drag)
     return max(0.0, net_investment_return + max(0.0, risk_buffer))
 
 

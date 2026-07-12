@@ -102,7 +102,7 @@ def baseline_purchase_plan_analysis(
         provident_equal_installment_payment=0.0,
         provident_repayment_advice="未启用购房目标，当前只展示家庭基线账本，不生成房贷还款方式建议。",
         renovation_cost=0.0,
-        renovation_funding_mode=scenario.renovation_funding_mode,
+        renovation_funding_mode="after_goal_saving",
         renovation_included_in_upfront_cash=False,
         months_to_renovation=None,
         years_to_renovation=None,
@@ -183,7 +183,7 @@ def run_strategy_pipeline(
                 market_snapshot=market_snapshot,
             )
         return StrategyPipelineResult(
-            purchase_plan_analyses=[baseline_plan],
+            purchase_plan_analyses=projection.purchase_plan_analyses,
             projection=projection,
         )
 
@@ -214,6 +214,7 @@ def run_strategy_pipeline(
                     parallel_workers=max(1, parallel_workers - 1),
                     market_snapshot=market_snapshot,
                     baseline_analyses=purchase_plans,
+                    calculation_context=calculation_context,
                 )
                 yield_sensitivity = yield_future.result()
         else:
@@ -228,6 +229,7 @@ def run_strategy_pipeline(
                 parallel_workers=1,
                 market_snapshot=market_snapshot,
                 baseline_analyses=purchase_plans,
+                calculation_context=calculation_context,
             )
     with profile_span("projection_pipeline"):
         projection = build_strategy_projection_pipeline(
@@ -243,7 +245,7 @@ def run_strategy_pipeline(
             market_snapshot=market_snapshot,
         )
     return StrategyPipelineResult(
-        purchase_plan_analyses=purchase_plans,
+        purchase_plan_analyses=projection.purchase_plan_analyses,
         yield_sensitivity=yield_sensitivity,
         projection=projection,
     )

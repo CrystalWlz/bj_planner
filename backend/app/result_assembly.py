@@ -18,6 +18,7 @@ from .schemas import (
     CoreObjectGroupSummary,
     InvestmentAllocationSummary,
     InvestmentPlanRecommendation,
+    PortfolioStrategyRecommendation,
     LoanSummary,
     LoanVisualizationPoint,
     MonthlyCashflowPoint,
@@ -45,6 +46,10 @@ from .schemas import (
 class AffordabilityResultInputs:
     status: str
     status_reason: str
+    immediate_purchase_status: str
+    immediate_purchase_reason: str
+    recommended_plan_status: str
+    recommended_plan_reason: str
     eligible: bool
     eligibility_notes: list[str]
     total_required_cash: float
@@ -76,6 +81,7 @@ class AffordabilityResultInputs:
     tax_strategy_timeline: list[TaxStrategyTimelinePoint]
     career_shock_projection: CareerShockProjection | None
     investment_plan_recommendations: list[InvestmentPlanRecommendation]
+    portfolio_strategy_recommendations: list[PortfolioStrategyRecommendation]
     current_investment_allocation: InvestmentAllocationSummary | None
     child_plan_strategies: list[ChildPlanStrategyPoint]
     annual_financial_summaries: list[AnnualFinancialSummary]
@@ -94,6 +100,7 @@ class AffordabilityResultInputs:
     strategy_explanations: list[StrategyExplanationPoint]
     plan_events: list[PlanEventPoint]
     property_goal_assumption: str
+    property_terminal_value_assumption: str
     provident_year_reasons: list[str]
     scenario: ScenarioData
     base_month: date
@@ -103,6 +110,7 @@ class AffordabilityResultInputs:
 def affordability_assumptions(
     *,
     property_goal_assumption: str,
+    property_terminal_value_assumption: str,
     provident_year_reasons: list[str],
 ) -> list[str]:
     assumptions = [
@@ -111,6 +119,8 @@ def affordability_assumptions(
     ]
     if property_goal_assumption:
         assumptions.append(property_goal_assumption)
+    if property_terminal_value_assumption:
+        assumptions.append(property_terminal_value_assumption)
     assumptions.extend(
         [
             "北京公积金贷款额度按当前规则包的每缴存年额度估算；夫妻分别缴存时，现阶段用家庭录入的社保/个税月数近似代表较长缴存年限。",
@@ -130,6 +140,10 @@ def build_affordability_result(inputs: AffordabilityResultInputs) -> Affordabili
         calculation_context=inputs.calculation_context,
         status=inputs.status,
         status_reason=inputs.status_reason,
+        immediate_purchase_status=inputs.immediate_purchase_status,
+        immediate_purchase_reason=inputs.immediate_purchase_reason,
+        recommended_plan_status=inputs.recommended_plan_status,
+        recommended_plan_reason=inputs.recommended_plan_reason,
         eligible=inputs.eligible,
         eligibility_notes=inputs.eligibility_notes,
         total_required_cash=round(inputs.total_required_cash, 2),
@@ -161,6 +175,7 @@ def build_affordability_result(inputs: AffordabilityResultInputs) -> Affordabili
         tax_strategy_timeline=inputs.tax_strategy_timeline,
         career_shock_projection=inputs.career_shock_projection,
         investment_plan_recommendations=inputs.investment_plan_recommendations,
+        portfolio_strategy_recommendations=inputs.portfolio_strategy_recommendations,
         current_investment_allocation=inputs.current_investment_allocation,
         child_plan_strategies=inputs.child_plan_strategies,
         annual_financial_summaries=inputs.annual_financial_summaries,
@@ -181,6 +196,7 @@ def build_affordability_result(inputs: AffordabilityResultInputs) -> Affordabili
         stress_tests=[],
         assumptions=affordability_assumptions(
             property_goal_assumption=inputs.property_goal_assumption,
+            property_terminal_value_assumption=inputs.property_terminal_value_assumption,
             provident_year_reasons=inputs.provident_year_reasons,
         ),
     )

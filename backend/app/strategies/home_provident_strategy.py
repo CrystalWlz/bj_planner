@@ -17,6 +17,7 @@ class MonthlyIncomeProfileLike(Protocol):
     net_income: float
     monthly_pf_deposit: float
     personal_pension_contribution: float
+    other_cash_outflow: float
 
 
 def _money_text(amount: float) -> str:
@@ -426,7 +427,7 @@ def post_purchase_cash_stress(
     extra_monthly_payment: float = 0.0,
     extra_payment_start_month: int = 1,
     strategy_preference: str = "auto",
-    horizon_months: int = 120,
+    horizon_months: int = 24,
 ) -> tuple[float, int | None, bool]:
     cash_balance = starting_cash
     pf_balance = max(0.0, starting_pf_balance)
@@ -437,6 +438,12 @@ def post_purchase_cash_stress(
     pf_monthly_rate = max(0.0, pf_interest_rate) / 12
     extra_monthly_payment = max(0.0, extra_monthly_payment)
     extra_payment_start_month = max(1, extra_payment_start_month)
+    selected_pf_strategy_mode: str | None = None
+    planned_investment_contribution = (
+        max(0.0, household.monthly_investment_amount)
+        if household.investment_plan_name != "cash_only"
+        else 0.0
+    )
 
     for absolute_month in range(purchase_month + 1, purchase_month + horizon_months + 1):
         repayment_month = max(1, absolute_month - purchase_month)
@@ -445,24 +452,40 @@ def post_purchase_cash_stress(
         monthly_expense = expense_at_month(absolute_month)
         free_cash_flow = (
             income.net_income
+            - max(0.0, float(getattr(income, "personal_pension_contribution", 0.0) or 0.0))
+            - max(0.0, float(getattr(income, "other_cash_outflow", 0.0) or 0.0))
+            - planned_investment_contribution
             - monthly_expense
             - household.monthly_debt_payment
             - car_monthly_cash_cost_at(absolute_month)
             - total_monthly_payment
         )
-        monthly_pf_withdrawal, pf_strategy_mode = post_purchase_pf_strategy(
-            household=household,
-            purchase_month=purchase_month,
-            starting_pf_balance=starting_pf_balance,
-            free_cash_flow=free_cash_flow,
-            monthly_pf_deposit=income.monthly_pf_deposit,
-            provident_monthly_payment=provident_monthly_payment,
-            total_monthly_payment=total_monthly_payment,
-            post_purchase_monthly_expense=monthly_expense,
-            rules=rules,
-            strategy_preference=strategy_preference,
-            current_month=absolute_month,
-        )
+        if selected_pf_strategy_mode is None:
+            monthly_pf_withdrawal, selected_pf_strategy_mode = post_purchase_pf_strategy(
+                household=household,
+                purchase_month=purchase_month,
+                starting_pf_balance=starting_pf_balance,
+                free_cash_flow=free_cash_flow,
+                monthly_pf_deposit=income.monthly_pf_deposit,
+                provident_monthly_payment=provident_monthly_payment,
+                total_monthly_payment=total_monthly_payment,
+                post_purchase_monthly_expense=monthly_expense,
+                rules=rules,
+                strategy_preference=strategy_preference,
+                current_month=absolute_month,
+            )
+        else:
+            active_selected_mode = pf_strategy_active_mode(
+                selected_pf_strategy_mode,
+                purchase_month=purchase_month,
+                current_month=absolute_month,
+            )
+            monthly_pf_withdrawal = (
+                min(max(0.0, income.monthly_pf_deposit), max(0.0, provident_monthly_payment))
+                if "monthly_repayment_withdrawal" in active_selected_mode
+                else 0.0
+            )
+        pf_strategy_mode = selected_pf_strategy_mode
         active_pf_mode = pf_strategy_active_mode(
             pf_strategy_mode,
             purchase_month=purchase_month,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import date
 import json
 
 import httpx
@@ -25,6 +26,8 @@ from .database import (
     list_generated_strategies,
     list_generated_strategies_for_cache_layers,
     list_household_records,
+    list_property_valuations,
+    list_personal_pension_return_snapshots,
     list_records,
     list_scenario_records,
     normalize_household_data,
@@ -32,13 +35,19 @@ from .database import (
     normalize_planning_goal_data,
     normalize_rule_pack_data,
     normalize_scenario_data,
+    latest_property_valuation,
+    latest_personal_pension_return_snapshot,
     update_household_record,
     update_planning_goal_record,
     upsert_calculation_cache,
     upsert_generated_strategies,
+    upsert_property_valuation,
+    upsert_personal_pension_return_snapshot,
     update_record,
     update_scenario_record,
 )
+from .domain.property_valuation import estimate_property_value
+from .domain.personal_pension_returns import refresh_personal_pension_return_snapshot
 from .planning_context import (
     apply_planning_goal_constraints,
     core_object_snapshot_from_record,
@@ -67,6 +76,13 @@ from .schemas import (
     MarketSnapshotCreate,
     MarketSnapshotData,
     MarketSnapshotRecord,
+    PropertyValuationRecord,
+    PropertyValuationRefreshRequest,
+    PropertyValuationRefreshResponse,
+    PersonalPensionReturnRefreshRequest,
+    PersonalPensionReturnRefreshResponse,
+    PersonalPensionReturnSnapshotData,
+    PersonalPensionReturnSnapshotRecord,
     PlanningGoalCreate,
     PlanningGoalData,
     PlanningFoundationSummary,
@@ -83,6 +99,25 @@ from .schemas import (
     SourceFetchRequest,
 )
 from .source_monitor import fetch_preview
+from .policies import with_personal_pension_return_snapshot
+
+
+def _with_latest_personal_pension_returns(payload: AffordabilityRequest) -> AffordabilityRequest:
+    latest = latest_personal_pension_return_snapshot()
+    if latest is None:
+        return payload
+    data = PersonalPensionReturnSnapshotData.model_validate(latest["data"])
+    return payload.model_copy(
+        update={
+            "rule_pack": with_personal_pension_return_snapshot(
+                payload.rule_pack,
+                pre_retirement_annual_return=data.pre_retirement_annual_return,
+                post_retirement_annual_return=data.post_retirement_annual_return,
+                snapshot_date=data.snapshot_date,
+                source_count=data.parsed_source_count,
+            )
+        }
+    )
 
 
 def _load_current_cached_affordability_payload(payload: str) -> dict | None:
@@ -312,11 +347,79 @@ def create_market_snapshot(payload: MarketSnapshotCreate) -> dict:
     return insert_record("market_snapshots", normalize_market_snapshot_data(payload.data.model_dump(mode="json")))
 
 
+@app.get("/api/property-valuations", response_model=list[PropertyValuationRecord])
+def get_property_valuations(
+    household_id: str,
+    planning_goal_id: str | None = None,
+) -> list[dict]:
+    return list_property_valuations(
+        household_id=household_id,
+        planning_goal_id=planning_goal_id,
+    )
+
+
+@app.post("/api/property-valuations/refresh", response_model=PropertyValuationRefreshResponse)
+def refresh_property_valuation(payload: PropertyValuationRefreshRequest) -> dict:
+    latest = latest_property_valuation(
+        household_id=payload.household_id,
+        planning_goal_id=payload.planning_goal_id,
+    )
+    today = date.today()
+    if latest is not None and not payload.force:
+        next_due = str(latest.get("data", {}).get("next_due_date") or "")
+        if next_due and next_due > today.isoformat():
+            return {"record": latest, "refreshed": False}
+
+    valuation = estimate_property_value(
+        payload.property_data,
+        payload.market_snapshot,
+        valuation_date=today,
+    )
+    record = upsert_property_valuation(
+        household_id=payload.household_id,
+        planning_goal_id=payload.planning_goal_id,
+        valuation_date=valuation.valuation_date,
+        market_snapshot_id=payload.market_snapshot_id,
+        data=valuation.model_dump(mode="json"),
+    )
+    return {"record": record, "refreshed": True}
+
+
+@app.get("/api/personal-pension-returns", response_model=list[PersonalPensionReturnSnapshotRecord])
+def get_personal_pension_return_snapshots() -> list[dict]:
+    return list_personal_pension_return_snapshots()
+
+
+@app.post("/api/personal-pension-returns/refresh", response_model=PersonalPensionReturnRefreshResponse)
+async def refresh_personal_pension_returns(payload: PersonalPensionReturnRefreshRequest) -> dict:
+    latest = latest_personal_pension_return_snapshot()
+    today = date.today()
+    if latest is not None and not payload.force:
+        next_due = str(latest.get("data", {}).get("next_due_date") or "")
+        if next_due and next_due > today.isoformat():
+            return {"record": latest, "refreshed": False}
+    previous = (
+        PersonalPensionReturnSnapshotData.model_validate(latest["data"])
+        if latest is not None
+        else None
+    )
+    snapshot = await refresh_personal_pension_return_snapshot(
+        payload.sources,
+        today=today,
+        previous=previous,
+    )
+    record = upsert_personal_pension_return_snapshot(
+        snapshot_date=snapshot.snapshot_date,
+        data=snapshot.model_dump(mode="json"),
+    )
+    return {"record": record, "refreshed": True}
+
+
 @app.post("/api/calculations/affordability", response_model=AffordabilityResult)
 def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
     with calculation_profile("affordability_api"):
         with profile_span("calculation_context"):
-            cache_payload = payload_with_calculation_context(payload)
+            cache_payload = payload_with_calculation_context(_with_latest_personal_pension_returns(payload))
         with profile_span("cache_key"):
             cache_key, engine_fingerprint, cache_layers = affordability_cache_key(cache_payload)
         with profile_span("cache_lookup"):

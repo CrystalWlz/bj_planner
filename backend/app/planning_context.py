@@ -10,7 +10,9 @@ from .database import (
     list_planning_goal_records,
     list_scenario_records,
 )
+from .core_objects import core_object_record_id, derive_core_objects_for_planning_goals
 from .domain.planning_goals import resolve_planning_sequence
+from .domain.goal_tradeoffs import resolve_goal_tradeoff_preference
 from .domain.time import add_months
 from .reporting import build_account_concepts_from_core_object_snapshots, build_core_object_group_summaries
 from .schemas import (
@@ -96,7 +98,12 @@ def calculation_context_snapshot(payload: AffordabilityRequest) -> CalculationCo
     sequence = foundation.planning_sequence or PlanningSequenceResult()
     current_goal_ids = [goal_id for goal_id in [scenario_id, scenario_goal_id] if goal_id]
     current_goal = next((goal for goal in sequence.goals if goal.id in current_goal_ids), None)
-    core_objects = [record.model_dump(mode="json") for record in foundation.core_objects]
+    core_objects = _core_objects_for_current_home_selection(
+        [record.model_dump(mode="json") for record in foundation.core_objects],
+        raw_goals,
+        current_goal,
+        household_id or "",
+    )
 
     goal_fingerprint_payload = [
         {
@@ -154,17 +161,71 @@ def core_object_snapshot_from_record(record: dict[str, Any]) -> CalculationConte
     )
 
 
+def _core_objects_for_current_home_selection(
+    core_objects: list[dict[str, Any]],
+    raw_goals: list[dict[str, Any]],
+    current_goal: ResolvedPlanningGoal | None,
+    household_id: str,
+) -> list[dict[str, Any]]:
+    if current_goal is None or current_goal.goal_type != "home":
+        return core_objects
+    home_goal_ids = {
+        str(record.get("id") or "")
+        for record in raw_goals
+        if str(record.get("goal_type") or (record.get("data") or {}).get("goal_type") or "") == "home"
+    }
+    retained: list[dict[str, Any]] = []
+    for record in core_objects:
+        data = record.get("data") if isinstance(record.get("data"), dict) else {}
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        is_home_goal_object = (
+            data.get("source") == "goal"
+            and (
+                metadata.get("goal_type") == "home"
+                or data.get("owner_key") in home_goal_ids
+                or data.get("category") == "property_asset"
+            )
+        )
+        if not is_home_goal_object:
+            retained.append(record)
+    selected_goal = next((record for record in raw_goals if str(record.get("id") or "") == current_goal.id), None)
+    if selected_goal is None:
+        return retained
+    for data in derive_core_objects_for_planning_goals(household_id, [selected_goal]):
+        object_type = str(data.get("object_type") or "asset")
+        category = str(data.get("category") or "other")
+        source = str(data.get("source") or "goal")
+        reference_id = str(data.get("reference_id") or current_goal.id)
+        retained.append(
+            {
+                "id": core_object_record_id(household_id, object_type, source, reference_id, category),
+                "household_id": household_id,
+                "object_type": object_type,
+                "category": category,
+                "data": data,
+            }
+        )
+    return retained
+
+
 def _goal_snapshot(goal: ResolvedPlanningGoal) -> CalculationContextGoalSnapshot:
     return CalculationContextGoalSnapshot(
         id=goal.id,
         goal_type=goal.goal_type,
         name=goal.name,
+        planning_group_id=goal.planning_group_id,
+        planning_group_name=goal.planning_group_name,
+        planning_group_size=goal.planning_group_size,
+        planning_group_member_ids=goal.planning_group_member_ids,
+        target_amount=goal.target_amount,
+        funding_mode=goal.funding_mode,
         enabled=goal.enabled,
         priority=goal.priority,
         sequence_index=goal.sequence_index,
         normalized_timing_mode=goal.normalized_timing_mode,
         depends_on_goal_id=goal.depends_on_goal_id,
         depends_on_goal_name=goal.depends_on_goal_name,
+        delay_after_dependency_months=goal.delay_after_dependency_months,
         resolved_not_before_month=goal.resolved_not_before_month,
         resolved_window_start_month=goal.resolved_window_start_month,
         resolved_window_end_month=goal.resolved_window_end_month,
@@ -197,6 +258,7 @@ def scenario_with_planning_goal_constraints(payload: AffordabilityRequest) -> Sc
     if home_goal is None:
         return scenario
     scenario = _project_explicit_home_goal_to_scenario(scenario, context, home_goal)
+    scenario = _project_renovation_goal_to_scenario(scenario, context, home_goal)
     if not home_goal.enabled or home_goal.normalized_timing_mode == "not_planned":
         if not scenario.enabled:
             return scenario
@@ -205,6 +267,44 @@ def scenario_with_planning_goal_constraints(payload: AffordabilityRequest) -> Sc
     if resolved_not_before <= scenario.manual_purchase_delay_months:
         return scenario
     return scenario.model_copy(update={"manual_purchase_delay_months": min(360, resolved_not_before)})
+
+
+def _project_renovation_goal_to_scenario(
+    scenario: ScenarioData,
+    context: CalculationContextSnapshot,
+    home_goal: CalculationContextGoalSnapshot,
+) -> ScenarioData:
+    home_group_id = home_goal.planning_group_id or home_goal.id
+    home_member_ids = set(home_goal.planning_group_member_ids or [home_goal.id])
+    renovation_goal = next(
+        (
+            goal for goal in context.planning_goals
+            if goal.goal_type == "renovation"
+            and goal.enabled
+            and goal.normalized_timing_mode != "not_planned"
+            and (
+                goal.depends_on_goal_id == home_group_id
+                or goal.depends_on_goal_id in home_member_ids
+            )
+        ),
+        None,
+    )
+    return scenario.model_copy(
+        update={
+            "renovation_cost": max(0.0, renovation_goal.target_amount) if renovation_goal else 0.0,
+            "renovation_funding_mode": (
+                renovation_goal.funding_mode
+                if renovation_goal and renovation_goal.funding_mode in {"cash_or_investment", "cash_only", "after_goal_saving"}
+                else "after_goal_saving"
+            ),
+            "renovation_goal_id": renovation_goal.id if renovation_goal else "",
+            "renovation_delay_after_purchase_months": (
+                max(0, renovation_goal.delay_after_dependency_months)
+                if renovation_goal
+                else 0
+            ),
+        }
+    )
 
 
 def _project_explicit_home_goal_to_scenario(
@@ -306,6 +406,8 @@ def household_with_planning_goal_constraints(payload: AffordabilityRequest) -> H
             context.household_id,
             all_goal_records,
             resolved_by_id,
+            household=constrained_household,
+            scenario=payload.scenario,
         )
         if next_child_plans != constrained_household.child_plans:
             constrained_household = constrained_household.model_copy(update={"child_plans": next_child_plans})
@@ -389,6 +491,11 @@ def _child_plan_with_planning_goal_constraints(
     child: ChildPlanData,
     goal: PlanningGoalRecord,
     resolved_not_before_month: int,
+    *,
+    resolved_window_start_month: int = 0,
+    resolved_window_end_month: int | None = None,
+    household: HouseholdData,
+    scenario: ScenarioData,
 ) -> ChildPlanData:
     data = goal.data
     update: dict[str, Any] = {}
@@ -415,6 +522,27 @@ def _child_plan_with_planning_goal_constraints(
             update["planned_birth_start_month"] = data.planning_window_start_month
         if data.planning_window_end_month:
             update["planned_birth_end_month"] = data.planning_window_end_month
+        window_start = max(0, resolved_not_before_month, resolved_window_start_month)
+        window_end = max(window_start, resolved_window_end_month if resolved_window_end_month is not None else window_start)
+        if window_end > window_start:
+            tradeoff = resolve_goal_tradeoff_preference(
+                household,
+                expected_investment_return=scenario.annual_investment_return,
+                urgency_months=window_start,
+                priority=data.priority,
+                life_utility_score=8.0,
+                cash_reserve_gap=max(
+                    0.0,
+                    household.monthly_expense * household.required_liquidity_months - household.cash_account_balance,
+                ),
+            )
+            selected_delay = round(
+                window_start + (window_end - window_start) * (1 - tradeoff.timing_weight)
+            )
+            selected_month = _month_label_from_delay(selected_delay)
+            update["planned_birth_month"] = selected_month
+            update["planned_birth_start_month"] = selected_month
+            update["planned_birth_end_month"] = selected_month
     target = data.target_params if isinstance(data.target_params, dict) else {}
     for key in [
         "expense_strategy_mode",
@@ -608,6 +736,9 @@ def _child_plans_with_planning_goal_constraints(
     household_id: str,
     all_goal_records: list[PlanningGoalRecord],
     resolved_by_id: dict[str, CalculationContextGoalSnapshot],
+    *,
+    household: HouseholdData,
+    scenario: ScenarioData,
 ) -> list[ChildPlanData]:
     child_goals = [
         goal for goal in all_goal_records
@@ -637,6 +768,10 @@ def _child_plans_with_planning_goal_constraints(
                 child,
                 goal,
                 resolved.resolved_not_before_month if resolved else goal.data.earliest_purchase_delay_months,
+                resolved_window_start_month=resolved.resolved_window_start_month if resolved else 0,
+                resolved_window_end_month=resolved.resolved_window_end_month if resolved else None,
+                household=household,
+                scenario=scenario,
             )
         )
     return constrained

@@ -34,7 +34,7 @@ def zero_cash_stage(template: IncomeStageData, name: str, start: date, end: date
             "start_date": start.isoformat(),
             "end_date": end.isoformat() if end else None,
             "monthly_salary_gross": 0,
-            "annual_bonus": 0,
+            "annual_bonus_months": 0,
             "annual_bonus_payout_mode": "lump_sum",
             "annual_bonus_payout_month": template.annual_bonus_payout_month,
             "monthly_freelance_income": 0,

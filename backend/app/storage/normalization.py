@@ -28,6 +28,15 @@ def safe_int(value: Any, fallback: int) -> int:
         return fallback
 
 
+def normalize_month_of_year(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and "-" in value:
+        value = value.rsplit("-", 1)[-1]
+    month = safe_int(value, 0)
+    return month if 1 <= month <= 12 else None
+
+
 ACCOUNT_CALIBRATION_TARGETS = {
     "cash",
     "investment",
@@ -67,12 +76,40 @@ HOME_PLANNING_TARGET_CONTROL_KEYS = {
     "planning_window_start_month",
     "planning_window_end_month",
     "selected_purchase_plan_variant",
+    "loan_repayment_strategy_mode",
     "provident_rate",
     "deed_tax_rate",
+    "commercial_repayment_method",
+    "provident_repayment_method",
+    "commercial_prepayment_mode",
+    "commercial_prepayment_enabled",
+    "commercial_prepayment_start_month",
+    "commercial_prepayment_allowed_after_month",
+    "commercial_prepayment_monthly_amount",
     "provident_account_repayment_strategy",
     "provident_account_repayment_switch_enabled",
     "provident_account_repayment_switch_after_month",
     "provident_account_repayment_switch_to_strategy",
+    "investment_withdrawal_mode",
+    "investment_min_balance_after_purchase",
+    "renovation_cost",
+    "renovation_funding_mode",
+}
+HOME_FINANCING_PREFERENCE_KEYS = {
+    "loan_repayment_strategy_mode",
+    "commercial_repayment_method",
+    "provident_repayment_method",
+    "commercial_prepayment_mode",
+    "commercial_prepayment_enabled",
+    "commercial_prepayment_start_month",
+    "commercial_prepayment_allowed_after_month",
+    "commercial_prepayment_monthly_amount",
+    "provident_account_repayment_strategy",
+    "provident_account_repayment_switch_enabled",
+    "provident_account_repayment_switch_after_month",
+    "provident_account_repayment_switch_to_strategy",
+    "investment_withdrawal_mode",
+    "investment_min_balance_after_purchase",
 }
 VEHICLE_PLANNING_TARGET_CONTROL_KEYS = {
     "schema_version",
@@ -85,6 +122,46 @@ VEHICLE_PLANNING_TARGET_CONTROL_KEYS = {
     "planning_window_start_month",
     "planning_window_end_month",
     "selected_strategy_variant",
+    "financing_options",
+    "selected_financing_option_id",
+    "selected_financing_option_name",
+    "selected_financing_type",
+    "selected_financing_min_down_payment_ratio",
+    "selected_financing_max_down_payment_ratio",
+    "selected_financing_prepayment_allowed",
+    "loan_prepayment_enabled",
+    "loan_prepayment_strategy_type",
+    "loan_prepayment_start_month",
+    "loan_prepayment_allowed_after_month",
+    "loan_prepayment_monthly_amount",
+    "loan_prepayment_lump_sum_month",
+    "loan_prepayment_lump_sum_amount",
+    "annual_mileage_km",
+    "monthly_parking_cost",
+    "annual_maintenance_cost",
+    "annual_insurance_rate",
+}
+VEHICLE_FINANCING_PREFERENCE_KEYS = {
+    "financing_options",
+    "selected_financing_option_id",
+    "selected_financing_option_name",
+    "selected_financing_type",
+    "selected_financing_min_down_payment_ratio",
+    "selected_financing_max_down_payment_ratio",
+    "selected_financing_prepayment_allowed",
+    "loan_prepayment_enabled",
+    "loan_prepayment_strategy_type",
+    "loan_prepayment_start_month",
+    "loan_prepayment_allowed_after_month",
+    "loan_prepayment_monthly_amount",
+    "loan_prepayment_lump_sum_month",
+    "loan_prepayment_lump_sum_amount",
+}
+VEHICLE_HOLDING_COST_KEYS = {
+    "annual_mileage_km",
+    "monthly_parking_cost",
+    "annual_maintenance_cost",
+    "annual_insurance_rate",
 }
 CHILD_PLANNING_TARGET_CONTROL_KEYS = {
     "schema_version",
@@ -243,9 +320,16 @@ def home_goal_from_scenario(
             "selected_strategy_id": str(normalized_scenario.get("selected_purchase_plan_variant") or ""),
             "target_params": planning_goal_target_params("home", normalized_scenario),
             "financing_preferences": {
+                "loan_repayment_strategy_mode": normalized_scenario.get("loan_repayment_strategy_mode", "auto"),
                 "commercial_repayment_method": normalized_scenario.get("commercial_repayment_method"),
                 "provident_repayment_method": normalized_scenario.get("provident_repayment_method"),
-                "commercial_prepayment_mode": normalized_scenario.get("commercial_prepayment_mode"),
+            "commercial_prepayment_mode": normalized_scenario.get("commercial_prepayment_mode"),
+            "commercial_prepayment_enabled": normalized_scenario.get("commercial_prepayment_enabled"),
+            "commercial_prepayment_start_month": normalized_scenario.get("commercial_prepayment_start_month"),
+            "commercial_prepayment_allowed_after_month": normalized_scenario.get(
+                "commercial_prepayment_allowed_after_month"
+            ),
+            "commercial_prepayment_monthly_amount": normalized_scenario.get("commercial_prepayment_monthly_amount"),
                 "provident_account_repayment_strategy": normalized_scenario.get("provident_account_repayment_strategy"),
                 "provident_account_repayment_switch_enabled": normalized_scenario.get(
                     "provident_account_repayment_switch_enabled"
@@ -256,7 +340,8 @@ def home_goal_from_scenario(
                 "provident_account_repayment_switch_to_strategy": normalized_scenario.get(
                     "provident_account_repayment_switch_to_strategy"
                 ),
-                "investment_withdrawal_mode": normalized_scenario.get("investment_withdrawal_mode"),
+            "investment_withdrawal_mode": normalized_scenario.get("investment_withdrawal_mode"),
+            "investment_min_balance_after_purchase": normalized_scenario.get("investment_min_balance_after_purchase"),
             },
             "metadata": {"household_id": household_id or ""},
         }
@@ -330,9 +415,26 @@ def vehicle_goal_from_plan(
             "selected_strategy_id": str(vehicle_data.get("selected_strategy_variant") or "target"),
             "target_params": planning_goal_target_params("vehicle", vehicle_data),
             "financing_preferences": {
-                "financing_options": vehicle_data.get("financing_options", []),
+            "financing_options": vehicle_data.get("financing_options", []),
+                "selected_financing_option_id": vehicle_data.get("selected_financing_option_id", ""),
+                "selected_financing_option_name": vehicle_data.get("selected_financing_option_name", ""),
+                "selected_financing_type": vehicle_data.get("selected_financing_type", ""),
+                "selected_financing_min_down_payment_ratio": vehicle_data.get(
+                    "selected_financing_min_down_payment_ratio", 0
+                ),
+                "selected_financing_max_down_payment_ratio": vehicle_data.get(
+                    "selected_financing_max_down_payment_ratio", 1
+                ),
+                "selected_financing_prepayment_allowed": vehicle_data.get(
+                    "selected_financing_prepayment_allowed", True
+                ),
                 "loan_prepayment_enabled": vehicle_data.get("loan_prepayment_enabled", False),
                 "loan_prepayment_strategy_type": vehicle_data.get("loan_prepayment_strategy_type", "none"),
+                "loan_prepayment_start_month": vehicle_data.get("loan_prepayment_start_month", 1),
+                "loan_prepayment_allowed_after_month": vehicle_data.get("loan_prepayment_allowed_after_month", 1),
+                "loan_prepayment_monthly_amount": vehicle_data.get("loan_prepayment_monthly_amount", 0),
+                "loan_prepayment_lump_sum_month": vehicle_data.get("loan_prepayment_lump_sum_month", 0),
+                "loan_prepayment_lump_sum_amount": vehicle_data.get("loan_prepayment_lump_sum_amount", 0),
             },
             "holding_cost_params": {
                 "annual_mileage_km": vehicle_data.get("annual_mileage_km", 0),
@@ -347,6 +449,8 @@ def vehicle_goal_from_plan(
 
 def vehicle_plan_from_goal(goal_id: str, goal: dict[str, Any], index: int, *, sequence_index: int | None = None) -> dict[str, Any]:
     vehicle = deepcopy(goal.get("target_params") if isinstance(goal.get("target_params"), dict) else {})
+    vehicle.update(deepcopy(goal.get("financing_preferences") if isinstance(goal.get("financing_preferences"), dict) else {}))
+    vehicle.update(deepcopy(goal.get("holding_cost_params") if isinstance(goal.get("holding_cost_params"), dict) else {}))
     vehicle["name"] = goal.get("name") or vehicle.get("name") or f"用车需求 {index + 1}"
     vehicle["enabled"] = bool(goal.get("enabled", True)) and str(goal.get("timing_mode") or "") != "not_planned"
     vehicle["planning_goal_id"] = goal_id
@@ -447,7 +551,6 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
         data["target_params"] = {}
     data.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
     data.setdefault("goal_type", "home")
-    data["target_params"] = planning_goal_target_params(str(data.get("goal_type") or "home"), data["target_params"])
     data.setdefault("name", "规划目标")
     data.setdefault("enabled", True)
     data.setdefault("priority", 1)
@@ -471,11 +574,27 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("notes", "")
     goal_type = str(data.get("goal_type") or "home")
     if goal_type == "home":
-        data["target_params"] = normalize_scenario(data.get("target_params") if isinstance(data.get("target_params"), dict) else {})
+        target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
+        financing = data["financing_preferences"] if isinstance(data["financing_preferences"], dict) else {}
+        for key in HOME_FINANCING_PREFERENCE_KEYS:
+            if key in target and key not in financing:
+                financing[key] = deepcopy(target[key])
+        data["financing_preferences"] = financing
+        data["target_params"] = normalize_scenario(target)
         data["priority"] = max(1, safe_int(data.get("priority"), safe_int(data["target_params"].get("purchase_sequence"), 1)))
         data["target_params"] = planning_goal_target_params(goal_type, data["target_params"])
     elif goal_type == "vehicle":
         target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
+        financing = data["financing_preferences"] if isinstance(data["financing_preferences"], dict) else {}
+        holding_costs = data["holding_cost_params"] if isinstance(data["holding_cost_params"], dict) else {}
+        for key in VEHICLE_FINANCING_PREFERENCE_KEYS:
+            if key in target and key not in financing:
+                financing[key] = deepcopy(target[key])
+        for key in VEHICLE_HOLDING_COST_KEYS:
+            if key in target and key not in holding_costs:
+                holding_costs[key] = deepcopy(target[key])
+        data["financing_preferences"] = financing
+        data["holding_cost_params"] = holding_costs
         fill_vehicle_timing_defaults(target, max(0, safe_int(data.get("priority"), 1) - 1))
         fill_vehicle_prepayment_defaults(target)
         candidates = target.get("candidate_vehicles")
@@ -509,6 +628,8 @@ def normalize_planning_goal(data: dict[str, Any]) -> dict[str, Any]:
             if key not in target or (not manual_child_expense and safe_float(target.get(key), 0.0) <= 0):
                 target[key] = fallback
         data["target_params"] = planning_goal_target_params(goal_type, target)
+    else:
+        data["target_params"] = planning_goal_target_params(goal_type, data["target_params"])
     normalized = PlanningGoalData.model_validate(data).model_dump(mode="json")
     normalized["schema_version"] = CURRENT_SCHEMA_VERSION
     return normalized
@@ -836,24 +957,45 @@ def normalize_members_and_career_shock(data: dict[str, Any]) -> None:
         member.setdefault("medical_account_balance", 0)
         member.setdefault("medical_account_enabled", True)
         member.setdefault("medical_account_open_month", member.get("family_join_month") or "2026-07")
-        member.setdefault("personal_pension_account_enabled", True)
+        member.setdefault("personal_pension_account_enabled", False)
+        member.setdefault(
+            "personal_pension_participation_eligible",
+            bool(member.get("personal_pension_account_enabled") and member.get("pension_account_enabled")),
+        )
         member.setdefault("personal_pension_account_balance", 0)
-        member.setdefault("personal_pension_open_mode", "auto_tax_optimal")
+        member.setdefault(
+            "personal_pension_open_mode",
+            "auto_tax_optimal" if member.get("personal_pension_account_enabled") else "none",
+        )
         member.setdefault("personal_pension_account_open_month", "")
-        member.setdefault("personal_pension_contribution_mode", "auto_tax_optimal")
+        member.setdefault(
+            "personal_pension_contribution_mode",
+            "auto_tax_optimal" if member.get("personal_pension_account_enabled") else "none",
+        )
+        member.setdefault("personal_pension_tax_deduction_mode", "monthly_withholding")
         member.setdefault("personal_pension_monthly_contribution", 0)
         member.setdefault("personal_pension_annual_contribution_target", 0)
         member.setdefault("personal_pension_contribution_month", 12)
         member.setdefault("personal_pension_contribution_start_month", "")
         member.setdefault("personal_pension_contribution_end_month", None)
+        member.setdefault("personal_pension_auto_suspend_for_cash_safety", True)
+        member.setdefault("personal_pension_cash_reserve_months", 6)
+        member.setdefault("personal_pension_return_mode", "auto_lifecycle")
         member.setdefault("personal_pension_annual_return", 0.025)
+        member.setdefault("personal_pension_post_retirement_annual_return", 0.015)
+        member.setdefault("personal_pension_withdrawal_mode", "auto_safe")
+        member.setdefault("personal_pension_withdrawal_start_month", "")
+        member.setdefault("personal_pension_early_withdrawal_reason", "none")
+        member.setdefault("personal_pension_early_withdrawal_month", "")
+        member.setdefault("personal_pension_withdrawal_years", 20)
+        member.setdefault("personal_pension_fixed_monthly_withdrawal", 0)
+        member.setdefault("personal_pension_product_liquidity_mode", "daily_liquid")
+        member.setdefault("personal_pension_redemption_delay_months", 0)
+        member.setdefault("personal_pension_monthly_redeemable_ratio", 1)
+        member.setdefault("personal_pension_redemption_fee_rate", 0)
         if not bool(member.get("personal_pension_account_enabled")):
             member["personal_pension_open_mode"] = "none"
             member["personal_pension_contribution_mode"] = "none"
-        elif not member.get("personal_pension_open_mode") or str(member.get("personal_pension_open_mode")) == "none":
-            member["personal_pension_open_mode"] = "auto_tax_optimal"
-        elif not member.get("personal_pension_contribution_mode") or str(member.get("personal_pension_contribution_mode")) == "none":
-            member["personal_pension_contribution_mode"] = "auto_tax_optimal"
         member_center = str(member.pop("provident_account_management_center", "") or "").strip().lower()
         default_stage_center = (
             "national"
@@ -861,14 +1003,16 @@ def normalize_members_and_career_shock(data: dict[str, Any]) -> None:
             else "beijing_municipal"
         )
         if "income_stages" not in member:
+            default_stage_salary = safe_float(member.get("monthly_salary_gross"))
+            default_stage_bonus = safe_float(member.get("annual_bonus"))
             member["income_stages"] = [
                 {
                     "name": "当前收入",
                     "stage_kind": "salary",
                     "start_date": member.get("employment_start_date") or "2026-07-01",
                     "end_date": None,
-                    "monthly_salary_gross": safe_float(member.get("monthly_salary_gross")),
-                    "annual_bonus": safe_float(member.get("annual_bonus")),
+                    "monthly_salary_gross": default_stage_salary,
+                    "annual_bonus_months": round(default_stage_bonus / default_stage_salary, 1) if default_stage_salary > 0 else 0,
                     "annual_bonus_payout_mode": member.get("annual_bonus_payout_mode") or "lump_sum",
                     "annual_bonus_payout_month": 4,
                     "monthly_freelance_income": 0,
@@ -890,8 +1034,21 @@ def normalize_members_and_career_shock(data: dict[str, Any]) -> None:
         for stage in member.get("income_stages", []):
             if isinstance(stage, dict):
                 stage.setdefault("stage_kind", "salary")
+                stage_salary = safe_float(stage.get("monthly_salary_gross"))
+                if stage.get("annual_bonus_months") is None:
+                    legacy_bonus_amount = safe_float(stage.get("annual_bonus"))
+                    stage["annual_bonus_months"] = round(legacy_bonus_amount / stage_salary, 1) if stage_salary > 0 else 0
+                else:
+                    stage["annual_bonus_months"] = round(max(0.0, safe_float(stage.get("annual_bonus_months"))), 1)
+                stage.pop("annual_bonus", None)
                 stage.setdefault("annual_bonus_payout_mode", "lump_sum")
                 stage.setdefault("annual_bonus_payout_month", 4)
+                stage["annual_bonus_earning_start_month"] = normalize_month_of_year(
+                    stage.get("annual_bonus_earning_start_month")
+                )
+                stage["annual_bonus_earning_end_month"] = normalize_month_of_year(
+                    stage.get("annual_bonus_earning_end_month")
+                )
                 center = str(stage.get("provident_account_management_center") or default_stage_center).strip().lower()
                 stage["provident_account_management_center"] = (
                     "national"
@@ -923,6 +1080,8 @@ def normalize_members_and_career_shock(data: dict[str, Any]) -> None:
 def normalize_household(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("family_down_payment_support_mode", "provident")
     data.setdefault("family_savings_support_amount", 0)
+    data.setdefault("major_goal_tradeoff_mode", "auto")
+    data.setdefault("major_goal_timing_preference", 0.5)
     data.setdefault("investment_buy_fee_rate", 0.0015)
     data.setdefault("investment_sell_fee_rate", 0.005)
     data.setdefault("investment_taxable_return_ratio", 0)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import sqlite3
 import uuid
+import zlib
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +128,32 @@ def initialize_database() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS property_valuations (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                planning_goal_id TEXT NOT NULL,
+                valuation_date TEXT NOT NULL,
+                market_snapshot_id TEXT NOT NULL DEFAULT '',
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(planning_goal_id, valuation_date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_property_valuations_household_goal
+                ON property_valuations(household_id, planning_goal_id, valuation_date DESC);
+
+            CREATE TABLE IF NOT EXISTS personal_pension_return_snapshots (
+                id TEXT PRIMARY KEY,
+                snapshot_date TEXT NOT NULL UNIQUE,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_personal_pension_return_snapshots_date
+                ON personal_pension_return_snapshots(snapshot_date DESC);
+
             CREATE TABLE IF NOT EXISTS source_documents (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -220,7 +248,10 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
 
 def migrate_database(conn: sqlite3.Connection) -> None:
     previous_schema_history = _has_previous_schema_history(conn)
-    changed = _normalize_current_records(conn)
+    child_count_semantics_migration_pending = not _migration_applied(conn, CURRENT_SCHEMA_VERSION)
+    changed = _migrate_home_renovation_fields_to_planning_events(conn)
+    changed = _normalize_current_records(conn) or changed
+    changed = _migrate_scenario_shadows_to_planning_goals(conn) or changed
     cache_layer_columns = {
         "input_hash": "TEXT NOT NULL DEFAULT ''",
         "strategy_hash": "TEXT NOT NULL DEFAULT ''",
@@ -247,7 +278,17 @@ def migrate_database(conn: sqlite3.Connection) -> None:
             _sync_vehicle_goals_from_household(conn, household_id, household)
         if has_child_goals is None and has_child_plan_source:
             _sync_child_goals_from_household(conn, household_id, household)
+        shadow_free_household = _without_planning_goal_shadows(household)
+        if shadow_free_household != household:
+            conn.execute(
+                "UPDATE households SET data = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(shadow_free_household, ensure_ascii=False), now_iso(), household_id),
+            )
+            household = shadow_free_household
+            changed = True
         _sync_core_objects_from_household(conn, household_id, household)
+    if child_count_semantics_migration_pending:
+        changed = _migrate_child_count_to_current_birth_semantics(conn) or changed
     if previous_schema_history or not _migration_applied(conn, CURRENT_SCHEMA_VERSION):
         conn.execute("DELETE FROM schema_migrations")
         _mark_migration(conn, CURRENT_SCHEMA_VERSION, "current schema baseline")
@@ -258,12 +299,175 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM generated_strategies")
 
 
+def _migrate_home_renovation_fields_to_planning_events(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        "SELECT id, household_id, goal_type, data, created_at FROM planning_goals ORDER BY household_id, created_at, id"
+    ).fetchall()
+    goals_by_household: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        household_key = str(row["household_id"] or "")
+        goals_by_household.setdefault(household_key, []).append(row)
+    changed = False
+    for household_key, household_goals in goals_by_household.items():
+        home_rows = [row for row in household_goals if row["goal_type"] == "home"]
+        if not home_rows:
+            continue
+        renovation_rows = [row for row in household_goals if row["goal_type"] == "renovation"]
+        first_home = min(
+            home_rows,
+            key=lambda row: (
+                _safe_int(_load_json(row["data"]).get("priority"), 1),
+                str(row["created_at"]),
+                str(row["id"]),
+            ),
+        )
+        first_home_data = _load_json(first_home["data"])
+        migrated_budget = 0.0
+        migrated_funding_mode = "after_goal_saving"
+        for row in home_rows:
+            data = _load_json(row["data"])
+            target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
+            try:
+                migrated_budget = max(migrated_budget, float(target.get("renovation_cost") or 0))
+            except (TypeError, ValueError):
+                pass
+            if target.get("renovation_funding_mode") == "upfront_cash":
+                migrated_funding_mode = "cash_or_investment"
+            if "renovation_cost" in target or "renovation_funding_mode" in target:
+                target.pop("renovation_cost", None)
+                target.pop("renovation_funding_mode", None)
+                data["target_params"] = target
+                conn.execute(
+                    "UPDATE planning_goals SET data = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(data, ensure_ascii=False), now_iso(), row["id"]),
+                )
+                changed = True
+
+        if renovation_rows:
+            renovation_row = min(
+                renovation_rows,
+                key=lambda row: (
+                    _safe_int(_load_json(row["data"]).get("priority"), 999),
+                    str(row["created_at"]),
+                    str(row["id"]),
+                ),
+            )
+            renovation_data = _load_json(renovation_row["data"])
+            if str(renovation_data.get("timing_mode") or "auto_sequence") == "auto_sequence" and not renovation_data.get("depends_on_goal_id"):
+                renovation_data["timing_mode"] = "after_goal"
+                renovation_data["depends_on_goal_id"] = str(first_home["id"])
+                renovation_data["priority"] = max(1, _safe_int(first_home_data.get("priority"), 1) + 1)
+                conn.execute(
+                    "UPDATE planning_goals SET data = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(renovation_data, ensure_ascii=False), now_iso(), renovation_row["id"]),
+                )
+                changed = True
+            continue
+
+        if migrated_budget <= 0:
+            continue
+        timestamp = now_iso()
+        renovation_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"house-planner:renovation-goal:{household_key or 'global'}:{first_home['id']}",
+        ).hex
+        renovation_data = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "goal_type": "renovation",
+            "name": "装修目标",
+            "enabled": True,
+            "priority": max(1, _safe_int(first_home_data.get("priority"), 1) + 1),
+            "timing_mode": "after_goal",
+            "earliest_purchase_month": "",
+            "earliest_purchase_delay_months": 0,
+            "planning_window_start_month": "",
+            "planning_window_end_month": "",
+            "depends_on_goal_id": str(first_home["id"]),
+            "delay_after_dependency_months": 0,
+            "allow_parallel": False,
+            "selected_strategy_id": "",
+            "target_params": {
+                "name": "装修目标",
+                "estimated_cost": migrated_budget,
+                "category": "renovation",
+            },
+            "financing_preferences": {"funding_mode": migrated_funding_mode},
+            "holding_cost_params": {},
+            "metadata": {"migrated_from_home_candidates": True},
+            "notes": "",
+        }
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO planning_goals (
+                id, household_id, goal_type, data, created_at, updated_at
+            ) VALUES (?, ?, 'renovation', ?, ?, ?)
+            """,
+            (
+                renovation_id,
+                household_key or None,
+                json.dumps(renovation_data, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+        changed = True
+    return changed
+
+
 def _load_json(value: str) -> dict[str, Any]:
     try:
         data = json.loads(value)
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _year_month_key(value: Any) -> tuple[int, int] | None:
+    raw = str(value or "").strip()
+    if len(raw) < 7 or raw[4] != "-":
+        return None
+    try:
+        year = int(raw[:4])
+        month = int(raw[5:7])
+    except ValueError:
+        return None
+    return (year, month) if year >= 1900 and 1 <= month <= 12 else None
+
+
+def _migrate_child_count_to_current_birth_semantics(conn: sqlite3.Connection) -> bool:
+    """Repair only the count signature produced by the legacy goal projection."""
+    current_month = (datetime.now().year, datetime.now().month)
+    changed = False
+    for household_row in conn.execute("SELECT id, data FROM households").fetchall():
+        household_id = str(household_row["id"])
+        household = _load_json(household_row["data"])
+        goal_rows = conn.execute(
+            "SELECT data FROM planning_goals WHERE household_id = ? AND goal_type = 'child'",
+            (household_id,),
+        ).fetchall()
+        enabled_goals = []
+        for goal_row in goal_rows:
+            goal = _load_json(goal_row["data"])
+            if bool(goal.get("enabled", True)) and str(goal.get("timing_mode") or "") != "not_planned":
+                enabled_goals.append(goal)
+        if not enabled_goals:
+            continue
+        born_goal_count = 0
+        for goal in enabled_goals:
+            target = goal.get("target_params") if isinstance(goal.get("target_params"), dict) else {}
+            birth_month = _year_month_key(target.get("birth_month"))
+            if birth_month is not None and birth_month <= current_month:
+                born_goal_count += 1
+        stored_count = _safe_int(household.get("child_count"), 0)
+        if stored_count != len(enabled_goals) or born_goal_count >= len(enabled_goals):
+            continue
+        household["child_count"] = born_goal_count
+        conn.execute(
+            "UPDATE households SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(household, ensure_ascii=False), now_iso(), household_id),
+        )
+        changed = True
+    return changed
 
 
 def _update_table_json(
@@ -508,6 +712,11 @@ def update_record(table: str, record_id: str, data: dict[str, Any]) -> dict[str,
     timestamp = now_iso()
     payload = json.dumps(data, ensure_ascii=False)
     with get_connection() as conn:
+        row = conn.execute(f"SELECT data FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        if row is None:
+            return None
+        if _load_json(row["data"]) == data:
+            return get_record(table, record_id)
         conn.execute(
             f"UPDATE {table} SET data = ?, updated_at = ? WHERE id = ?",
             (payload, timestamp, record_id),
@@ -525,6 +734,129 @@ def list_records(table: str) -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(f"SELECT * FROM {table} ORDER BY created_at ASC").fetchall()
     return [_row_to_record(row) for row in rows]
+
+
+def list_property_valuations(
+    *,
+    household_id: str,
+    planning_goal_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["household_id = ?"]
+    params = [household_id]
+    if planning_goal_id:
+        clauses.append("planning_goal_id = ?")
+        params.append(planning_goal_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM property_valuations
+            WHERE {' AND '.join(clauses)}
+            ORDER BY valuation_date DESC, created_at DESC
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def latest_property_valuation(
+    *,
+    household_id: str,
+    planning_goal_id: str,
+) -> dict[str, Any] | None:
+    records = list_property_valuations(
+        household_id=household_id,
+        planning_goal_id=planning_goal_id,
+    )
+    return records[0] if records else None
+
+
+def upsert_property_valuation(
+    *,
+    household_id: str,
+    planning_goal_id: str,
+    valuation_date: str,
+    market_snapshot_id: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    record_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"house-planner:property-valuation:{planning_goal_id}:{valuation_date}",
+    ).hex
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO property_valuations (
+                id, household_id, planning_goal_id, valuation_date,
+                market_snapshot_id, data, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(planning_goal_id, valuation_date) DO UPDATE SET
+                household_id = excluded.household_id,
+                market_snapshot_id = excluded.market_snapshot_id,
+                data = excluded.data,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record_id,
+                household_id,
+                planning_goal_id,
+                valuation_date,
+                market_snapshot_id,
+                payload,
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = conn.execute("SELECT * FROM property_valuations WHERE id = ?", (record_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("Property valuation upsert failed")
+    return _row_to_record(row)
+
+
+def list_personal_pension_return_snapshots() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM personal_pension_return_snapshots ORDER BY snapshot_date DESC, updated_at DESC"
+        ).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def latest_personal_pension_return_snapshot() -> dict[str, Any] | None:
+    records = list_personal_pension_return_snapshots()
+    return records[0] if records else None
+
+
+def upsert_personal_pension_return_snapshot(
+    *,
+    snapshot_date: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    record_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"house-planner:personal-pension-return:{snapshot_date}",
+    ).hex
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO personal_pension_return_snapshots (id, snapshot_date, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                data = excluded.data,
+                updated_at = excluded.updated_at
+            """,
+            (record_id, snapshot_date, json.dumps(data, ensure_ascii=False, sort_keys=True), timestamp, timestamp),
+        )
+        conn.execute("DELETE FROM calculation_cache")
+        conn.execute("DELETE FROM generated_strategies")
+        row = conn.execute(
+            "SELECT * FROM personal_pension_return_snapshots WHERE snapshot_date = ?",
+            (snapshot_date,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("Personal pension return snapshot upsert failed")
+    return _row_to_record(row)
 
 
 def list_core_object_records(
@@ -659,7 +991,7 @@ def update_planning_goal_record(
 ) -> dict[str, Any] | None:
     normalized = _normalize_planning_goal(data)
     with get_connection() as conn:
-        row = conn.execute("SELECT household_id, goal_type, data, created_at FROM planning_goals WHERE id = ?", (record_id,)).fetchone()
+        row = conn.execute("SELECT * FROM planning_goals WHERE id = ?", (record_id,)).fetchone()
         if row is None:
             return None
         previous_household_id = str(row["household_id"] or "") or None
@@ -667,6 +999,12 @@ def update_planning_goal_record(
         previous_goal_data = _load_json(row["data"])
         effective_household_id = previous_household_id if preserve_household_when_omitted else household_id
         next_goal_type = str(normalized.get("goal_type") or "home")
+        if (
+            previous_household_id == effective_household_id
+            and previous_goal_type == next_goal_type
+            and previous_goal_data == normalized
+        ):
+            return _row_to_planning_goal_record(row)
         timestamp = now_iso()
         if (
             previous_household_id
@@ -862,7 +1200,6 @@ def _project_child_goals_into_household(record: dict[str, Any]) -> dict[str, Any
             for index, goal in enumerate(child_goals)
         ]
         data["child_plans"] = projected_children
-        data["child_count"] = sum(1 for child in projected_children if bool(child.get("enabled")))
     record = deepcopy(record)
     record["data"] = _normalize_household(data)
     return record
@@ -888,6 +1225,40 @@ def _child_plan_items_from_household(household: dict[str, Any] | None) -> list[d
         return []
     children = household.get("child_plans") if isinstance(household.get("child_plans"), list) else []
     return [child for child in children if isinstance(child, dict)]
+
+
+def _without_planning_goal_shadows(household: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(household)
+    car_plan = normalized.get("car_plan") if isinstance(normalized.get("car_plan"), dict) else {}
+    car_plan["vehicle_plans"] = []
+    normalized["car_plan"] = car_plan
+    normalized["child_plans"] = []
+    return normalized
+
+
+def _ingest_unlinked_household_goal_shadows(
+    conn: sqlite3.Connection,
+    household_id: str,
+    household: dict[str, Any],
+) -> None:
+    """Import legacy, unlinked goal lists once without accepting projected goals as a write source."""
+    vehicles = _vehicle_plan_items_from_household(household)
+    if vehicles and all(not str(vehicle.get("planning_goal_id") or "").strip() for vehicle in vehicles):
+        existing = conn.execute(
+            "SELECT 1 FROM planning_goals WHERE household_id = ? AND goal_type = 'vehicle' LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if existing is None:
+            _sync_vehicle_goals_from_household(conn, household_id, household)
+
+    children = _child_plan_items_from_household(household)
+    if children and all(not str(child.get("planning_goal_id") or "").strip() for child in children):
+        existing = conn.execute(
+            "SELECT 1 FROM planning_goals WHERE household_id = ? AND goal_type = 'child' LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if existing is None:
+            _sync_child_goals_from_household(conn, household_id, household)
 
 
 def _empty_shadow_list_is_stale(
@@ -969,6 +1340,39 @@ def _sync_child_goals_from_household(
     return changed
 
 
+def _migrate_scenario_shadows_to_planning_goals(conn: sqlite3.Connection) -> bool:
+    """Promote any legacy scenario rows before removing the obsolete shadow table data."""
+    rows = conn.execute("SELECT id, household_id, data, created_at, updated_at FROM scenarios").fetchall()
+    changed = False
+    for row in rows:
+        goal_exists = conn.execute(
+            "SELECT 1 FROM planning_goals WHERE id = ? AND goal_type = 'home'",
+            (row["id"],),
+        ).fetchone()
+        if goal_exists is not None:
+            continue
+        scenario = _normalize_scenario(_load_json(row["data"]))
+        goal = _home_goal_from_scenario(
+            scenario,
+            goal_id=str(row["id"]),
+            household_id=row["household_id"],
+        )
+        _insert_or_replace_planning_goal(
+            conn,
+            goal_id=str(row["id"]),
+            household_id=row["household_id"],
+            goal_type="home",
+            data=goal,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+        changed = True
+    if rows:
+        conn.execute("DELETE FROM scenarios")
+        changed = True
+    return changed
+
+
 def list_household_records() -> list[dict[str, Any]]:
     return [
         projected for record in list_records("households")
@@ -977,25 +1381,23 @@ def list_household_records() -> list[dict[str, Any]]:
 
 
 def insert_household_record(data: dict[str, Any]) -> dict[str, Any]:
-    record = insert_record("households", _normalize_household(data))
+    normalized = _normalize_household(data)
+    record = insert_record("households", _without_planning_goal_shadows(normalized))
     with get_connection() as conn:
-        _sync_vehicle_goals_from_household(conn, str(record["id"]), record["data"])
-        _sync_child_goals_from_household(conn, str(record["id"]), record["data"])
+        _ingest_unlinked_household_goal_shadows(conn, str(record["id"]), normalized)
         _sync_core_objects_from_household(conn, str(record["id"]), record["data"])
     saved = get_record("households", str(record["id"]))
     return _project_planning_goals_into_household(saved)
 
 
 def update_household_record(record_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    previous_record = get_record("households", record_id)
-    previous_household = deepcopy(previous_record["data"]) if previous_record is not None else None
-    normalized = _normalize_household(data)
+    incoming = _normalize_household(data)
+    normalized = _without_planning_goal_shadows(incoming)
     record = update_record("households", record_id, normalized)
     if record is None:
         return None
     with get_connection() as conn:
-        _sync_vehicle_goals_from_household(conn, record_id, normalized, previous_household=previous_household)
-        _sync_child_goals_from_household(conn, record_id, normalized, previous_household=previous_household)
+        _ingest_unlinked_household_goal_shadows(conn, record_id, incoming)
         _sync_core_objects_from_household(conn, record_id, normalized)
     saved = get_record("households", record_id)
     return _project_planning_goals_into_household(saved)
@@ -1059,10 +1461,6 @@ def insert_scenario_record(data: dict[str, Any], household_id: str | None = None
             created_at=timestamp,
             updated_at=timestamp,
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO scenarios (id, household_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (record_id, household_id, json.dumps(normalized_scenario, ensure_ascii=False), timestamp, timestamp),
-        )
         _sync_core_objects_for_households_affected_by_goal(conn, household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
@@ -1073,11 +1471,10 @@ def update_scenario_record(record_id: str, data: dict[str, Any]) -> dict[str, An
     normalized_scenario = _normalize_scenario(data)
     with get_connection() as conn:
         goal_row = conn.execute("SELECT household_id, created_at FROM planning_goals WHERE id = ? AND goal_type = 'home'", (record_id,)).fetchone()
-        scenario_row = conn.execute("SELECT household_id, created_at FROM scenarios WHERE id = ?", (record_id,)).fetchone()
-        if goal_row is None and scenario_row is None:
+        if goal_row is None:
             return None
-        household_id = (goal_row or scenario_row)["household_id"]
-        created_at = (goal_row or scenario_row)["created_at"]
+        household_id = goal_row["household_id"]
+        created_at = goal_row["created_at"]
         goal = _home_goal_from_scenario(normalized_scenario, goal_id=record_id, household_id=household_id)
         timestamp = now_iso()
         _insert_or_replace_planning_goal(
@@ -1089,10 +1486,6 @@ def update_scenario_record(record_id: str, data: dict[str, Any]) -> dict[str, An
             created_at=created_at,
             updated_at=timestamp,
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO scenarios (id, household_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (record_id, household_id, json.dumps(normalized_scenario, ensure_ascii=False), created_at, timestamp),
-        )
         _sync_core_objects_for_households_affected_by_goal(conn, household_id)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
@@ -1102,11 +1495,10 @@ def update_scenario_record(record_id: str, data: dict[str, Any]) -> dict[str, An
 def delete_scenario_record(record_id: str) -> bool:
     with get_connection() as conn:
         goal_cursor = conn.execute("DELETE FROM planning_goals WHERE id = ? AND goal_type = 'home'", (record_id,))
-        scenario_cursor = conn.execute("DELETE FROM scenarios WHERE id = ?", (record_id,))
         _sync_core_objects_for_households_affected_by_goal(conn, None)
         conn.execute("DELETE FROM calculation_cache")
         conn.execute("DELETE FROM generated_strategies")
-        return goal_cursor.rowcount > 0 or scenario_cursor.rowcount > 0
+        return goal_cursor.rowcount > 0
 
 
 def get_calculation_cache(cache_key: str) -> dict[str, Any] | None:
@@ -1129,7 +1521,15 @@ def get_calculation_cache_payload(cache_key: str) -> str | None:
     if row is None:
         return None
     payload = row["result"]
-    return payload if isinstance(payload, str) and payload.strip().startswith("{") else None
+    if not isinstance(payload, str):
+        return None
+    if payload.startswith("zlib:"):
+        try:
+            compressed = base64.b64decode(payload[5:].encode("ascii"), validate=True)
+            payload = zlib.decompress(compressed).decode("utf-8")
+        except (ValueError, UnicodeDecodeError, zlib.error):
+            return None
+    return payload if payload.strip().startswith("{") else None
 
 
 def generated_strategies_exist_for_cache(cache_key: str) -> bool:
@@ -1148,7 +1548,10 @@ def upsert_calculation_cache(
     result: dict[str, Any],
 ) -> None:
     timestamp = now_iso()
-    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    raw_payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    payload = raw_payload
+    if len(raw_payload) >= 64 * 1024:
+        payload = "zlib:" + base64.b64encode(zlib.compress(raw_payload.encode("utf-8"), level=6)).decode("ascii")
     with get_connection() as conn:
         conn.execute(
             """

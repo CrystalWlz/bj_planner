@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal
 
 from ..domain.children import child_plan_birth_month_for_strategy as _child_plan_birth_month_for_strategy
 from ..domain.career import household_with_pension_income_stages as _household_with_pension_income_stages
-from ..domain.investments import investment_tax_estimate
+from ..domain.investments import investment_effective_tax_rate, investment_tax_estimate
+from ..domain.personal_pension import (
+    personal_pension_annual_return_for_month,
+    personal_pension_withdrawal_start_month,
+)
 from ..domain.tax import (
     income_stage_for_month as _income_stage_for_month,
     stage_bonus_cash_amount as _stage_bonus_cash_amount,
@@ -25,6 +30,7 @@ from ..policies import get_policy
 from ..schemas import (
     HouseholdData,
     IncomeMember,
+    PurchasePlanAnalysis,
     RulePackData,
     ScenarioData,
     TaxEventPoint,
@@ -33,7 +39,268 @@ from ..schemas import (
 )
 
 
-PersonalPensionTaxSavingEstimator = Callable[[HouseholdData, IncomeMember, RulePackData, int], float]
+PersonalPensionTaxSavingEstimator = Callable[[HouseholdData, IncomeMember, RulePackData, int, float], float]
+
+
+@dataclass(frozen=True)
+class PersonalPensionAnnualOptimization:
+    year: int
+    annual_contribution: float
+    estimated_tax_saving: float
+    pension_net_value_at_withdrawal: float
+    alternative_investment_value_at_withdrawal: float
+    tax_saving_future_value: float
+    net_advantage_at_withdrawal: float
+
+
+@dataclass(frozen=True)
+class PersonalPensionOptimizationDecision:
+    member_index: int
+    should_open: bool
+    open_month: str = ""
+    annual_schedule: dict[str, float] = field(default_factory=dict)
+    annual_points: list[PersonalPensionAnnualOptimization] = field(default_factory=list)
+    cumulative_contribution: float = 0.0
+    cumulative_tax_saving: float = 0.0
+    pension_net_value_at_withdrawal: float = 0.0
+    alternative_investment_value_at_withdrawal: float = 0.0
+    tax_saving_future_value: float = 0.0
+    net_advantage_at_withdrawal: float = 0.0
+    full_cap_annual_tax_saving: float = 0.0
+    full_cap_net_advantage_at_withdrawal: float = 0.0
+
+
+def _future_value_with_monthly_rate(amount: float, annual_return: float, months: int) -> float:
+    if amount <= 0:
+        return 0.0
+    monthly_return = (1 + max(-0.95, annual_return)) ** (1 / 12) - 1
+    return amount * ((1 + monthly_return) ** max(0, months))
+
+
+def optimize_personal_pension_strategies(
+    household: HouseholdData,
+    scenario: ScenarioData,
+    rules: RulePackData,
+    *,
+    base_date: date,
+    personal_pension_tax_saving_estimator: PersonalPensionTaxSavingEstimator,
+) -> tuple[HouseholdData, dict[int, PersonalPensionOptimizationDecision]]:
+    current_month = date(base_date.year, base_date.month, 1)
+    annual_cap = max(0.0, get_policy(rules).tax_benefit_policy().personal_pension_deduction_annual_cap)
+    withdrawal_tax_rate = get_policy(rules).tax_benefit_policy().personal_pension_withdrawal_tax_rate
+    ordinary_return = max(-0.95, scenario.annual_investment_return * (1 - investment_effective_tax_rate(household)))
+    buy_fee_rate = max(0.0, min(0.05, household.investment_buy_fee_rate))
+    sell_fee_rate = max(0.0, min(0.05, household.investment_sell_fee_rate))
+    candidate_step = max(500.0, annual_cap / 12) if annual_cap > 0 else 0.0
+    candidate_amounts = (
+        [0.0]
+        if annual_cap <= 0
+        else sorted({0.0, annual_cap, *[min(annual_cap, candidate_step * index) for index in range(1, 13)]})
+    )
+    decisions: dict[int, PersonalPensionOptimizationDecision] = {}
+    optimized_members: list[IncomeMember] = []
+
+    for member_index, member in enumerate(household.members):
+        auto_managed = bool(
+            member.personal_pension_account_enabled
+            and member.personal_pension_participation_eligible
+            and member.pension_account_enabled
+            and member.personal_pension_open_mode == "auto_tax_optimal"
+            and member.personal_pension_contribution_mode == "auto_tax_optimal"
+        )
+        if not auto_managed:
+            optimized_members.append(member)
+            continue
+        withdrawal_month = personal_pension_withdrawal_start_month(
+            member,
+            member_index,
+            rules,
+            base_month=current_month,
+        )
+        withdrawal_offset = max(0, _months_between_months(current_month, withdrawal_month))
+        annual_points: list[PersonalPensionAnnualOptimization] = []
+        annual_schedule: dict[str, float] = {}
+        first_full_cap_point: PersonalPensionAnnualOptimization | None = None
+        for year in range(current_month.year, withdrawal_month.year + 1):
+            contribution_month_number = max(current_month.month, 6) if year == current_month.year else 6
+            contribution_month = date(year, contribution_month_number, 1)
+            contribution_offset = _months_between_months(current_month, contribution_month)
+            if contribution_offset < 0 or contribution_offset >= withdrawal_offset:
+                continue
+            months_to_withdrawal = withdrawal_offset - contribution_offset
+            best_point = PersonalPensionAnnualOptimization(year, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            for amount in candidate_amounts[1:]:
+                tax_saving = personal_pension_tax_saving_estimator(household, member, rules, year, amount)
+                pension_value = amount
+                for month_offset in range(contribution_offset, withdrawal_offset):
+                    annual_return = personal_pension_annual_return_for_month(
+                        member,
+                        member_index,
+                        rules,
+                        base_month=current_month,
+                        months_from_now=month_offset,
+                    )
+                    pension_value = _future_value_with_monthly_rate(pension_value, annual_return, 1)
+                pension_net = pension_value * (1 - member.personal_pension_redemption_fee_rate) * (1 - withdrawal_tax_rate)
+                alternative_value = _future_value_with_monthly_rate(
+                    amount * (1 - buy_fee_rate),
+                    ordinary_return,
+                    months_to_withdrawal,
+                ) * (1 - sell_fee_rate)
+                tax_saving_future = _future_value_with_monthly_rate(
+                    tax_saving * (1 - buy_fee_rate),
+                    ordinary_return,
+                    months_to_withdrawal,
+                ) * (1 - sell_fee_rate)
+                net_advantage = pension_net + tax_saving_future - alternative_value
+                point = PersonalPensionAnnualOptimization(
+                    year=year,
+                    annual_contribution=round(amount, 2),
+                    estimated_tax_saving=round(tax_saving, 2),
+                    pension_net_value_at_withdrawal=round(pension_net, 2),
+                    alternative_investment_value_at_withdrawal=round(alternative_value, 2),
+                    tax_saving_future_value=round(tax_saving_future, 2),
+                    net_advantage_at_withdrawal=round(net_advantage, 2),
+                )
+                if amount == annual_cap and first_full_cap_point is None:
+                    first_full_cap_point = point
+                if point.net_advantage_at_withdrawal > best_point.net_advantage_at_withdrawal:
+                    best_point = point
+            if best_point.net_advantage_at_withdrawal > max(100.0, best_point.annual_contribution * 0.005):
+                annual_schedule[str(year)] = best_point.annual_contribution
+                annual_points.append(best_point)
+
+        should_open = bool(annual_schedule)
+        first_open_year = min((int(year) for year in annual_schedule), default=0)
+        first_open_month_number = 1
+        if should_open:
+            for month_number in range(current_month.month if first_open_year == current_month.year else 1, 13):
+                stage = _income_stage_for_month(member, first_open_year, month_number)
+                if stage is None or stage.stage_kind in {"pension", "unemployment"}:
+                    continue
+                taxable_income = (
+                    stage.monthly_salary_gross
+                    + stage.monthly_freelance_income
+                    + stage.other_annual_taxable_income / 12
+                    + _stage_bonus_cash_amount(stage, first_open_year, month_number)
+                )
+                if taxable_income > 0:
+                    first_open_month_number = month_number
+                    break
+        open_month = (
+            f"{first_open_year:04d}-{first_open_month_number:02d}"
+            if should_open
+            else ""
+        )
+        decision = PersonalPensionOptimizationDecision(
+            member_index=member_index,
+            should_open=should_open,
+            open_month=open_month,
+            annual_schedule=annual_schedule,
+            annual_points=annual_points,
+            cumulative_contribution=round(sum(point.annual_contribution for point in annual_points), 2),
+            cumulative_tax_saving=round(sum(point.estimated_tax_saving for point in annual_points), 2),
+            pension_net_value_at_withdrawal=round(sum(point.pension_net_value_at_withdrawal for point in annual_points), 2),
+            alternative_investment_value_at_withdrawal=round(sum(point.alternative_investment_value_at_withdrawal for point in annual_points), 2),
+            tax_saving_future_value=round(sum(point.tax_saving_future_value for point in annual_points), 2),
+            net_advantage_at_withdrawal=round(sum(point.net_advantage_at_withdrawal for point in annual_points), 2),
+            full_cap_annual_tax_saving=first_full_cap_point.estimated_tax_saving if first_full_cap_point else 0.0,
+            full_cap_net_advantage_at_withdrawal=first_full_cap_point.net_advantage_at_withdrawal if first_full_cap_point else 0.0,
+        )
+        decisions[member_index] = decision
+        if should_open:
+            optimized_members.append(
+                member.model_copy(
+                    update={
+                        "personal_pension_account_enabled": True,
+                        "personal_pension_open_mode": "auto_tax_optimal",
+                        "personal_pension_account_open_month": open_month,
+                        "personal_pension_contribution_mode": "auto_tax_optimal",
+                        "personal_pension_contribution_start_month": open_month,
+                        "personal_pension_annual_contribution_target": annual_schedule.get(str(current_month.year), 0.0),
+                        "personal_pension_auto_annual_contribution_schedule": annual_schedule,
+                    }
+                )
+            )
+        else:
+            optimized_members.append(
+                member.model_copy(
+                    update={
+                        "personal_pension_account_enabled": member.personal_pension_account_balance > 0,
+                        "personal_pension_open_mode": "manual" if member.personal_pension_account_balance > 0 else "none",
+                        "personal_pension_contribution_mode": "none",
+                        "personal_pension_annual_contribution_target": 0.0,
+                        "personal_pension_auto_annual_contribution_schedule": {},
+                    }
+                )
+            )
+    return household.model_copy(update={"members": optimized_members}), decisions
+
+
+def _personal_pension_retirement_estimate(
+    member: IncomeMember,
+    member_index: int,
+    rules: RulePackData,
+    *,
+    base_month: date,
+    monthly_contribution: float,
+) -> tuple[str, float, float]:
+    withdrawal_month = personal_pension_withdrawal_start_month(
+        member,
+        member_index,
+        rules,
+        base_month=base_month,
+    )
+    redemption_delay = (
+        0
+        if member.personal_pension_product_liquidity_mode == "daily_liquid"
+        else member.personal_pension_redemption_delay_months
+    )
+    if redemption_delay:
+        withdrawal_year, withdrawal_month_number = _month_after(
+            withdrawal_month,
+            redemption_delay,
+        )
+        withdrawal_month = date(withdrawal_year, withdrawal_month_number, 1)
+    months_to_withdrawal = max(0, _months_between_months(base_month, withdrawal_month))
+    configured_end = _parse_year_month(member.personal_pension_contribution_end_month or "")
+    configured_end_offset = (
+        _months_between_months(base_month, date(configured_end[0], configured_end[1], 1))
+        if configured_end
+        else months_to_withdrawal - 1
+    )
+    balance = max(0.0, member.personal_pension_account_balance)
+    for month in range(months_to_withdrawal + 1):
+        contribution = monthly_contribution if month < months_to_withdrawal and month <= configured_end_offset else 0.0
+        annual_return = personal_pension_annual_return_for_month(
+            member,
+            member_index,
+            rules,
+            base_month=base_month,
+            months_from_now=month,
+        )
+        monthly_return = (1 + max(-0.95, annual_return)) ** (1 / 12) - 1
+        balance = max(0.0, (balance + contribution) * (1 + monthly_return))
+    mode = member.personal_pension_withdrawal_mode
+    if mode == "lump_sum":
+        gross_monthly = balance
+    elif mode == "fixed_monthly":
+        gross_monthly = min(balance, member.personal_pension_fixed_monthly_withdrawal)
+    else:
+        gross_monthly = balance / max(12, member.personal_pension_withdrawal_years * 12)
+    redeemable_ratio = (
+        1.0
+        if member.personal_pension_product_liquidity_mode == "daily_liquid"
+        else member.personal_pension_monthly_redeemable_ratio
+    )
+    gross_monthly = min(balance * redeemable_ratio, gross_monthly)
+    withdrawal_tax_rate = get_policy(rules).tax_benefit_policy().personal_pension_withdrawal_tax_rate
+    redemption_fee_rate = member.personal_pension_redemption_fee_rate
+    return (
+        f"{withdrawal_month.year:04d}-{withdrawal_month.month:02d}",
+        balance,
+        gross_monthly * (1 - redemption_fee_rate) * (1 - withdrawal_tax_rate),
+    )
 
 
 def _tax_source_labeled_detail(source: str, category: str, detail: str) -> str:
@@ -176,6 +443,10 @@ def build_tax_strategy_items(
     base_date: date | None = None,
     horizon_months: int = 840,
     selected_purchase_month: int | None = None,
+    selected_purchase_plan: PurchasePlanAnalysis | None = None,
+    auto_suspended_personal_pension_member_indexes: set[int] | None = None,
+    personal_pension_original_insolvency_month: int | None = None,
+    personal_pension_optimization_decisions: dict[int, PersonalPensionOptimizationDecision] | None = None,
     personal_pension_tax_saving_estimator: PersonalPensionTaxSavingEstimator,
 ) -> list[TaxStrategyItem]:
     current = base_date or date.today()
@@ -186,6 +457,8 @@ def build_tax_strategy_items(
     mortgage_monthly = tax_benefit.first_home_mortgage_interest_monthly
     max_mortgage_months = tax_benefit.first_home_mortgage_interest_max_months
     rent_window = _active_rent_deduction_window(household, base_date=current_month, horizon_months=horizon_months)
+    suspended_personal_pension_indexes = auto_suspended_personal_pension_member_indexes or set()
+    pension_optimization_decisions = personal_pension_optimization_decisions or {}
 
     items: list[TaxStrategyItem] = []
     if rent_window:
@@ -299,7 +572,7 @@ def build_tax_strategy_items(
                 )
             )
 
-    for member in household.members:
+    for member_index, member in enumerate(household.members):
         if bool(getattr(member, "personal_pension_account_enabled", False)):
             open_mode = str(getattr(member, "personal_pension_open_mode", "auto_tax_optimal") or "auto_tax_optimal")
             contribution_mode = str(getattr(member, "personal_pension_contribution_mode", "auto_tax_optimal") or "auto_tax_optimal")
@@ -320,37 +593,183 @@ def build_tax_strategy_items(
                 else recommended_start
             )
             status = "auto_enabled" if open_mode == "auto_tax_optimal" and contribution_mode == "auto_tax_optimal" else "manual_enabled"
-            if open_mode == "none" or contribution_mode == "none":
+            eligible = bool(member.personal_pension_participation_eligible and member.pension_account_enabled)
+            if open_mode == "none" or contribution_mode == "none" or not eligible:
                 status = "not_applicable"
+            counterfactual_suspended = member_index in suspended_personal_pension_indexes
+            optimization_decision = pension_optimization_decisions.get(member_index)
+            economic_not_worthwhile = bool(optimization_decision is not None and not optimization_decision.should_open)
+            if counterfactual_suspended:
+                status = "conflict"
+            elif economic_not_worthwhile:
+                status = "conflict"
             annual_cash_contribution = 0.0
-            if status != "not_applicable":
+            if status in {"auto_enabled", "manual_enabled"}:
                 if contribution_mode == "fixed_monthly":
-                    annual_cash_contribution = max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0))) * 12
+                    annual_cash_contribution = min(
+                        annual_cap,
+                        max(0.0, float(getattr(member, "personal_pension_monthly_contribution", 0.0))) * 12,
+                    )
                 elif contribution_mode == "fixed_annual":
-                    annual_cash_contribution = max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0)))
+                    annual_cash_contribution = min(
+                        annual_cap,
+                        max(0.0, float(getattr(member, "personal_pension_annual_contribution_target", 0.0))),
+                    )
                 else:
-                    annual_cash_contribution = annual_cap if recommended_start or strategy_start_month else 0.0
+                    if optimization_decision is not None:
+                        strategy_start_month = optimization_decision.open_month
+                        first_planned_amount = next(iter(optimization_decision.annual_schedule.values()), 0.0)
+                        annual_cash_contribution = optimization_decision.annual_schedule.get(
+                            str(current_month.year),
+                            first_planned_amount,
+                        )
+                        if strategy_start_month > f"{current_month.year:04d}-{current_month.month:02d}":
+                            status = "available"
+                    else:
+                        annual_cash_contribution = annual_cap if recommended_start or strategy_start_month else 0.0
             deductible_amount = min(max(0.0, annual_cash_contribution), max(0.0, annual_cap))
             strategy_start_tuple = _parse_year_month(strategy_start_month)
             tax_saving_year = strategy_start_tuple[0] if strategy_start_tuple else current.year
             estimated_tax_saving = (
-                personal_pension_tax_saving_estimator(household, member, rules, tax_saving_year)
+                personal_pension_tax_saving_estimator(
+                    household,
+                    member,
+                    rules,
+                    tax_saving_year,
+                    deductible_amount,
+                )
                 if deductible_amount > 0
                 else 0.0
             )
-            account_return_rate = float(getattr(member, "personal_pension_annual_return", 0.025) or 0.0)
-            reason = (
-                f"税务策略建议在 {strategy_start_month or '首次有应税工作收入时'} 开户并开始缴存，按年度 {annual_cap:.0f} 元扣除上限测算；"
-                f"当前策略年度现金缴费约 {annual_cash_contribution:.0f} 元，可扣除约 {deductible_amount:.0f} 元，"
-                f"按当前年度估算节税约 {estimated_tax_saving:.0f} 元。个人养老金与基本养老保险个人账户不同，缴费环节税前扣除，投资环节暂不征税，领取环节按 {withdrawal_tax_rate:.1%} 税率估算。"
-                if status == "auto_enabled"
-                else (
-                    f"个人养老金开户或缴存由用户手动控制；后端按手动月份、缴存方式和年度扣除上限测算。"
-                    f"当前年度现金缴费约 {annual_cash_contribution:.0f} 元，可扣除约 {deductible_amount:.0f} 元，估算节税约 {estimated_tax_saving:.0f} 元；领取环节按 {withdrawal_tax_rate:.1%} 税率估算。"
-                    if status == "manual_enabled"
-                    else "该成员没有启用个人养老金缴费策略，因此不产生个人养老金税前扣除、现金转出和账户收益。"
+            if member.personal_pension_return_mode == "manual":
+                account_return_rate = float(getattr(member, "personal_pension_annual_return", 0.025) or 0.0)
+                post_retirement_return_rate = float(
+                    getattr(member, "personal_pension_post_retirement_annual_return", 0.015) or 0.0
+                )
+            else:
+                return_policy = get_policy(rules).personal_pension_return_policy()
+                account_return_rate = return_policy.pre_retirement_annual_return
+                post_retirement_return_rate = return_policy.post_retirement_annual_return
+            withdrawal_mode = member.personal_pension_withdrawal_mode
+            withdrawal_start_month, estimated_retirement_balance, estimated_monthly_withdrawal = (
+                _personal_pension_retirement_estimate(
+                    member,
+                    member_index,
+                    rules,
+                    base_month=current_month,
+                    monthly_contribution=annual_cash_contribution / 12,
                 )
             )
+            configured_end_month = getattr(member, "personal_pension_contribution_end_month", "") or None
+            contribution_end_reason = (
+                f"按手动设置缴至 {configured_end_month}；开始领取后自动停止缴费。"
+                if configured_end_month
+                else f"默认缴至 {withdrawal_start_month} 开始领取前；退休后不再继续锁定新增现金。"
+            )
+            cash_safety_rule = (
+                f"现金低于约 {member.personal_pension_cash_reserve_months} 个月基础生活费时暂停缴费，并同步取消当期未实际缴费对应的节税。"
+                if member.personal_pension_auto_suspend_for_cash_safety
+                else "未启用现金安全自动暂停；长期方案会把个人养老金缴费持续计入现金压力。"
+            )
+            long_term_cash_risk_month = ""
+            recommended_action = "按当前缴费配置执行，并由现金安全垫规则逐月复核。"
+            risk_month_offset = (
+                personal_pension_original_insolvency_month
+                if counterfactual_suspended
+                else selected_purchase_plan.insolvency_month
+                if selected_purchase_plan is not None
+                else None
+            )
+            if counterfactual_suspended and risk_month_offset is not None:
+                risk_year, risk_month = _month_after(current_month, risk_month_offset)
+                long_term_cash_risk_month = f"{risk_year:04d}-{risk_month:02d}"
+                has_existing_balance = member.personal_pension_account_balance > 0
+                contribution_end_reason = (
+                    f"原整体方案预计在 {long_term_cash_risk_month} 发生现金穿底，且停缴反事实能够改善整体可行性；"
+                    "自动策略已从本期起停止新增缴费。"
+                )
+                recommended_action = (
+                    "保留已开户账户和既有余额，但暂停新增缴费；待降低大额目标压力、补足自由现金安全垫，"
+                    "并确认完整账本不再穿底后，再按边际税率恢复缴费。"
+                    if has_existing_balance
+                    else "当前不建议为了税优专门开户并缴费；先让购房等整体方案恢复长期可行，再评估开户。"
+                )
+            elif economic_not_worthwhile:
+                contribution_end_reason = "在当前税率、养老金收益、领取税和普通理财税后收益假设下，没有找到净收益为正的缴费金额。"
+                recommended_action = (
+                    "当前建议暂不开户和缴费。普通理财的预期税后终值高于个人养老金净领取加节税再投资终值；"
+                    "收入税率、产品收益或普通理财收益假设变化后，系统会重新搜索开户年份和缴费额。"
+                )
+            elif (
+                selected_purchase_plan is not None
+                and selected_purchase_plan.insolvency_month is not None
+                and selected_purchase_plan.insolvency_month
+                < _months_between_months(current_month, personal_pension_withdrawal_start_month(
+                    member,
+                    member_index,
+                    rules,
+                    base_month=current_month,
+                ))
+            ):
+                risk_year, risk_month = _month_after(current_month, selected_purchase_plan.insolvency_month)
+                long_term_cash_risk_month = f"{risk_year:04d}-{risk_month:02d}"
+                contribution_end_reason = (
+                    f"当前整体方案预计在 {long_term_cash_risk_month} 发生现金穿底，早于 {withdrawal_start_month} 可领取月份；"
+                    "但仅暂停个人养老金尚未被验证为足以修复整体风险。"
+                )
+                recommended_action = (
+                    "应优先调整购房总价、买入时点和其他长期现金压力；个人养老金继续由逐月现金安全规则暂停，"
+                    "不能把停缴本身误写成已经消除破产风险。"
+                )
+            withdrawal_mode_label = {
+                "auto_safe": "现金安全优先动态领取",
+                "monthly_annuity": "按计划年限动态均匀领取",
+                "fixed_monthly": "固定月领",
+                "lump_sum": "一次性领取",
+            }.get(withdrawal_mode, withdrawal_mode)
+            if status == "conflict" and counterfactual_suspended:
+                reason = (
+                    "个人养老金自动缴费与家庭长期现金安全冲突。系统已用停缴反事实重新推演：年度新增缴费和扣除均为 0；"
+                    f"{contribution_end_reason}收益率假设仍用于既有余额，退休前为 {account_return_rate:.1%}、退休后为 {post_retirement_return_rate:.1%}，"
+                    f"预计 {withdrawal_start_month} 起可领取，领取环节按 {withdrawal_tax_rate:.1%} 税率估算。{recommended_action}"
+                )
+            elif status == "conflict" and economic_not_worthwhile:
+                reason = f"个人养老金当前经济性不足。{contribution_end_reason}{recommended_action}"
+            elif status in {"auto_enabled", "available"}:
+                reason = (
+                    f"税务策略建议在 {strategy_start_month or '首次有应税工作收入时'} 开户并开始缴存，按年度 {annual_cap:.0f} 元扣除上限搜索最优金额；"
+                    f"首个计划年度缴费约 {annual_cash_contribution:.0f} 元，可扣除约 {deductible_amount:.0f} 元，"
+                    f"估算节税约 {estimated_tax_saving:.0f} 元。{contribution_end_reason}"
+                    f"收益率在退休前十年由 {account_return_rate:.1%} 平滑降至 {post_retirement_return_rate:.1%}，"
+                    f"预计领取起点余额约 {estimated_retirement_balance:.0f} 元，采用“{withdrawal_mode_label}”；"
+                    f"领取环节按 {withdrawal_tax_rate:.1%} 税率估算。{cash_safety_rule}"
+                )
+            elif status == "manual_enabled":
+                reason = (
+                    "个人养老金开户或缴存由用户手动控制；后端按手动月份、缴存方式和年度扣除上限测算。"
+                    f"当前年度现金缴费约 {annual_cash_contribution:.0f} 元，可扣除约 {deductible_amount:.0f} 元，估算节税约 {estimated_tax_saving:.0f} 元。"
+                    f"{contribution_end_reason}预计 {withdrawal_start_month} 起采用“{withdrawal_mode_label}”，首月净领取约 {estimated_monthly_withdrawal:.0f} 元；"
+                    f"领取环节按 {withdrawal_tax_rate:.1%} 税率估算。{cash_safety_rule}"
+                )
+            else:
+                reason = (
+                    "该成员没有启用个人养老金缴费策略，因此不产生个人养老金税前扣除、现金转出和账户收益。"
+                    if eligible
+                    else "该成员尚未确认参加基本养老保险并具备个人养老金参加资格，不能生成开户、缴费或税前扣除。"
+                )
+            if optimization_decision is not None and optimization_decision.should_open:
+                reason += (
+                    f" 全周期计划累计缴费约 {optimization_decision.cumulative_contribution:.0f} 元，名义节税约 {optimization_decision.cumulative_tax_saving:.0f} 元；"
+                    f"到领取起点，养老金税费后价值约 {optimization_decision.pension_net_value_at_withdrawal:.0f} 元，"
+                    f"同额普通理财约 {optimization_decision.alternative_investment_value_at_withdrawal:.0f} 元，"
+                    f"节税再投资约 {optimization_decision.tax_saving_future_value:.0f} 元，综合净增益约 {optimization_decision.net_advantage_at_withdrawal:.0f} 元。"
+                )
+            elif optimization_decision is not None and not optimization_decision.should_open:
+                reason += (
+                    f" 若本年仍按 {annual_cap:.0f} 元上限缴费，预计当年节税约 {optimization_decision.full_cap_annual_tax_saving:.0f} 元，"
+                    f"但到领取起点相对普通理财的净差额约 {optimization_decision.full_cap_net_advantage_at_withdrawal:.0f} 元。"
+                )
+            optimization_points = optimization_decision.annual_points if optimization_decision is not None else []
             items.append(
                 TaxStrategyItem(
                     deduction_type="personal_pension",
@@ -362,9 +781,40 @@ def build_tax_strategy_items(
                     estimated_tax_saving=round(estimated_tax_saving, 2),
                     cash_contribution=round(annual_cash_contribution, 2),
                     account_return_rate=round(account_return_rate, 6),
+                    post_retirement_return_rate=round(post_retirement_return_rate, 6),
                     withdrawal_tax_rate=round(withdrawal_tax_rate, 6),
-                    start_month=strategy_start_month,
-                    end_month=getattr(member, "personal_pension_contribution_end_month", "") or None,
+                    withdrawal_mode=withdrawal_mode,
+                    withdrawal_start_month=withdrawal_start_month,
+                    withdrawal_years=member.personal_pension_withdrawal_years,
+                    estimated_retirement_balance=round(estimated_retirement_balance, 2),
+                    estimated_monthly_withdrawal=round(estimated_monthly_withdrawal, 2),
+                    cumulative_contribution=round(optimization_decision.cumulative_contribution, 2) if optimization_decision else 0.0,
+                    cumulative_estimated_tax_saving=round(optimization_decision.cumulative_tax_saving, 2) if optimization_decision else 0.0,
+                    pension_net_value_at_withdrawal=round(optimization_decision.pension_net_value_at_withdrawal, 2) if optimization_decision else 0.0,
+                    alternative_investment_value_at_withdrawal=round(optimization_decision.alternative_investment_value_at_withdrawal, 2) if optimization_decision else 0.0,
+                    forgone_investment_earnings=round(max(0.0, optimization_decision.alternative_investment_value_at_withdrawal - optimization_decision.cumulative_contribution), 2) if optimization_decision else 0.0,
+                    tax_saving_future_value=round(optimization_decision.tax_saving_future_value, 2) if optimization_decision else 0.0,
+                    net_advantage_at_withdrawal=round(optimization_decision.net_advantage_at_withdrawal, 2) if optimization_decision else 0.0,
+                    full_cap_annual_tax_saving=round(optimization_decision.full_cap_annual_tax_saving, 2) if optimization_decision else 0.0,
+                    full_cap_net_advantage_at_withdrawal=round(optimization_decision.full_cap_net_advantage_at_withdrawal, 2) if optimization_decision else 0.0,
+                    personal_pension_annual_plan=[
+                        {
+                            "year": point.year,
+                            "annual_contribution": point.annual_contribution,
+                            "estimated_tax_saving": point.estimated_tax_saving,
+                            "pension_net_value_at_withdrawal": point.pension_net_value_at_withdrawal,
+                            "alternative_investment_value_at_withdrawal": point.alternative_investment_value_at_withdrawal,
+                            "tax_saving_future_value": point.tax_saving_future_value,
+                            "net_advantage_at_withdrawal": point.net_advantage_at_withdrawal,
+                        }
+                        for point in optimization_points
+                    ],
+                    cash_safety_rule=cash_safety_rule,
+                    contribution_end_reason=contribution_end_reason,
+                    long_term_cash_risk_month=long_term_cash_risk_month,
+                    recommended_action=recommended_action,
+                    start_month="" if status == "conflict" else strategy_start_month,
+                    end_month=configured_end_month,
                     reason=reason,
                     source="backend_auto",
                 )
@@ -467,11 +917,32 @@ def build_tax_strategy_timeline(
         if item.status == "not_applicable":
             continue
         if item.deduction_type == "personal_pension":
+            if item.status == "conflict":
+                add_point(
+                    month_text=start_month,
+                    category="personal_pension",
+                    title=item.title,
+                    action="暂不开户或暂停新增缴费",
+                    member_name=item.member_name,
+                    deduction_type=item.deduction_type,
+                    status=item.status,
+                    amount=0,
+                    estimated_tax_saving=0,
+                    detail=item.recommended_action or item.reason,
+                    source=item.source,
+                )
+                continue
             add_point(
                 month_text=start_month,
                 category="personal_pension",
                 title=item.title,
-                action="开启个人养老金税前扣除策略" if item.status == "auto_enabled" else "按手动设置执行个人养老金策略",
+                action=(
+                    "开启个人养老金税前扣除策略"
+                    if item.status == "auto_enabled"
+                    else "按最优月份计划开户并开始缴费"
+                    if item.status == "available"
+                    else "按手动设置执行个人养老金策略"
+                ),
                 member_name=item.member_name,
                 deduction_type=item.deduction_type,
                 status=item.status,

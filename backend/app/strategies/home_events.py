@@ -178,25 +178,30 @@ def purchase_plan_events(
 
     if scenario.renovation_cost > 0:
         renovation_month = (
-            purchase_month
-            if plan.renovation_included_in_upfront_cash
-            else purchase_month + plan.months_to_renovation
+            purchase_month + plan.months_to_renovation
             if plan.months_to_renovation is not None
             else purchase_month
         )
+        funding_mode_label = {
+            "cash_or_investment": "现金与投资账户统筹",
+            "cash_only": "仅现金账户",
+            "after_goal_saving": "购房后逐月储备",
+        }.get(plan.renovation_funding_mode, "购房后逐月储备")
         events.append(
             PlanEventPoint(
                 plan_variant=plan.variant,
                 month=renovation_month,
                 category="renovation",
-                title="装修资金",
+                title="装修规划事件",
                 detail=(
-                    f"装修预算 {_money_text(scenario.renovation_cost)}。"
-                    if plan.renovation_included_in_upfront_cash
-                    else f"装修预算 {_money_text(scenario.renovation_cost)} 买后慢慢攒；后端按买后月结余 {_money_text(plan.post_purchase_renovation_monthly_saving)} 估算启动时间。"
+                    f"装修预算 {_money_text(plan.renovation_cost)}，资金方式为“{funding_mode_label}”；"
+                    f"在购房后第 {plan.months_to_renovation} 个月进入现金账本。"
+                    if plan.months_to_renovation is not None
+                    else f"装修预算 {_money_text(plan.renovation_cost)}，但当前可用资金与买后月结余不足，暂未形成可执行月份。"
                 ),
-                amount=round(scenario.renovation_cost, 2),
+                amount=round(plan.renovation_cost, 2),
                 severity="success" if plan.months_to_renovation is not None else "warning",
+                source="planning_goals" if scenario.renovation_goal_id else "backend",
             )
         )
     return events

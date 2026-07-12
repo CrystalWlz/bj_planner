@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..schemas import (
     CarLoanSummary,
+    CalculationContextSnapshot,
     HouseholdData,
     MarketSnapshotData,
     PurchasePlanAnalysis,
@@ -31,6 +32,7 @@ def build_yield_sensitivity(
     parallel_workers: int = 1,
     market_snapshot: MarketSnapshotData | None = None,
     baseline_analyses: list[PurchasePlanAnalysis] | None = None,
+    calculation_context: CalculationContextSnapshot | None = None,
 ) -> list[YieldSensitivityPoint]:
     annual_returns = [0.015, 0.025, 0.035]
 
@@ -47,6 +49,14 @@ def build_yield_sensitivity(
         )
 
     baseline_return = round(scenario.annual_investment_return, 8)
+    representative_variant = (
+        min(
+            baseline_analyses,
+            key=lambda item: item.months_to_buy if item.months_to_buy is not None else 999999,
+        ).variant
+        if baseline_analyses
+        else None
+    )
     baseline_points: dict[float, YieldSensitivityPoint] = {}
     if baseline_analyses:
         for annual_return in annual_returns:
@@ -66,6 +76,8 @@ def build_yield_sensitivity(
             car_loan=car_loan,
             taxes_and_fees=taxes_and_fees,
             market_snapshot=market_snapshot,
+            calculation_context=calculation_context,
+            variant_names={representative_variant} if representative_variant else None,
         )
         return point_from_analyses(annual_return, analyses)
 

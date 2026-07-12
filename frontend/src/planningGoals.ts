@@ -22,12 +22,24 @@ const HOME_TARGET_CONTROL_KEYS = [
   "planning_window_start_month",
   "planning_window_end_month",
   "selected_purchase_plan_variant",
+  "loan_repayment_strategy_mode",
   "provident_rate",
   "deed_tax_rate",
+  "commercial_repayment_method",
+  "provident_repayment_method",
+  "commercial_prepayment_mode",
+  "commercial_prepayment_enabled",
+  "commercial_prepayment_start_month",
+  "commercial_prepayment_allowed_after_month",
+  "commercial_prepayment_monthly_amount",
   "provident_account_repayment_strategy",
   "provident_account_repayment_switch_enabled",
   "provident_account_repayment_switch_after_month",
-  "provident_account_repayment_switch_to_strategy"
+  "provident_account_repayment_switch_to_strategy",
+  "investment_withdrawal_mode",
+  "investment_min_balance_after_purchase",
+  "renovation_cost",
+  "renovation_funding_mode"
 ];
 
 const VEHICLE_TARGET_CONTROL_KEYS = [
@@ -39,7 +51,25 @@ const VEHICLE_TARGET_CONTROL_KEYS = [
   "manual_purchase_delay_months",
   "planning_window_start_month",
   "planning_window_end_month",
-  "selected_strategy_variant"
+  "selected_strategy_variant",
+  "financing_options",
+  "selected_financing_option_id",
+  "selected_financing_option_name",
+  "selected_financing_type",
+  "selected_financing_min_down_payment_ratio",
+  "selected_financing_max_down_payment_ratio",
+  "selected_financing_prepayment_allowed",
+  "loan_prepayment_enabled",
+  "loan_prepayment_strategy_type",
+  "loan_prepayment_start_month",
+  "loan_prepayment_allowed_after_month",
+  "loan_prepayment_monthly_amount",
+  "loan_prepayment_lump_sum_month",
+  "loan_prepayment_lump_sum_amount",
+  "annual_mileage_km",
+  "monthly_parking_cost",
+  "annual_maintenance_cost",
+  "annual_insurance_rate"
 ];
 
 const CHILD_TARGET_CONTROL_KEYS = [
@@ -232,7 +262,7 @@ export function genericPlanningGoalDefaultData(
   const defaultBudget = isRenovation ? 250000 : 100000;
   const name = isRenovation ? `装修目标 ${index + 1}` : `其它目标 ${index + 1}`;
   return {
-    schema_version: 34,
+    schema_version: 55,
     goal_type: goalType,
     name,
     enabled: true,
@@ -280,24 +310,50 @@ export function genericPlanningGoalDuplicateData(goal: PlanningGoalRecord, index
 
 export type PlanningGoalOptionSource = Pick<
   ResolvedPlanningGoal | CalculationContextGoalSnapshot,
-  "id" | "name" | "goal_type" | "enabled" | "normalized_timing_mode"
+  | "id"
+  | "name"
+  | "goal_type"
+  | "priority"
+  | "planning_group_id"
+  | "planning_group_name"
+  | "planning_group_size"
+  | "planning_group_member_ids"
+  | "enabled"
+  | "normalized_timing_mode"
 >;
 
 export interface PlanningGoalDependencyOption {
   id: string;
   label: string;
+  member_ids: string[];
 }
 
 export function planningGoalDependencyOptions(
   goals: PlanningGoalOptionSource[] = [],
   excludedIds = new Set<string>()
 ): PlanningGoalDependencyOption[] {
-  return goals
-    .filter((goal) => goal.enabled && goal.normalized_timing_mode !== "not_planned" && !excludedIds.has(goal.id))
-    .map((goal) => ({
-      id: goal.id,
-      label: `${goal.name}（${planningGoalTypeLabel(goal.goal_type)}）`
-    }));
+  const groups = new Map<string, PlanningGoalOptionSource[]>();
+  goals
+    .filter((goal) => goal.enabled && goal.normalized_timing_mode !== "not_planned")
+    .forEach((goal) => {
+      const key = goal.planning_group_id || (goal.goal_type === "home" ? `home:${goal.priority}` : goal.id);
+      groups.set(key, [...(groups.get(key) ?? []), goal]);
+    });
+  return Array.from(groups.values())
+    .filter((group) => !group.some((goal) => excludedIds.has(goal.id)))
+    .map((group) => {
+      const representative = group[0];
+      const memberIds = representative.planning_group_member_ids.length
+        ? representative.planning_group_member_ids
+        : group.map((goal) => goal.id);
+      const groupName = representative.planning_group_name || representative.name;
+      const groupSize = Math.max(representative.planning_group_size, group.length);
+      return {
+        id: representative.planning_group_id || representative.id,
+        label: `${groupName}（${planningGoalTypeLabel(representative.goal_type)}${groupSize > 1 ? `，${groupSize} 个候选房源` : ""}）`,
+        member_ids: memberIds
+      };
+    });
 }
 
 export function planningGoalDependencyLabel(
@@ -305,7 +361,10 @@ export function planningGoalDependencyLabel(
   options: PlanningGoalDependencyOption[] = [],
   goals: PlanningGoalOptionSource[] = []
 ) {
-  return options.find((goal) => goal.id === goalId)?.label ?? goals.find((goal) => goal.id === goalId)?.name ?? "";
+  return options.find((goal) => goal.id === goalId || goal.member_ids.includes(goalId))?.label
+    ?? goals.find((goal) => goal.id === goalId)?.planning_group_name
+    ?? goals.find((goal) => goal.id === goalId)?.name
+    ?? "";
 }
 
 export function planningGoalIsNotPlanned(goal: { normalized_timing_mode: PlanningTimingMode }) {
@@ -349,13 +408,16 @@ export function scenarioPlanningTimingSummary(
   dependencyLabel = "指定目标"
 ) {
   if (!scenario.enabled) return "暂不纳入规划";
-  if (scenario.purchase_planning_mode === "parallel") return "允许并行考虑";
+  const start = scenario.planning_window_start_month || "不限";
+  const end = scenario.planning_window_end_month || "不限";
+  const demandWindow = `需求时间段：${start} 至 ${end}`;
+  if (scenario.purchase_planning_mode === "parallel") return `允许并行考虑，${demandWindow}`;
   if (scenario.depends_on_goal_id) {
-    return `跟随「${dependencyLabel || "指定目标"}」后 ${scenario.after_previous_purchase_delay_months || 0} 个月`;
+    return `跟随「${dependencyLabel || "指定目标"}」后在${demandWindow}内安排`;
   }
   return scenario.purchase_sequence <= 1
-    ? "自动安排"
-    : `排在第 ${scenario.purchase_sequence - 1} 个目标之后 ${scenario.after_previous_purchase_delay_months || 0} 个月`;
+    ? demandWindow
+    : `排在第 ${scenario.purchase_sequence - 1} 个目标之后，${demandWindow}`;
 }
 
 export function homePurchasePlanningModeForSequence(sequence: number): ScenarioData["purchase_planning_mode"] {
@@ -391,14 +453,17 @@ export function vehiclePlanningTimingSummary(
   dependencyLabel = "指定目标"
 ) {
   if (!vehicle.enabled || vehicle.purchase_timing_mode === "not_planned") return "暂不纳入规划";
-  if (vehicle.purchase_timing_mode === "parallel") return "允许并行考虑";
+  const start = vehicle.planning_window_start_month || "不限";
+  const end = vehicle.planning_window_end_month || "不限";
+  const demandWindow = `需求时间段：${start} 至 ${end}`;
+  if (vehicle.purchase_timing_mode === "parallel") return `允许并行考虑，${demandWindow}`;
   if (vehicle.purchase_timing_mode === "manual_month") {
-    return `不早于 ${vehicle.manual_purchase_delay_months || vehicle.purchase_delay_months || 0} 个月后`;
+    return demandWindow;
   }
   if (vehicle.depends_on_goal_id) {
-    return `跟随「${dependencyLabel || "指定目标"}」后 ${vehicle.after_previous_event_delay_months || 0} 个月`;
+    return `跟随「${dependencyLabel || "指定目标"}」后在${demandWindow}内安排`;
   }
-  return `按消费顺序自动排，前一事件后 ${vehicle.after_previous_event_delay_months || 0} 个月`;
+  return `按消费顺序自动安排，${demandWindow}`;
 }
 
 export function vehiclePlanningControlDefaults(
@@ -480,7 +545,7 @@ export function childPlanningGoalData(child: ChildPlanData, index: number, first
   const targetParams = withoutPlanningControlFields({ ...child }, CHILD_TARGET_CONTROL_KEYS);
   const timingMode = planningTimingModeFromChildPlan(child);
   return {
-    schema_version: 34,
+    schema_version: 55,
     goal_type: "child",
     name: child.name || `子女计划 ${index + 1}`,
     enabled: child.enabled,
@@ -523,7 +588,7 @@ export function vehiclePlanningGoalData(vehicle: VehiclePlanData, index: number)
   const targetParams = withoutPlanningControlFields({ ...vehicle }, VEHICLE_TARGET_CONTROL_KEYS);
   const timingMode = planningTimingModeFromVehiclePlan(vehicle);
   return {
-    schema_version: 34,
+    schema_version: 55,
     goal_type: "vehicle",
     name: vehicle.name || `用车需求 ${index + 1}`,
     enabled: vehicle.enabled,
@@ -540,8 +605,19 @@ export function vehiclePlanningGoalData(vehicle: VehiclePlanData, index: number)
     target_params: targetParams,
     financing_preferences: {
       financing_options: vehicle.financing_options,
+      selected_financing_option_id: vehicle.selected_financing_option_id,
+      selected_financing_option_name: vehicle.selected_financing_option_name,
+      selected_financing_type: vehicle.selected_financing_type,
+      selected_financing_min_down_payment_ratio: vehicle.selected_financing_min_down_payment_ratio,
+      selected_financing_max_down_payment_ratio: vehicle.selected_financing_max_down_payment_ratio,
+      selected_financing_prepayment_allowed: vehicle.selected_financing_prepayment_allowed,
       loan_prepayment_enabled: vehicle.loan_prepayment_enabled,
-      loan_prepayment_strategy_type: vehicle.loan_prepayment_strategy_type
+      loan_prepayment_strategy_type: vehicle.loan_prepayment_strategy_type,
+      loan_prepayment_start_month: vehicle.loan_prepayment_start_month,
+      loan_prepayment_allowed_after_month: vehicle.loan_prepayment_allowed_after_month,
+      loan_prepayment_monthly_amount: vehicle.loan_prepayment_monthly_amount,
+      loan_prepayment_lump_sum_month: vehicle.loan_prepayment_lump_sum_month,
+      loan_prepayment_lump_sum_amount: vehicle.loan_prepayment_lump_sum_amount
     },
     holding_cost_params: {
       annual_mileage_km: vehicle.annual_mileage_km,
@@ -564,7 +640,7 @@ export function homePlanningGoalData(scenario: ScenarioData): PlanningGoalData {
   const targetParams = withoutPlanningControlFields({ ...scenario }, HOME_TARGET_CONTROL_KEYS);
   const timingMode = planningTimingModeFromScenario(scenario);
   return {
-    schema_version: 34,
+    schema_version: 55,
     goal_type: "home",
     name: scenario.name || "购房目标",
     enabled: scenario.enabled,
@@ -580,17 +656,44 @@ export function homePlanningGoalData(scenario: ScenarioData): PlanningGoalData {
     selected_strategy_id: scenario.selected_purchase_plan_variant || "",
     target_params: targetParams,
     financing_preferences: {
+      loan_repayment_strategy_mode: scenario.loan_repayment_strategy_mode,
       commercial_repayment_method: scenario.commercial_repayment_method,
       provident_repayment_method: scenario.provident_repayment_method,
       commercial_prepayment_mode: scenario.commercial_prepayment_mode,
+      commercial_prepayment_enabled: scenario.commercial_prepayment_enabled,
+      commercial_prepayment_start_month: scenario.commercial_prepayment_start_month,
+      commercial_prepayment_allowed_after_month: scenario.commercial_prepayment_allowed_after_month,
+      commercial_prepayment_monthly_amount: scenario.commercial_prepayment_monthly_amount,
       provident_account_repayment_strategy: scenario.provident_account_repayment_strategy,
       provident_account_repayment_switch_enabled: scenario.provident_account_repayment_switch_enabled,
       provident_account_repayment_switch_after_month: scenario.provident_account_repayment_switch_after_month,
       provident_account_repayment_switch_to_strategy: scenario.provident_account_repayment_switch_to_strategy,
-      investment_withdrawal_mode: scenario.investment_withdrawal_mode
+      investment_withdrawal_mode: scenario.investment_withdrawal_mode,
+      investment_min_balance_after_purchase: scenario.investment_min_balance_after_purchase
     },
     holding_cost_params: {},
     metadata: {},
     notes: ""
   };
+}
+
+export function scenarioFromHomePlanningGoal(goal: PlanningGoalRecord): ScenarioData {
+  const targetParams = goal.data.target_params as Partial<ScenarioData>;
+  const financingPreferences = goal.data.financing_preferences as Partial<ScenarioData>;
+  const timingMode = goal.data.timing_mode;
+  return {
+    ...targetParams,
+    ...financingPreferences,
+    planning_goal_id: goal.id,
+    name: goal.data.name || targetParams.name || "购房目标",
+    enabled: goal.data.enabled && timingMode !== "not_planned",
+    purchase_sequence: Math.max(1, goal.data.priority),
+    purchase_planning_mode: timingMode === "parallel" ? "parallel" : "after_previous_purchase",
+    depends_on_goal_id: timingMode === "after_goal" ? goal.data.depends_on_goal_id : "",
+    after_previous_purchase_delay_months: Math.max(0, goal.data.delay_after_dependency_months),
+    manual_purchase_delay_months: Math.max(0, goal.data.earliest_purchase_delay_months),
+    planning_window_start_month: goal.data.planning_window_start_month,
+    planning_window_end_month: goal.data.planning_window_end_month,
+    selected_purchase_plan_variant: goal.data.selected_strategy_id || ""
+  } as ScenarioData;
 }

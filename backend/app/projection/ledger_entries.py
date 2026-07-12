@@ -76,6 +76,18 @@ def build_monthly_ledger_entries(inputs: MonthlyLedgerEntryInputs) -> list[Month
                 ),
             ]
         )
+    if inputs.renovation_expense:
+        entries.append(
+            ledger_entry(
+                plan_variant=inputs.plan_variant,
+                month=inputs.month,
+                account="cash",
+                category="renovation",
+                label="装修规划事件支出",
+                amount=-inputs.renovation_expense,
+                direction="outflow",
+            )
+        )
     if inputs.cash_income:
         entries.append(
             ledger_entry(
@@ -230,6 +242,54 @@ def build_monthly_ledger_entries(inputs: MonthlyLedgerEntryInputs) -> list[Month
                 label="个人养老金账户收益",
                 amount=inputs.personal_pension_return,
                 direction="valuation",
+            )
+        )
+    if inputs.personal_pension_withdrawal:
+        entries.append(
+            ledger_entry(
+                plan_variant=inputs.plan_variant,
+                month=inputs.month,
+                account="personal_pension",
+                category="personal_pension_withdrawal",
+                label="个人养老金领取到账",
+                amount=inputs.personal_pension_withdrawal,
+                direction="inflow",
+            )
+        )
+    if inputs.personal_pension_suspended_contribution:
+        entries.append(
+            ledger_entry(
+                plan_variant=inputs.plan_variant,
+                month=inputs.month,
+                account="personal_pension",
+                category="personal_pension_suspended_contribution",
+                label="因现金安全暂停的个人养老金缴费",
+                amount=inputs.personal_pension_suspended_contribution,
+                direction="valuation",
+            )
+        )
+    if inputs.personal_pension_withdrawal_tax:
+        entries.append(
+            ledger_entry(
+                plan_variant=inputs.plan_variant,
+                month=inputs.month,
+                account="personal_pension",
+                category="personal_pension_withdrawal_tax",
+                label="个人养老金领取税",
+                amount=-inputs.personal_pension_withdrawal_tax,
+                direction="outflow",
+            )
+        )
+    if inputs.personal_pension_redemption_fee:
+        entries.append(
+            ledger_entry(
+                plan_variant=inputs.plan_variant,
+                month=inputs.month,
+                account="personal_pension",
+                category="personal_pension_redemption_fee",
+                label="个人养老金产品赎回或退保费用",
+                amount=-inputs.personal_pension_redemption_fee,
+                direction="outflow",
             )
         )
     if inputs.investment_return:

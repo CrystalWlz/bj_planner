@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from calendar import monthrange
 from typing import Any
 
 from ..policies import (
@@ -11,9 +12,7 @@ from ..policies import (
 )
 from ..schemas import BonusTaxMethod, IncomeMember, IncomeStageData, RulePackData
 from .time import (
-    month_distance,
     parse_iso_date,
-    parse_year_month,
 )
 
 
@@ -100,7 +99,7 @@ def income_stage_for_month(member: IncomeMember, year: int, month: int) -> Incom
 
 
 def stage_bonus_payout_month(stage: IncomeStageData, projection_year: int) -> int | None:
-    if stage.annual_bonus <= 0:
+    if stage_annual_bonus_target_amount(stage) <= 0:
         return None
     if stage.annual_bonus_payout_mode == "monthly_spread":
         return None
@@ -110,36 +109,68 @@ def stage_bonus_payout_month(stage: IncomeStageData, projection_year: int) -> in
     return payout_month if stage_active_in_month(stage, projection_year, payout_month) else None
 
 
-def stage_bonus_earning_months(stage: IncomeStageData, projection_year: int) -> int:
-    earning_start = parse_year_month(stage.annual_bonus_earning_start_month)
-    earning_end = parse_year_month(stage.annual_bonus_earning_end_month)
-    if earning_start and earning_end:
-        stage_start = parse_year_month(stage.start_date[:7])
-        stage_end = parse_year_month(stage.end_date[:7]) if stage.end_date else earning_end
-        start = max(earning_start, stage_start or earning_start)
-        end = min(earning_end, stage_end or earning_end)
-        return max(0, min(12, month_distance(start, end) + 1))
+def stage_annual_bonus_target_amount(stage: IncomeStageData) -> float:
+    return max(0.0, stage.monthly_salary_gross) * max(0.0, stage.annual_bonus_months)
+
+
+def _bonus_earning_period(stage: IncomeStageData, projection_year: int) -> tuple[date, date] | None:
+    earning_start = stage.annual_bonus_earning_start_month
+    earning_end = stage.annual_bonus_earning_end_month
+    if earning_start is None or earning_end is None:
+        return None
+    payout_month = max(1, min(12, stage.annual_bonus_payout_month))
+    payout_period_end = date(projection_year, payout_month, monthrange(projection_year, payout_month)[1])
+    earning_end_year = projection_year
+    candidate_end = date(earning_end_year, earning_end, monthrange(earning_end_year, earning_end)[1])
+    if candidate_end > payout_period_end:
+        earning_end_year -= 1
+    earning_start_year = earning_end_year if earning_start <= earning_end else earning_end_year - 1
+    return (
+        date(earning_start_year, earning_start, 1),
+        date(earning_end_year, earning_end, monthrange(earning_end_year, earning_end)[1]),
+    )
+
+
+def stage_bonus_earning_months(stage: IncomeStageData, projection_year: int) -> float:
+    earning_period = _bonus_earning_period(stage, projection_year)
+    if earning_period is not None:
+        earning_period_start, earning_period_end = earning_period
+        month_cursor = earning_period_start
+        active_months = 0
+        while month_cursor <= earning_period_end:
+            if stage_active_in_month(stage, month_cursor.year, month_cursor.month):
+                active_months += 1
+            if month_cursor.month == 12:
+                month_cursor = date(month_cursor.year + 1, 1, 1)
+            else:
+                month_cursor = date(month_cursor.year, month_cursor.month + 1, 1)
+        return float(active_months)
     return active_months_in_period(stage.start_date, stage.end_date, projection_year)
 
 
 def stage_monthly_spread_bonus_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
-    if stage.annual_bonus <= 0 or stage.annual_bonus_payout_mode != "monthly_spread":
+    target_amount = stage_annual_bonus_target_amount(stage)
+    if target_amount <= 0 or stage.annual_bonus_payout_mode != "monthly_spread":
         return 0.0
     if not stage_active_in_month(stage, projection_year, month):
         return 0.0
-    earning_start = parse_year_month(stage.annual_bonus_earning_start_month)
-    earning_end = parse_year_month(stage.annual_bonus_earning_end_month)
-    if earning_start and earning_end:
-        target = (projection_year, month)
-        if month_distance(earning_start, target) < 0 or month_distance(target, earning_end) < 0:
+    earning_start = stage.annual_bonus_earning_start_month
+    earning_end = stage.annual_bonus_earning_end_month
+    if earning_start is not None and earning_end is not None:
+        in_window = (
+            earning_start <= month <= earning_end
+            if earning_start <= earning_end
+            else month >= earning_start or month <= earning_end
+        )
+        if not in_window:
             return 0.0
-    return stage.annual_bonus / 12
+    return target_amount / 12
 
 
 def stage_bonus_payout_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
     if stage_bonus_payout_month(stage, projection_year) != month:
         return 0.0
-    return stage.annual_bonus * min(12, stage_bonus_earning_months(stage, projection_year)) / 12
+    return stage_annual_bonus_target_amount(stage) * min(12.0, stage_bonus_earning_months(stage, projection_year)) / 12
 
 
 def stage_bonus_cash_amount(stage: IncomeStageData, projection_year: int, month: int) -> float:
@@ -254,7 +285,12 @@ def stage_selected_bonus_method(stage: IncomeStageData, rules: RulePackData, tar
         + stage.other_annual_taxable_income
         - common_deductions,
     )
-    merged_taxable = max(0.0, salary_taxable + stage.annual_bonus)
-    separate_total = progressive_tax(salary_taxable, annual_brackets) + bonus_tax(stage.annual_bonus, bonus_brackets)
+    bonus_amount = stage_annual_bonus_target_amount(stage)
+    if target_year is not None:
+        payout_month = stage_bonus_payout_month(stage, target_year)
+        if payout_month is not None:
+            bonus_amount = stage_bonus_payout_amount(stage, target_year, payout_month)
+    merged_taxable = max(0.0, salary_taxable + bonus_amount)
+    separate_total = progressive_tax(salary_taxable, annual_brackets) + bonus_tax(bonus_amount, bonus_brackets)
     merged_total = progressive_tax(merged_taxable, annual_brackets)
     return "merged" if merged_total < separate_total else "separate"

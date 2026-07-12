@@ -8,6 +8,8 @@ from ..domain.loans import (
     prepayment_investment_hurdle_rate,
     vehicle_loan_projection,
 )
+from ..domain.investments import investment_effective_tax_rate
+from ..domain.goal_tradeoffs import resolve_goal_tradeoff_preference
 from ..domain.scoring import (
     cash_flow_score,
     clamp_score,
@@ -635,6 +637,7 @@ def choose_auto_vehicle_prepayment(
     annual_investment_return: float = 0.0,
     investment_buy_fee_rate: float = 0.0,
     investment_sell_fee_rate: float = 0.0,
+    investment_effective_tax_rate: float = 0.0,
 ) -> VehiclePrepaymentChoice:
     total_months = max(1, total_months)
     interest_free_months = max(0, min(interest_free_months, total_months))
@@ -704,6 +707,7 @@ def choose_auto_vehicle_prepayment(
     )
     hurdle_rate = prepayment_investment_hurdle_rate(
         annual_investment_return,
+        effective_tax_rate=investment_effective_tax_rate,
         buy_fee_rate=investment_buy_fee_rate,
         sell_fee_rate=investment_sell_fee_rate,
     )
@@ -888,6 +892,9 @@ def build_car_plan_analyses(
     annual_investment_return: float = 0.0,
     rules: RulePackData,
     calculation_context: CalculationContextSnapshot | None = None,
+    income_at_month: Callable[[int], float] | None = None,
+    expense_at_month: Callable[[int], float] | None = None,
+    lifecycle_horizon_months: int = 480,
 ) -> list[CarPlanAnalysis]:
     active_vehicle_plans = vehicle_plans(household.car_plan, calculation_context=calculation_context)
     if not active_vehicle_plans:
@@ -964,7 +971,6 @@ def build_car_plan_analyses(
                 "high_down_low_loan": [optimized_vehicle_down_ratio(plan, "high_down_low_loan", plan.purchase_delay_months)],
                 "low_down_keep_cash": [optimized_vehicle_down_ratio(plan, "low_down_keep_cash", plan.purchase_delay_months)],
                 "accelerated_principal": [optimized_vehicle_down_ratio(plan, "accelerated_principal", plan.purchase_delay_months)],
-                "delay_purchase": [optimized_vehicle_down_ratio(plan, "delay_purchase", delay_months)],
             }
             cash_spec = ("cash", "全款购买，不形成车贷，适合现金安全垫非常充足时。", base_purchase_delay, 1, 0, 0.0)
             specs = [cash_spec] if financing_type == "cash_only" else [
@@ -973,11 +979,34 @@ def build_car_plan_analyses(
                 ("high_down_low_loan", "在经销商金融方案内选择较高首付比例，用较低贷款本金控制月供和总利息。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
                 ("low_down_keep_cash", "在经销商金融方案内选择较低首付比例，尽量保留购房现金和应急垫。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
                 ("accelerated_principal", "沿用经销商金融方案，系统比较一次性、分月和组合提前还本，选择净收益更好的还本节奏。", base_purchase_delay, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
-                ("delay_purchase", "延后购车并在经销商金融方案内搜索较稳首付比例，把现金优先留给购房窗口和安全垫。", delay_months, plan.total_months, plan.interest_free_months, plan.later_annual_rate),
             ]
+            if financing_type != "cash_only":
+                for candidate_delay in sorted(
+                    {
+                        delay_months,
+                        max(base_purchase_delay, 24),
+                        max(base_purchase_delay, 36),
+                        max(base_purchase_delay, 60),
+                    }
+                ):
+                    specs.append(
+                        (
+                            "delay_purchase",
+                            "在规划窗口内主动搜索更晚购车月份和较稳首付比例，直到长期现金压力恢复安全。",
+                            candidate_delay,
+                            plan.total_months,
+                            plan.interest_free_months,
+                            plan.later_annual_rate,
+                        )
+                    )
             for strategy_key, description, purchase_delay, total_months, interest_free_months, later_rate in specs:
                 skip_strategy = False
-                for down_ratio in ratio_candidates[strategy_key]:
+                strategy_ratios = (
+                    [optimized_vehicle_down_ratio(plan, "delay_purchase", purchase_delay)]
+                    if strategy_key == "delay_purchase"
+                    else ratio_candidates[strategy_key]
+                )
+                for down_ratio in strategy_ratios:
                     if strategy_key not in {"cash", "delay_purchase"} and down_ratio >= 0.999:
                         skip_strategy = True
                         break
@@ -997,6 +1026,7 @@ def build_car_plan_analyses(
                             annual_investment_return=annual_investment_return,
                             investment_buy_fee_rate=household.investment_buy_fee_rate,
                             investment_sell_fee_rate=household.investment_sell_fee_rate,
+                            investment_effective_tax_rate=investment_effective_tax_rate(household),
                         )
                         if strategy_key == "accelerated_principal"
                         else no_prepayment
@@ -1065,6 +1095,51 @@ def build_car_plan_analyses(
                 expected_payment = max(loan.first_phase_monthly_payment, loan.later_phase_monthly_payment)
                 expected_total_payment = expected_payment + (loan.prepayment_monthly_amount if loan.prepayment_enabled else 0.0)
                 monthly_after_car = monthly_savings_before_transport - expected_total_payment - loan.monthly_cash_operating_cost
+                lifecycle_cash = cash_after_purchase
+                lifecycle_worst_cash = lifecycle_cash
+                lifecycle_insolvency_month = 0 if lifecycle_cash < 0 else None
+                if months_to_buy is not None:
+                    for absolute_month in range(months_to_buy + 1, max(months_to_buy + 1, lifecycle_horizon_months) + 1):
+                        months_after_purchase = absolute_month - months_to_buy
+                        lifecycle_income = (
+                            income_at_month(absolute_month)
+                            if income_at_month is not None
+                            else net_monthly_income
+                        )
+                        lifecycle_expense = (
+                            expense_at_month(absolute_month)
+                            if expense_at_month is not None
+                            else current_monthly_expense
+                        )
+                        vehicle_payment = expected_total_payment if months_after_purchase <= loan.actual_payoff_months else 0.0
+                        lifecycle_cash += (
+                            lifecycle_income
+                            - lifecycle_expense
+                            - household.monthly_debt_payment
+                            - loan.monthly_cash_operating_cost
+                            - vehicle_payment
+                        )
+                        lifecycle_worst_cash = min(lifecycle_worst_cash, lifecycle_cash)
+                        if lifecycle_cash < 0 and lifecycle_insolvency_month is None:
+                            lifecycle_insolvency_month = absolute_month
+                lifecycle_cash_shortfall = max(0.0, -lifecycle_worst_cash)
+                lifecycle_feasible = (
+                    months_to_buy is not None
+                    and lifecycle_insolvency_month is None
+                    and lifecycle_cash_shortfall <= 0
+                    and cash_after_purchase >= required_reserve
+                    and monthly_after_car >= 0
+                )
+                lifecycle_risk_note = (
+                    "已通过长期收入阶段、养娃支出、既有债务和车辆持有成本压力检查。"
+                    if lifecycle_feasible
+                    else (
+                        f"长期现金曲线最差缺口约 {round(lifecycle_cash_shortfall)} 元，"
+                        f"首次穿底约在第 {lifecycle_insolvency_month} 个月；应继续延后、降低车价或取消购车。"
+                        if lifecycle_insolvency_month is not None
+                        else "当前规划窗口内无法同时满足交易现金、安全垫和买后月现金流。"
+                    )
+                )
                 debt_burden_score = clamp_score(10 - expected_payment / max(net_monthly_income, 1) / 0.18 * 10)
                 total_cost_score = clamp_score(10 - loan.monthly_total_ownership_cost / max(net_monthly_income, 1) / 0.16 * 10)
                 happiness_score = (
@@ -1113,7 +1188,15 @@ def build_car_plan_analyses(
                     CarPlanAnalysis(
                         variant=" | ".join(
                             part
-                            for part in [variant_prefix, financing_name, strategy_key]
+                            for part in [
+                                variant_prefix,
+                                financing_name,
+                                (
+                                    f"delay_purchase_{purchase_delay}m"
+                                    if strategy_key == "delay_purchase"
+                                    else strategy_key
+                                ),
+                            ]
                             if part
                         ),
                         description=description,
@@ -1165,6 +1248,7 @@ def build_car_plan_analyses(
                         interest_saved_by_prepayment=loan.interest_saved_by_prepayment,
                         total_interest=loan.total_interest,
                         required_cash_at_purchase=round(required_cash, 2),
+                        required_liquidity_reserve=round(required_reserve, 2),
                         cash_after_purchase=round(cash_after_purchase, 2),
                         monthly_cash_flow_after_car=round(monthly_after_car, 2),
                         operating_cost=loan.monthly_cash_operating_cost,
@@ -1175,16 +1259,63 @@ def build_car_plan_analyses(
                         monthly_cash_operating_cost=loan.monthly_cash_operating_cost,
                         monthly_depreciation_cost=loan.monthly_depreciation_cost,
                         monthly_total_ownership_cost=loan.monthly_total_ownership_cost,
+                        lifecycle_cash_shortfall=round(lifecycle_cash_shortfall, 2),
+                        lifecycle_insolvency_month=lifecycle_insolvency_month,
+                        lifecycle_worst_liquid_balance=round(lifecycle_worst_cash, 2),
+                        lifecycle_terminal_liquid_balance=round(lifecycle_cash, 2),
+                        lifecycle_feasible=lifecycle_feasible,
+                        lifecycle_risk_note=lifecycle_risk_note,
                         happiness_score=round(clamp_score(happiness_score), 2),
                         notes=notes,
                     )
                 )
-    return representative_car_plan_analyses(analyses)
+    feasible_months = [item.months_to_buy for item in analyses if item.months_to_buy is not None and item.lifecycle_feasible]
+    tradeoff = resolve_goal_tradeoff_preference(
+        household,
+        expected_investment_return=annual_investment_return,
+        urgency_months=min(feasible_months) if feasible_months else None,
+        priority=min((plan.planning_sequence for plan in active_vehicle_plans), default=1),
+        life_utility_score=sum(item.happiness_score for item in analyses) / max(1, len(analyses)),
+        cash_reserve_gap=max(0.0, required_reserve - household.cash_account_balance),
+    )
+    return representative_car_plan_analyses(
+        analyses,
+        timing_weight=tradeoff.timing_weight,
+        tradeoff_explanation=tradeoff.explanation,
+    )
 
 
-def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[CarPlanAnalysis]:
+def representative_car_plan_analyses(
+    analyses: list[CarPlanAnalysis],
+    *,
+    timing_weight: float = 0.5,
+    tradeoff_explanation: str = "",
+) -> list[CarPlanAnalysis]:
     if not analyses:
         return []
+
+    finite_months = [item.months_to_buy for item in analyses if item.months_to_buy is not None]
+    earliest_month = min(finite_months or [0])
+    latest_month = max(finite_months or [earliest_month])
+    terminal_values = [item.lifecycle_terminal_liquid_balance for item in analyses if item.lifecycle_feasible]
+    minimum_terminal = min(terminal_values or [0.0])
+    maximum_terminal = max(terminal_values or [minimum_terminal])
+    effective_timing_weight = max(0.05, min(0.95, timing_weight))
+
+    def timing_wealth_score(item: CarPlanAnalysis) -> float:
+        speed = (
+            0.0
+            if item.months_to_buy is None
+            else 1.0
+            if latest_month <= earliest_month
+            else (latest_month - item.months_to_buy) / (latest_month - earliest_month)
+        )
+        wealth = (
+            1.0
+            if maximum_terminal <= minimum_terminal
+            else (item.lifecycle_terminal_liquid_balance - minimum_terminal) / (maximum_terminal - minimum_terminal)
+        )
+        return speed * effective_timing_weight + wealth * (1 - effective_timing_weight)
 
     grouped: dict[tuple[int, int | None, str], list[CarPlanAnalysis]] = {}
     group_order: dict[tuple[int, int | None, str], int] = {}
@@ -1195,15 +1326,22 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
         group_order.setdefault(key, index)
 
     def is_viable(item: CarPlanAnalysis) -> bool:
-        return item.months_to_buy is not None and item.cash_after_purchase >= 0 and item.monthly_cash_flow_after_car >= 0
+        return (
+            item.months_to_buy is not None
+            and item.cash_after_purchase >= item.required_liquidity_reserve
+            and item.monthly_cash_flow_after_car >= 0
+            and item.lifecycle_feasible
+            and item.lifecycle_insolvency_month is None
+            and item.lifecycle_cash_shortfall <= 0
+        )
 
     def target_score(item: CarPlanAnalysis) -> tuple[bool, bool, float, float, float]:
         return (
             item.financing_type != "cash_only",
             is_viable(item),
+            timing_wealth_score(item),
             item.happiness_score,
             -item.expected_monthly_payment_after_purchase,
-            -item.total_interest,
         )
 
     def strategy_score(item: CarPlanAnalysis) -> tuple[float, ...]:
@@ -1211,6 +1349,7 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
         if item.strategy_key == "cash":
             return (
                 viable_bonus,
+                timing_wealth_score(item),
                 -float(item.months_to_buy if item.months_to_buy is not None else 999999),
                 item.happiness_score,
                 item.cash_after_purchase,
@@ -1218,6 +1357,7 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
         if item.strategy_key == "high_down_low_loan":
             return (
                 viable_bonus,
+                timing_wealth_score(item),
                 -item.expected_monthly_payment_after_purchase,
                 -item.total_interest,
                 item.happiness_score,
@@ -1226,6 +1366,7 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
         if item.strategy_key == "low_down_keep_cash":
             return (
                 viable_bonus,
+                timing_wealth_score(item),
                 item.cash_after_purchase,
                 -item.down_payment,
                 item.happiness_score,
@@ -1235,6 +1376,7 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
             return (
                 1.0 if item.prepayment_enabled else 0.0,
                 viable_bonus,
+                timing_wealth_score(item),
                 item.prepayment_net_benefit,
                 item.interest_saved_by_prepayment,
                 -item.expected_monthly_payment_after_purchase,
@@ -1243,12 +1385,13 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
         if item.strategy_key == "delay_purchase":
             return (
                 viable_bonus,
+                timing_wealth_score(item),
                 item.cash_after_purchase,
                 item.happiness_score,
                 -item.expected_monthly_payment_after_purchase,
                 -float(item.months_to_buy if item.months_to_buy is not None else 999999),
             )
-        return (viable_bonus, item.happiness_score)
+        return (viable_bonus, timing_wealth_score(item), item.happiness_score)
 
     def difference_signature(item: CarPlanAnalysis) -> tuple[object, ...]:
         return (
@@ -1289,7 +1432,17 @@ def representative_car_plan_analyses(analyses: list[CarPlanAnalysis]) -> list[Ca
             if item.strategy_key != "target" and signature in seen_signatures:
                 continue
             seen_signatures.add(signature)
-            result.append(item)
+            result.append(
+                item.model_copy(
+                    update={
+                        "notes": [
+                            *item.notes,
+                            f"goal_tradeoff:{tradeoff_explanation}",
+                            f"goal_tradeoff_score:{timing_wealth_score(item):.4f}",
+                        ]
+                    }
+                )
+            )
     return result
 
 

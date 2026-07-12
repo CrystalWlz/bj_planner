@@ -94,26 +94,22 @@ interface BuildMonthlyChartSeriesOptions {
   backendCashflowSeries: MonthlyCashflowPoint[];
   horizonMonths: number;
   requiredLiquidityReserve: number;
-  fallbackHappinessScore: number;
   loanVisualizationByMonth: Map<number, LoanVisualizationPoint>;
   providentVisualizationByMonth: Map<number, ProvidentVisualizationPoint>;
   socialSecurityVisualizationByMonth: Map<number, SocialSecurityVisualizationPoint>;
   formatMonthName: (month: number) => string;
   scheduledExpenseRowsAt: (month: number) => MonthlyChartPoint["scheduledExpenseRows"];
-  householdMonthlyDebtPayment: number;
 }
 
 export function buildMonthlyChartSeries({
   backendCashflowSeries,
   horizonMonths,
   requiredLiquidityReserve,
-  fallbackHappinessScore,
   loanVisualizationByMonth,
   providentVisualizationByMonth,
   socialSecurityVisualizationByMonth,
   formatMonthName,
   scheduledExpenseRowsAt,
-  householdMonthlyDebtPayment
 }: BuildMonthlyChartSeriesOptions): MonthlyChartPoint[] {
   return backendCashflowSeries
     .filter((item) => item.month <= horizonMonths)
@@ -159,7 +155,7 @@ export function buildMonthlyChartSeries({
         流动资产: Math.round(liquidAssetValue),
         流动固定资产合计: Math.round(liquidAssetValue + item.fixed_asset_value),
         净资产: Math.round(item.net_worth),
-        happinessScore: item.happiness_score ?? fallbackHappinessScore,
+        happinessScore: item.happiness_score,
         公积金余额: Math.round(item.provident_balance),
         安全垫: Math.round(requiredLiquidityReserve),
         cashIncome: item.cash_income,
@@ -171,7 +167,7 @@ export function buildMonthlyChartSeries({
         scheduledExpenseRows: scheduledExpenseRowsAt(item.month),
         debtPayment,
         regularDebtPayment: item.regular_debt_payment ?? Math.max(0, debtPayment - (item.phased_loan_payment ?? 0)),
-        phasedLoanPayment: item.phased_loan_payment ?? Math.max(0, debtPayment - householdMonthlyDebtPayment),
+        phasedLoanPayment: item.phased_loan_payment,
         carCost: vehiclePayment + vehicleOperatingCost,
         firstCarLoanPayment: item.first_vehicle_payment ?? vehiclePayment,
         firstCarEnergyCost: item.first_vehicle_energy_cost ?? 0,

@@ -171,6 +171,7 @@ def derive_core_objects_for_planning_goals(
     goals: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     objects: list[dict[str, Any]] = []
+    processed_home_groups: set[int] = set()
     for goal in goals:
         data = goal.get("data") if isinstance(goal.get("data"), dict) else {}
         timing_mode = str(data.get("timing_mode") or "")
@@ -179,12 +180,45 @@ def derive_core_objects_for_planning_goals(
         target = data.get("target_params") if isinstance(data.get("target_params"), dict) else {}
         goal_type = str(goal.get("goal_type") or data.get("goal_type") or "")
         if goal_type == "home":
+            priority = max(1, int(data.get("priority") or 1))
+            if priority in processed_home_groups:
+                continue
+            processed_home_groups.add(priority)
+            home_candidates = [
+                candidate
+                for candidate in goals
+                if isinstance(candidate.get("data"), dict)
+                and str(candidate.get("goal_type") or candidate["data"].get("goal_type") or "") == "home"
+                and bool(candidate["data"].get("enabled", True))
+                and str(candidate["data"].get("timing_mode") or "") != "not_planned"
+                and max(1, int(candidate["data"].get("priority") or 1)) == priority
+            ]
             goal_id = str(goal.get("id") or "")
+            candidate_ids = [str(candidate.get("id") or "") for candidate in home_candidates]
+            candidate_names = [str(candidate["data"].get("name") or "候选房源") for candidate in home_candidates]
+            candidate_prices = [
+                max(0.0, float((candidate["data"].get("target_params") or {}).get("total_price") or 0))
+                for candidate in home_candidates
+            ]
+            demand_name = (
+                ("第一套购房需求" if priority == 1 else f"第 {priority} 套购房需求")
+                if len(home_candidates) > 1
+                else str(data.get("name") or target.get("name") or "目标房产")
+            )
+            group_metadata = {
+                "planning_group_id": goal_id,
+                "planning_group_name": demand_name,
+                "candidate_count": len(home_candidates),
+                "candidate_goal_ids": candidate_ids,
+                "candidate_names": candidate_names,
+                "candidate_price_min": min(candidate_prices, default=0.0),
+                "candidate_price_max": max(candidate_prices, default=0.0),
+            }
             objects.append(
                 _core_object_payload(
                     object_type="asset",
                     category="property_asset",
-                    name=str(data.get("name") or target.get("name") or "目标房产"),
+                    name=demand_name,
                     household_id=household_id,
                     source="goal",
                     reference_id=goal_id,
@@ -196,10 +230,19 @@ def derive_core_objects_for_planning_goals(
                         "timing_mode": data.get("timing_mode", ""),
                         "planning_window_start_month": data.get("planning_window_start_month", ""),
                         "planning_window_end_month": data.get("planning_window_end_month", ""),
+                        **group_metadata,
                     },
                 )
             )
-            objects.extend(_home_goal_planned_loan_objects(household_id, goal_id, data, target))
+            objects.extend(
+                _home_goal_planned_loan_objects(
+                    household_id,
+                    goal_id,
+                    data,
+                    target,
+                    planning_group_metadata=group_metadata,
+                )
+            )
         elif goal_type == "vehicle":
             goal_id = str(goal.get("id") or "")
             objects.append(
@@ -271,6 +314,8 @@ def _home_goal_planned_loan_objects(
     goal_id: str,
     data: dict[str, Any],
     target: dict[str, Any],
+    *,
+    planning_group_metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     objects: list[dict[str, Any]] = []
     goal_name = str(data.get("name") or target.get("name") or "目标房产")
@@ -301,6 +346,7 @@ def _home_goal_planned_loan_objects(
                     "repayment_method": target.get("provident_repayment_method") or target.get("repayment_method") or "",
                     "loan_years": target.get("loan_years", 0),
                     "timing_mode": data.get("timing_mode", ""),
+                    **(planning_group_metadata or {}),
                 },
             )
         )
@@ -324,6 +370,7 @@ def _home_goal_planned_loan_objects(
                     "repayment_method": target.get("commercial_repayment_method") or target.get("repayment_method") or "",
                     "loan_years": target.get("loan_years", 0),
                     "timing_mode": data.get("timing_mode", ""),
+                    **(planning_group_metadata or {}),
                 },
             )
         )
