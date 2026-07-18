@@ -228,6 +228,7 @@ export interface QuantInvestmentPolicyData {
   equity_cap: number;
   defensive_min: number;
   rebalance_threshold: number;
+  rebalance_months: number[];
   drawdown_reduce_threshold: number;
   drawdown_pause_threshold: number;
   drawdown_freeze_threshold: number;
@@ -236,6 +237,12 @@ export interface QuantInvestmentPolicyData {
   qdii_nav_max_stale_days: number;
   default_monthly_budget: number;
   slippage_rate: number;
+  max_single_instrument_ratio: number;
+  max_single_market_ratio: number;
+  max_order_amount: number;
+  post_trade_price_deviation_limit: number;
+  research_strategy: "disabled" | "min_variance";
+  freeze_on_reconciliation_mismatch: boolean;
   notes: string;
 }
 
@@ -253,25 +260,42 @@ export interface InvestmentInstrumentData {
   monthly_purchase_limit: number | null;
   buy_fee_rate: number;
   sell_fee_rate: number;
+  lot_size: number;
   qdii_premium_threshold: number | null;
   notes: string;
 }
 
 export interface InvestmentMarketBarData {
   date: string;
+  price_date: string;
   close: number;
   adjusted_close: number | null;
   nav: number | null;
   nav_date: string;
+  nav_available_date: string;
   premium_rate: number | null;
   is_trading: boolean;
+  is_suspended: boolean;
+  purchase_limited: boolean;
 }
 
 export interface InvestmentMarketSnapshotData {
   schema_version: number;
   source: "tushare_pro" | "manual";
+  api_name: string;
+  fetched_at: string;
   snapshot_date: string;
   status: "complete" | "partial" | "empty";
+  trading_calendar: string;
+  calendar_source: "provider" | "observed_prices" | "manual";
+  trading_days: string[];
+  suspension_dates: string[];
+  adjustment: "none" | "forward" | "backward" | "provider";
+  data_version: string;
+  dataset_hash: string;
+  expected_bar_count: number | null;
+  actual_bar_count: number;
+  completeness_ratio: number;
   bars: InvestmentMarketBarData[];
   warning: string;
 }
@@ -287,23 +311,69 @@ export interface QuantInvestmentProposalData {
   effective_equity_cap: number;
   estimated_drawdown: number;
   risk_state: "normal" | "reduced" | "paused" | "frozen" | "blocked";
+  rebalance_triggered: boolean;
+  current_equity_ratio: number;
+  target_weights: Record<string, number>;
+  strategy_versions: Record<string, string>;
   reasons: string[];
 }
 
 export interface PaperOrderData {
   schema_version: number;
+  client_order_id: string;
   proposal_id: string;
   instrument_id: string;
   side: "buy" | "sell";
+  funding_source: "external_contribution" | "paper_cash";
+  is_rebalance: boolean;
   order_amount: number;
   estimated_price: number;
   estimated_quantity: number;
   estimated_fee: number;
+  lot_size: number;
+  expected_trade_date: string;
   status: InvestmentOrderStatus;
   reason: string;
   executed_date: string;
   executed_price: number | null;
   executed_quantity: number | null;
+}
+
+export interface PaperPositionData {
+  instrument_id: string;
+  symbol: string;
+  name: string;
+  market: InvestmentInstrumentMarket;
+  asset_class: InvestmentAssetClass;
+  currency: "CNY" | "HKD" | "USD";
+  quantity: number;
+  average_cost: number;
+  total_cost: number;
+  latest_price: number;
+  latest_price_date: string;
+  market_value: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  total_fees: number;
+}
+
+export interface PaperPortfolioSummary {
+  household_id: string;
+  net_contributions: number;
+  cash_balance: number;
+  market_value: number;
+  total_equity: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  total_fees: number;
+  fill_count: number;
+  frozen: boolean;
+  reconciliation_status: "not_required" | "matched" | "mismatch";
+  positions: PaperPositionData[];
+  ledger_entries: MonthlyLedgerEntry[];
+  account_snapshots: AccountSnapshotPoint[];
+  visualization_details: MonthlyVisualizationDetail[];
+  warnings: string[];
 }
 
 export interface QuantBacktestResult {
@@ -315,7 +385,68 @@ export interface QuantBacktestResult {
   static_terminal_value: number;
   strategy_max_drawdown: number;
   static_max_drawdown: number;
+  strategy_cagr: number;
+  static_cagr: number;
+  strategy_annualized_volatility: number;
+  static_annualized_volatility: number;
+  strategy_turnover: number;
+  static_turnover: number;
+  strategy_total_fees: number;
+  static_total_fees: number;
+  strategy_min_cash_balance: number;
+  static_min_cash_balance: number;
+  trade_count: number;
+  benchmarks: QuantBenchmarkResult[];
+  walk_forward_folds: QuantWalkForwardFold[];
   warnings: string[];
+}
+
+export interface QuantBenchmarkResult {
+  benchmark_id: string;
+  name: string;
+  terminal_value: number;
+  cagr: number;
+  annualized_volatility: number;
+  max_drawdown: number;
+  total_fees: number;
+}
+
+export interface QuantWalkForwardFold {
+  fold_index: number;
+  train_start_date: string;
+  train_end_date: string;
+  test_start_date: string;
+  test_end_date: string;
+  strategy_return: number;
+  static_return: number;
+  strategy_max_drawdown: number;
+  static_max_drawdown: number;
+  warnings: string[];
+}
+
+export interface QuantBacktestRunData {
+  schema_version: number;
+  engine_version: string;
+  policy_id: string;
+  snapshot_ids: string[];
+  strategy_versions: Record<string, string>;
+  universe_version: string;
+  dataset_versions: Record<string, string>;
+  data_fingerprint: string;
+  monthly_contribution: number;
+  start_date: string;
+  end_date: string;
+  cost_assumptions: Record<string, number>;
+  parameters: Record<string, unknown>;
+  policy_snapshot: QuantInvestmentPolicyData;
+  result: QuantBacktestResult;
+  warnings: string[];
+}
+
+export interface QuantBacktestRunRecord extends RecordEnvelope<QuantBacktestRunData> {
+  household_id: string;
+  policy_id: string;
+  data_fingerprint: string;
 }
 
 export interface QuantInvestmentPolicyRecord extends RecordEnvelope<QuantInvestmentPolicyData> {
@@ -2044,6 +2175,7 @@ export interface AffordabilityResult {
   tax_visualization_details: TaxVisualizationDetail[];
   account_snapshots: AccountSnapshotPoint[];
   monthly_ledger: MonthlyLedgerEntry[];
+  paper_portfolio: PaperPortfolioSummary | null;
   loan_visualization: LoanVisualizationPoint[];
   provident_visualization: ProvidentVisualizationPoint[];
   social_security_visualization: SocialSecurityVisualizationPoint[];

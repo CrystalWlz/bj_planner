@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+import uuid
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
@@ -2283,6 +2284,7 @@ class QuantInvestmentPolicyData(BaseModel):
     equity_cap: float = Field(0.35, ge=0, le=1)
     defensive_min: float = Field(0.65, ge=0, le=1)
     rebalance_threshold: float = Field(0.05, ge=0, le=0.5)
+    rebalance_months: list[int] = Field(default_factory=lambda: [3, 6, 9, 12], min_length=1, max_length=12)
     drawdown_reduce_threshold: float = Field(0.08, ge=0, le=1)
     drawdown_pause_threshold: float = Field(0.12, ge=0, le=1)
     drawdown_freeze_threshold: float = Field(0.15, ge=0, le=1)
@@ -2291,6 +2293,12 @@ class QuantInvestmentPolicyData(BaseModel):
     qdii_nav_max_stale_days: int = Field(3, ge=0, le=20)
     default_monthly_budget: float = Field(0, ge=0)
     slippage_rate: float = Field(0.001, ge=0, le=0.05)
+    max_single_instrument_ratio: float = Field(0.35, gt=0, le=1)
+    max_single_market_ratio: float = Field(0.35, gt=0, le=1)
+    max_order_amount: float = Field(20_000, gt=0)
+    post_trade_price_deviation_limit: float = Field(0.02, ge=0, le=0.2)
+    research_strategy: Literal["disabled", "min_variance"] = "disabled"
+    freeze_on_reconciliation_mismatch: bool = True
     notes: str = ""
 
     @model_validator(mode="after")
@@ -2303,6 +2311,9 @@ class QuantInvestmentPolicyData(BaseModel):
             <= self.drawdown_freeze_threshold
         ):
             raise ValueError("回撤阈值必须按降仓、暂停、冻结顺序递增")
+        if any(month < 1 or month > 12 for month in self.rebalance_months):
+            raise ValueError("季度再平衡月份必须位于 1-12 月")
+        self.rebalance_months = sorted(set(self.rebalance_months))
         return self
 
 
@@ -2333,6 +2344,7 @@ class InvestmentInstrumentData(BaseModel):
     monthly_purchase_limit: float | None = Field(default=None, ge=0)
     buy_fee_rate: float = Field(0.0015, ge=0, le=0.05)
     sell_fee_rate: float = Field(0.005, ge=0, le=0.05)
+    lot_size: int = Field(100, ge=1, le=1_000_000)
     qdii_premium_threshold: float | None = Field(default=None, ge=0, le=0.2)
     notes: str = ""
 
@@ -2360,19 +2372,43 @@ class InvestmentInstrumentCreate(BaseModel):
 
 class InvestmentMarketBarData(BaseModel):
     date: str
+    price_date: str = ""
     close: float = Field(gt=0)
     adjusted_close: float | None = Field(default=None, gt=0)
     nav: float | None = Field(default=None, gt=0)
     nav_date: str = ""
+    nav_available_date: str = ""
     premium_rate: float | None = Field(default=None, ge=-1, le=1)
     is_trading: bool = True
+    is_suspended: bool = False
+    purchase_limited: bool = False
+
+    @model_validator(mode="after")
+    def normalize_market_dates(self) -> "InvestmentMarketBarData":
+        if not self.price_date:
+            self.price_date = self.date
+        if self.nav is not None and self.nav_date and not self.nav_available_date:
+            self.nav_available_date = self.nav_date
+        return self
 
 
 class InvestmentMarketSnapshotData(BaseModel):
-    schema_version: int = Field(1, ge=1)
+    schema_version: int = Field(2, ge=1)
     source: Literal["tushare_pro", "manual"] = "tushare_pro"
+    api_name: str = ""
+    fetched_at: str = ""
     snapshot_date: str
     status: InvestmentMarketDataStatus = "complete"
+    trading_calendar: str = ""
+    calendar_source: Literal["provider", "observed_prices", "manual"] = "observed_prices"
+    trading_days: list[str] = Field(default_factory=list, max_length=10000)
+    suspension_dates: list[str] = Field(default_factory=list, max_length=5000)
+    adjustment: Literal["none", "forward", "backward", "provider"] = "none"
+    data_version: str = ""
+    dataset_hash: str = ""
+    expected_bar_count: int | None = Field(default=None, ge=0)
+    actual_bar_count: int = Field(0, ge=0)
+    completeness_ratio: float = Field(0, ge=0, le=1)
     bars: list[InvestmentMarketBarData] = Field(default_factory=list, max_length=5000)
     warning: str = ""
 
@@ -2413,6 +2449,10 @@ class QuantInvestmentProposalData(BaseModel):
     effective_equity_cap: float = Field(ge=0, le=1)
     estimated_drawdown: float = Field(ge=0, le=1)
     risk_state: Literal["normal", "reduced", "paused", "frozen", "blocked"]
+    rebalance_triggered: bool = False
+    current_equity_ratio: float = Field(0, ge=0, le=1)
+    target_weights: dict[str, float] = Field(default_factory=dict)
+    strategy_versions: dict[str, str] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
 
 
@@ -2431,13 +2471,18 @@ class QuantInvestmentProposalRequest(BaseModel):
 
 class PaperOrderData(BaseModel):
     schema_version: int = Field(1, ge=1)
+    client_order_id: str = Field(default_factory=lambda: str(uuid.uuid4()), min_length=8, max_length=100)
     proposal_id: str
     instrument_id: str
     side: Literal["buy", "sell"] = "buy"
+    funding_source: Literal["external_contribution", "paper_cash"] = "external_contribution"
+    is_rebalance: bool = False
     order_amount: float = Field(gt=0)
     estimated_price: float = Field(gt=0)
     estimated_quantity: float = Field(gt=0)
     estimated_fee: float = Field(ge=0)
+    lot_size: int = Field(1, ge=1)
+    expected_trade_date: str = ""
     status: InvestmentOrderStatus = "proposed"
     reason: str = ""
     executed_date: str = ""
@@ -2464,10 +2509,100 @@ class PaperOrderSimulateRequest(BaseModel):
     executed_price: float | None = Field(default=None, gt=0)
 
 
+class PaperFillData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    order_id: str
+    client_order_id: str = ""
+    proposal_id: str
+    instrument_id: str
+    side: Literal["buy", "sell"]
+    executed_date: str
+    executed_price: float = Field(gt=0)
+    executed_quantity: float = Field(gt=0)
+    gross_amount: float = Field(ge=0)
+    fee: float = Field(ge=0)
+    slippage_amount: float = Field(0, ge=0)
+    cash_change: float
+    contribution_amount: float = Field(ge=0)
+    reconciliation_status: Literal["pending", "matched", "mismatch"] = "matched"
+
+
+class PaperFillRecord(BaseModel):
+    id: str
+    household_id: str
+    order_id: str
+    proposal_id: str
+    instrument_id: str
+    data: PaperFillData
+    created_at: datetime
+
+
+class PaperPositionData(BaseModel):
+    instrument_id: str
+    symbol: str
+    name: str
+    market: InvestmentInstrumentMarket
+    asset_class: InvestmentAssetClass
+    currency: Literal["CNY", "HKD", "USD"]
+    quantity: float = Field(ge=0)
+    average_cost: float = Field(ge=0)
+    total_cost: float = Field(ge=0)
+    latest_price: float = Field(ge=0)
+    latest_price_date: str = ""
+    market_value: float = Field(ge=0)
+    unrealized_pnl: float
+    realized_pnl: float = 0.0
+    total_fees: float = Field(ge=0)
+
+
+class PaperPortfolioSummary(BaseModel):
+    household_id: str
+    net_contributions: float = Field(ge=0)
+    cash_balance: float = Field(ge=0)
+    market_value: float = Field(ge=0)
+    total_equity: float = Field(ge=0)
+    unrealized_pnl: float
+    realized_pnl: float
+    total_fees: float = Field(ge=0)
+    fill_count: int = Field(ge=0)
+    frozen: bool = False
+    reconciliation_status: Literal["not_required", "matched", "mismatch"] = "not_required"
+    positions: list[PaperPositionData] = Field(default_factory=list)
+    ledger_entries: list[MonthlyLedgerEntry] = Field(default_factory=list)
+    account_snapshots: list[AccountSnapshotPoint] = Field(default_factory=list)
+    visualization_details: list[MonthlyVisualizationDetail] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class QuantBacktestRequest(BaseModel):
     household_id: str
     policy_id: str
     monthly_contribution: float = Field(1000, gt=0)
+    walk_forward_train_months: int = Field(24, ge=12, le=60)
+    walk_forward_test_months: int = Field(12, ge=3, le=24)
+
+
+class QuantBenchmarkResult(BaseModel):
+    benchmark_id: str
+    name: str
+    terminal_value: float = Field(ge=0)
+    cagr: float = 0.0
+    annualized_volatility: float = Field(0, ge=0)
+    max_drawdown: float = Field(0, ge=0, le=1)
+    total_fees: float = Field(0, ge=0)
+
+
+class QuantWalkForwardFold(BaseModel):
+    fold_index: int = Field(ge=1)
+    train_start_date: str
+    train_end_date: str
+    test_start_date: str
+    test_end_date: str
+    strategy_return: float
+    static_return: float
+    strategy_max_drawdown: float = Field(0, ge=0, le=1)
+    static_max_drawdown: float = Field(0, ge=0, le=1)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class QuantBacktestResult(BaseModel):
@@ -2479,7 +2614,48 @@ class QuantBacktestResult(BaseModel):
     static_terminal_value: float = Field(ge=0)
     strategy_max_drawdown: float = Field(ge=0, le=1)
     static_max_drawdown: float = Field(ge=0, le=1)
+    strategy_cagr: float = 0.0
+    static_cagr: float = 0.0
+    strategy_annualized_volatility: float = Field(0, ge=0)
+    static_annualized_volatility: float = Field(0, ge=0)
+    strategy_turnover: float = Field(0, ge=0)
+    static_turnover: float = Field(0, ge=0)
+    strategy_total_fees: float = Field(0, ge=0)
+    static_total_fees: float = Field(0, ge=0)
+    strategy_min_cash_balance: float = Field(0, ge=0)
+    static_min_cash_balance: float = Field(0, ge=0)
+    trade_count: int = Field(0, ge=0)
+    benchmarks: list[QuantBenchmarkResult] = Field(default_factory=list)
+    walk_forward_folds: list[QuantWalkForwardFold] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class QuantBacktestRunData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    engine_version: str = Field(min_length=1, max_length=100)
+    policy_id: str
+    snapshot_ids: list[str] = Field(default_factory=list)
+    strategy_versions: dict[str, str] = Field(default_factory=dict)
+    universe_version: str = ""
+    dataset_versions: dict[str, str] = Field(default_factory=dict)
+    data_fingerprint: str = Field(min_length=64, max_length=64)
+    monthly_contribution: float = Field(gt=0)
+    start_date: str = ""
+    end_date: str = ""
+    cost_assumptions: dict[str, float] = Field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    policy_snapshot: QuantInvestmentPolicyData
+    result: QuantBacktestResult
+    warnings: list[str] = Field(default_factory=list)
+
+
+class QuantBacktestRunRecord(BaseModel):
+    id: str
+    household_id: str
+    policy_id: str
+    data_fingerprint: str
+    data: QuantBacktestRunData
+    created_at: datetime
 
 
 class PortfolioStrategyRecommendation(BaseModel):
@@ -2676,6 +2852,7 @@ class AffordabilityResult(BaseModel):
     tax_visualization_details: list[TaxVisualizationDetail] = []
     account_snapshots: list[AccountSnapshotPoint] = []
     monthly_ledger: list[MonthlyLedgerEntry] = []
+    paper_portfolio: PaperPortfolioSummary | None = None
     loan_visualization: list[LoanVisualizationPoint] = []
     provident_visualization: list[ProvidentVisualizationPoint] = []
     social_security_visualization: list[SocialSecurityVisualizationPoint] = []

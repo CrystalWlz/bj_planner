@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from hashlib import sha256
+import json
 from typing import Iterable
 
 from ..schemas import (
@@ -13,6 +15,9 @@ from ..schemas import (
 )
 
 
+QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v4"
+
+
 @dataclass(frozen=True)
 class QuantRiskAssessment:
     as_of_date: str
@@ -22,7 +27,39 @@ class QuantRiskAssessment:
     reasons: list[str]
 
 
-def protected_cash_for_quant_investment(household: HouseholdData) -> float:
+def _month_ordinal(value: str) -> int:
+    year_text, month_text = value[:7].split("-", 1)
+    return int(year_text) * 12 + int(month_text) - 1
+
+
+def _scheduled_expenses_next_24_months(household: HouseholdData, *, as_of_month: str) -> float:
+    start_ordinal = _month_ordinal(as_of_month)
+    end_ordinal = start_ordinal + 23
+    total = 0.0
+    for item in household.scheduled_expenses:
+        item_start = _month_ordinal(item.start_month)
+        item_end = _month_ordinal(item.end_month) if item.end_month else end_ordinal
+        overlap_start = max(start_ordinal, item_start)
+        overlap_end = min(end_ordinal, item_end)
+        if overlap_start > overlap_end:
+            continue
+        if item.frequency == "monthly":
+            total += item.monthly_amount * (overlap_end - overlap_start + 1)
+        elif item.frequency == "one_time":
+            total += item.monthly_amount
+        else:
+            for ordinal in range(overlap_start, overlap_end + 1):
+                if ordinal % 12 + 1 == item.annual_occurrence_month:
+                    total += item.monthly_amount
+    return total
+
+
+def protected_cash_for_quant_investment(
+    household: HouseholdData,
+    *,
+    additional_goal_cash: float = 0.0,
+    as_of_month: str | None = None,
+) -> float:
     """Cash that remains unavailable to the investment strategy.
 
     The normal ledger remains the source of truth for full lifecycle goal
@@ -36,17 +73,14 @@ def protected_cash_for_quant_investment(household: HouseholdData) -> float:
         6,
     )
     monthly_expense = max(0.0, household.monthly_expense + household.monthly_debt_payment)
-    scheduled_next_24 = sum(
-        max(0.0, item.amount)
-        for item in household.scheduled_expenses
-        if item.enabled and item.frequency in {"one_time", "annual_once"}
-    )
-    return round(monthly_expense * reserve_months + scheduled_next_24, 2)
+    current_month = as_of_month or date.today().isoformat()[:7]
+    scheduled_next_24 = _scheduled_expenses_next_24_months(household, as_of_month=current_month)
+    return round(monthly_expense * reserve_months + scheduled_next_24 + max(0.0, additional_goal_cash), 2)
 
 
 def _latest_trading_bar(snapshot: InvestmentMarketSnapshotData):
-    bars = [bar for bar in snapshot.bars if bar.is_trading]
-    return max(bars, key=lambda bar: bar.date) if bars else None
+    bars = [bar for bar in snapshot.bars if bar.is_trading and not bar.is_suspended]
+    return max(bars, key=lambda bar: bar.price_date or bar.date) if bars else None
 
 
 def _drawdown_from_prices(prices: Iterable[float]) -> float:
@@ -108,6 +142,8 @@ def instrument_is_buyable(
 ) -> tuple[bool, str]:
     if not instrument.enabled:
         return False, "标的已停用。"
+    if snapshot.status != "complete" and snapshot.source != "manual":
+        return False, "行情数据集不完整，暂停新增买入。"
     if instrument.purchase_suspended:
         return False, "该标的已标记为暂停申购或交易。"
     if instrument.market == "hong_kong_connect" and not instrument.hong_kong_connect_eligible:
@@ -117,10 +153,15 @@ def instrument_is_buyable(
         return False, "没有可用的交易日价格。"
     if instrument.market == "qdii_fund":
         return False, "场外 QDII 仅支持人工申购确认，暂不生成模拟盘口订单。"
+    if latest.purchase_limited:
+        return False, "该交易日存在申购或交易额度限制。"
     if instrument.market == "qdii_etf":
-        if latest.nav is None or not latest.nav_date:
+        if latest.nav is None or not latest.nav_date or not latest.nav_available_date:
             return False, "跨境 QDII ETF 缺少净值，不能判断溢价风险。"
         try:
+            available_date = date.fromisoformat(latest.nav_available_date)
+            if available_date > date.fromisoformat(as_of_date):
+                return False, "跨境 QDII ETF 净值在决策日尚不可得，禁止使用未来净值。"
             nav_age = (date.fromisoformat(as_of_date) - date.fromisoformat(latest.nav_date)).days
         except ValueError:
             return False, "跨境 QDII ETF 的净值日期格式无效。"
@@ -189,66 +230,46 @@ def run_monthly_backtest(
     *,
     monthly_contribution: float,
 ) -> QuantBacktestResult:
-    series = []
-    for snapshot in equity_snapshots:
-        values = [bar for bar in snapshot.bars if bar.is_trading and (bar.adjusted_close or bar.close) > 0]
-        if len(values) >= 36:
-            values.sort(key=lambda bar: bar.date)
-            series.append(values)
-    if not series:
-        raise ValueError("至少需要一只拥有 36 个交易月的权益 ETF 日线数据才能回测。")
-    common_length = min(len(values) for values in series)
-    # Keep at most five years of daily history.  A completed month is roughly
-    # 21 trading sessions, not 12 daily observations.
-    monthly_points = min(common_length, 60 * 21)
-    # A daily source is compressed into regular monthly checkpoints without
-    # looking ahead.  The last observation in each completed 21-day window is
-    # used for the next month's contribution.
-    prices = [values[-monthly_points:] for values in series]
-    checkpoints = list(range(20, monthly_points, 21))
-    if len(checkpoints) < 36:
-        raise ValueError("共同可用历史不足 36 个月，不能给出可比较的回测结果。")
-    strategy_value = 0.0
-    static_value = 0.0
-    strategy_high = 0.0
-    static_high = 0.0
-    strategy_dd = 0.0
-    static_dd = 0.0
-    basket_history: list[float] = []
-    start_date = prices[0][0].date
-    end_date = prices[0][checkpoints[-1]].date
-    prior_prices: list[float] | None = None
-    for checkpoint in checkpoints:
-        current_prices = [values[checkpoint].adjusted_close or values[checkpoint].close for values in prices]
-        if prior_prices is None:
-            monthly_return = 0.0
-        else:
-            monthly_return = sum(current / prior - 1 for current, prior in zip(current_prices, prior_prices)) / len(current_prices)
-        basket_history.append((basket_history[-1] if basket_history else 1.0) * (1 + monthly_return))
-        drawdown = _drawdown_from_prices(basket_history)
-        if drawdown >= policy.drawdown_pause_threshold:
-            strategy_equity = 0.0
-        elif drawdown >= policy.drawdown_reduce_threshold:
-            strategy_equity = min(policy.equity_cap, policy.drawdown_reduced_equity_cap)
-        else:
-            strategy_equity = policy.equity_cap
-        strategy_value = strategy_value * (1 + monthly_return * strategy_equity) + monthly_contribution
-        static_value = static_value * (1 + monthly_return * policy.equity_cap) + monthly_contribution
-        strategy_high = max(strategy_high, strategy_value)
-        static_high = max(static_high, static_value)
-        if strategy_high:
-            strategy_dd = max(strategy_dd, (strategy_high - strategy_value) / strategy_high)
-        if static_high:
-            static_dd = max(static_dd, (static_high - static_value) / static_high)
-        prior_prices = current_prices
-    return QuantBacktestResult(
-        policy_id="",
-        start_date=start_date,
-        end_date=end_date,
-        months=len(checkpoints),
-        strategy_terminal_value=round(strategy_value, 2),
-        static_terminal_value=round(static_value, 2),
-        strategy_max_drawdown=round(strategy_dd, 6),
-        static_max_drawdown=round(static_dd, 6),
-        warnings=["回测基于用户手工标的池，不代表未来收益；未将回测结果用于自动选择标的。"],
-    )
+    from .quant_backtest import BacktestAsset, run_calendar_backtest
+
+    assets = [
+        BacktestAsset(
+            instrument_id=f"legacy-{index}",
+            instrument=InvestmentInstrumentData(
+                symbol=f"LEGACY{index}",
+                name=f"兼容回测标的 {index + 1}",
+                market="mainland_etf",
+                asset_class="equity",
+                lot_size=1,
+            ),
+            snapshot=snapshot,
+        )
+        for index, snapshot in enumerate(equity_snapshots)
+    ]
+    return run_calendar_backtest(policy, assets, monthly_contribution=monthly_contribution)
+
+
+def quant_backtest_fingerprint(
+    policy: QuantInvestmentPolicyData,
+    snapshots: list[tuple[str, InvestmentMarketSnapshotData]],
+    *,
+    monthly_contribution: float,
+    instruments: list[tuple[str, InvestmentInstrumentData]] | None = None,
+    extra_parameters: dict[str, object] | None = None,
+) -> str:
+    payload = {
+        "engine_version": QUANT_BACKTEST_ENGINE_VERSION,
+        "policy": policy.model_dump(mode="json"),
+        "monthly_contribution": round(monthly_contribution, 6),
+        "extra_parameters": extra_parameters or {},
+        "instruments": [
+            {"id": instrument_id, "data": instrument.model_dump(mode="json")}
+            for instrument_id, instrument in sorted(instruments or [], key=lambda item: item[0])
+        ],
+        "snapshots": [
+            {"id": snapshot_id, "data": snapshot.model_dump(mode="json")}
+            for snapshot_id, snapshot in sorted(snapshots, key=lambda item: item[0])
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()

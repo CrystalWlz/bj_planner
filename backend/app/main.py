@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import date
+from hashlib import sha256
 import json
 
 import httpx
@@ -34,7 +35,9 @@ from .database import (
     list_personal_pension_return_snapshots,
     list_records,
     list_investment_market_snapshots,
+    list_paper_investment_fills,
     list_paper_investment_orders,
+    list_quant_backtest_runs,
     list_quant_scoped_records,
     list_scenario_records,
     normalize_household_data,
@@ -52,16 +55,25 @@ from .database import (
     upsert_property_valuation,
     upsert_personal_pension_return_snapshot,
     update_record,
-    update_paper_investment_order,
     update_quant_scoped_record,
     update_scenario_record,
+    record_paper_fill_atomic,
+    upsert_quant_backtest_run,
 )
 from .domain.property_valuation import estimate_property_value
 from .domain.personal_pension_returns import refresh_personal_pension_return_snapshot
-from .domain.quant_investment import run_monthly_backtest
-from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot
+from .domain.paper_portfolio import build_paper_portfolio_summary, paper_fill_from_order
+from .domain.quant_backtest import BacktestAsset, run_calendar_backtest
+from .domain.quant_investment import QUANT_BACKTEST_ENGINE_VERSION, quant_backtest_fingerprint
+from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot, trace_market_snapshot
 from .broker_adapters import PaperBrokerAdapter
-from .strategies.quant_investment import build_quant_monthly_proposal
+from .strategies.quant_investment import (
+    EXECUTION_PLANNER_VERSION,
+    PORTFOLIO_CONSTRUCTOR_VERSION,
+    PRE_TRADE_RISK_VERSION,
+    SIGNAL_MODEL_VERSION,
+    build_quant_monthly_proposal,
+)
 from .planning_context import (
     apply_planning_goal_constraints,
     core_object_snapshot_from_record,
@@ -117,11 +129,16 @@ from .schemas import (
     InvestmentMarketSnapshotData,
     InvestmentMarketSnapshotRecord,
     PaperOrderCreate,
+    PaperFillRecord,
     PaperOrderRecord,
     PaperOrderSimulateRequest,
+    PaperPortfolioSummary,
     QuantBacktestRequest,
     QuantBacktestResult,
+    QuantBacktestRunData,
+    QuantBacktestRunRecord,
     QuantInvestmentPolicyCreate,
+    QuantInvestmentPolicyData,
     QuantInvestmentPolicyRecord,
     QuantInvestmentProposalRecord,
     QuantInvestmentProposalRequest,
@@ -196,6 +213,14 @@ def _upgrade_cached_affordability_payload(
         result["calculation_context"] = next_calculation_context
         changed = True
     return result, changed
+
+
+def _attach_paper_portfolio(result: AffordabilityResult, household_id: str) -> AffordabilityResult:
+    if not household_id:
+        return result
+    policy_records = list_quant_scoped_records("quant_investment_policies", household_id=household_id)
+    policy = QuantInvestmentPolicyRecord.model_validate(policy_records[0]).data if policy_records else None
+    return result.model_copy(update={"paper_portfolio": _paper_portfolio_for_household(household_id, policy)})
 
 
 @asynccontextmanager
@@ -476,11 +501,12 @@ def create_quant_market_snapshot(payload: InvestmentMarketSnapshotCreate) -> dic
     )
     if not instrument_exists:
         raise HTTPException(status_code=404, detail="未找到该家庭的投资标的")
+    snapshot = trace_market_snapshot(payload.data)
     record = upsert_investment_market_snapshot(
         instrument_id=payload.instrument_id,
-        snapshot_date=payload.data.snapshot_date,
-        source=payload.data.source,
-        data=payload.data.model_dump(mode="json"),
+        snapshot_date=snapshot.snapshot_date,
+        source=snapshot.source,
+        data=snapshot.model_dump(mode="json"),
     )
     bump_quant_investment_data_version(payload.household_id)
     return record
@@ -539,19 +565,40 @@ def create_quant_investment_proposal(payload: QuantInvestmentProposalRequest) ->
     policy_record = _quant_policy_record(payload.household_id, payload.policy_id)
     policy = QuantInvestmentPolicyRecord.model_validate(policy_record)
     instruments, snapshots = _quant_snapshot_map(payload.household_id)
+    planning_sequence = planning_goal_sequence_for_request(payload.household_id)
+    protected_by_group: dict[str, float] = {}
+    for goal in planning_sequence.goals:
+        if not goal.enabled or goal.resolved_window_start_month > 24:
+            continue
+        group_key = goal.planning_group_id or goal.id
+        protected_by_group[group_key] = max(protected_by_group.get(group_key, 0.0), max(0.0, goal.target_amount))
+    paper_portfolio = _paper_portfolio_for_household(payload.household_id, policy.data)
     result = build_quant_monthly_proposal(
         household=household,
         policy_id=policy.id,
         policy=policy.data,
         instruments=instruments,
         snapshots=snapshots,
+        additional_goal_cash=sum(protected_by_group.values()),
+        paper_portfolio=paper_portfolio,
     )
+    proposal_data = result.proposal
+    orders = result.orders
+    if paper_portfolio.frozen:
+        proposal_data = proposal_data.model_copy(
+            update={
+                "proposed_budget": 0.0,
+                "risk_state": "frozen",
+                "reasons": [*proposal_data.reasons, *paper_portfolio.warnings, "模拟账户事后风控异常，仅允许暂停新增，不执行自动补仓。"],
+            }
+        )
+        orders = []
     proposal_record = insert_quant_scoped_record(
         "quant_investment_proposals",
         household_id=payload.household_id,
-        data=result.proposal.model_dump(mode="json"),
+        data=proposal_data.model_dump(mode="json"),
     )
-    for order in result.orders:
+    for order in orders:
         order_data = order.model_copy(update={"proposal_id": proposal_record["id"]})
         insert_paper_investment_order(
             household_id=payload.household_id,
@@ -567,21 +614,127 @@ def run_quant_investment_backtest(payload: QuantBacktestRequest) -> QuantBacktes
     policy_record = _quant_policy_record(payload.household_id, payload.policy_id)
     policy = QuantInvestmentPolicyRecord.model_validate(policy_record)
     instruments, snapshots = _quant_snapshot_map(payload.household_id)
-    equity_snapshots = [
-        snapshot
-        for instrument_id, (_snapshot_id, snapshot) in snapshots.items()
-        if any(item_id == instrument_id and item.asset_class == "equity" for item_id, item in instruments)
+    instrument_map = dict(instruments)
+    asset_snapshot_entries = [
+        (instrument_id, snapshot_id, snapshot)
+        for instrument_id, (snapshot_id, snapshot) in snapshots.items()
+        if instrument_map.get(instrument_id) and instrument_map[instrument_id].enabled
+    ]
+    assets = [
+        BacktestAsset(instrument_id, instrument_map[instrument_id], snapshot)
+        for instrument_id, _snapshot_id, snapshot in asset_snapshot_entries
     ]
     try:
-        result = run_monthly_backtest(policy.data, equity_snapshots, monthly_contribution=payload.monthly_contribution)
+        result = run_calendar_backtest(
+            policy.data,
+            assets,
+            monthly_contribution=payload.monthly_contribution,
+            walk_forward_train_months=payload.walk_forward_train_months,
+            walk_forward_test_months=payload.walk_forward_test_months,
+        ).model_copy(update={"policy_id": policy.id})
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return result.model_copy(update={"policy_id": policy.id})
+    fingerprint = quant_backtest_fingerprint(
+        policy.data,
+        [(snapshot_id, snapshot) for _instrument_id, snapshot_id, snapshot in asset_snapshot_entries],
+        monthly_contribution=payload.monthly_contribution,
+        instruments=[(asset.instrument_id, asset.instrument) for asset in assets],
+        extra_parameters={
+            "walk_forward_train_months": payload.walk_forward_train_months,
+            "walk_forward_test_months": payload.walk_forward_test_months,
+        },
+    )
+    strategy_versions = {
+        "signal_model": SIGNAL_MODEL_VERSION,
+        "portfolio_constructor": PORTFOLIO_CONSTRUCTOR_VERSION,
+        "pre_trade_risk_manager": PRE_TRADE_RISK_VERSION,
+        "execution_planner": EXECUTION_PLANNER_VERSION,
+    }
+    universe_payload = [
+        {"id": asset.instrument_id, "data": asset.instrument.model_dump(mode="json")}
+        for asset in sorted(assets, key=lambda item: item.instrument_id)
+    ]
+    universe_version = sha256(json.dumps(universe_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    run_data = QuantBacktestRunData(
+        engine_version=QUANT_BACKTEST_ENGINE_VERSION,
+        policy_id=policy.id,
+        snapshot_ids=[snapshot_id for _instrument_id, snapshot_id, _snapshot in asset_snapshot_entries],
+        strategy_versions=strategy_versions,
+        universe_version=universe_version,
+        dataset_versions={snapshot_id: snapshot.data_version for _instrument_id, snapshot_id, snapshot in asset_snapshot_entries},
+        data_fingerprint=fingerprint,
+        monthly_contribution=payload.monthly_contribution,
+        start_date=result.start_date,
+        end_date=result.end_date,
+        cost_assumptions={
+            "slippage_rate": policy.data.slippage_rate,
+            "maximum_buy_fee_rate": max((asset.instrument.buy_fee_rate for asset in assets), default=0.0),
+        },
+        parameters={
+            "research_strategy": policy.data.research_strategy,
+            "walk_forward_train_months": payload.walk_forward_train_months,
+            "walk_forward_test_months": payload.walk_forward_test_months,
+        },
+        policy_snapshot=policy.data,
+        result=result,
+        warnings=result.warnings,
+    )
+    upsert_quant_backtest_run(
+        household_id=payload.household_id,
+        policy_id=policy.id,
+        data_fingerprint=fingerprint,
+        data=run_data.model_dump(mode="json"),
+    )
+    return result
+
+
+@app.get("/api/quant-investment/backtest-runs", response_model=list[QuantBacktestRunRecord])
+def get_quant_backtest_runs(household_id: str) -> list[dict]:
+    return list_quant_backtest_runs(household_id=household_id)
 
 
 @app.get("/api/quant-investment/paper-orders", response_model=list[PaperOrderRecord])
 def get_quant_paper_orders(household_id: str) -> list[dict]:
     return list_paper_investment_orders(household_id=household_id)
+
+
+@app.get("/api/quant-investment/paper-fills", response_model=list[PaperFillRecord])
+def get_quant_paper_fills(household_id: str) -> list[dict]:
+    return list_paper_investment_fills(household_id=household_id)
+
+
+@app.get("/api/quant-investment/paper-portfolio", response_model=PaperPortfolioSummary)
+def get_quant_paper_portfolio(household_id: str) -> PaperPortfolioSummary:
+    policy_records = list_quant_scoped_records("quant_investment_policies", household_id=household_id)
+    policy = QuantInvestmentPolicyRecord.model_validate(policy_records[0]).data if policy_records else None
+    return _paper_portfolio_for_household(household_id, policy)
+
+
+def _paper_portfolio_for_household(
+    household_id: str,
+    policy: QuantInvestmentPolicyData | None = None,
+) -> PaperPortfolioSummary:
+    instrument_records = list_quant_scoped_records("investment_instruments", household_id=household_id)
+    instruments = {
+        item["id"]: InvestmentInstrumentRecord.model_validate(item).data
+        for item in instrument_records
+    }
+    snapshot_records = list_investment_market_snapshots(instrument_ids=list(instruments))
+    snapshots = {
+        item["instrument_id"]: InvestmentMarketSnapshotRecord.model_validate(item).data
+        for item in snapshot_records
+    }
+    fills = [
+        PaperFillRecord.model_validate(item).data
+        for item in list_paper_investment_fills(household_id=household_id)
+    ]
+    return build_paper_portfolio_summary(
+        household_id=household_id,
+        fills=fills,
+        instruments=instruments,
+        snapshots=snapshots,
+        policy=policy,
+    )
 
 
 @app.post("/api/quant-investment/paper-orders", response_model=PaperOrderRecord)
@@ -600,23 +753,49 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
     if existing is None:
         raise HTTPException(status_code=404, detail="未找到模拟订单")
     order = PaperOrderRecord.model_validate(existing)
+    if order.data.status not in {"proposed", "simulated"}:
+        raise HTTPException(status_code=409, detail="当前订单状态不允许模拟成交")
+    policy_records = list_quant_scoped_records("quant_investment_policies", household_id=payload.household_id)
+    policy = QuantInvestmentPolicyRecord.model_validate(policy_records[0]).data if policy_records else None
+    portfolio = _paper_portfolio_for_household(payload.household_id, policy)
+    if order.data.status == "proposed" and order.data.side == "buy" and portfolio.frozen:
+        raise HTTPException(status_code=409, detail="模拟账户事后风控已冻结新增买入；请先人工复核异常")
+    if order.data.status == "proposed" and order.data.side == "buy" and order.data.funding_source == "paper_cash":
+        if order.data.order_amount > portfolio.cash_balance + 1e-6:
+            raise HTTPException(status_code=409, detail="模拟现金不足；请先成交再平衡卖出订单或降低买入金额")
+    if order.data.status == "proposed" and order.data.side == "sell":
+        position = next((item for item in portfolio.positions if item.instrument_id == order.data.instrument_id), None)
+        if position is None or order.data.estimated_quantity > position.quantity + 1e-6:
+            raise HTTPException(status_code=409, detail="模拟卖出数量超过当前可用持仓")
+    fill_existed = any(
+        item["order_id"] == record_id
+        for item in list_paper_investment_fills(household_id=payload.household_id)
+    )
     if order.data.status == "simulated":
-        return existing
+        simulated = order.data
+    else:
+        try:
+            simulated = PaperBrokerAdapter().simulate(
+                order.data,
+                executed_date=payload.executed_date,
+                executed_price=payload.executed_price,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
-        simulated = PaperBrokerAdapter().simulate(
-            order.data,
-            executed_date=payload.executed_date,
-            executed_price=payload.executed_price,
-        )
+        fill = paper_fill_from_order(record_id, simulated)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    record = update_paper_investment_order(
+    record, _fill_record = record_paper_fill_atomic(
         record_id,
         household_id=payload.household_id,
-        data=simulated.model_dump(mode="json"),
+        order_data=simulated.model_dump(mode="json"),
+        fill_data=fill.model_dump(mode="json"),
     )
     if record is None:
         raise HTTPException(status_code=404, detail="未找到模拟订单")
+    if not fill_existed:
+        bump_quant_investment_data_version(payload.household_id)
     return record
 
 
@@ -728,7 +907,9 @@ def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
             if not strategies_exist:
                 with profile_span("cache_hit_strategy_writeback"):
                     upsert_generated_strategies(cache_key, engine_fingerprint, cache_layers, upgraded_payload)
-            return AffordabilityResult.model_validate(upgraded_payload)
+            cached_result = AffordabilityResult.model_validate(upgraded_payload)
+            cached_result = _attach_paper_portfolio(cached_result, cache_payload.household_id)
+            return cached_result
 
         with profile_span("planning_goal_constraints"):
             payload = apply_planning_goal_constraints(cache_payload)
@@ -743,6 +924,7 @@ def calculate(payload: AffordabilityRequest) -> AffordabilityResult:
             )
         with profile_span("result_payload"):
             result = result.model_copy(update={"cache_layers": cache_layers})
+            result = _attach_paper_portfolio(result, cache_payload.household_id)
             result_payload = result.model_dump(mode="json")
         with profile_span("calculation_cache_write"):
             upsert_calculation_cache(cache_key, engine_fingerprint, cache_layers, result_payload)

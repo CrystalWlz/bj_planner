@@ -5151,6 +5151,21 @@ button.comparison-row:hover {
   line-height: 1.55;
 }
 
+.quant-instrument-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.quant-instrument-heading span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .strategy-card .strategy-note {
   margin: 12px 0 0;
   padding-top: 10px;

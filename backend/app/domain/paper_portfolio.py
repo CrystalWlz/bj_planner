@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+
+from ..schemas import (
+    AccountSnapshotPoint,
+    InvestmentInstrumentData,
+    InvestmentMarketSnapshotData,
+    MonthlyLedgerEntry,
+    MonthlyVisualizationDetail,
+    PaperFillData,
+    PaperOrderData,
+    PaperPortfolioSummary,
+    PaperPositionData,
+    QuantInvestmentPolicyData,
+    VisualizationBreakdownItem,
+)
+
+
+@dataclass
+class _PositionState:
+    quantity: float = 0.0
+    total_cost: float = 0.0
+    realized_pnl: float = 0.0
+    total_fees: float = 0.0
+
+
+def paper_fill_from_order(order_id: str, order: PaperOrderData) -> PaperFillData:
+    if order.status != "simulated" or order.executed_price is None or order.executed_quantity is None:
+        raise ValueError("只有已模拟成交且包含成交价格和数量的订单才能写入成交账本")
+    gross_amount = order.executed_price * order.executed_quantity
+    if order.side == "buy":
+        cash_change = -(gross_amount + order.estimated_fee)
+        contribution_amount = order.order_amount if order.funding_source == "external_contribution" else 0.0
+    else:
+        cash_change = gross_amount - order.estimated_fee
+        contribution_amount = 0.0
+    return PaperFillData(
+        order_id=order_id,
+        client_order_id=order.client_order_id,
+        proposal_id=order.proposal_id,
+        instrument_id=order.instrument_id,
+        side=order.side,
+        executed_date=order.executed_date,
+        executed_price=order.executed_price,
+        executed_quantity=order.executed_quantity,
+        gross_amount=round(gross_amount, 2),
+        fee=round(order.estimated_fee, 2),
+        slippage_amount=round(abs(order.executed_price - order.estimated_price) * order.executed_quantity, 2),
+        cash_change=round(cash_change, 2),
+        contribution_amount=round(contribution_amount, 2),
+    )
+
+
+def _ledger_entry(
+    *,
+    month: int,
+    account: str,
+    category: str,
+    label: str,
+    amount: float,
+    direction: str,
+) -> MonthlyLedgerEntry:
+    return MonthlyLedgerEntry(
+        plan_variant="paper_quant",
+        month=month,
+        account=account,
+        category=category,
+        label=label,
+        amount=round(amount, 2),
+        direction=direction,
+        source="paper_portfolio_ledger",
+    )
+
+
+def _paper_ledger_artifacts(
+    fills: list[PaperFillData],
+    *,
+    cash_balance: float,
+    market_value: float,
+    total_equity: float,
+    unrealized_pnl: float,
+    realized_pnl: float,
+) -> tuple[list[MonthlyLedgerEntry], list[AccountSnapshotPoint], list[MonthlyVisualizationDetail]]:
+    if not fills:
+        return [], [], []
+    month_keys = sorted({fill.executed_date[:7] for fill in fills})
+    month_index = {key: index + 1 for index, key in enumerate(month_keys)}
+    entries: list[MonthlyLedgerEntry] = []
+    running_cash = 0.0
+    running_investment = 0.0
+    snapshots: list[AccountSnapshotPoint] = []
+    details: list[MonthlyVisualizationDetail] = []
+    fills_by_month: dict[str, list[PaperFillData]] = {key: [] for key in month_keys}
+    for fill in fills:
+        fills_by_month[fill.executed_date[:7]].append(fill)
+
+    for key in month_keys:
+        month = month_index[key]
+        month_entries: list[MonthlyLedgerEntry] = []
+        for fill in fills_by_month[key]:
+            running_cash += fill.contribution_amount + fill.cash_change
+            if fill.contribution_amount:
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_contribution", label="模拟账户资金投入", amount=fill.contribution_amount, direction="inflow"))
+            if fill.side == "buy":
+                running_investment += fill.gross_amount
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_buy", label="模拟买入现金划出", amount=-fill.gross_amount, direction="transfer"))
+                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_buy", label="模拟投资持仓增加", amount=fill.gross_amount, direction="transfer"))
+            else:
+                running_investment = max(0.0, running_investment - fill.gross_amount)
+                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_sell", label="模拟投资持仓卖出", amount=-fill.gross_amount, direction="transfer"))
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_sell", label="模拟卖出现金到账", amount=fill.gross_amount, direction="transfer"))
+            if fill.fee:
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_fee", label="模拟交易手续费", amount=-fill.fee, direction="outflow"))
+        entries.extend(month_entries)
+        is_last = key == month_keys[-1]
+        snapshot_market_value = market_value if is_last else running_investment
+        snapshot_cash = cash_balance if is_last else max(0.0, running_cash)
+        snapshot_total = total_equity if is_last else snapshot_cash + snapshot_market_value
+        snapshots.append(
+            AccountSnapshotPoint(
+                plan_variant="paper_quant",
+                month=month,
+                cash_balance=round(snapshot_cash, 2),
+                investment_balance=round(snapshot_market_value, 2),
+                liquid_asset_value=round(snapshot_total, 2),
+                provident_balance=0.0,
+                fixed_asset_value=0.0,
+                total_asset_value=round(snapshot_total, 2),
+                total_loan_balance=0.0,
+                net_worth=round(snapshot_total, 2),
+            )
+        )
+        cash_flow_items = [
+            VisualizationBreakdownItem(
+                name=item.label,
+                value=abs(item.amount),
+                amount=item.amount,
+                kind="income" if item.direction == "inflow" else ("expense" if item.direction == "outflow" else "asset"),
+            )
+            for item in month_entries
+        ]
+        if is_last and unrealized_pnl:
+            entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_unrealized_pnl", label="模拟持仓未实现盈亏", amount=unrealized_pnl, direction="valuation"))
+            cash_flow_items.append(VisualizationBreakdownItem(name="未实现盈亏", value=abs(unrealized_pnl), amount=unrealized_pnl, kind="result"))
+        if is_last and realized_pnl:
+            entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_realized_pnl", label="模拟交易已实现盈亏", amount=realized_pnl, direction="valuation"))
+            cash_flow_items.append(VisualizationBreakdownItem(name="已实现盈亏", value=abs(realized_pnl), amount=realized_pnl, kind="result"))
+        details.append(
+            MonthlyVisualizationDetail(
+                plan_variant="paper_quant",
+                month=month,
+                cash_flow_items=cash_flow_items,
+                cash_flow_drivers=sorted(cash_flow_items, key=lambda item: item.value, reverse=True)[:5],
+                advisor_text=f"模拟账户第 {month} 期净值 {snapshot_total:.2f} 元；该账户与家庭真实现金、投资账户相互隔离。",
+                explanation_items=[{"title": "模拟账本", "body": "提案生成订单意图，成交事件进入账本，再由账本派生账户快照和可视化；任何异常只冻结新增订单。"}],
+            )
+        )
+    return entries, snapshots, details
+
+
+def build_paper_portfolio_summary(
+    *,
+    household_id: str,
+    fills: list[PaperFillData],
+    instruments: dict[str, InvestmentInstrumentData],
+    snapshots: dict[str, InvestmentMarketSnapshotData],
+    policy: QuantInvestmentPolicyData | None = None,
+) -> PaperPortfolioSummary:
+    states: dict[str, _PositionState] = {}
+    warnings: list[str] = []
+    frozen = False
+    reconciliation_mismatch = False
+    contributions = 0.0
+    cash_balance = 0.0
+    for fill in fills:
+        if fill.reconciliation_status == "mismatch":
+            reconciliation_mismatch = True
+            frozen = True
+            warnings.append(f"订单 {fill.client_order_id or fill.order_id} 存在对账差异，已冻结新增提案")
+        if policy and fill.gross_amount > 0 and fill.slippage_amount / fill.gross_amount > policy.post_trade_price_deviation_limit:
+            frozen = True
+            warnings.append(f"订单 {fill.client_order_id or fill.order_id} 的成交偏离超过阈值，已冻结新增提案")
+        state = states.setdefault(fill.instrument_id, _PositionState())
+        contributions += fill.contribution_amount
+        cash_balance += fill.cash_change + fill.contribution_amount
+        state.total_fees += fill.fee
+        if fill.side == "buy":
+            state.quantity += fill.executed_quantity
+            state.total_cost += fill.gross_amount + fill.fee
+            continue
+        sold_quantity = min(state.quantity, fill.executed_quantity)
+        if sold_quantity < fill.executed_quantity:
+            warnings.append(f"{fill.instrument_id} 的卖出成交超过模拟持仓，已按可用持仓计算")
+        average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
+        removed_cost = average_cost * sold_quantity
+        sale_proceeds = fill.executed_price * sold_quantity - fill.fee
+        state.realized_pnl += sale_proceeds - removed_cost
+        state.quantity -= sold_quantity
+        state.total_cost = max(0.0, state.total_cost - removed_cost)
+
+    positions: list[PaperPositionData] = []
+    for instrument_id, state in states.items():
+        if state.quantity <= 1e-9:
+            continue
+        instrument = instruments.get(instrument_id)
+        if instrument is None:
+            warnings.append(f"成交账本中的标的 {instrument_id} 已不在当前标的池")
+            continue
+        average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
+        latest_price = average_cost
+        latest_price_date = ""
+        snapshot = snapshots.get(instrument_id)
+        if snapshot is not None:
+            bars = [bar for bar in snapshot.bars if bar.is_trading and (bar.adjusted_close or bar.close) > 0]
+            if bars:
+                latest_bar = max(bars, key=lambda bar: bar.date)
+                latest_price = float(latest_bar.adjusted_close or latest_bar.close)
+                latest_price_date = latest_bar.price_date or latest_bar.date
+                if policy and instrument.market == "qdii_etf":
+                    nav_available_date = latest_bar.nav_available_date or latest_bar.nav_date
+                    if not nav_available_date or latest_bar.nav is None:
+                        frozen = True
+                        warnings.append(f"{instrument.name} 的最新可得净值缺失，已冻结新增提案")
+                    elif latest_bar.nav_date and (date.fromisoformat(snapshot.snapshot_date) - date.fromisoformat(latest_bar.nav_date)).days > policy.qdii_nav_max_stale_days:
+                        frozen = True
+                        warnings.append(f"{instrument.name} 的最新可得净值已过期，已冻结新增提案")
+        if not latest_price_date:
+            warnings.append(f"{instrument.name} 缺少最新行情，暂按持仓成本估值")
+        market_value = state.quantity * latest_price
+        positions.append(
+            PaperPositionData(
+                instrument_id=instrument_id,
+                symbol=instrument.symbol,
+                name=instrument.name,
+                market=instrument.market,
+                asset_class=instrument.asset_class,
+                currency=instrument.currency,
+                quantity=round(state.quantity, 6),
+                average_cost=round(average_cost, 6),
+                total_cost=round(state.total_cost, 2),
+                latest_price=round(latest_price, 6),
+                latest_price_date=latest_price_date,
+                market_value=round(market_value, 2),
+                unrealized_pnl=round(market_value - state.total_cost, 2),
+                realized_pnl=round(state.realized_pnl, 2),
+                total_fees=round(state.total_fees, 2),
+            )
+        )
+    positions.sort(key=lambda item: (-item.market_value, item.symbol))
+    market_value = sum(item.market_value for item in positions)
+    unrealized_pnl = sum(item.unrealized_pnl for item in positions)
+    realized_pnl = sum(state.realized_pnl for state in states.values())
+    total_fees = sum(state.total_fees for state in states.values())
+    ledger_entries, account_snapshots, visualization_details = _paper_ledger_artifacts(
+        fills,
+        cash_balance=max(0.0, cash_balance),
+        market_value=market_value,
+        total_equity=max(0.0, cash_balance) + market_value,
+        unrealized_pnl=unrealized_pnl,
+        realized_pnl=realized_pnl,
+    )
+    return PaperPortfolioSummary(
+        household_id=household_id,
+        net_contributions=round(contributions, 2),
+        cash_balance=round(max(0.0, cash_balance), 2),
+        market_value=round(market_value, 2),
+        total_equity=round(max(0.0, cash_balance) + market_value, 2),
+        unrealized_pnl=round(unrealized_pnl, 2),
+        realized_pnl=round(realized_pnl, 2),
+        total_fees=round(total_fees, 2),
+        fill_count=len(fills),
+        frozen=frozen,
+        reconciliation_status="not_required" if not fills else ("mismatch" if reconciliation_mismatch else "matched"),
+        positions=positions,
+        ledger_entries=ledger_entries,
+        account_snapshots=account_snapshots,
+        visualization_details=visualization_details,
+        warnings=warnings,
+    )

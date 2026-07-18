@@ -155,10 +155,11 @@ def initialize_database() -> None:
                 instrument_id TEXT NOT NULL,
                 snapshot_date TEXT NOT NULL,
                 source TEXT NOT NULL,
+                dataset_hash TEXT NOT NULL,
                 data TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(instrument_id, snapshot_date, source)
+                UNIQUE(instrument_id, dataset_hash)
             );
 
             CREATE INDEX IF NOT EXISTS idx_investment_market_snapshots_instrument
@@ -188,6 +189,37 @@ def initialize_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_paper_investment_orders_household
                 ON paper_investment_orders(household_id, updated_at DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_investment_orders_client_order_id
+                ON paper_investment_orders(json_extract(data, '$.client_order_id'))
+                WHERE json_extract(data, '$.client_order_id') IS NOT NULL
+                  AND json_extract(data, '$.client_order_id') <> '';
+
+            CREATE TABLE IF NOT EXISTS paper_investment_fills (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                order_id TEXT NOT NULL UNIQUE,
+                proposal_id TEXT NOT NULL,
+                instrument_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_investment_fills_household
+                ON paper_investment_fills(household_id, created_at ASC);
+
+            CREATE TABLE IF NOT EXISTS quant_backtest_runs (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                data_fingerprint TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(household_id, data_fingerprint)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_quant_backtest_runs_household
+                ON quant_backtest_runs(household_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS property_valuations (
                 id TEXT PRIMARY KEY,
@@ -307,12 +339,55 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
     return changed
 
 
+def _ensure_versioned_investment_market_snapshots(conn: sqlite3.Connection) -> bool:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(investment_market_snapshots)").fetchall()}
+    if "dataset_hash" in columns:
+        return False
+    rows = conn.execute("SELECT * FROM investment_market_snapshots").fetchall()
+    conn.executescript(
+        """
+        CREATE TABLE investment_market_snapshots_next (
+            id TEXT PRIMARY KEY,
+            instrument_id TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            source TEXT NOT NULL,
+            dataset_hash TEXT NOT NULL,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(instrument_id, dataset_hash)
+        );
+        """
+    )
+    for row in rows:
+        data = _load_json(row["data"])
+        dataset_hash = str(data.get("dataset_hash") or row["id"])
+        conn.execute(
+            """
+            INSERT INTO investment_market_snapshots_next
+                (id, instrument_id, snapshot_date, source, dataset_hash, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row["id"], row["instrument_id"], row["snapshot_date"], row["source"], dataset_hash, row["data"], row["created_at"], row["updated_at"]),
+        )
+    conn.executescript(
+        """
+        DROP TABLE investment_market_snapshots;
+        ALTER TABLE investment_market_snapshots_next RENAME TO investment_market_snapshots;
+        CREATE INDEX idx_investment_market_snapshots_instrument
+            ON investment_market_snapshots(instrument_id, snapshot_date DESC, created_at DESC);
+        """
+    )
+    return True
+
+
 def migrate_database(conn: sqlite3.Connection) -> None:
     previous_schema_history = _has_previous_schema_history(conn)
     child_count_semantics_migration_pending = not _migration_applied(conn, CURRENT_SCHEMA_VERSION)
     changed = _migrate_home_renovation_fields_to_planning_events(conn)
     changed = _normalize_current_records(conn) or changed
     changed = _migrate_scenario_shadows_to_planning_goals(conn) or changed
+    changed = _ensure_versioned_investment_market_snapshots(conn) or changed
     cache_layer_columns = {
         "input_hash": "TEXT NOT NULL DEFAULT ''",
         "strategy_hash": "TEXT NOT NULL DEFAULT ''",
@@ -884,19 +959,20 @@ def upsert_investment_market_snapshot(
     source: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
-    record_id = uuid.uuid5(uuid.NAMESPACE_URL, f"house-planner:investment-market:{instrument_id}:{snapshot_date}:{source}").hex
+    dataset_hash = str(data.get("dataset_hash") or uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(data, ensure_ascii=False, sort_keys=True)).hex)
+    record_id = uuid.uuid5(uuid.NAMESPACE_URL, f"house-planner:investment-market:{instrument_id}:{dataset_hash}").hex
     timestamp = now_iso()
     payload = json.dumps(data, ensure_ascii=False)
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO investment_market_snapshots (id, instrument_id, snapshot_date, source, data, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(instrument_id, snapshot_date, source) DO UPDATE SET
+            INSERT INTO investment_market_snapshots (id, instrument_id, snapshot_date, source, dataset_hash, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(instrument_id, dataset_hash) DO UPDATE SET
                 data = excluded.data,
                 updated_at = excluded.updated_at
             """,
-            (record_id, instrument_id, snapshot_date, source, payload, timestamp, timestamp),
+            (record_id, instrument_id, snapshot_date, source, dataset_hash, payload, timestamp, timestamp),
         )
         row = conn.execute("SELECT * FROM investment_market_snapshots WHERE id = ?", (record_id,)).fetchone()
     if row is None:
@@ -982,6 +1058,122 @@ def update_paper_investment_order(record_id: str, *, household_id: str, data: di
         )
         row = conn.execute("SELECT * FROM paper_investment_orders WHERE id = ?", (record_id,)).fetchone()
     return _paper_order_record(row) if row else None
+
+
+def record_paper_fill_atomic(
+    order_id: str,
+    *,
+    household_id: str,
+    order_data: dict[str, Any],
+    fill_data: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Persist the simulated order state and immutable fill in one transaction."""
+    timestamp = now_iso()
+    with get_connection() as conn:
+        order_row = conn.execute(
+            "SELECT * FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (order_id, household_id),
+        ).fetchone()
+        if order_row is None:
+            return None, None
+        fill_row = conn.execute(
+            "SELECT * FROM paper_investment_fills WHERE order_id = ? AND household_id = ?",
+            (order_id, household_id),
+        ).fetchone()
+        if fill_row is None:
+            conn.execute(
+                "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(order_data, ensure_ascii=False), timestamp, order_id),
+            )
+            fill_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO paper_investment_fills
+                    (id, household_id, order_id, proposal_id, instrument_id, data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill_id,
+                    household_id,
+                    order_id,
+                    str(fill_data["proposal_id"]),
+                    str(fill_data["instrument_id"]),
+                    json.dumps(fill_data, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+        order_row = conn.execute("SELECT * FROM paper_investment_orders WHERE id = ?", (order_id,)).fetchone()
+        fill_row = conn.execute("SELECT * FROM paper_investment_fills WHERE order_id = ?", (order_id,)).fetchone()
+    return (
+        _paper_order_record(order_row) if order_row else None,
+        _paper_fill_record(fill_row) if fill_row else None,
+    )
+
+
+def _paper_fill_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["data"] = _load_json(record["data"])
+    return record
+
+
+def list_paper_investment_fills(*, household_id: str) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM paper_investment_fills WHERE household_id = ? ORDER BY created_at ASC, id ASC",
+            (household_id,),
+        ).fetchall()
+    return [_paper_fill_record(row) for row in rows]
+
+
+def upsert_quant_backtest_run(
+    *,
+    household_id: str,
+    policy_id: str,
+    data_fingerprint: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM quant_backtest_runs WHERE household_id = ? AND data_fingerprint = ?",
+            (household_id, data_fingerprint),
+        ).fetchone()
+        if row is None:
+            record_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO quant_backtest_runs
+                    (id, household_id, policy_id, data_fingerprint, data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    household_id,
+                    policy_id,
+                    data_fingerprint,
+                    json.dumps(data, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            row = conn.execute("SELECT * FROM quant_backtest_runs WHERE id = ?", (record_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("Quant backtest run upsert failed")
+    return _quant_backtest_run_record(row)
+
+
+def _quant_backtest_run_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["data"] = _load_json(record["data"])
+    return record
+
+
+def list_quant_backtest_runs(*, household_id: str) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM quant_backtest_runs WHERE household_id = ? ORDER BY created_at DESC, id DESC",
+            (household_id,),
+        ).fetchall()
+    return [_quant_backtest_run_record(row) for row in rows]
 
 
 def list_property_valuations(

@@ -19,6 +19,7 @@ import type {
   PersonalPensionReturnSnapshotRecord,
   PaperOrderData,
   PaperOrderRecord,
+  PaperPortfolioSummary,
   PlanningGoalData,
   PlanningFoundationSummary,
   PlanningGoalRecord,
@@ -27,6 +28,7 @@ import type {
   RecordEnvelope,
   RulePackData,
   QuantBacktestResult,
+  QuantBacktestRunRecord,
   QuantInvestmentPolicyData,
   QuantInvestmentPolicyRecord,
   QuantInvestmentProposalRecord,
@@ -179,8 +181,16 @@ export function runQuantInvestmentBacktest(householdId: string, policyId: string
   });
 }
 
+export function fetchQuantBacktestRuns(householdId: string) {
+  return request<QuantBacktestRunRecord[]>(`/api/quant-investment/backtest-runs?${new URLSearchParams({ household_id: householdId })}`);
+}
+
 export function fetchQuantPaperOrders(householdId: string) {
   return request<PaperOrderRecord[]>(`/api/quant-investment/paper-orders?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function fetchQuantPaperPortfolio(householdId: string) {
+  return request<PaperPortfolioSummary>(`/api/quant-investment/paper-portfolio?${new URLSearchParams({ household_id: householdId })}`);
 }
 
 export function simulateQuantPaperOrder(id: string, householdId: string, executedPrice?: number) {
