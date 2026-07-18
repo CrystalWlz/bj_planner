@@ -1266,6 +1266,30 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
             PaperBrokerAdapter(),
             is_order_persisted=lambda _local_order_id, _client_order_id: False,
         ).submit(local_order_id="local-order-1", order=order)
+    with pytest.raises(RuntimeError, match="动作状态校验器"):
+        LocalFirstBrokerGateway(
+            PaperBrokerAdapter(),
+            is_order_persisted=lambda _local_order_id, _client_order_id: True,
+        ).submit(local_order_id="local-order-1", order=order)
+    with pytest.raises(RuntimeError, match="不允许执行 submit"):
+        LocalFirstBrokerGateway(
+            PaperBrokerAdapter(),
+            is_order_persisted=lambda _local_order_id, _client_order_id: True,
+            is_order_action_allowed=lambda _local_order_id, _client_order_id, _action: False,
+        ).submit(local_order_id="local-order-1", order=order)
+    submitted = LocalFirstBrokerGateway(
+        PaperBrokerAdapter(),
+        is_order_persisted=lambda _local_order_id, _client_order_id: True,
+        is_order_action_allowed=lambda _local_order_id, _client_order_id, action: action == "submit",
+    ).submit(local_order_id="local-order-1", order=order)
+    assert submitted.status == "simulated"
+    cancel_requested = order.model_copy(update={"status": "cancel_requested"})
+    cancelled = LocalFirstBrokerGateway(
+        PaperBrokerAdapter(orders=(cancel_requested,)),
+        is_order_persisted=lambda _local_order_id, _client_order_id: True,
+        is_order_action_allowed=lambda _local_order_id, _client_order_id, action: action == "cancel",
+    ).cancel(local_order_id="local-order-1", client_order_id=order.client_order_id)
+    assert cancelled
     with pytest.raises(RuntimeError, match="尚未启用"):
         QmtBrokerAdapter().query_cash()
     with pytest.raises(ValueError, match="不能小于订单成交预算"):
@@ -1785,6 +1809,58 @@ def test_paper_order_cancel_is_local_first_atomic_and_idempotent(tmp_path, monke
     assert blocked_order is not None
     assert blocked_order["data"]["status"] == "cancelled"
     assert blocked_fill is None
+
+
+def test_persisted_broker_action_gate_follows_order_state_machine(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.schemas import PaperOrderData
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    order_data = PaperOrderData(
+        proposal_id="action-proposal",
+        instrument_id="action-instrument",
+        order_amount=1000,
+        estimated_price=1,
+        estimated_quantity=995,
+        estimated_fee=5,
+    )
+    record = database.insert_paper_investment_order(
+        household_id="household-a",
+        proposal_id=order_data.proposal_id,
+        instrument_id=order_data.instrument_id,
+        data=order_data.model_dump(mode="json"),
+    )
+
+    def allowed(action: str) -> bool:
+        return database.paper_order_action_is_allowed(
+            record["id"],
+            household_id="household-a",
+            client_order_id=order_data.client_order_id,
+            action=action,
+        )
+
+    assert allowed("submit")
+    assert not allowed("cancel")
+    requested, request_status = database.request_paper_order_cancel(
+        record["id"],
+        household_id="household-a",
+        reason="test cancellation",
+    )
+    assert requested is not None
+    assert request_status == "requested"
+    assert not allowed("submit")
+    assert allowed("cancel")
+    cancelled, cancel_status = database.confirm_paper_order_cancel(
+        record["id"],
+        household_id="household-a",
+        reason="test cancellation",
+    )
+    assert cancelled is not None
+    assert cancel_status == "cancelled"
+    assert not allowed("submit")
+    assert not allowed("cancel")
 
 
 def test_persisted_reconciliation_mismatch_latches_freeze_until_manual_review(tmp_path, monkeypatch) -> None:

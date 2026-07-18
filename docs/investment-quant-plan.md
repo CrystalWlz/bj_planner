@@ -57,7 +57,7 @@
 
 ## QMT 边界与阶段门槛
 
-`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：提交或取消前必须通过持久化校验器确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配；对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
+`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：调用适配器前既要确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配，也要通过动作状态校验；`submit` 只允许本地 `proposed`，`cancel` 只允许已原子写入 `cancel_requested` 的订单。缺少任一持久化校验器或状态不符都主动拒绝，已取消、已成交订单不能重新发送。对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
 
 - 二期 B：已具备手工防御资产池、季度阈值再平衡、现金/权益基准、独立交易日历、滚动样本外分段和最小方差逐信号日训练；最小方差仍仅限研究且默认关闭。
 - 三期：仅在券商书面确认 QMT/XtQuant 权限后，实现只读订单、持仓、现金查询和每日对账。

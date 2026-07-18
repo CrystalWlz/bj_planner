@@ -214,8 +214,15 @@ class LocalFirstBrokerGateway:
 
     adapter: BrokerAdapter
     is_order_persisted: Callable[[str, str], bool] | None = None
+    is_order_action_allowed: Callable[[str, str, str], bool] | None = None
 
-    def _require_persisted(self, local_order_id: str, client_order_id: str) -> None:
+    def _require_persisted(
+        self,
+        local_order_id: str,
+        client_order_id: str,
+        *,
+        action: str,
+    ) -> None:
         if not local_order_id:
             raise RuntimeError("订单必须先在本地账本落库，之后才允许调用券商适配器")
         if not client_order_id:
@@ -224,13 +231,17 @@ class LocalFirstBrokerGateway:
             raise RuntimeError("未提供本地订单持久化校验器，禁止调用券商适配器")
         if not self.is_order_persisted(local_order_id, client_order_id):
             raise RuntimeError("本地订单 ID 与 client_order_id 无法在持久化账本中匹配")
+        if self.is_order_action_allowed is None:
+            raise RuntimeError("未提供本地订单动作状态校验器，禁止调用券商适配器")
+        if not self.is_order_action_allowed(local_order_id, client_order_id, action):
+            raise RuntimeError(f"本地订单当前状态不允许执行 {action} 动作")
 
     def submit(self, *, local_order_id: str, order: PaperOrderData) -> PaperOrderData:
-        self._require_persisted(local_order_id, order.client_order_id)
+        self._require_persisted(local_order_id, order.client_order_id, action="submit")
         return self.adapter.submit(order)
 
     def cancel(self, *, local_order_id: str, client_order_id: str) -> bool:
-        self._require_persisted(local_order_id, client_order_id)
+        self._require_persisted(local_order_id, client_order_id, action="cancel")
         return self.adapter.cancel(client_order_id)
 
     def reconcile(

@@ -64,6 +64,7 @@ from .database import (
     update_quant_scoped_record,
     update_scenario_record,
     record_paper_fill_atomic,
+    paper_order_action_is_allowed,
     paper_order_is_persisted,
     request_paper_order_cancel,
     resolve_broker_reconciliation_run,
@@ -930,6 +931,12 @@ def cancel_quant_paper_order(record_id: str, payload: PaperOrderCancelRequest) -
             local_order_id,
             household_id=payload.household_id,
             client_order_id=client_order_id,
+        ),
+        is_order_action_allowed=lambda local_order_id, client_order_id, action: paper_order_action_is_allowed(
+            local_order_id,
+            household_id=payload.household_id,
+            client_order_id=client_order_id,
+            action=action,
         ),
     )
     try:

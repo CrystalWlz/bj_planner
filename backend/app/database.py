@@ -1220,6 +1220,27 @@ def paper_order_is_persisted(
     return str(data.get("client_order_id") or "") == client_order_id
 
 
+def paper_order_action_is_allowed(
+    record_id: str,
+    *,
+    household_id: str,
+    client_order_id: str,
+    action: str,
+) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT data FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+    if row is None:
+        return False
+    data = _load_json(row["data"])
+    if str(data.get("client_order_id") or "") != client_order_id:
+        return False
+    allowed_status = {"submit": "proposed", "cancel": "cancel_requested"}.get(action)
+    return allowed_status is not None and str(data.get("status") or "proposed") == allowed_status
+
+
 def _insert_paper_order_event(
     conn: sqlite3.Connection,
     *,
