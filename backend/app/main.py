@@ -156,6 +156,7 @@ from .schemas import (
     QuantBacktestResult,
     QuantBacktestRunData,
     QuantBacktestRunRecord,
+    QuantExecutionAssumptionData,
     QuantInvestmentPolicyCreate,
     QuantInvestmentPolicyData,
     QuantInvestmentPolicyRecord,
@@ -696,12 +697,36 @@ def run_quant_investment_backtest(payload: QuantBacktestRequest) -> QuantBacktes
         for asset in sorted(assets, key=lambda item: item.instrument_id)
     ]
     universe_version = sha256(json.dumps(universe_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    universe_snapshot = {
+        asset.instrument_id: asset.instrument
+        for asset in sorted(assets, key=lambda item: item.instrument_id)
+    }
+    execution_assumptions = {
+        asset.instrument_id: QuantExecutionAssumptionData(
+            instrument_id=asset.instrument_id,
+            symbol=asset.instrument.symbol,
+            market=asset.instrument.market,
+            asset_class=asset.instrument.asset_class,
+            currency=asset.instrument.currency,
+            trading_mode=asset.instrument.trading_mode,
+            lot_size=asset.instrument.lot_size,
+            buy_fee_rate=asset.instrument.buy_fee_rate,
+            sell_fee_rate=asset.instrument.sell_fee_rate,
+            monthly_purchase_limit=asset.instrument.monthly_purchase_limit,
+            qdii_premium_threshold=asset.instrument.qdii_premium_threshold,
+            purchase_suspended=asset.instrument.purchase_suspended,
+            hong_kong_connect_eligible=asset.instrument.hong_kong_connect_eligible,
+        )
+        for asset in sorted(assets, key=lambda item: item.instrument_id)
+    }
     run_data = QuantBacktestRunData(
         engine_version=QUANT_BACKTEST_ENGINE_VERSION,
         policy_id=policy.id,
         snapshot_ids=[snapshot_id for _instrument_id, snapshot_id, _snapshot in asset_snapshot_entries],
         strategy_versions=strategy_versions,
         universe_version=universe_version,
+        universe_snapshot=universe_snapshot,
+        execution_assumptions=execution_assumptions,
         dataset_versions={snapshot_id: snapshot.data_version for _instrument_id, snapshot_id, snapshot in asset_snapshot_entries},
         data_fingerprint=fingerprint,
         monthly_contribution=payload.monthly_contribution,
@@ -710,6 +735,7 @@ def run_quant_investment_backtest(payload: QuantBacktestRequest) -> QuantBacktes
         cost_assumptions={
             "slippage_rate": policy.data.slippage_rate,
             "maximum_buy_fee_rate": max((asset.instrument.buy_fee_rate for asset in assets), default=0.0),
+            "maximum_sell_fee_rate": max((asset.instrument.sell_fee_rate for asset in assets), default=0.0),
         },
         parameters={
             "research_strategy": policy.data.research_strategy,

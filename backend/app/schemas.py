@@ -2761,13 +2761,31 @@ class QuantBacktestResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class QuantExecutionAssumptionData(BaseModel):
+    instrument_id: str
+    symbol: str
+    market: InvestmentInstrumentMarket
+    asset_class: InvestmentAssetClass
+    currency: Literal["CNY", "HKD", "USD"]
+    trading_mode: InvestmentTradingMode
+    lot_size: int = Field(ge=1)
+    buy_fee_rate: float = Field(ge=0, le=0.2)
+    sell_fee_rate: float = Field(ge=0, le=0.2)
+    monthly_purchase_limit: float | None = Field(default=None, ge=0)
+    qdii_premium_threshold: float | None = Field(default=None, ge=0, le=1)
+    purchase_suspended: bool = False
+    hong_kong_connect_eligible: bool = False
+
+
 class QuantBacktestRunData(BaseModel):
-    schema_version: int = Field(1, ge=1)
+    schema_version: int = Field(2, ge=1)
     engine_version: str = Field(min_length=1, max_length=100)
     policy_id: str
     snapshot_ids: list[str] = Field(default_factory=list)
     strategy_versions: dict[str, str] = Field(default_factory=dict)
     universe_version: str = ""
+    universe_snapshot: dict[str, InvestmentInstrumentData] = Field(default_factory=dict)
+    execution_assumptions: dict[str, QuantExecutionAssumptionData] = Field(default_factory=dict)
     dataset_versions: dict[str, str] = Field(default_factory=dict)
     data_fingerprint: str = Field(min_length=64, max_length=64)
     monthly_contribution: float = Field(gt=0)

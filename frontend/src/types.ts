@@ -466,6 +466,22 @@ export interface QuantWalkForwardFold {
   warnings: string[];
 }
 
+export interface QuantExecutionAssumptionData {
+  instrument_id: string;
+  symbol: string;
+  market: InvestmentInstrumentMarket;
+  asset_class: InvestmentAssetClass;
+  currency: "CNY" | "HKD" | "USD";
+  trading_mode: InvestmentTradingMode;
+  lot_size: number;
+  buy_fee_rate: number;
+  sell_fee_rate: number;
+  monthly_purchase_limit: number | null;
+  qdii_premium_threshold: number | null;
+  purchase_suspended: boolean;
+  hong_kong_connect_eligible: boolean;
+}
+
 export interface QuantBacktestRunData {
   schema_version: number;
   engine_version: string;
@@ -473,6 +489,8 @@ export interface QuantBacktestRunData {
   snapshot_ids: string[];
   strategy_versions: Record<string, string>;
   universe_version: string;
+  universe_snapshot: Record<string, InvestmentInstrumentData>;
+  execution_assumptions: Record<string, QuantExecutionAssumptionData>;
   dataset_versions: Record<string, string>;
   data_fingerprint: string;
   monthly_contribution: number;

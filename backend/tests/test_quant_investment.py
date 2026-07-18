@@ -201,6 +201,10 @@ def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_p
                     "market": "mainland_etf",
                     "trading_mode": "exchange",
                     "asset_class": "equity",
+                    "lot_size": 100,
+                    "buy_fee_rate": 0.0015,
+                    "sell_fee_rate": 0.0025,
+                    "monthly_purchase_limit": 10_000,
                 },
             },
         ).json()
@@ -267,6 +271,7 @@ def test_quant_backtest_run_is_reproducible_and_deduplicated(tmp_path, monkeypat
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
     from app import database
     from app.main import app
+    from app.schemas import QuantBacktestRunData
 
     database.DB_PATH = database.default_db_path()
     start = date(2022, 1, 3)
@@ -293,6 +298,10 @@ def test_quant_backtest_run_is_reproducible_and_deduplicated(tmp_path, monkeypat
                     "market": "mainland_etf",
                     "trading_mode": "exchange",
                     "asset_class": "equity",
+                    "lot_size": 100,
+                    "buy_fee_rate": 0.0015,
+                    "sell_fee_rate": 0.0025,
+                    "monthly_purchase_limit": 10_000,
                 },
             },
         ).json()
@@ -318,9 +327,27 @@ def test_quant_backtest_run_is_reproducible_and_deduplicated(tmp_path, monkeypat
         assert repeated_snapshot.status_code == 200
         second = client.post("/api/quant-investment/backtests", json=request)
         runs = client.get(f"/api/quant-investment/backtest-runs?household_id={household_id}").json()
+        updated_instrument_data = {
+            **instrument["data"],
+            "buy_fee_rate": 0.02,
+            "sell_fee_rate": 0.03,
+        }
+        update_response = client.put(
+            f"/api/quant-investment/instruments/{instrument['id']}",
+            json={"household_id": household_id, "data": updated_instrument_data},
+        )
+        runs_after_update = client.get(
+            f"/api/quant-investment/backtest-runs?household_id={household_id}"
+        ).json()
+        third = client.post("/api/quant-investment/backtests", json=request)
+        changed_runs = client.get(
+            f"/api/quant-investment/backtest-runs?household_id={household_id}"
+        ).json()
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert update_response.status_code == 200
+    assert third.status_code == 200
     assert repeated_snapshot.json()["id"] == initial_snapshot.json()["id"]
     assert first.json() == second.json()
     assert len(runs) == 1
@@ -328,10 +355,28 @@ def test_quant_backtest_run_is_reproducible_and_deduplicated(tmp_path, monkeypat
     assert runs[0]["data"]["snapshot_ids"]
     assert runs[0]["data"]["strategy_versions"]["signal_model"]
     assert runs[0]["data"]["universe_version"]
+    assert runs[0]["data"]["schema_version"] == 2
+    assert runs[0]["data"]["universe_snapshot"][instrument["id"]]["buy_fee_rate"] == pytest.approx(0.0015)
+    assert runs[0]["data"]["execution_assumptions"][instrument["id"]]["lot_size"] == 100
+    assert runs[0]["data"]["execution_assumptions"][instrument["id"]]["sell_fee_rate"] == pytest.approx(0.0025)
     assert runs[0]["data"]["dataset_versions"]
     assert runs[0]["data"]["start_date"] == first.json()["start_date"]
     assert runs[0]["data"]["cost_assumptions"]["slippage_rate"] == pytest.approx(0.001)
+    assert runs[0]["data"]["cost_assumptions"]["maximum_sell_fee_rate"] == pytest.approx(0.0025)
     assert runs[0]["data"]["result"] == first.json()
+    assert len(runs_after_update) == 1
+    assert runs_after_update[0]["data"]["universe_snapshot"][instrument["id"]]["buy_fee_rate"] == pytest.approx(0.0015)
+    assert len(changed_runs) == 2
+    assert changed_runs[0]["data_fingerprint"] != changed_runs[1]["data_fingerprint"]
+    assert changed_runs[0]["data"]["universe_snapshot"][instrument["id"]]["buy_fee_rate"] == pytest.approx(0.02)
+    assert changed_runs[1]["data"]["universe_snapshot"][instrument["id"]]["buy_fee_rate"] == pytest.approx(0.0015)
+    legacy_payload = json.loads(json.dumps(runs[0]["data"]))
+    legacy_payload["schema_version"] = 1
+    legacy_payload.pop("universe_snapshot")
+    legacy_payload.pop("execution_assumptions")
+    legacy_run = QuantBacktestRunData.model_validate(legacy_payload)
+    assert legacy_run.universe_snapshot == {}
+    assert legacy_run.execution_assumptions == {}
 
 
 def test_qdii_stale_nav_blocks_new_buy() -> None:

@@ -17,6 +17,7 @@ from ..schemas import (
 
 
 QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v7"
+QUANT_RECORDER_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -348,6 +349,7 @@ def quant_backtest_fingerprint(
 ) -> str:
     payload = {
         "engine_version": QUANT_BACKTEST_ENGINE_VERSION,
+        "recorder_schema_version": QUANT_RECORDER_SCHEMA_VERSION,
         "policy": policy.model_dump(mode="json"),
         "monthly_contribution": round(monthly_contribution, 6),
         "extra_parameters": extra_parameters or {},
