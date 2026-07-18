@@ -236,6 +236,9 @@ def trace_market_snapshot(snapshot: InvestmentMarketSnapshotData) -> InvestmentM
             "bars": bars,
         }
     )
-    hash_payload = payload.model_copy(update={"dataset_hash": "", "fetched_at": ""}).model_dump(mode="json")
+    # These fields are derived or capture metadata; neither may change content identity.
+    hash_payload = payload.model_copy(
+        update={"dataset_hash": "", "data_version": "", "fetched_at": ""}
+    ).model_dump(mode="json")
     digest = sha256(json.dumps(hash_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return payload.model_copy(update={"dataset_hash": digest, "data_version": f"{payload.source}:{payload.api_name or 'manual'}:{digest[:12]}"})

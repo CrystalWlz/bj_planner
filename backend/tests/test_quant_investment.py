@@ -186,6 +186,7 @@ def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_p
     assert second.status_code == 200
     assert first.json() == second.json()
     assert first.json()["data"]["status"] == "simulated"
+    assert first.json()["data"]["executed_date"] == orders[0]["data"]["expected_trade_date"]
     assert first.json()["data"]["executed_price"] == pytest.approx(4.2)
     assert len(fills) == 1
     assert fills[0]["order_id"] == orders[0]["id"]
@@ -627,7 +628,14 @@ def test_market_snapshots_keep_content_addressed_versions(tmp_path, monkeypatch)
         }
         first = client.post("/api/quant-investment/market-snapshots", json=payload).json()
         version_after_first = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
-        repeated = client.post("/api/quant-investment/market-snapshots", json=payload).json()
+        repeated = client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": instrument["id"],
+                "data": first["data"],
+            },
+        ).json()
         version_after_repeat = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
         changed_payload = json.loads(json.dumps(payload))
         changed_payload["data"]["bars"][0]["close"] = 1.1
@@ -937,6 +945,38 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
             estimated_quantity=1000,
             estimated_fee=5,
             cash_contribution_amount=1000,
+        )
+
+
+def test_paper_broker_uses_planned_trade_date_and_rejects_backdating() -> None:
+    from app.broker_adapters import PaperBrokerAdapter
+    from app.schemas import PaperOrderData
+
+    expected_date = date.today().isoformat()
+    order = PaperOrderData(
+        proposal_id="proposal-1",
+        instrument_id="instrument-1",
+        order_amount=1000,
+        estimated_price=1,
+        estimated_quantity=900,
+        estimated_fee=1.35,
+        expected_trade_date=expected_date,
+    )
+
+    simulated = PaperBrokerAdapter().simulate(order)
+
+    assert simulated.executed_date == order.expected_trade_date
+    with pytest.raises(ValueError, match="不能早于订单计划成交日"):
+        PaperBrokerAdapter().simulate(
+            order,
+            executed_date=(date.today() - timedelta(days=1)).isoformat(),
+        )
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        PaperBrokerAdapter().simulate(order, executed_date="2026/07/20")
+    with pytest.raises(ValueError, match="不能晚于当前日期"):
+        PaperBrokerAdapter().simulate(
+            order,
+            executed_date=(date.today() + timedelta(days=1)).isoformat(),
         )
 
 

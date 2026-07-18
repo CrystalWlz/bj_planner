@@ -138,6 +138,16 @@ class PaperBrokerAdapter:
     cash_balance: float = 0.0
 
     def simulate(self, order: PaperOrderData, *, executed_date: str = "", executed_price: float | None = None) -> PaperOrderData:
+        trade_date = executed_date or order.expected_trade_date or date.today().isoformat()
+        try:
+            parsed_trade_date = date.fromisoformat(trade_date)
+            expected_trade_date = date.fromisoformat(order.expected_trade_date) if order.expected_trade_date else None
+        except ValueError:
+            raise ValueError("模拟成交日期必须是有效的 YYYY-MM-DD 日期") from None
+        if expected_trade_date is not None and parsed_trade_date < expected_trade_date:
+            raise ValueError("模拟成交日期不能早于订单计划成交日")
+        if parsed_trade_date > date.today():
+            raise ValueError("模拟成交日期不能晚于当前日期")
         price = executed_price if executed_price is not None else order.estimated_price
         if price <= 0:
             raise ValueError("模拟成交价格必须大于 0")
@@ -156,7 +166,7 @@ class PaperBrokerAdapter:
         return order.model_copy(
             update={
                 "status": "simulated",
-                "executed_date": executed_date or date.today().isoformat(),
+                "executed_date": trade_date,
                 "executed_price": round(price, 6),
                 "executed_quantity": round(quantity, 6),
                 "estimated_fee": round(executed_fee, 2),
