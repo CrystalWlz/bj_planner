@@ -73,7 +73,11 @@ from .domain.property_valuation import estimate_property_value
 from .domain.personal_pension_returns import refresh_personal_pension_return_snapshot
 from .domain.paper_portfolio import build_paper_portfolio_summary, paper_fill_from_order
 from .domain.quant_backtest import BacktestAsset, run_calendar_backtest
-from .domain.quant_investment import QUANT_BACKTEST_ENGINE_VERSION, quant_backtest_fingerprint
+from .domain.quant_investment import (
+    QUANT_BACKTEST_ENGINE_VERSION,
+    execution_session_is_allowed,
+    quant_backtest_fingerprint,
+)
 from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot, trace_market_snapshot
 from .broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter
 from .strategies.quant_investment import (
@@ -956,6 +960,16 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if order.data.status == "proposed":
+        _instruments, market_snapshots = _quant_snapshot_map(payload.household_id)
+        market_snapshot_entry = market_snapshots.get(order.data.instrument_id)
+        if market_snapshot_entry is not None:
+            execution_allowed, execution_reason = execution_session_is_allowed(
+                market_snapshot_entry[1],
+                execution_date=fill.executed_date,
+                side=fill.side,
+            )
+            if not execution_allowed:
+                raise HTTPException(status_code=409, detail=execution_reason)
         persisted_fills = [PaperFillRecord.model_validate(item).data for item in fill_records]
         prior_fills = [
             item for item in persisted_fills if item.executed_date <= fill.executed_date

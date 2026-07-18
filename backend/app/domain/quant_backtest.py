@@ -15,7 +15,12 @@ from ..schemas import (
     QuantInvestmentPolicyData,
     QuantWalkForwardFold,
 )
-from .quant_investment import _drawdown_from_prices, instrument_is_buyable, optimized_equity_weights
+from .quant_investment import (
+    _drawdown_from_prices,
+    execution_session_is_allowed,
+    instrument_is_buyable,
+    optimized_equity_weights,
+)
 
 
 @dataclass(frozen=True)
@@ -91,7 +96,15 @@ def _execute_contribution(
             as_of_date=signal_date,
         )
         execution_bar = bars.get(asset.instrument_id)
-        if allowed and execution_bar is not None and execution_bar.is_trading and not execution_bar.is_suspended and not execution_bar.purchase_limited:
+        execution_allowed = (
+            execution_bar is not None
+            and execution_session_is_allowed(
+                asset.snapshot,
+                execution_date=execution_bar.price_date or execution_bar.date,
+                side="buy",
+            )[0]
+        )
+        if allowed and execution_bar is not None and execution_allowed:
             eligible.append(asset)
     if not eligible:
         return
@@ -182,7 +195,13 @@ def _rebalance_portfolio(
 
     for asset in assets:
         quantity = state.quantities.get(asset.instrument_id, 0.0)
-        if quantity <= 0 or not bars[asset.instrument_id].is_trading or bars[asset.instrument_id].is_suspended:
+        execution_bar = bars[asset.instrument_id]
+        sell_allowed, _reason = execution_session_is_allowed(
+            asset.snapshot,
+            execution_date=execution_bar.price_date or execution_bar.date,
+            side="sell",
+        )
+        if quantity <= 0 or not sell_allowed:
             continue
         price = prices[asset.instrument_id]
         excess_value = quantity * price - target_weights.get(asset.instrument_id, 0.0) * total_value
@@ -202,7 +221,13 @@ def _rebalance_portfolio(
         state.trade_count += 1
 
     for asset in assets:
-        if not bars[asset.instrument_id].is_trading or bars[asset.instrument_id].is_suspended:
+        execution_bar = bars[asset.instrument_id]
+        buy_allowed, _reason = execution_session_is_allowed(
+            asset.snapshot,
+            execution_date=execution_bar.price_date or execution_bar.date,
+            side="buy",
+        )
+        if not buy_allowed:
             continue
         history = [bar for bar in asset.snapshot.bars if (bar.price_date or bar.date) <= signal_date]
         allowed, _reason = instrument_is_buyable(

@@ -56,6 +56,8 @@ flowchart LR
 
   `PaperBrokerAdapter` 统一校验模拟成交日期：未填写时使用订单的 `expected_trade_date`，人工回填不得早于计划日或晚于当前日，且必须是有效 ISO 日期，避免成交事件早于信号时钟或提前确认未来成交。
 
+  `execution_session_is_allowed` 是 Paper 成交与回测撮合共享的执行日市场门禁。行情覆盖范围内的闭市、停牌、开放日缺价会拒绝买卖，执行日限购只拒绝买入；行情尚未覆盖时允许人工成交确认。月度投入和季度再平衡都必须经过该门禁，回测引擎/执行规划版本随语义变化递增，保证 Recorder 可区分旧结果。
+
   `client_order_id` 由 SQLite 全局唯一索引强制，而不只依赖 UUID 默认值。数据库迁移先规范缺失、非法或重复的历史订单号并同步成交/取消事件引用，再创建索引；同订单重试复用原记录，不同订单号冲突由 API 返回 `409`。这使 `LocalFirstBrokerGateway` 的持久化校验拥有稳定且唯一的券商幂等键。
 
 - `scripts/perf_calculation_sample.py`

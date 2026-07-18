@@ -26,7 +26,7 @@ from ..schemas import (
 SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
 PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v2"
 PRE_TRADE_RISK_VERSION = "cash-concentration-v4"
-EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v2"
+EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v3"
 
 
 @dataclass(frozen=True)

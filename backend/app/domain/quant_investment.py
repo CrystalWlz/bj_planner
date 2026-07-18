@@ -16,7 +16,7 @@ from ..schemas import (
 )
 
 
-QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v6"
+QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v7"
 
 
 @dataclass(frozen=True)
@@ -227,6 +227,42 @@ def instrument_is_buyable(
         if premium > threshold:
             return False, "跨境 QDII ETF 溢价超过风险阈值，暂停新增买入。"
     return True, "可交易。"
+
+
+def execution_session_is_allowed(
+    snapshot: InvestmentMarketSnapshotData,
+    *,
+    execution_date: str,
+    side: str,
+) -> tuple[bool, str]:
+    """Validate execution-day market state without requiring future coverage."""
+    if execution_date in snapshot.suspension_dates:
+        return False, "执行日已标记为停牌，不能模拟成交。"
+    trading_days = sorted(set(snapshot.trading_days))
+    calendar_covers_date = bool(
+        trading_days and trading_days[0] <= execution_date <= trading_days[-1]
+    )
+    if (
+        snapshot.calendar_source == "provider"
+        and calendar_covers_date
+        and execution_date not in trading_days
+    ):
+        return False, "执行日不是该市场开放日，不能模拟成交。"
+    exact_bars = [
+        bar for bar in snapshot.bars if (bar.price_date or bar.date) == execution_date
+    ]
+    if exact_bars:
+        execution_bar = exact_bars[-1]
+        if not execution_bar.is_trading or execution_bar.is_suspended:
+            return False, "执行日标的停牌或不可交易，不能模拟成交。"
+        if side == "buy" and execution_bar.purchase_limited:
+            return False, "执行日存在申购或买入限制，不能模拟买入。"
+        return True, "执行日行情确认可交易。"
+    if calendar_covers_date:
+        if execution_date not in trading_days:
+            return False, "执行日不是该市场开放日，不能模拟成交。"
+        return False, "执行日开放但缺少价格，按停牌处理并禁止模拟成交。"
+    return True, "行情数据集尚未覆盖执行日，需由人工成交确认补充。"
 
 
 def rebalance_due(current_equity_ratio: float, target_equity_ratio: float, policy: QuantInvestmentPolicyData) -> bool:

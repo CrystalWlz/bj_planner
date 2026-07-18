@@ -114,6 +114,64 @@ def test_snapshot_trace_does_not_mark_future_calendar_days_as_suspensions() -> N
     assert snapshot.trading_days == ["2026-07-17", "2026-07-20"]
 
 
+def test_execution_session_gate_distinguishes_suspension_limit_and_calendar_coverage() -> None:
+    from app.domain.quant_investment import execution_session_is_allowed
+    from app.schemas import InvestmentMarketSnapshotData
+
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-03",
+        calendar_source="provider",
+        trading_days=["2026-07-01", "2026-07-02", "2026-07-03"],
+        suspension_dates=["2026-07-02"],
+        bars=[
+            {"date": "2026-07-01", "close": 1},
+            {"date": "2026-07-03", "close": 1, "purchase_limited": True},
+        ],
+    )
+
+    assert not execution_session_is_allowed(
+        snapshot, execution_date="2026-07-02", side="buy"
+    )[0]
+    assert not execution_session_is_allowed(
+        snapshot, execution_date="2026-07-03", side="buy"
+    )[0]
+    assert execution_session_is_allowed(
+        snapshot, execution_date="2026-07-03", side="sell"
+    )[0]
+    assert execution_session_is_allowed(
+        snapshot, execution_date="2026-07-04", side="buy"
+    )[0]
+
+    closed_day = snapshot.model_copy(
+        update={
+            "trading_days": ["2026-07-01", "2026-07-03"],
+            "suspension_dates": [],
+        }
+    )
+    missing_price = snapshot.model_copy(update={"suspension_dates": []})
+    assert not execution_session_is_allowed(
+        closed_day, execution_date="2026-07-02", side="sell"
+    )[0]
+    assert not execution_session_is_allowed(
+        missing_price, execution_date="2026-07-02", side="sell"
+    )[0]
+    provider_closed_with_bar = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-03",
+        calendar_source="provider",
+        trading_days=["2026-07-01", "2026-07-03"],
+        bars=[
+            {"date": "2026-07-01", "close": 1},
+            {"date": "2026-07-02", "close": 1},
+            {"date": "2026-07-03", "close": 1},
+        ],
+    )
+    assert not execution_session_is_allowed(
+        provider_closed_with_bar, execution_date="2026-07-02", side="buy"
+    )[0]
+
+
 def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
     from app import database
@@ -512,6 +570,64 @@ def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None
     assert result.months == 37
     assert result.trade_count == 37
     assert result.end_date == trading_days[-1]
+
+
+def test_backtest_rebalance_does_not_buy_purchase_limited_asset() -> None:
+    from app.domain.quant_backtest import BacktestAsset, _PortfolioState, _rebalance_portfolio
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+
+    equity = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+        sell_fee_rate=0,
+    )
+    defensive = InvestmentInstrumentData(
+        symbol="511010.SH",
+        name="示例防御 ETF",
+        market="mainland_etf",
+        asset_class="defensive",
+        lot_size=1,
+    )
+    equity_snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-01",
+        bars=[
+            {"date": "2026-06-30", "close": 1},
+            {"date": "2026-07-01", "close": 1},
+        ],
+    )
+    defensive_snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-01",
+        bars=[
+            {"date": "2026-06-30", "close": 1},
+            {"date": "2026-07-01", "close": 1, "purchase_limited": True},
+        ],
+    )
+    assets = [
+        BacktestAsset("equity", equity, equity_snapshot),
+        BacktestAsset("defensive", defensive, defensive_snapshot),
+    ]
+    state = _PortfolioState(quantities={"equity": 100})
+
+    _rebalance_portfolio(
+        state,
+        assets=assets,
+        bars={
+            "equity": equity_snapshot.bars[-1],
+            "defensive": defensive_snapshot.bars[-1],
+        },
+        policy=QuantInvestmentPolicyData(),
+        equity_ratio=0.35,
+        signal_date="2026-06-30",
+    )
+
+    assert state.quantities["equity"] == pytest.approx(35)
+    assert state.quantities.get("defensive", 0) == 0
+    assert state.cash > 0
 
 
 def test_min_variance_research_uses_only_trailing_training_window(monkeypatch) -> None:
@@ -1161,6 +1277,70 @@ def test_paper_broker_uses_planned_trade_date_and_rejects_backdating() -> None:
             order,
             executed_date=(date.today() + timedelta(days=1)).isoformat(),
         )
+
+
+def test_paper_execution_rechecks_purchase_limit_before_writing_fill(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    today = date.today().isoformat()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        instrument = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "513500.SH",
+                    "name": "示例限购 ETF",
+                    "market": "qdii_etf",
+                    "asset_class": "equity",
+                },
+            },
+        ).json()
+        snapshot = client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": instrument["id"],
+                "data": {
+                    "source": "manual",
+                    "snapshot_date": today,
+                    "bars": [{"date": today, "close": 1, "purchase_limited": True}],
+                },
+            },
+        )
+        order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "limited-proposal",
+                    "instrument_id": instrument["id"],
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                    "cash_contribution_amount": 1000,
+                    "expected_trade_date": today,
+                },
+            },
+        ).json()
+        execution = client.post(
+            f"/api/quant-investment/paper-orders/{order['id']}/simulate",
+            json={"household_id": household_id},
+        )
+        fills = client.get(
+            "/api/quant-investment/paper-fills",
+            params={"household_id": household_id},
+        ).json()
+
+    assert snapshot.status_code == 200
+    assert execution.status_code == 409
+    assert "限制" in execution.json()["detail"]
+    assert fills == []
 
 
 def test_paper_order_api_rejects_duplicate_client_order_id(tmp_path, monkeypatch) -> None:
