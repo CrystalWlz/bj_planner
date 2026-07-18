@@ -1014,26 +1014,28 @@ def upsert_investment_market_snapshot(
     snapshot_date: str,
     source: str,
     data: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     dataset_hash = str(data.get("dataset_hash") or uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(data, ensure_ascii=False, sort_keys=True)).hex)
     record_id = uuid.uuid5(uuid.NAMESPACE_URL, f"house-planner:investment-market:{instrument_id}:{dataset_hash}").hex
     timestamp = now_iso()
     payload = json.dumps(data, ensure_ascii=False)
     with get_connection() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO investment_market_snapshots (id, instrument_id, snapshot_date, source, dataset_hash, data, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(instrument_id, dataset_hash) DO UPDATE SET
-                data = excluded.data,
-                updated_at = excluded.updated_at
+            ON CONFLICT(instrument_id, dataset_hash) DO NOTHING
             """,
             (record_id, instrument_id, snapshot_date, source, dataset_hash, payload, timestamp, timestamp),
         )
-        row = conn.execute("SELECT * FROM investment_market_snapshots WHERE id = ?", (record_id,)).fetchone()
+        inserted = cursor.rowcount > 0
+        row = conn.execute(
+            "SELECT * FROM investment_market_snapshots WHERE instrument_id = ? AND dataset_hash = ?",
+            (instrument_id, dataset_hash),
+        ).fetchone()
     if row is None:
         raise RuntimeError("Investment market snapshot upsert failed")
-    return _quant_market_snapshot_record(row)
+    return _quant_market_snapshot_record(row), inserted
 
 
 def _quant_market_snapshot_record(row: sqlite3.Row) -> dict[str, Any]:

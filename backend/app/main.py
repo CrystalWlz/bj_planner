@@ -515,13 +515,14 @@ def create_quant_market_snapshot(payload: InvestmentMarketSnapshotCreate) -> dic
     if not instrument_exists:
         raise HTTPException(status_code=404, detail="未找到该家庭的投资标的")
     snapshot = trace_market_snapshot(payload.data)
-    record = upsert_investment_market_snapshot(
+    record, inserted = upsert_investment_market_snapshot(
         instrument_id=payload.instrument_id,
         snapshot_date=snapshot.snapshot_date,
         source=snapshot.source,
         data=snapshot.model_dump(mode="json"),
     )
-    bump_quant_investment_data_version(payload.household_id)
+    if inserted:
+        bump_quant_investment_data_version(payload.household_id)
     return record
 
 
@@ -530,25 +531,26 @@ def refresh_quant_market_data(payload: QuantMarketRefreshRequest) -> dict:
     instruments = list_quant_scoped_records("investment_instruments", household_id=payload.household_id)
     records: list[dict] = []
     warnings: list[str] = []
+    changed = False
     for instrument_record in instruments:
         instrument = InvestmentInstrumentRecord.model_validate(instrument_record)
         if not instrument.data.enabled:
             continue
         try:
             snapshot = fetch_tushare_snapshot(instrument.data, start_date=payload.start_date)
-            records.append(
-                upsert_investment_market_snapshot(
-                    instrument_id=instrument.id,
-                    snapshot_date=snapshot.snapshot_date,
-                    source=snapshot.source,
-                    data=snapshot.model_dump(mode="json"),
-                )
+            record, inserted = upsert_investment_market_snapshot(
+                instrument_id=instrument.id,
+                snapshot_date=snapshot.snapshot_date,
+                source=snapshot.source,
+                data=snapshot.model_dump(mode="json"),
             )
+            records.append(record)
+            changed = changed or inserted
         except MarketDataConfigurationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:  # external provider failures must not erase prior snapshots
             warnings.append(f"{instrument.data.name}：{exc}")
-    if records:
+    if changed:
         bump_quant_investment_data_version(payload.household_id)
     return {"records": records, "warnings": warnings}
 

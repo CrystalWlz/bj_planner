@@ -237,30 +237,32 @@ def test_quant_backtest_run_is_reproducible_and_deduplicated(tmp_path, monkeypat
                 },
             },
         ).json()
-        assert client.post(
-            "/api/quant-investment/market-snapshots",
-            json={
-                "household_id": household_id,
-                "instrument_id": instrument["id"],
-                "data": {
-                    "source": "manual",
-                    "snapshot_date": bars[-1]["date"],
-                    "status": "complete",
-                    "bars": bars,
-                },
+        snapshot_payload = {
+            "household_id": household_id,
+            "instrument_id": instrument["id"],
+            "data": {
+                "source": "manual",
+                "snapshot_date": bars[-1]["date"],
+                "status": "complete",
+                "bars": bars,
             },
-        ).status_code == 200
+        }
+        initial_snapshot = client.post("/api/quant-investment/market-snapshots", json=snapshot_payload)
+        assert initial_snapshot.status_code == 200
         request = {
             "household_id": household_id,
             "policy_id": policy["id"],
             "monthly_contribution": 1_000,
         }
         first = client.post("/api/quant-investment/backtests", json=request)
+        repeated_snapshot = client.post("/api/quant-investment/market-snapshots", json=snapshot_payload)
+        assert repeated_snapshot.status_code == 200
         second = client.post("/api/quant-investment/backtests", json=request)
         runs = client.get(f"/api/quant-investment/backtest-runs?household_id={household_id}").json()
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert repeated_snapshot.json()["id"] == initial_snapshot.json()["id"]
     assert first.json() == second.json()
     assert len(runs) == 1
     assert len(runs[0]["data_fingerprint"]) == 64
@@ -612,6 +614,7 @@ def test_market_snapshots_keep_content_addressed_versions(tmp_path, monkeypatch)
                 },
             },
         ).json()
+        version_before_snapshot = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
         payload = {
             "household_id": household_id,
             "instrument_id": instrument["id"],
@@ -623,8 +626,13 @@ def test_market_snapshots_keep_content_addressed_versions(tmp_path, monkeypatch)
             },
         }
         first = client.post("/api/quant-investment/market-snapshots", json=payload).json()
-        payload["data"]["bars"][0]["close"] = 1.1
-        second = client.post("/api/quant-investment/market-snapshots", json=payload).json()
+        version_after_first = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
+        repeated = client.post("/api/quant-investment/market-snapshots", json=payload).json()
+        version_after_repeat = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
+        changed_payload = json.loads(json.dumps(payload))
+        changed_payload["data"]["bars"][0]["close"] = 1.1
+        second = client.post("/api/quant-investment/market-snapshots", json=changed_payload).json()
+        version_after_change = client.get("/api/households").json()[0]["data"]["quant_investment_data_version"]
 
     with database.get_connection() as conn:
         count = conn.execute(
@@ -632,6 +640,12 @@ def test_market_snapshots_keep_content_addressed_versions(tmp_path, monkeypatch)
             (instrument["id"],),
         ).fetchone()[0]
     assert count == 2
+    assert repeated["id"] == first["id"]
+    assert repeated["data"]["fetched_at"] == first["data"]["fetched_at"]
+    assert repeated["updated_at"] == first["updated_at"]
+    assert version_after_repeat == version_after_first
+    assert version_after_first == version_before_snapshot + 1
+    assert version_after_change == version_after_first + 1
     assert first["data"]["dataset_hash"] != second["data"]["dataset_hash"]
     assert second["data"]["actual_bar_count"] == 1
     assert second["data"]["data_version"].startswith("manual:")
@@ -669,12 +683,20 @@ def test_market_snapshot_table_migrates_existing_rows_without_rebuild_loss(tmp_p
 
     database.DB_PATH = database.default_db_path()
     database.initialize_database()
+    reused, inserted = database.upsert_investment_market_snapshot(
+        instrument_id="instrument-1",
+        snapshot_date="2026-07-17",
+        source="manual",
+        data={**legacy_data, "dataset_hash": "legacy-snapshot"},
+    )
     with database.get_connection() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(investment_market_snapshots)").fetchall()}
         row = conn.execute("SELECT id, dataset_hash FROM investment_market_snapshots WHERE id = 'legacy-snapshot'").fetchone()
     assert "dataset_hash" in columns
     assert row is not None
     assert row["dataset_hash"] == "legacy-snapshot"
+    assert inserted is False
+    assert reused["id"] == "legacy-snapshot"
 
 
 def test_default_strategy_interfaces_disable_research_optimizer_and_plan_round_lots(monkeypatch) -> None:
