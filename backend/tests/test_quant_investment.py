@@ -885,6 +885,13 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
     )
     with pytest.raises(RuntimeError, match="先在本地账本落库"):
         LocalFirstBrokerGateway(PaperBrokerAdapter()).submit(local_order_id="", order=order)
+    with pytest.raises(RuntimeError, match="持久化校验器"):
+        LocalFirstBrokerGateway(PaperBrokerAdapter()).submit(local_order_id="local-order-1", order=order)
+    with pytest.raises(RuntimeError, match="无法在持久化账本中匹配"):
+        LocalFirstBrokerGateway(
+            PaperBrokerAdapter(),
+            is_order_persisted=lambda _local_order_id, _client_order_id: False,
+        ).submit(local_order_id="local-order-1", order=order)
     with pytest.raises(RuntimeError, match="尚未启用"):
         QmtBrokerAdapter().query_cash()
     with pytest.raises(ValueError, match="不能小于订单成交预算"):
@@ -979,6 +986,124 @@ def test_broker_reconciliation_compares_orders_positions_and_cash() -> None:
     assert matched_result.matched
     assert not matched_result.freeze_new_orders
     assert matched_result.local_state_hash == matched_result.remote_state_hash
+
+
+def test_paper_order_cancel_is_local_first_atomic_and_idempotent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        first_order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "cancel-proposal-1",
+                    "instrument_id": "cancel-instrument-1",
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                },
+            },
+        ).json()
+        first_cancel = client.post(
+            f"/api/quant-investment/paper-orders/{first_order['id']}/cancel",
+            json={"household_id": household_id, "reason": "本月不再执行该模拟订单"},
+        )
+        second_cancel = client.post(
+            f"/api/quant-investment/paper-orders/{first_order['id']}/cancel",
+            json={"household_id": household_id, "reason": "重复取消不应新增事件"},
+        )
+        events = client.get(
+            "/api/quant-investment/paper-order-events",
+            params={"household_id": household_id, "order_id": first_order["id"]},
+        ).json()
+        simulate_cancelled = client.post(
+            f"/api/quant-investment/paper-orders/{first_order['id']}/simulate",
+            json={"household_id": household_id},
+        )
+        invalid_initial_status = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "cancel-proposal-invalid",
+                    "instrument_id": "cancel-instrument-invalid",
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                    "status": "cancelled",
+                },
+            },
+        )
+
+        filled_order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "cancel-proposal-2",
+                    "instrument_id": "cancel-instrument-2",
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                },
+            },
+        ).json()
+        simulated = client.post(
+            f"/api/quant-investment/paper-orders/{filled_order['id']}/simulate",
+            json={"household_id": household_id},
+        )
+        cancel_filled = client.post(
+            f"/api/quant-investment/paper-orders/{filled_order['id']}/cancel",
+            json={"household_id": household_id, "reason": "已成交订单不能取消"},
+        )
+        filled_events = client.get(
+            "/api/quant-investment/paper-order-events",
+            params={"household_id": household_id, "order_id": filled_order["id"]},
+        ).json()
+
+    blocked_order, blocked_fill = database.record_paper_fill_atomic(
+        first_order["id"],
+        household_id=household_id,
+        order_data={**first_cancel.json()["data"], "status": "simulated"},
+        fill_data={
+            "order_id": first_order["id"],
+            "client_order_id": first_order["data"]["client_order_id"],
+            "proposal_id": "cancel-proposal-1",
+            "instrument_id": "cancel-instrument-1",
+            "side": "buy",
+            "executed_date": "2026-07-19",
+            "executed_price": 1,
+            "executed_quantity": 995,
+            "gross_amount": 995,
+            "fee": 5,
+            "cash_change": -1000,
+            "contribution_amount": 1000,
+        },
+    )
+
+    assert first_cancel.status_code == 200
+    assert second_cancel.status_code == 200
+    assert first_cancel.json()["data"]["status"] == "cancelled"
+    assert second_cancel.json() == first_cancel.json()
+    assert [event["data"]["event_type"] for event in events] == ["cancel_requested", "cancelled"]
+    assert events[0]["data"]["from_status"] == "proposed"
+    assert events[1]["data"]["from_status"] == "cancel_requested"
+    assert simulate_cancelled.status_code == 409
+    assert invalid_initial_status.status_code == 422
+    assert simulated.status_code == 200
+    assert cancel_filled.status_code == 409
+    assert not filled_events
+    assert blocked_order is not None
+    assert blocked_order["data"]["status"] == "cancelled"
+    assert blocked_fill is None
 
 
 def test_persisted_reconciliation_mismatch_latches_freeze_until_manual_review(tmp_path, monkeypatch) -> None:

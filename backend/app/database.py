@@ -208,6 +208,19 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_paper_investment_fills_household
                 ON paper_investment_fills(household_id, created_at ASC);
 
+            CREATE TABLE IF NOT EXISTS paper_investment_order_events (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(order_id, event_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_investment_order_events_household
+                ON paper_investment_order_events(household_id, created_at ASC);
+
             CREATE TABLE IF NOT EXISTS quant_backtest_runs (
                 id TEXT PRIMARY KEY,
                 household_id TEXT NOT NULL,
@@ -1103,6 +1116,164 @@ def update_paper_investment_order(record_id: str, *, household_id: str, data: di
     return _paper_order_record(row) if row else None
 
 
+def paper_order_is_persisted(
+    record_id: str,
+    *,
+    household_id: str,
+    client_order_id: str,
+) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT data FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+    if row is None:
+        return False
+    data = _load_json(row["data"])
+    return str(data.get("client_order_id") or "") == client_order_id
+
+
+def _insert_paper_order_event(
+    conn: sqlite3.Connection,
+    *,
+    household_id: str,
+    order_id: str,
+    data: dict[str, Any],
+    timestamp: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO paper_investment_order_events
+            (id, household_id, order_id, event_type, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            household_id,
+            order_id,
+            str(data["event_type"]),
+            json.dumps(data, ensure_ascii=False),
+            timestamp,
+        ),
+    )
+
+
+def request_paper_order_cancel(
+    record_id: str,
+    *,
+    household_id: str,
+    reason: str,
+) -> tuple[dict[str, Any] | None, str]:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+        if row is None:
+            return None, "not_found"
+        data = _load_json(row["data"])
+        status = str(data.get("status") or "proposed")
+        if status == "cancelled":
+            return _paper_order_record(row), "already_cancelled"
+        if status == "cancel_requested":
+            return _paper_order_record(row), "already_requested"
+        if status != "proposed":
+            return _paper_order_record(row), "not_cancellable"
+        client_order_id = str(data.get("client_order_id") or "")
+        event_data = {
+            "schema_version": 1,
+            "order_id": record_id,
+            "client_order_id": client_order_id,
+            "event_type": "cancel_requested",
+            "from_status": status,
+            "to_status": "cancel_requested",
+            "reason": reason,
+        }
+        data["status"] = "cancel_requested"
+        conn.execute(
+            "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), timestamp, record_id),
+        )
+        _insert_paper_order_event(
+            conn,
+            household_id=household_id,
+            order_id=record_id,
+            data=event_data,
+            timestamp=timestamp,
+        )
+        row = conn.execute("SELECT * FROM paper_investment_orders WHERE id = ?", (record_id,)).fetchone()
+    return (_paper_order_record(row) if row else None), "requested"
+
+
+def confirm_paper_order_cancel(
+    record_id: str,
+    *,
+    household_id: str,
+    reason: str,
+) -> tuple[dict[str, Any] | None, str]:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+        if row is None:
+            return None, "not_found"
+        data = _load_json(row["data"])
+        status = str(data.get("status") or "proposed")
+        if status == "cancelled":
+            return _paper_order_record(row), "already_cancelled"
+        if status != "cancel_requested":
+            return _paper_order_record(row), "not_requested"
+        event_data = {
+            "schema_version": 1,
+            "order_id": record_id,
+            "client_order_id": str(data.get("client_order_id") or ""),
+            "event_type": "cancelled",
+            "from_status": status,
+            "to_status": "cancelled",
+            "reason": reason,
+        }
+        data["status"] = "cancelled"
+        conn.execute(
+            "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), timestamp, record_id),
+        )
+        _insert_paper_order_event(
+            conn,
+            household_id=household_id,
+            order_id=record_id,
+            data=event_data,
+            timestamp=timestamp,
+        )
+        row = conn.execute("SELECT * FROM paper_investment_orders WHERE id = ?", (record_id,)).fetchone()
+    return (_paper_order_record(row) if row else None), "cancelled"
+
+
+def list_paper_order_events(*, household_id: str, order_id: str | None = None) -> list[dict[str, Any]]:
+    clauses = ["household_id = ?"]
+    params: list[Any] = [household_id]
+    if order_id:
+        clauses.append("order_id = ?")
+        params.append(order_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM paper_investment_order_events
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        record["data"] = _load_json(record["data"])
+        result.append(record)
+    return result
+
+
 def record_paper_fill_atomic(
     order_id: str,
     *,
@@ -1124,6 +1295,10 @@ def record_paper_fill_atomic(
             (order_id, household_id),
         ).fetchone()
         if fill_row is None:
+            persisted_order_data = _load_json(order_row["data"])
+            persisted_status = str(persisted_order_data.get("status") or "proposed")
+            if persisted_status not in {"proposed", "simulated"}:
+                return _paper_order_record(order_row), None
             conn.execute(
                 "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(order_data, ensure_ascii=False), timestamp, order_id),

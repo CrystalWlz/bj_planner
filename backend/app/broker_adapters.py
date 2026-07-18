@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
 import json
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .schemas import PaperOrderData, PaperPositionData
 
@@ -168,7 +168,7 @@ class PaperBrokerAdapter:
 
     def cancel(self, client_order_id: str) -> bool:
         return any(
-            order.client_order_id == client_order_id and order.status == "proposed"
+            order.client_order_id == client_order_id and order.status in {"proposed", "cancel_requested"}
             for order in self.orders
         )
 
@@ -203,13 +203,25 @@ class LocalFirstBrokerGateway:
     """Reject submission unless a local immutable order id already exists."""
 
     adapter: BrokerAdapter
+    is_order_persisted: Callable[[str, str], bool] | None = None
+
+    def _require_persisted(self, local_order_id: str, client_order_id: str) -> None:
+        if not local_order_id:
+            raise RuntimeError("订单必须先在本地账本落库，之后才允许调用券商适配器")
+        if not client_order_id:
+            raise RuntimeError("订单缺少唯一 client_order_id")
+        if self.is_order_persisted is None:
+            raise RuntimeError("未提供本地订单持久化校验器，禁止调用券商适配器")
+        if not self.is_order_persisted(local_order_id, client_order_id):
+            raise RuntimeError("本地订单 ID 与 client_order_id 无法在持久化账本中匹配")
 
     def submit(self, *, local_order_id: str, order: PaperOrderData) -> PaperOrderData:
-        if not local_order_id:
-            raise RuntimeError("订单必须先在本地账本落库，之后才允许发送到券商适配器")
-        if not order.client_order_id:
-            raise RuntimeError("订单缺少唯一 client_order_id")
+        self._require_persisted(local_order_id, order.client_order_id)
         return self.adapter.submit(order)
+
+    def cancel(self, *, local_order_id: str, client_order_id: str) -> bool:
+        self._require_persisted(local_order_id, client_order_id)
+        return self.adapter.cancel(client_order_id)
 
     def reconcile(
         self,

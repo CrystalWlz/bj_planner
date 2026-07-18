@@ -218,7 +218,7 @@ export interface InvestmentPlanRecommendation {
 export type InvestmentInstrumentMarket = "mainland_etf" | "hong_kong_connect" | "qdii_etf" | "qdii_fund";
 export type InvestmentTradingMode = "exchange" | "fund_subscription";
 export type InvestmentAssetClass = "equity" | "defensive";
-export type InvestmentOrderStatus = "proposed" | "simulated" | "confirmed" | "cancelled" | "blocked";
+export type InvestmentOrderStatus = "proposed" | "cancel_requested" | "simulated" | "confirmed" | "cancelled" | "blocked";
 
 export interface QuantInvestmentPolicyData {
   schema_version: number;

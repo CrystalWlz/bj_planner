@@ -15,6 +15,7 @@ from .calculator import calculate_affordability
 from .database import (
     delete_record,
     bump_quant_investment_data_version,
+    confirm_paper_order_cancel,
     delete_quant_scoped_record,
     delete_planning_goal_record,
     delete_scenario_record,
@@ -39,6 +40,7 @@ from .database import (
     list_investment_market_snapshots,
     list_paper_investment_fills,
     list_paper_investment_orders,
+    list_paper_order_events,
     list_quant_backtest_runs,
     list_quant_scoped_records,
     list_scenario_records,
@@ -60,6 +62,8 @@ from .database import (
     update_quant_scoped_record,
     update_scenario_record,
     record_paper_fill_atomic,
+    paper_order_is_persisted,
+    request_paper_order_cancel,
     resolve_broker_reconciliation_run,
     upsert_quant_backtest_run,
 )
@@ -69,7 +73,7 @@ from .domain.paper_portfolio import build_paper_portfolio_summary, paper_fill_fr
 from .domain.quant_backtest import BacktestAsset, run_calendar_backtest
 from .domain.quant_investment import QUANT_BACKTEST_ENGINE_VERSION, quant_backtest_fingerprint
 from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot, trace_market_snapshot
-from .broker_adapters import PaperBrokerAdapter
+from .broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter
 from .strategies.quant_investment import (
     EXECUTION_PLANNER_VERSION,
     PORTFOLIO_CONSTRUCTOR_VERSION,
@@ -136,6 +140,8 @@ from .schemas import (
     InvestmentMarketSnapshotData,
     InvestmentMarketSnapshotRecord,
     PaperOrderCreate,
+    PaperOrderCancelRequest,
+    PaperOrderEventRecord,
     PaperFillRecord,
     PaperOrderRecord,
     PaperOrderSimulateRequest,
@@ -795,6 +801,11 @@ def get_quant_paper_fills(household_id: str) -> list[dict]:
     return list_paper_investment_fills(household_id=household_id)
 
 
+@app.get("/api/quant-investment/paper-order-events", response_model=list[PaperOrderEventRecord])
+def get_quant_paper_order_events(household_id: str, order_id: str | None = None) -> list[dict]:
+    return list_paper_order_events(household_id=household_id, order_id=order_id)
+
+
 @app.get("/api/quant-investment/paper-portfolio", response_model=PaperPortfolioSummary)
 def get_quant_paper_portfolio(household_id: str) -> PaperPortfolioSummary:
     policy_records = list_quant_scoped_records("quant_investment_policies", household_id=household_id)
@@ -844,6 +855,52 @@ def create_quant_paper_order(payload: PaperOrderCreate) -> dict:
     )
 
 
+@app.post("/api/quant-investment/paper-orders/{record_id}/cancel", response_model=PaperOrderRecord)
+def cancel_quant_paper_order(record_id: str, payload: PaperOrderCancelRequest) -> dict:
+    requested, request_status = request_paper_order_cancel(
+        record_id,
+        household_id=payload.household_id,
+        reason=payload.reason,
+    )
+    if requested is None:
+        raise HTTPException(status_code=404, detail="未找到模拟订单")
+    if request_status == "not_cancellable":
+        raise HTTPException(status_code=409, detail="订单已成交、已确认或已冻结，不能取消")
+    if request_status == "already_cancelled":
+        return requested
+    requested_order = PaperOrderRecord.model_validate(requested)
+    adapter = PaperBrokerAdapter(orders=(requested_order.data,))
+    gateway = LocalFirstBrokerGateway(
+        adapter,
+        is_order_persisted=lambda local_order_id, client_order_id: paper_order_is_persisted(
+            local_order_id,
+            household_id=payload.household_id,
+            client_order_id=client_order_id,
+        ),
+    )
+    try:
+        acknowledged = gateway.cancel(
+            local_order_id=record_id,
+            client_order_id=requested_order.data.client_order_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not acknowledged:
+        raise HTTPException(status_code=409, detail="适配器尚未确认取消，订单保持取消请求状态")
+    cancelled, confirm_status = confirm_paper_order_cancel(
+        record_id,
+        household_id=payload.household_id,
+        reason=payload.reason,
+    )
+    if cancelled is None:
+        raise HTTPException(status_code=404, detail="未找到模拟订单")
+    if confirm_status == "not_requested":
+        raise HTTPException(status_code=409, detail="订单不处于取消请求状态")
+    if confirm_status == "cancelled":
+        bump_quant_investment_data_version(payload.household_id)
+    return cancelled
+
+
 @app.post("/api/quant-investment/paper-orders/{record_id}/simulate", response_model=PaperOrderRecord)
 def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateRequest) -> dict:
     existing = next((item for item in list_paper_investment_orders(household_id=payload.household_id) if item["id"] == record_id), None)
@@ -883,7 +940,7 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
         fill = paper_fill_from_order(record_id, simulated)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    record, _fill_record = record_paper_fill_atomic(
+    record, fill_record = record_paper_fill_atomic(
         record_id,
         household_id=payload.household_id,
         order_data=simulated.model_dump(mode="json"),
@@ -891,6 +948,8 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
     )
     if record is None:
         raise HTTPException(status_code=404, detail="未找到模拟订单")
+    if fill_record is None:
+        raise HTTPException(status_code=409, detail="订单状态已变化，模拟成交未写入；请刷新订单后重试")
     if not fill_existed:
         bump_quant_investment_data_version(payload.household_id)
     return record

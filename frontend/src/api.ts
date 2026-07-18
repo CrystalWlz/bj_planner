@@ -212,6 +212,13 @@ export function simulateQuantPaperOrder(id: string, householdId: string, execute
   });
 }
 
+export function cancelQuantPaperOrder(id: string, householdId: string, reason = "用户人工取消模拟订单") {
+  return request<PaperOrderRecord>(`/api/quant-investment/paper-orders/${id}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, reason })
+  });
+}
+
 export function createMarketSnapshot(data: MarketSnapshotData) {
   return request<RecordEnvelope<MarketSnapshotData>>("/api/market-snapshots", {
     method: "POST",

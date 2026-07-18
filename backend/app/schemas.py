@@ -29,7 +29,7 @@ InvestmentInstrumentMarket = Literal["mainland_etf", "hong_kong_connect", "qdii_
 InvestmentTradingMode = Literal["exchange", "fund_subscription"]
 InvestmentAssetClass = Literal["equity", "defensive"]
 InvestmentMarketDataStatus = Literal["complete", "partial", "empty"]
-InvestmentOrderStatus = Literal["proposed", "simulated", "confirmed", "cancelled", "blocked"]
+InvestmentOrderStatus = Literal["proposed", "cancel_requested", "simulated", "confirmed", "cancelled", "blocked"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
 MemberSex = Literal["female", "male", "unspecified"]
 ProvidentAccountManagementCenter = Literal["beijing_municipal", "national"]
@@ -2516,11 +2516,41 @@ class PaperOrderCreate(BaseModel):
     household_id: str
     data: PaperOrderData
 
+    @model_validator(mode="after")
+    def validate_initial_order_status(self) -> "PaperOrderCreate":
+        if self.data.status != "proposed":
+            raise ValueError("新建模拟订单必须从待模拟状态开始")
+        return self
+
 
 class PaperOrderSimulateRequest(BaseModel):
     household_id: str
     executed_date: str = ""
     executed_price: float | None = Field(default=None, gt=0)
+
+
+class PaperOrderCancelRequest(BaseModel):
+    household_id: str
+    reason: str = Field("用户人工取消模拟订单", min_length=1, max_length=300)
+
+
+class PaperOrderEventData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    order_id: str
+    client_order_id: str
+    event_type: Literal["cancel_requested", "cancelled"]
+    from_status: InvestmentOrderStatus
+    to_status: InvestmentOrderStatus
+    reason: str = Field("", max_length=300)
+
+
+class PaperOrderEventRecord(BaseModel):
+    id: str
+    household_id: str
+    order_id: str
+    event_type: Literal["cancel_requested", "cancelled"]
+    data: PaperOrderEventData
+    created_at: datetime
 
 
 class PaperFillData(BaseModel):

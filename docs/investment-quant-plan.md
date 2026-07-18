@@ -39,6 +39,8 @@
 
 模拟订单只是交易意图；每个订单拥有唯一 `client_order_id`。点击模拟成交后，订单状态和成交事件必须在同一数据库事务中写入。同一订单只允许产生一条成交，重复点击返回已有成交，不重复增加持仓。月度提案采用的外部预算通过 `cash_contribution_amount` 只注入模拟账户一次，各订单至少覆盖自身预计成交所需资金，整手、费用取整和集中度约束后的未使用预算继续保留为模拟现金；只有再平衡订单的提案不注入外部资金。持仓、平均成本、市值、手续费、已实现/未实现盈亏全部由成交事件与最新行情在后端派生，不修改家庭真实现金或真实投资账户。
 
+未成交订单取消使用 `proposed → cancel_requested → cancelled` 状态机。系统先在同一 SQLite 事务中写入 `cancel_requested` 状态和不可变订单事件，再调用适配器；只有适配器确认后才写入 `cancelled` 事件。适配器未确认时保留取消请求供重试，不能伪装成已取消；已成交、已确认、已冻结订单拒绝取消，已取消订单拒绝再次模拟成交，重复取消幂等复用原事件。
+
 模拟订单持久化格式为 schema v2。数据库启动迁移会就地为旧外部买入订单补入等于原 `order_amount` 的模拟现金投入，为旧模拟现金买入和卖出订单补 0；迁移保留订单 ID、状态和已有成交关系，并可重复执行。运行期只消费迁移后的显式字段，旧订单回退逻辑仅用于迁移前的读取保护。
 
 `PaperPortfolioLedger` 把成交事件转换成现有 `MonthlyLedgerEntry → AccountSnapshotPoint → MonthlyVisualizationDetail` 数据结构，并作为 `AffordabilityResult.paper_portfolio` 进入主计算结果。模拟账户回撤按资金流中性的单位净值计算，追加资金不会掩盖既有亏损；历史最大回撤达到 15% 时与成交偏离过大、净值过期、对账不一致一样，只冻结新增订单，不会自动卖出、补仓或修改真实家庭账户。
@@ -49,7 +51,7 @@
 
 ## QMT 边界与阶段门槛
 
-`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 要求订单先取得本地落库 ID 和唯一 `client_order_id` 才能调用适配器；对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
+`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：提交或取消前必须通过持久化校验器确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配；对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
 
 - 二期 B：已具备手工防御资产池、季度阈值再平衡、现金/权益基准、独立交易日历、滚动样本外分段和最小方差逐信号日训练；最小方差仍仅限研究且默认关闭。
 - 三期：仅在券商书面确认 QMT/XtQuant 权限后，实现只读订单、持仓、现金查询和每日对账。

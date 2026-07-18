@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Database, PlayCircle, Plus, RefreshCw, ShieldCheck } from "lucide-react";
+import { Database, PlayCircle, Plus, RefreshCw, ShieldCheck, XCircle } from "lucide-react";
 import {
+  cancelQuantPaperOrder,
   createQuantInvestmentInstrument,
   createQuantInvestmentPolicy,
   createQuantInvestmentProposal,
@@ -166,6 +167,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     setBacktest(result);
   });
   const simulateOrder = (id: string) => runAction(async () => { await simulateQuantPaperOrder(id, householdId); });
+  const cancelOrder = (id: string) => runAction(async () => { await cancelQuantPaperOrder(id, householdId); });
   const reconcilePaperBroker = () => runAction(async () => { await reconcileQuantPaperBroker(householdId); });
   const writeManualSnapshot = (instrument: InvestmentInstrumentRecord) => runAction(async () => {
     const today = new Date();
@@ -245,7 +247,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
 
       {latestProposal ? <div className="setting-group"><strong className="setting-group-title">最近模拟提案 · {latestProposal.data.risk_state}</strong><div className="metric-grid"><Metric label="受保护现金" value={money(latestProposal.data.protected_cash)} /><Metric label="可投资现金" value={money(latestProposal.data.investable_cash)} /><Metric label="提案金额" value={money(latestProposal.data.proposed_budget)} /><Metric label="风险篮子回撤" value={percent(latestProposal.data.estimated_drawdown)} tone={latestProposal.data.risk_state === "normal" ? "good" : "warn"} /><Metric label="当前权益比例" value={percent(latestProposal.data.current_equity_ratio)} /><Metric label="季度再平衡" value={latestProposal.data.rebalance_triggered ? "已触发" : "未触发"} tone={latestProposal.data.rebalance_triggered ? "warn" : "good"} /></div><div className="warning-list">{latestProposal.data.reasons.map((reason) => <span key={reason}>{reason}</span>)}</div></div> : null}
 
-      {orders.length ? <div className="setting-group"><strong className="setting-group-title">模拟订单</strong>{orders.map((order) => <div className="strategy-card" key={order.id}><strong>{instrumentById.get(order.data.instrument_id)?.data.name ?? "未知标的"} · {order.data.side === "buy" ? "买入" : "卖出"} · {order.data.status === "simulated" ? "已模拟成交" : "待模拟"}</strong><p>{money(order.data.order_amount)}，预计价格 {order.data.estimated_price}，费用 {money(order.data.estimated_fee)}，预计交易日 {order.data.expected_trade_date || "待确认"}。{order.data.funding_source === "external_contribution" ? `模拟现金投入 ${money(order.data.cash_contribution_amount || order.data.order_amount)}。` : ""}{order.data.is_rebalance ? "季度再平衡；" : ""}{order.data.reason}</p>{order.data.status === "proposed" ? <button className="secondary-button" type="button" onClick={() => void simulateOrder(order.id)} disabled={busy}>按估算价模拟成交</button> : <span className="status-badge success">成交价 {order.data.executed_price}</span>}</div>)}</div> : null}
+      {orders.length ? <div className="setting-group"><strong className="setting-group-title">模拟订单</strong>{orders.map((order) => <div className="strategy-card" key={order.id}><strong>{instrumentById.get(order.data.instrument_id)?.data.name ?? "未知标的"} · {order.data.side === "buy" ? "买入" : "卖出"} · {orderStatusLabel(order.data.status)}</strong><p>{money(order.data.order_amount)}，预计价格 {order.data.estimated_price}，费用 {money(order.data.estimated_fee)}，预计交易日 {order.data.expected_trade_date || "待确认"}。{order.data.funding_source === "external_contribution" ? `模拟现金投入 ${money(order.data.cash_contribution_amount || order.data.order_amount)}。` : ""}{order.data.is_rebalance ? "季度再平衡；" : ""}{order.data.reason}</p><div className="inline-actions">{order.data.status === "proposed" ? <button className="secondary-button" type="button" onClick={() => void simulateOrder(order.id)} disabled={busy}>按估算价模拟成交</button> : null}{order.data.status === "proposed" || order.data.status === "cancel_requested" ? <button className="ghost-button" type="button" onClick={() => void cancelOrder(order.id)} disabled={busy} aria-label={order.data.status === "cancel_requested" ? "重试取消模拟订单" : "取消模拟订单"}><XCircle size={16} /> {order.data.status === "cancel_requested" ? "重试取消" : "取消"}</button> : null}{order.data.status === "simulated" ? <span className="status-badge success">成交价 {order.data.executed_price}</span> : null}{order.data.status === "cancelled" ? <span className="status-badge warning">已取消，不再成交</span> : null}</div></div>)}</div> : null}
 
       {portfolio ? <div className="setting-group"><div className="section-header"><strong className="setting-group-title">对账与事后风控</strong><button className="secondary-button" type="button" onClick={() => void reconcilePaperBroker()} disabled={busy}><ShieldCheck size={16} /> 核验模拟账本</button></div><div className="metric-grid"><Metric label="对账日期" value={displayedReconciliation?.data.reconciliation_date || "尚未运行"} /><Metric label="对账范围" value={displayedReconciliation?.data.adapter === "qmt" ? "QMT 只读" : "模拟盘"} /><Metric label="对账结果" value={!displayedReconciliation ? "待核验" : displayedReconciliation.data.matched ? "一致" : "存在差异"} tone={!displayedReconciliation ? undefined : displayedReconciliation.data.matched ? "good" : "bad"} /><Metric label="复核状态" value={!displayedReconciliation ? "无需复核" : displayedReconciliation.data.review_status === "pending" ? "待人工复核" : displayedReconciliation.data.review_status === "resolved" ? "已复核" : "无需复核"} tone={displayedReconciliation?.data.review_status === "pending" ? "bad" : "good"} /></div>{portfolio.post_trade_risk_issues.length ? <div className="warning-list">{portfolio.post_trade_risk_issues.map((issue) => <span key={`${issue.code}-${issue.order_id}-${issue.instrument_id}`} className={issue.severity === "freeze" ? "error-text" : undefined}>{issue.message}</span>)}</div> : null}</div> : null}
 
@@ -258,4 +260,13 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: "good" | "warn" | "bad" }) {
   return <div className={`metric ${tone ? `metric-${tone}` : ""}`}><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function orderStatusLabel(status: PaperOrderRecord["data"]["status"]) {
+  if (status === "proposed") return "待模拟";
+  if (status === "cancel_requested") return "取消处理中";
+  if (status === "simulated") return "已模拟成交";
+  if (status === "confirmed") return "已确认成交";
+  if (status === "cancelled") return "已取消";
+  return "已冻结";
 }
