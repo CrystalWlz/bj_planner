@@ -47,7 +47,7 @@
 
 模拟订单持久化格式为 schema v2。数据库启动迁移会就地为旧外部买入订单补入等于原 `order_amount` 的模拟现金投入，为旧模拟现金买入和卖出订单补 0；迁移保留订单 ID、状态和已有成交关系，并可重复执行。运行期只消费迁移后的显式字段，旧订单回退逻辑仅用于迁移前的读取保护。
 
-`PaperPortfolioLedger` 把成交事件转换成现有 `MonthlyLedgerEntry → AccountSnapshotPoint → MonthlyVisualizationDetail` 数据结构，并作为 `AffordabilityResult.paper_portfolio` 进入主计算结果。模拟账户回撤按资金流中性的单位净值计算，追加资金不会掩盖既有亏损；历史最大回撤达到 15% 时与成交偏离过大、净值过期、对账不一致一样，只冻结新增订单，不会自动卖出、补仓或修改真实家庭账户。
+`PaperPortfolioLedger` 先按 `executed_date + order_id` 重放不可变成交，再转换成现有 `MonthlyLedgerEntry → AccountSnapshotPoint → MonthlyVisualizationDetail` 数据结构，并作为 `AffordabilityResult.paper_portfolio` 进入主计算结果。每个月末的现金、持仓市值、已实现和未实现盈亏都使用当月末最近已确认价格派生；没有成交的月份也保留估值快照，不再用累计买入额减累计卖出额近似投资余额。模拟卖出和模拟现金买入按实际成交日校验当时可用持仓与现金，不能借用未来成交。模拟账户回撤按资金流中性的单位净值计算，追加资金不会掩盖既有亏损，未来行情不能进入估值或回撤；历史最大回撤达到 15% 时与成交偏离过大、净值过期、对账不一致一样，只冻结新增订单，不会自动卖出、补仓或修改真实家庭账户。
 
 事后风控同时输出机器可读的 `PostTradeRiskIssue`：稳定 code 区分组合回撤、成交价格偏离、QDII 净值缺失/过期、卖出超过持仓和对账差异，前端只展示后端给出的严重级别、观测值、阈值与说明。对账差异会形成不可变 `BrokerReconciliationRun`，保存适配器、本地/远端订单数、持仓数、现金、状态哈希和差异清单。`mismatch` 采用锁存冻结：后续一次 `matched` 不会自动清除旧异常，必须针对原运行记录填写人工复核说明后才解除该次冻结。
 

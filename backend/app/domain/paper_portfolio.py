@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import dataclass
+from datetime import date
 
 from ..schemas import (
     AccountSnapshotPoint,
     BrokerReconciliationRunData,
     InvestmentInstrumentData,
+    InvestmentMarketBarData,
     InvestmentMarketSnapshotData,
     MonthlyLedgerEntry,
     MonthlyVisualizationDetail,
@@ -28,13 +31,61 @@ class _PositionState:
     total_fees: float = 0.0
 
 
+def _ordered_fills(fills: list[PaperFillData]) -> list[PaperFillData]:
+    return sorted(fills, key=lambda item: (item.executed_date, item.order_id))
+
+
+def _apply_fill_to_position(state: _PositionState, fill: PaperFillData) -> tuple[float, float]:
+    state.total_fees += fill.fee
+    if fill.side == "buy":
+        state.quantity += fill.executed_quantity
+        state.total_cost += fill.gross_amount + fill.fee
+        return fill.executed_quantity, 0.0
+    sold_quantity = min(state.quantity, fill.executed_quantity)
+    average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
+    removed_cost = average_cost * sold_quantity
+    allocated_fee = fill.fee * sold_quantity / fill.executed_quantity if fill.executed_quantity > 0 else 0.0
+    sale_proceeds = fill.executed_price * sold_quantity - allocated_fee
+    state.realized_pnl += sale_proceeds - removed_cost
+    state.quantity = max(0.0, state.quantity - sold_quantity)
+    state.total_cost = max(0.0, state.total_cost - removed_cost)
+    return sold_quantity, removed_cost
+
+
+def _month_keys_between(start_month: str, end_month: str) -> list[str]:
+    start_year, start_value = (int(item) for item in start_month.split("-", 1))
+    end_year, end_value = (int(item) for item in end_month.split("-", 1))
+    start_ordinal = start_year * 12 + start_value - 1
+    end_ordinal = end_year * 12 + end_value - 1
+    return [
+        f"{ordinal // 12:04d}-{ordinal % 12 + 1:02d}"
+        for ordinal in range(start_ordinal, end_ordinal + 1)
+    ]
+
+
+def _latest_confirmed_bar(
+    snapshot: InvestmentMarketSnapshotData,
+    *,
+    as_of_date: str,
+) -> InvestmentMarketBarData | None:
+    bars = [
+        bar
+        for bar in snapshot.bars
+        if bar.is_trading
+        and not bar.is_suspended
+        and (bar.adjusted_close or bar.close) > 0
+        and (bar.price_date or bar.date) <= as_of_date
+    ]
+    return max(bars, key=lambda bar: bar.price_date or bar.date) if bars else None
+
+
 def _paper_nav_drawdowns(
     fills: list[PaperFillData],
     snapshots: dict[str, InvestmentMarketSnapshotData],
 ) -> tuple[float, float]:
     if not fills:
         return 0.0, 0.0
-    ordered_fills = sorted(fills, key=lambda item: (item.executed_date, item.order_id))
+    ordered_fills = _ordered_fills(fills)
     first_fill_date = ordered_fills[0].executed_date
     fills_by_date: dict[str, list[PaperFillData]] = {}
     for fill in ordered_fills:
@@ -43,7 +94,12 @@ def _paper_nav_drawdowns(
     for instrument_id, snapshot in snapshots.items():
         for bar in snapshot.bars:
             price_date = bar.price_date or bar.date
-            if price_date < first_fill_date or not bar.is_trading or bar.is_suspended:
+            if (
+                price_date < first_fill_date
+                or price_date > date.today().isoformat()
+                or not bar.is_trading
+                or bar.is_suspended
+            ):
                 continue
             price_updates.setdefault(price_date, {})[instrument_id] = float(bar.adjusted_close or bar.close)
 
@@ -141,25 +197,37 @@ def _ledger_entry(
 def _paper_ledger_artifacts(
     fills: list[PaperFillData],
     *,
-    cash_balance: float,
-    market_value: float,
-    total_equity: float,
-    unrealized_pnl: float,
-    realized_pnl: float,
+    market_snapshots: dict[str, InvestmentMarketSnapshotData],
     current_drawdown: float,
     max_drawdown: float,
 ) -> tuple[list[MonthlyLedgerEntry], list[AccountSnapshotPoint], list[MonthlyVisualizationDetail]]:
     if not fills:
         return [], [], []
-    month_keys = sorted({fill.executed_date[:7] for fill in fills})
+    ordered_fills = _ordered_fills(fills)
+    latest_price_date = max(
+        (
+            bar.price_date or bar.date
+            for snapshot in market_snapshots.values()
+            for bar in snapshot.bars
+            if bar.is_trading and not bar.is_suspended and (bar.price_date or bar.date) <= date.today().isoformat()
+        ),
+        default=ordered_fills[-1].executed_date,
+    )
+    month_keys = _month_keys_between(
+        ordered_fills[0].executed_date[:7],
+        max(ordered_fills[-1].executed_date, latest_price_date)[:7],
+    )
     month_index = {key: index + 1 for index, key in enumerate(month_keys)}
     entries: list[MonthlyLedgerEntry] = []
     running_cash = 0.0
-    running_investment = 0.0
+    states: dict[str, _PositionState] = {}
+    latest_execution_prices: dict[str, float] = {}
+    prior_realized_pnl = 0.0
+    prior_unrealized_pnl = 0.0
     snapshots: list[AccountSnapshotPoint] = []
     details: list[MonthlyVisualizationDetail] = []
     fills_by_month: dict[str, list[PaperFillData]] = {key: [] for key in month_keys}
-    for fill in fills:
+    for fill in ordered_fills:
         fills_by_month[fill.executed_date[:7]].append(fill)
 
     for key in month_keys:
@@ -167,23 +235,53 @@ def _paper_ledger_artifacts(
         month_entries: list[MonthlyLedgerEntry] = []
         for fill in fills_by_month[key]:
             running_cash += fill.contribution_amount + fill.cash_change
+            latest_execution_prices[fill.instrument_id] = fill.executed_price
             if fill.contribution_amount:
                 month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_contribution", label="模拟账户资金投入", amount=fill.contribution_amount, direction="inflow"))
             if fill.side == "buy":
-                running_investment += fill.gross_amount
                 month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_buy", label="模拟买入现金划出", amount=-fill.gross_amount, direction="transfer"))
                 month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_buy", label="模拟投资持仓增加", amount=fill.gross_amount, direction="transfer"))
             else:
-                running_investment = max(0.0, running_investment - fill.gross_amount)
                 month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_sell", label="模拟投资持仓卖出", amount=-fill.gross_amount, direction="transfer"))
                 month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_sell", label="模拟卖出现金到账", amount=fill.gross_amount, direction="transfer"))
             if fill.fee:
                 month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_fee", label="模拟交易手续费", amount=-fill.fee, direction="outflow"))
+            _apply_fill_to_position(states.setdefault(fill.instrument_id, _PositionState()), fill)
+
+        year, month_of_year = (int(item) for item in key.split("-", 1))
+        valuation_date = min(
+            date.today().isoformat(),
+            f"{key}-{monthrange(year, month_of_year)[1]:02d}",
+        )
+        snapshot_market_value = 0.0
+        for instrument_id, state in states.items():
+            if state.quantity <= 1e-9:
+                continue
+            latest_price = (
+                state.total_cost / state.quantity
+                if state.total_cost > 0
+                else latest_execution_prices.get(instrument_id, 0.0)
+            )
+            market_snapshot = market_snapshots.get(instrument_id)
+            if market_snapshot is not None:
+                latest_bar = _latest_confirmed_bar(market_snapshot, as_of_date=valuation_date)
+                if latest_bar is not None:
+                    latest_price = float(latest_bar.adjusted_close or latest_bar.close)
+            snapshot_market_value += state.quantity * latest_price
+        snapshot_cash = max(0.0, running_cash)
+        snapshot_total = snapshot_cash + snapshot_market_value
+        realized_pnl = sum(state.realized_pnl for state in states.values())
+        remaining_cost = sum(state.total_cost for state in states.values())
+        unrealized_pnl = snapshot_market_value - remaining_cost
+        realized_change = realized_pnl - prior_realized_pnl
+        unrealized_change = unrealized_pnl - prior_unrealized_pnl
+        if abs(unrealized_change) > 0.005:
+            month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_unrealized_pnl", label="模拟持仓未实现盈亏变动", amount=unrealized_change, direction="valuation"))
+        if abs(realized_change) > 0.005:
+            month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_realized_pnl", label="模拟交易已实现盈亏", amount=realized_change, direction="valuation"))
+        prior_realized_pnl = realized_pnl
+        prior_unrealized_pnl = unrealized_pnl
         entries.extend(month_entries)
-        is_last = key == month_keys[-1]
-        snapshot_market_value = market_value if is_last else running_investment
-        snapshot_cash = cash_balance if is_last else max(0.0, running_cash)
-        snapshot_total = total_equity if is_last else snapshot_cash + snapshot_market_value
         snapshots.append(
             AccountSnapshotPoint(
                 plan_variant="paper_quant",
@@ -203,16 +301,19 @@ def _paper_ledger_artifacts(
                 name=item.label,
                 value=abs(item.amount),
                 amount=item.amount,
-                kind="income" if item.direction == "inflow" else ("expense" if item.direction == "outflow" else "asset"),
+                kind=(
+                    "result"
+                    if item.direction == "valuation"
+                    else "income"
+                    if item.direction == "inflow"
+                    else "expense"
+                    if item.direction == "outflow"
+                    else "asset"
+                ),
             )
             for item in month_entries
         ]
-        if is_last and unrealized_pnl:
-            entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_unrealized_pnl", label="模拟持仓未实现盈亏", amount=unrealized_pnl, direction="valuation"))
-            cash_flow_items.append(VisualizationBreakdownItem(name="未实现盈亏", value=abs(unrealized_pnl), amount=unrealized_pnl, kind="result"))
-        if is_last and realized_pnl:
-            entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_realized_pnl", label="模拟交易已实现盈亏", amount=realized_pnl, direction="valuation"))
-            cash_flow_items.append(VisualizationBreakdownItem(name="已实现盈亏", value=abs(realized_pnl), amount=realized_pnl, kind="result"))
+        is_last = key == month_keys[-1]
         details.append(
             MonthlyVisualizationDetail(
                 plan_variant="paper_quant",
@@ -316,7 +417,8 @@ def build_paper_portfolio_summary(
 
     contributions = 0.0
     cash_balance = 0.0
-    for fill in fills:
+    ordered_fills = _ordered_fills(fills)
+    for fill in ordered_fills:
         if fill.reconciliation_status == "mismatch":
             reconciliation_mismatch = True
             frozen = True
@@ -345,13 +447,9 @@ def build_paper_portfolio_summary(
         state = states.setdefault(fill.instrument_id, _PositionState())
         contributions += fill.contribution_amount
         cash_balance += fill.cash_change + fill.contribution_amount
-        state.total_fees += fill.fee
-        if fill.side == "buy":
-            state.quantity += fill.executed_quantity
-            state.total_cost += fill.gross_amount + fill.fee
-            continue
-        sold_quantity = min(state.quantity, fill.executed_quantity)
-        if sold_quantity < fill.executed_quantity:
+        available_quantity = state.quantity
+        sold_quantity, _removed_cost = _apply_fill_to_position(state, fill)
+        if fill.side == "sell" and sold_quantity < fill.executed_quantity:
             add_issue(
                 code="position_oversell",
                 severity="warning",
@@ -359,15 +457,9 @@ def build_paper_portfolio_summary(
                 order_id=fill.order_id,
                 instrument_id=fill.instrument_id,
                 observed_value=fill.executed_quantity,
-                threshold=state.quantity,
+                threshold=available_quantity,
                 message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，已按可用持仓计算",
             )
-        average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
-        removed_cost = average_cost * sold_quantity
-        sale_proceeds = fill.executed_price * sold_quantity - fill.fee
-        state.realized_pnl += sale_proceeds - removed_cost
-        state.quantity -= sold_quantity
-        state.total_cost = max(0.0, state.total_cost - removed_cost)
 
     positions: list[PaperPositionData] = []
     for instrument_id, state in states.items():
@@ -382,13 +474,8 @@ def build_paper_portfolio_summary(
         latest_price_date = ""
         snapshot = snapshots.get(instrument_id)
         if snapshot is not None:
-            bars = [
-                bar
-                for bar in snapshot.bars
-                if bar.is_trading and not bar.is_suspended and (bar.adjusted_close or bar.close) > 0
-            ]
-            if bars:
-                latest_bar = max(bars, key=lambda bar: bar.price_date or bar.date)
+            latest_bar = _latest_confirmed_bar(snapshot, as_of_date=date.today().isoformat())
+            if latest_bar is not None:
                 latest_price = float(latest_bar.adjusted_close or latest_bar.close)
                 latest_price_date = latest_bar.price_date or latest_bar.date
                 if policy and instrument.market == "qdii_etf":
@@ -467,12 +554,8 @@ def build_paper_portfolio_summary(
             message=f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已暂停新增并等待人工复核",
         )
     ledger_entries, account_snapshots, visualization_details = _paper_ledger_artifacts(
-        fills,
-        cash_balance=max(0.0, cash_balance),
-        market_value=market_value,
-        total_equity=max(0.0, cash_balance) + market_value,
-        unrealized_pnl=unrealized_pnl,
-        realized_pnl=realized_pnl,
+        ordered_fills,
+        market_snapshots=snapshots,
         current_drawdown=current_drawdown,
         max_drawdown=max_drawdown,
     )

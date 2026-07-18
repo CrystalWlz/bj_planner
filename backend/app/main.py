@@ -938,17 +938,8 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
     portfolio = _paper_portfolio_for_household(payload.household_id, policy)
     if order.data.status == "proposed" and order.data.side == "buy" and portfolio.frozen:
         raise HTTPException(status_code=409, detail="模拟账户事后风控已冻结新增买入；请先人工复核异常")
-    if order.data.status == "proposed" and order.data.side == "buy" and order.data.funding_source == "paper_cash":
-        if order.data.order_amount > portfolio.cash_balance + 1e-6:
-            raise HTTPException(status_code=409, detail="模拟现金不足；请先成交再平衡卖出订单或降低买入金额")
-    if order.data.status == "proposed" and order.data.side == "sell":
-        position = next((item for item in portfolio.positions if item.instrument_id == order.data.instrument_id), None)
-        if position is None or order.data.estimated_quantity > position.quantity + 1e-6:
-            raise HTTPException(status_code=409, detail="模拟卖出数量超过当前可用持仓")
-    fill_existed = any(
-        item["order_id"] == record_id
-        for item in list_paper_investment_fills(household_id=payload.household_id)
-    )
+    fill_records = list_paper_investment_fills(household_id=payload.household_id)
+    fill_existed = any(item["order_id"] == record_id for item in fill_records)
     if order.data.status == "simulated":
         simulated = order.data
     else:
@@ -964,6 +955,24 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
         fill = paper_fill_from_order(record_id, simulated)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if order.data.status == "proposed":
+        persisted_fills = [PaperFillRecord.model_validate(item).data for item in fill_records]
+        prior_fills = [
+            item for item in persisted_fills if item.executed_date <= fill.executed_date
+        ]
+        if order.data.side == "buy" and order.data.funding_source == "paper_cash":
+            available_cash = sum(item.contribution_amount + item.cash_change for item in prior_fills)
+            required_cash = max(0.0, -fill.cash_change)
+            if required_cash > available_cash + 1e-6:
+                raise HTTPException(status_code=409, detail="成交日模拟现金不足；请先成交更早的再平衡卖出订单或降低买入金额")
+        if order.data.side == "sell":
+            available_quantity = sum(
+                item.executed_quantity if item.side == "buy" else -item.executed_quantity
+                for item in prior_fills
+                if item.instrument_id == order.data.instrument_id
+            )
+            if fill.executed_quantity > available_quantity + 1e-6:
+                raise HTTPException(status_code=409, detail="成交日模拟卖出数量超过当前可用持仓")
     record, fill_record = record_paper_fill_atomic(
         record_id,
         household_id=payload.household_id,

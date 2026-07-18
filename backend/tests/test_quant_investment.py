@@ -901,6 +901,96 @@ def test_paper_portfolio_drawdown_is_cashflow_neutral_and_freezes_new_orders() -
     assert any("历史最大回撤" in warning for warning in summary.warnings)
 
 
+def test_paper_portfolio_replays_out_of_order_fills_into_month_end_snapshots() -> None:
+    from app.domain.paper_portfolio import build_paper_portfolio_summary
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例账本 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+    )
+    buy = PaperFillData(
+        order_id="order-buy",
+        client_order_id="client-order-buy",
+        proposal_id="proposal-buy",
+        instrument_id="instrument-1",
+        side="buy",
+        executed_date="2026-01-10",
+        executed_price=10,
+        executed_quantity=100,
+        gross_amount=1000,
+        fee=10,
+        cash_change=-1010,
+        contribution_amount=1100,
+    )
+    sell = PaperFillData(
+        order_id="order-sell",
+        client_order_id="client-order-sell",
+        proposal_id="proposal-sell",
+        instrument_id="instrument-1",
+        side="sell",
+        executed_date="2026-02-20",
+        executed_price=12,
+        executed_quantity=50,
+        gross_amount=600,
+        fee=6,
+        cash_change=594,
+        contribution_amount=0,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-02-20",
+        bars=[
+            {"date": "2026-01-31", "close": 11},
+            {"date": "2026-02-20", "close": 12},
+        ],
+    )
+
+    summary = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[sell, buy],
+        instruments={"instrument-1": instrument},
+        snapshots={"instrument-1": snapshot},
+    )
+
+    assert len(summary.positions) == 1
+    assert summary.positions[0].quantity == pytest.approx(50)
+    assert summary.positions[0].average_cost == pytest.approx(10.1)
+    assert summary.positions[0].total_cost == pytest.approx(505)
+    assert summary.realized_pnl == pytest.approx(89)
+    assert summary.unrealized_pnl == pytest.approx(95)
+    assert summary.cash_balance == pytest.approx(684)
+    assert summary.total_equity == pytest.approx(1284)
+    assert not any(issue.code == "position_oversell" for issue in summary.post_trade_risk_issues)
+    assert [point.cash_balance for point in summary.account_snapshots] == pytest.approx([90, 684])
+    assert [point.investment_balance for point in summary.account_snapshots] == pytest.approx([1100, 600])
+    assert [point.net_worth for point in summary.account_snapshots] == pytest.approx([1190, 1284])
+    unrealized_changes = [
+        entry.amount
+        for entry in summary.ledger_entries
+        if entry.category == "paper_unrealized_pnl"
+    ]
+    realized_changes = [
+        entry.amount
+        for entry in summary.ledger_entries
+        if entry.category == "paper_realized_pnl"
+    ]
+    assert unrealized_changes == pytest.approx([90, 5])
+    assert realized_changes == pytest.approx([89])
+
+    cost_valued = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[buy],
+        instruments={"instrument-1": instrument},
+        snapshots={},
+    )
+    assert cost_valued.positions[0].market_value == pytest.approx(1010)
+    assert cost_valued.account_snapshots[-1].investment_balance == pytest.approx(1010)
+    assert cost_valued.account_snapshots[-1].net_worth == pytest.approx(cost_valued.total_equity)
+
+
 def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
     from app.broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter, QmtBrokerAdapter
     from app.schemas import PaperOrderData
@@ -1797,3 +1887,73 @@ def test_rebalance_execution_cannot_overdraw_cash_or_oversell_positions(tmp_path
     assert "模拟现金不足" in buy_response.json()["detail"]
     assert sell_response.status_code == 409
     assert "超过当前可用持仓" in sell_response.json()["detail"]
+
+
+def test_paper_sell_uses_position_available_on_execution_date(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        instrument = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "510300.SH",
+                    "name": "示例成交时钟 ETF",
+                    "market": "mainland_etf",
+                    "asset_class": "equity",
+                },
+            },
+        ).json()
+        buy = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "clock-buy",
+                    "instrument_id": instrument["id"],
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                    "cash_contribution_amount": 1000,
+                },
+            },
+        ).json()
+        buy_response = client.post(
+            f"/api/quant-investment/paper-orders/{buy['id']}/simulate",
+            json={"household_id": household_id, "executed_date": "2026-02-01"},
+        )
+        sell = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "clock-sell",
+                    "instrument_id": instrument["id"],
+                    "side": "sell",
+                    "funding_source": "paper_cash",
+                    "order_amount": 500,
+                    "estimated_price": 1,
+                    "estimated_quantity": 500,
+                    "estimated_fee": 2.5,
+                },
+            },
+        ).json()
+        backdated_sell = client.post(
+            f"/api/quant-investment/paper-orders/{sell['id']}/simulate",
+            json={"household_id": household_id, "executed_date": "2026-01-15"},
+        )
+        valid_sell = client.post(
+            f"/api/quant-investment/paper-orders/{sell['id']}/simulate",
+            json={"household_id": household_id, "executed_date": "2026-02-02"},
+        )
+
+    assert buy_response.status_code == 200
+    assert backdated_sell.status_code == 409
+    assert "成交日" in backdated_sell.json()["detail"]
+    assert valid_sell.status_code == 200
