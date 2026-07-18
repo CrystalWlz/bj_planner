@@ -13,6 +13,8 @@ from starlette.middleware.gzip import GZipMiddleware
 from .cache import affordability_cache_key, calculation_code_fingerprints
 from .calculator import calculate_affordability
 from .database import (
+    DuplicateClientOrderIdError,
+    InvalidClientOrderIdError,
     delete_record,
     bump_quant_investment_data_version,
     confirm_paper_order_cancel,
@@ -569,6 +571,26 @@ def _quant_snapshot_map(household_id: str) -> tuple[list[tuple[str, object]], di
     return parsed_instruments, parsed_snapshots
 
 
+def _insert_paper_order_or_conflict(
+    *,
+    household_id: str,
+    proposal_id: str,
+    instrument_id: str,
+    data: dict,
+) -> dict:
+    try:
+        return insert_paper_investment_order(
+            household_id=household_id,
+            proposal_id=proposal_id,
+            instrument_id=instrument_id,
+            data=data,
+        )
+    except DuplicateClientOrderIdError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidClientOrderIdError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/api/quant-investment/proposals", response_model=list[QuantInvestmentProposalRecord])
 def get_quant_investment_proposals(household_id: str) -> list[dict]:
     return list_quant_scoped_records("quant_investment_proposals", household_id=household_id)
@@ -615,7 +637,7 @@ def create_quant_investment_proposal(payload: QuantInvestmentProposalRequest) ->
     )
     for order in orders:
         order_data = order.model_copy(update={"proposal_id": proposal_record["id"]})
-        insert_paper_investment_order(
+        _insert_paper_order_or_conflict(
             household_id=payload.household_id,
             proposal_id=proposal_record["id"],
             instrument_id=order_data.instrument_id,
@@ -849,7 +871,7 @@ def _paper_portfolio_for_household(
 
 @app.post("/api/quant-investment/paper-orders", response_model=PaperOrderRecord)
 def create_quant_paper_order(payload: PaperOrderCreate) -> dict:
-    return insert_paper_investment_order(
+    return _insert_paper_order_or_conflict(
         household_id=payload.household_id,
         proposal_id=payload.data.proposal_id,
         instrument_id=payload.data.instrument_id,

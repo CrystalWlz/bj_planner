@@ -50,6 +50,14 @@ def default_db_path() -> Path:
 DB_PATH = default_db_path()
 
 
+class DuplicateClientOrderIdError(ValueError):
+    pass
+
+
+class InvalidClientOrderIdError(ValueError):
+    pass
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -189,11 +197,6 @@ def initialize_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_paper_investment_orders_household
                 ON paper_investment_orders(household_id, updated_at DESC);
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_investment_orders_client_order_id
-                ON paper_investment_orders(json_extract(data, '$.client_order_id'))
-                WHERE json_extract(data, '$.client_order_id') IS NOT NULL
-                  AND json_extract(data, '$.client_order_id') <> '';
 
             CREATE TABLE IF NOT EXISTS paper_investment_fills (
                 id TEXT PRIMARY KEY,
@@ -436,6 +439,68 @@ def _normalize_paper_order_cash_contributions(conn: sqlite3.Connection) -> bool:
     return changed
 
 
+def _ensure_unique_paper_client_order_ids(conn: sqlite3.Connection) -> bool:
+    """Normalize legacy order identifiers before enforcing broker idempotency."""
+    changed = False
+    seen: set[str] = set()
+    rows = conn.execute(
+        "SELECT id, data FROM paper_investment_orders ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        order_id = str(row["id"])
+        data = _load_json(row["data"])
+        client_order_id = str(data.get("client_order_id") or "").strip()
+        is_valid = 8 <= len(client_order_id) <= 100 and client_order_id not in seen
+        if is_valid:
+            seen.add(client_order_id)
+            continue
+        replacement = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"house-planner:paper-client-order:{order_id}")
+        )
+        suffix = 0
+        while replacement in seen:
+            suffix += 1
+            replacement = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"house-planner:paper-client-order:{order_id}:{suffix}",
+                )
+            )
+        seen.add(replacement)
+        data["client_order_id"] = replacement
+        conn.execute(
+            "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), now_iso(), order_id),
+        )
+        for table in ("paper_investment_fills", "paper_investment_order_events"):
+            related_rows = conn.execute(
+                f"SELECT id, data FROM {table} WHERE order_id = ?",
+                (order_id,),
+            ).fetchall()
+            for related in related_rows:
+                related_data = _load_json(related["data"])
+                related_data["client_order_id"] = replacement
+                conn.execute(
+                    f"UPDATE {table} SET data = ? WHERE id = ?",
+                    (json.dumps(related_data, ensure_ascii=False), related["id"]),
+                )
+        changed = True
+
+    index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("idx_paper_investment_orders_client_order_id",),
+    ).fetchone()
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_investment_orders_client_order_id
+            ON paper_investment_orders(json_extract(data, '$.client_order_id'))
+            WHERE json_extract(data, '$.client_order_id') IS NOT NULL
+              AND json_extract(data, '$.client_order_id') <> ''
+        """
+    )
+    return changed or index_exists is None
+
+
 def migrate_database(conn: sqlite3.Connection) -> None:
     previous_schema_history = _has_previous_schema_history(conn)
     child_count_semantics_migration_pending = not _migration_applied(conn, CURRENT_SCHEMA_VERSION)
@@ -444,6 +509,7 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     changed = _migrate_scenario_shadows_to_planning_goals(conn) or changed
     changed = _ensure_versioned_investment_market_snapshots(conn) or changed
     changed = _normalize_paper_order_cash_contributions(conn) or changed
+    changed = _ensure_unique_paper_client_order_ids(conn) or changed
     cache_layer_columns = {
         "input_hash": "TEXT NOT NULL DEFAULT ''",
         "strategy_hash": "TEXT NOT NULL DEFAULT ''",
@@ -1066,20 +1132,39 @@ def list_investment_market_snapshots(*, instrument_ids: list[str]) -> list[dict[
 def insert_paper_investment_order(*, household_id: str, proposal_id: str, instrument_id: str, data: dict[str, Any]) -> dict[str, Any]:
     record_id = str(uuid.uuid4())
     timestamp = now_iso()
+    client_order_id = str(data.get("client_order_id") or "").strip()
+    if not 8 <= len(client_order_id) <= 100:
+        raise InvalidClientOrderIdError("client_order_id 必须为 8 到 100 个字符")
     with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             "SELECT * FROM paper_investment_orders WHERE proposal_id = ? AND instrument_id = ?",
             (proposal_id, instrument_id),
         ).fetchone()
         if existing is not None:
             return _paper_order_record(existing)
-        conn.execute(
-            """
-            INSERT INTO paper_investment_orders (id, household_id, proposal_id, instrument_id, data, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (record_id, household_id, proposal_id, instrument_id, json.dumps(data, ensure_ascii=False), timestamp, timestamp),
-        )
+        duplicate = conn.execute(
+            "SELECT id FROM paper_investment_orders WHERE json_extract(data, '$.client_order_id') = ?",
+            (client_order_id,),
+        ).fetchone()
+        if duplicate is not None:
+            raise DuplicateClientOrderIdError("client_order_id 已被其他本地订单使用")
+        try:
+            conn.execute(
+                """
+                INSERT INTO paper_investment_orders (id, household_id, proposal_id, instrument_id, data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (record_id, household_id, proposal_id, instrument_id, json.dumps(data, ensure_ascii=False), timestamp, timestamp),
+            )
+        except sqlite3.IntegrityError as exc:
+            duplicate = conn.execute(
+                "SELECT id FROM paper_investment_orders WHERE json_extract(data, '$.client_order_id') = ?",
+                (client_order_id,),
+            ).fetchone()
+            if duplicate is not None:
+                raise DuplicateClientOrderIdError("client_order_id 已被其他本地订单使用") from exc
+            raise
         row = conn.execute("SELECT * FROM paper_investment_orders WHERE id = ?", (record_id,)).fetchone()
     if row is None:
         raise RuntimeError("Paper investment order insert failed")

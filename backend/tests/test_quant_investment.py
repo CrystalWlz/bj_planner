@@ -980,6 +980,217 @@ def test_paper_broker_uses_planned_trade_date_and_rejects_backdating() -> None:
         )
 
 
+def test_paper_order_api_rejects_duplicate_client_order_id(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        order_data = {
+            "client_order_id": "duplicate-client-order-id",
+            "proposal_id": "proposal-a",
+            "instrument_id": "instrument-a",
+            "order_amount": 1000,
+            "estimated_price": 1,
+            "estimated_quantity": 995,
+            "estimated_fee": 5,
+        }
+        first = client.post(
+            "/api/quant-investment/paper-orders",
+            json={"household_id": household_id, "data": order_data},
+        )
+        repeated_same_order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={"household_id": household_id, "data": order_data},
+        )
+        duplicate = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    **order_data,
+                    "proposal_id": "proposal-b",
+                    "instrument_id": "instrument-b",
+                },
+            },
+        )
+        orders = client.get(
+            "/api/quant-investment/paper-orders",
+            params={"household_id": household_id},
+        ).json()
+
+    assert first.status_code == 200
+    assert repeated_same_order.status_code == 200
+    assert repeated_same_order.json()["id"] == first.json()["id"]
+    assert duplicate.status_code == 409
+    assert "client_order_id" in duplicate.json()["detail"]
+    assert len(orders) == 1
+    with pytest.raises(database.InvalidClientOrderIdError):
+        database.insert_paper_investment_order(
+            household_id=household_id,
+            proposal_id="proposal-invalid",
+            instrument_id="instrument-invalid",
+            data={"client_order_id": "short"},
+        )
+
+
+def test_concurrent_paper_orders_cannot_share_client_order_id(tmp_path, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    barrier = Barrier(2)
+
+    def insert_order(suffix: str) -> str:
+        barrier.wait()
+        try:
+            database.insert_paper_investment_order(
+                household_id="household-a",
+                proposal_id=f"proposal-{suffix}",
+                instrument_id=f"instrument-{suffix}",
+                data={
+                    "client_order_id": "concurrent-client-order-id",
+                    "proposal_id": f"proposal-{suffix}",
+                    "instrument_id": f"instrument-{suffix}",
+                },
+            )
+        except database.DuplicateClientOrderIdError:
+            return "duplicate"
+        return "inserted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = sorted(executor.map(insert_order, ("a", "b")))
+
+    with database.get_connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM paper_investment_orders WHERE json_extract(data, '$.client_order_id') = ?",
+            ("concurrent-client-order-id",),
+        ).fetchone()[0]
+
+    assert results == ["duplicate", "inserted"]
+    assert count == 1
+
+
+def test_database_repairs_duplicate_legacy_client_order_ids_before_indexing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    timestamp = "2026-07-01T00:00:00+00:00"
+    with database.get_connection() as conn:
+        conn.execute("DROP INDEX idx_paper_investment_orders_client_order_id")
+        for suffix in ("a", "b"):
+            order_data = {
+                "schema_version": 2,
+                "client_order_id": "legacy-duplicate-client-id",
+                "proposal_id": f"proposal-{suffix}",
+                "instrument_id": f"instrument-{suffix}",
+                "side": "buy",
+                "funding_source": "external_contribution",
+                "order_amount": 1000,
+                "estimated_price": 1,
+                "estimated_quantity": 995,
+                "estimated_fee": 5,
+                "cash_contribution_amount": 1000,
+                "status": "simulated" if suffix == "b" else "proposed",
+            }
+            conn.execute(
+                """
+                INSERT INTO paper_investment_orders
+                    (id, household_id, proposal_id, instrument_id, data, created_at, updated_at)
+                VALUES (?, 'household-a', ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"order-{suffix}",
+                    order_data["proposal_id"],
+                    order_data["instrument_id"],
+                    json.dumps(order_data, ensure_ascii=False),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        fill_data = {
+            "schema_version": 1,
+            "order_id": "order-b",
+            "client_order_id": "legacy-duplicate-client-id",
+            "proposal_id": "proposal-b",
+            "instrument_id": "instrument-b",
+            "side": "buy",
+            "executed_date": "2026-07-01",
+            "executed_price": 1,
+            "executed_quantity": 995,
+            "gross_amount": 995,
+            "fee": 5,
+            "cash_change": -1000,
+            "contribution_amount": 1000,
+        }
+        conn.execute(
+            """
+            INSERT INTO paper_investment_fills
+                (id, household_id, order_id, proposal_id, instrument_id, data, created_at)
+            VALUES ('fill-b', 'household-a', 'order-b', 'proposal-b', 'instrument-b', ?, ?)
+            """,
+            (json.dumps(fill_data, ensure_ascii=False), timestamp),
+        )
+        event_data = {
+            "schema_version": 1,
+            "order_id": "order-b",
+            "client_order_id": "legacy-duplicate-client-id",
+            "event_type": "cancel_requested",
+            "from_status": "proposed",
+            "to_status": "cancel_requested",
+            "reason": "legacy event",
+        }
+        conn.execute(
+            """
+            INSERT INTO paper_investment_order_events
+                (id, household_id, order_id, event_type, data, created_at)
+            VALUES ('event-b', 'household-a', 'order-b', 'cancel_requested', ?, ?)
+            """,
+            (json.dumps(event_data, ensure_ascii=False), timestamp),
+        )
+
+    database.initialize_database()
+    with database.get_connection() as conn:
+        first_state = {
+            row["id"]: json.loads(row["data"])
+            for row in conn.execute(
+                "SELECT id, data FROM paper_investment_orders ORDER BY id"
+            ).fetchall()
+        }
+        fill_client_order_id = json.loads(
+            conn.execute("SELECT data FROM paper_investment_fills WHERE id = 'fill-b'").fetchone()["data"]
+        )["client_order_id"]
+        event_client_order_id = json.loads(
+            conn.execute("SELECT data FROM paper_investment_order_events WHERE id = 'event-b'").fetchone()["data"]
+        )["client_order_id"]
+        index_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_paper_investment_orders_client_order_id'"
+        ).fetchone()
+    database.initialize_database()
+    with database.get_connection() as conn:
+        second_state = {
+            row["id"]: json.loads(row["data"])
+            for row in conn.execute(
+                "SELECT id, data FROM paper_investment_orders ORDER BY id"
+            ).fetchall()
+        }
+
+    assert first_state["order-a"]["client_order_id"] == "legacy-duplicate-client-id"
+    assert first_state["order-b"]["client_order_id"] != "legacy-duplicate-client-id"
+    assert fill_client_order_id == first_state["order-b"]["client_order_id"]
+    assert event_client_order_id == first_state["order-b"]["client_order_id"]
+    assert index_exists is not None
+    assert second_state == first_state
+
+
 def test_broker_reconciliation_compares_orders_positions_and_cash() -> None:
     from app.broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter
     from app.schemas import PaperOrderData, PaperPositionData

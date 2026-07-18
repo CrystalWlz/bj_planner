@@ -54,6 +54,8 @@ flowchart LR
 
   `PaperBrokerAdapter` 统一校验模拟成交日期：未填写时使用订单的 `expected_trade_date`，人工回填不得早于计划日或晚于当前日，且必须是有效 ISO 日期，避免成交事件早于信号时钟或提前确认未来成交。
 
+  `client_order_id` 由 SQLite 全局唯一索引强制，而不只依赖 UUID 默认值。数据库迁移先规范缺失、非法或重复的历史订单号并同步成交/取消事件引用，再创建索引；同订单重试复用原记录，不同订单号冲突由 API 返回 `409`。这使 `LocalFirstBrokerGateway` 的持久化校验拥有稳定且唯一的券商幂等键。
+
 - `scripts/perf_calculation_sample.py`
   固定性能样例脚本。它强制使用临时 SQLite 数据库，默认开启 `HOUSE_PLANNER_PROFILE=1`，通过 FastAPI TestClient 对同一份基准输入连续执行冷启动和缓存命中两次计算，并输出总耗时、cache layer、策略数量和月度账本行数。做计算速度优化前后，应先运行这个脚本保存对比口径，再决定是否需要更完整的业务一致性回归。
 
