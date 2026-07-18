@@ -381,6 +381,35 @@ def _ensure_versioned_investment_market_snapshots(conn: sqlite3.Connection) -> b
     return True
 
 
+def _normalize_paper_order_cash_contributions(conn: sqlite3.Connection) -> bool:
+    changed = False
+    rows = conn.execute("SELECT id, data FROM paper_investment_orders").fetchall()
+    for row in rows:
+        data = _load_json(row["data"])
+        try:
+            schema_version = int(data.get("schema_version") or 1)
+        except (TypeError, ValueError):
+            schema_version = 1
+        if schema_version >= 2 and "cash_contribution_amount" in data:
+            continue
+        is_external_buy = (
+            str(data.get("side") or "buy") == "buy"
+            and str(data.get("funding_source") or "external_contribution") == "external_contribution"
+        )
+        try:
+            order_amount = max(0.0, float(data.get("order_amount") or 0.0))
+        except (TypeError, ValueError):
+            order_amount = 0.0
+        data["schema_version"] = 2
+        data["cash_contribution_amount"] = order_amount if is_external_buy else 0.0
+        conn.execute(
+            "UPDATE paper_investment_orders SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), now_iso(), row["id"]),
+        )
+        changed = True
+    return changed
+
+
 def migrate_database(conn: sqlite3.Connection) -> None:
     previous_schema_history = _has_previous_schema_history(conn)
     child_count_semantics_migration_pending = not _migration_applied(conn, CURRENT_SCHEMA_VERSION)
@@ -388,6 +417,7 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     changed = _normalize_current_records(conn) or changed
     changed = _migrate_scenario_shadows_to_planning_goals(conn) or changed
     changed = _ensure_versioned_investment_market_snapshots(conn) or changed
+    changed = _normalize_paper_order_cash_contributions(conn) or changed
     cache_layer_columns = {
         "input_hash": "TEXT NOT NULL DEFAULT ''",
         "strategy_hash": "TEXT NOT NULL DEFAULT ''",

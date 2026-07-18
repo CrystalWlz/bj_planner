@@ -3893,6 +3893,113 @@ def test_database_migrates_home_bound_renovation_to_single_planning_event(tmp_pa
     assert renovation_rows[0]["depends_on_goal_id"] == "home-a"
 
 
+def test_database_migrates_paper_order_cash_contributions_in_place(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+
+    from app import database
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    timestamp = "2026-07-01T00:00:00+00:00"
+    old_orders = [
+        (
+            "external-buy",
+            {
+                "schema_version": 1,
+                "client_order_id": "client-external-buy",
+                "proposal_id": "proposal-a",
+                "instrument_id": "instrument-a",
+                "side": "buy",
+                "funding_source": "external_contribution",
+                "order_amount": 1000,
+                "estimated_price": 1,
+                "estimated_quantity": 995,
+                "estimated_fee": 5,
+                "status": "simulated",
+            },
+        ),
+        (
+            "paper-cash-buy",
+            {
+                "schema_version": 1,
+                "client_order_id": "client-paper-cash-buy",
+                "proposal_id": "proposal-b",
+                "instrument_id": "instrument-b",
+                "side": "buy",
+                "funding_source": "paper_cash",
+                "is_rebalance": True,
+                "order_amount": 600,
+                "estimated_price": 1,
+                "estimated_quantity": 595,
+                "estimated_fee": 5,
+                "status": "proposed",
+            },
+        ),
+        (
+            "paper-cash-sell",
+            {
+                "client_order_id": "client-paper-cash-sell",
+                "proposal_id": "proposal-c",
+                "instrument_id": "instrument-c",
+                "side": "sell",
+                "funding_source": "paper_cash",
+                "is_rebalance": True,
+                "order_amount": 500,
+                "estimated_price": 1,
+                "estimated_quantity": 500,
+                "estimated_fee": 5,
+                "status": "simulated",
+            },
+        ),
+    ]
+    with database.get_connection() as conn:
+        for order_id, data in old_orders:
+            conn.execute(
+                """
+                INSERT INTO paper_investment_orders
+                    (id, household_id, proposal_id, instrument_id, data, created_at, updated_at)
+                VALUES (?, 'household-a', ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    data["proposal_id"],
+                    data["instrument_id"],
+                    json.dumps(data, ensure_ascii=False),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    database.initialize_database()
+    with database.get_connection() as conn:
+        first_migration = {
+            row["id"]: (row["data"], row["updated_at"])
+            for row in conn.execute(
+                "SELECT id, data, updated_at FROM paper_investment_orders ORDER BY id"
+            ).fetchall()
+        }
+    database.initialize_database()
+
+    with database.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, proposal_id, instrument_id, data, updated_at FROM paper_investment_orders ORDER BY id"
+        ).fetchall()
+
+    migrated = {row["id"]: json.loads(row["data"]) for row in rows}
+    assert set(migrated) == {order_id for order_id, _ in old_orders}
+    assert all(data["schema_version"] == 2 for data in migrated.values())
+    assert migrated["external-buy"]["cash_contribution_amount"] == pytest.approx(1000)
+    assert migrated["paper-cash-buy"]["cash_contribution_amount"] == 0
+    assert migrated["paper-cash-sell"]["cash_contribution_amount"] == 0
+    assert migrated["external-buy"]["status"] == "simulated"
+    assert migrated["paper-cash-buy"]["status"] == "proposed"
+    assert migrated["paper-cash-sell"]["status"] == "simulated"
+    assert {(row["proposal_id"], row["instrument_id"]) for row in rows} == {
+        (data["proposal_id"], data["instrument_id"]) for _, data in old_orders
+    }
+    assert {row["id"]: (row["data"], row["updated_at"]) for row in rows} == first_migration
+
+
 def test_not_planned_goal_does_not_consume_sequence_index(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
 

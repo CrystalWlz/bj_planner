@@ -91,7 +91,10 @@ def paper_fill_from_order(order_id: str, order: PaperOrderData) -> PaperFillData
     gross_amount = order.executed_price * order.executed_quantity
     if order.side == "buy":
         cash_change = -(gross_amount + order.estimated_fee)
-        contribution_amount = order.order_amount if order.funding_source == "external_contribution" else 0.0
+        if order.funding_source == "external_contribution":
+            contribution_amount = order.cash_contribution_amount or order.order_amount
+        else:
+            contribution_amount = 0.0
     else:
         cash_change = gross_amount - order.estimated_fee
         contribution_amount = 0.0

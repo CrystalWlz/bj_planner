@@ -169,6 +169,7 @@ def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_p
         )
         assert proposal.status_code == 200
         assert proposal.json()["data"]["risk_state"] == "normal"
+        assert proposal.json()["data"]["proposed_budget"] == pytest.approx(8_000)
         orders = client.get(f"/api/quant-investment/paper-orders?household_id={household_id}").json()
         assert len(orders) == 1
         first = client.post(
@@ -189,8 +190,13 @@ def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_p
     assert len(fills) == 1
     assert fills[0]["order_id"] == orders[0]["id"]
     assert portfolio["fill_count"] == 1
-    assert portfolio["net_contributions"] == pytest.approx(orders[0]["data"]["order_amount"])
-    assert portfolio["cash_balance"] > 0
+    assert orders[0]["data"]["cash_contribution_amount"] == pytest.approx(8_000)
+    assert portfolio["net_contributions"] == pytest.approx(orders[0]["data"]["cash_contribution_amount"])
+    assert portfolio["cash_balance"] == pytest.approx(
+        orders[0]["data"]["cash_contribution_amount"]
+        - first.json()["data"]["executed_price"] * first.json()["data"]["executed_quantity"]
+        - first.json()["data"]["estimated_fee"]
+    )
     assert portfolio["ledger_entries"]
     assert portfolio["account_snapshots"]
     assert portfolio["visualization_details"]
@@ -701,6 +707,48 @@ def test_default_strategy_interfaces_disable_research_optimizer_and_plan_round_l
     assert order.client_order_id
 
 
+def test_external_order_batch_contributes_budget_once_and_keeps_round_lot_cash() -> None:
+    from app.schemas import HouseholdData, InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+    from app.strategies.quant_investment import build_quant_monthly_proposal
+
+    equity = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=100,
+    )
+    defensive = equity.model_copy(
+        update={"symbol": "511010.SH", "name": "示例防御 ETF", "asset_class": "defensive"}
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-31",
+        bars=[{"date": "2026-06-30", "close": 1}, {"date": "2026-07-31", "close": 1}],
+    )
+
+    result = build_quant_monthly_proposal(
+        household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
+        policy_id="policy-1",
+        policy=QuantInvestmentPolicyData(
+            default_monthly_budget=1000,
+            max_single_instrument_ratio=1,
+            max_single_market_ratio=1,
+        ),
+        instruments=[("equity", equity), ("defensive", defensive)],
+        snapshots={
+            "equity": ("snapshot-equity", snapshot),
+            "defensive": ("snapshot-defensive", snapshot),
+        },
+    )
+
+    assert len(result.orders) == 2
+    assert sum(order.cash_contribution_amount for order in result.orders) == pytest.approx(1000)
+    assert all(order.cash_contribution_amount >= order.order_amount for order in result.orders)
+    assert sum(order.order_amount for order in result.orders) < 1000
+    assert result.proposal.proposed_budget == pytest.approx(1000)
+
+
 def test_qdii_nav_not_yet_available_is_never_used() -> None:
     from app.domain.quant_investment import instrument_is_buyable
     from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
@@ -838,6 +886,28 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
         LocalFirstBrokerGateway(PaperBrokerAdapter()).submit(local_order_id="", order=order)
     with pytest.raises(RuntimeError, match="尚未启用"):
         QmtBrokerAdapter().query_cash()
+    with pytest.raises(ValueError, match="不能小于订单成交预算"):
+        PaperOrderData(
+            proposal_id="proposal-1",
+            instrument_id="instrument-1",
+            order_amount=1000,
+            estimated_price=1,
+            estimated_quantity=900,
+            estimated_fee=1.35,
+            cash_contribution_amount=500,
+        )
+    with pytest.raises(ValueError, match="只有外部资金买入订单"):
+        PaperOrderData(
+            proposal_id="proposal-1",
+            instrument_id="instrument-1",
+            side="sell",
+            funding_source="paper_cash",
+            order_amount=1000,
+            estimated_price=1,
+            estimated_quantity=1000,
+            estimated_fee=5,
+            cash_contribution_amount=1000,
+        )
 
 
 def test_protected_cash_expands_real_scheduled_expenses_only_within_24_months() -> None:
@@ -855,6 +925,152 @@ def test_protected_cash_expands_real_scheduled_expenses_only_within_24_months() 
     baseline_cash = protected_cash_for_quant_investment(baseline, as_of_month="2026-07")
     protected_cash = protected_cash_for_quant_investment(household, additional_goal_cash=1234, as_of_month="2026-07")
     assert protected_cash - baseline_cash == pytest.approx(1934)
+
+
+def test_existing_position_caps_new_instrument_exposure_after_contribution() -> None:
+    from app.schemas import (
+        HouseholdData,
+        InvestmentInstrumentData,
+        InvestmentMarketSnapshotData,
+        PaperPortfolioSummary,
+        PaperPositionData,
+        QuantInvestmentPolicyData,
+    )
+    from app.strategies.quant_investment import build_quant_monthly_proposal
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-31",
+        bars=[{"date": "2026-06-30", "close": 1}, {"date": "2026-07-31", "close": 1}],
+    )
+    portfolio = PaperPortfolioSummary(
+        household_id="household-1",
+        net_contributions=10000,
+        cash_balance=6210,
+        market_value=3790,
+        total_equity=10000,
+        unrealized_pnl=0,
+        realized_pnl=0,
+        total_fees=0,
+        fill_count=1,
+        positions=[
+            PaperPositionData(
+                instrument_id="equity",
+                symbol=instrument.symbol,
+                name=instrument.name,
+                market=instrument.market,
+                asset_class="equity",
+                currency="CNY",
+                quantity=3790,
+                average_cost=1,
+                total_cost=3790,
+                latest_price=1,
+                latest_price_date="2026-07-31",
+                market_value=3790,
+                unrealized_pnl=0,
+                total_fees=0,
+            )
+        ],
+    )
+
+    result = build_quant_monthly_proposal(
+        household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
+        policy_id="policy-1",
+        policy=QuantInvestmentPolicyData(
+            default_monthly_budget=1000,
+            max_single_instrument_ratio=0.35,
+            max_single_market_ratio=1,
+        ),
+        instruments=[("equity", instrument)],
+        snapshots={"equity": ("snapshot-equity", snapshot)},
+        paper_portfolio=portfolio,
+    )
+
+    assert len(result.orders) == 1
+    order = result.orders[0]
+    assert order.order_amount <= 60
+    assert order.cash_contribution_amount == pytest.approx(1000)
+    assert (3790 + order.order_amount) / 11000 <= 0.35
+
+
+def test_existing_market_exposure_caps_all_new_orders_in_same_market() -> None:
+    from app.schemas import (
+        HouseholdData,
+        InvestmentInstrumentData,
+        InvestmentMarketSnapshotData,
+        PaperPortfolioSummary,
+        PaperPositionData,
+        QuantInvestmentPolicyData,
+    )
+    from app.strategies.quant_investment import build_quant_monthly_proposal
+
+    existing = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例已有 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+    )
+    candidate = existing.model_copy(update={"symbol": "159915.SZ", "name": "示例新增 ETF"})
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-31",
+        bars=[{"date": "2026-06-30", "close": 1}, {"date": "2026-07-31", "close": 1}],
+    )
+    portfolio = PaperPortfolioSummary(
+        household_id="household-1",
+        net_contributions=10000,
+        cash_balance=6210,
+        market_value=3790,
+        total_equity=10000,
+        unrealized_pnl=0,
+        realized_pnl=0,
+        total_fees=0,
+        fill_count=1,
+        positions=[
+            PaperPositionData(
+                instrument_id="existing",
+                symbol=existing.symbol,
+                name=existing.name,
+                market=existing.market,
+                asset_class="equity",
+                currency="CNY",
+                quantity=3790,
+                average_cost=1,
+                total_cost=3790,
+                latest_price=1,
+                latest_price_date="2026-07-31",
+                market_value=3790,
+                unrealized_pnl=0,
+                total_fees=0,
+            )
+        ],
+    )
+
+    result = build_quant_monthly_proposal(
+        household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
+        policy_id="policy-1",
+        policy=QuantInvestmentPolicyData(
+            default_monthly_budget=1000,
+            max_single_instrument_ratio=1,
+            max_single_market_ratio=0.35,
+        ),
+        instruments=[("candidate", candidate)],
+        snapshots={"candidate": ("snapshot-candidate", snapshot)},
+        paper_portfolio=portfolio,
+    )
+
+    assert len(result.orders) == 1
+    assert result.orders[0].order_amount <= 60
+    assert result.orders[0].cash_contribution_amount == pytest.approx(1000)
+    assert (3790 + result.orders[0].order_amount) / 11000 <= 0.35
 
 
 def test_paused_equity_signal_can_still_allocate_to_defensive_pool() -> None:
@@ -946,7 +1162,7 @@ def test_quarterly_rebalance_generates_paper_cash_sell_order() -> None:
             )
         ],
     )
-    policy = QuantInvestmentPolicyData(default_monthly_budget=1000, max_single_instrument_ratio=1, max_single_market_ratio=1)
+    policy = QuantInvestmentPolicyData(default_monthly_budget=1000)
     result = build_quant_monthly_proposal(
         household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
         policy_id="policy-1",

@@ -2470,7 +2470,7 @@ class QuantInvestmentProposalRequest(BaseModel):
 
 
 class PaperOrderData(BaseModel):
-    schema_version: int = Field(1, ge=1)
+    schema_version: int = Field(2, ge=1)
     client_order_id: str = Field(default_factory=lambda: str(uuid.uuid4()), min_length=8, max_length=100)
     proposal_id: str
     instrument_id: str
@@ -2481,6 +2481,7 @@ class PaperOrderData(BaseModel):
     estimated_price: float = Field(gt=0)
     estimated_quantity: float = Field(gt=0)
     estimated_fee: float = Field(ge=0)
+    cash_contribution_amount: float = Field(0, ge=0)
     lot_size: int = Field(1, ge=1)
     expected_trade_date: str = ""
     status: InvestmentOrderStatus = "proposed"
@@ -2488,6 +2489,19 @@ class PaperOrderData(BaseModel):
     executed_date: str = ""
     executed_price: float | None = Field(default=None, gt=0)
     executed_quantity: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_cash_contribution(self) -> "PaperOrderData":
+        is_external_buy = self.side == "buy" and self.funding_source == "external_contribution"
+        if not is_external_buy and self.cash_contribution_amount > 0:
+            raise ValueError("只有外部资金买入订单可以向模拟现金账户注入资金")
+        if (
+            is_external_buy
+            and self.cash_contribution_amount > 0
+            and self.cash_contribution_amount + 1e-6 < self.order_amount
+        ):
+            raise ValueError("模拟现金投入不能小于订单成交预算")
+        return self
 
 
 class PaperOrderRecord(BaseModel):

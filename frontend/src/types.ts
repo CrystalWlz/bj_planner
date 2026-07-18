@@ -330,6 +330,7 @@ export interface PaperOrderData {
   estimated_price: number;
   estimated_quantity: number;
   estimated_fee: number;
+  cash_contribution_amount: number;
   lot_size: number;
   expected_trade_date: string;
   status: InvestmentOrderStatus;

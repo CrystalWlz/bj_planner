@@ -25,7 +25,7 @@ from ..schemas import (
 
 SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
 PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v2"
-PRE_TRADE_RISK_VERSION = "cash-concentration-v2"
+PRE_TRADE_RISK_VERSION = "cash-concentration-v3"
 EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v2"
 
 
@@ -45,6 +45,15 @@ class TradeRiskDecision:
     allowed: bool
     maximum_amount: float
     reason: str
+
+
+@dataclass(frozen=True)
+class PreTradeRiskContext:
+    post_trade_total_equity: float
+    existing_instrument_values: dict[str, float]
+    existing_market_values: dict[str, float]
+    planned_instrument_values: dict[str, float]
+    planned_market_values: dict[str, float]
 
 
 class SignalModel(Protocol):
@@ -75,9 +84,9 @@ class PreTradeRiskManager(Protocol):
         self,
         candidate: QuantInstrumentCandidate,
         requested_amount: float,
-        total_budget: float,
         policy: QuantInvestmentPolicyData,
         as_of_date: str,
+        context: PreTradeRiskContext,
     ) -> TradeRiskDecision: ...
 
 
@@ -145,23 +154,31 @@ class CashAndConcentrationRiskManager:
         self,
         candidate: QuantInstrumentCandidate,
         requested_amount: float,
-        total_budget: float,
         policy: QuantInvestmentPolicyData,
         as_of_date: str,
+        context: PreTradeRiskContext,
     ) -> TradeRiskDecision:
         allowed, message = instrument_is_buyable(candidate.instrument, candidate.snapshot, policy, as_of_date=as_of_date)
         if not allowed:
             return TradeRiskDecision(False, 0.0, message)
-        cap = min(
-            max(0.0, total_budget * policy.max_single_instrument_ratio),
-            policy.max_order_amount,
+        total_equity = max(0.0, context.post_trade_total_equity)
+        instrument_exposure = (
+            context.existing_instrument_values.get(candidate.instrument_id, 0.0)
+            + context.planned_instrument_values.get(candidate.instrument_id, 0.0)
         )
+        market_exposure = (
+            context.existing_market_values.get(candidate.instrument.market, 0.0)
+            + context.planned_market_values.get(candidate.instrument.market, 0.0)
+        )
+        instrument_remaining = max(0.0, total_equity * policy.max_single_instrument_ratio - instrument_exposure)
+        market_remaining = max(0.0, total_equity * policy.max_single_market_ratio - market_exposure)
+        cap = min(instrument_remaining, market_remaining, policy.max_order_amount)
         if candidate.instrument.monthly_purchase_limit is not None:
             cap = min(cap, candidate.instrument.monthly_purchase_limit)
         amount = min(max(0.0, requested_amount), cap)
         if amount <= 0:
-            return TradeRiskDecision(False, 0.0, "订单金额触发单标的或最大订单金额限制。")
-        return TradeRiskDecision(True, amount, "通过现金、交易资格、单标的集中度和最大订单金额检查。")
+            return TradeRiskDecision(False, 0.0, "订单会使成交后组合触发单标的、单市场或最大订单金额限制。")
+        return TradeRiskDecision(True, amount, "通过现金、交易资格、成交后组合集中度和最大订单金额检查。")
 
 
 @dataclass(frozen=True)
@@ -200,6 +217,7 @@ class PaperLotExecutionPlanner:
             estimated_price=round(price, 6),
             estimated_quantity=round(quantity, 6),
             estimated_fee=round(fee, 2),
+            cash_contribution_amount=0.0,
             lot_size=lot_size,
             expected_trade_date=candidate.execution_date or _next_weekday(candidate.price_date),
             status="proposed",
@@ -249,6 +267,30 @@ def _next_common_execution_date(
         if common_dates:
             return min(common_dates), True
     return _next_weekday(signal_date), False
+
+
+def _assign_external_cash_contributions(
+    orders: list[PaperOrderData],
+    *,
+    proposed_budget: float,
+) -> list[PaperOrderData]:
+    external_indexes = [
+        index
+        for index, order in enumerate(orders)
+        if order.side == "buy" and order.funding_source == "external_contribution"
+    ]
+    if not external_indexes:
+        return orders
+    total_order_amount = sum(orders[index].order_amount for index in external_indexes)
+    contribution_total = max(total_order_amount, proposed_budget)
+    leftover = max(0.0, contribution_total - total_order_amount)
+    result = list(orders)
+    for offset, index in enumerate(external_indexes):
+        contribution = orders[index].order_amount + (leftover if offset == 0 else 0.0)
+        result[index] = orders[index].model_copy(
+            update={"cash_contribution_amount": round(contribution, 2)}
+        )
+    return result
 
 
 def build_quant_monthly_proposal(
@@ -316,28 +358,50 @@ def build_quant_monthly_proposal(
 
     weights = portfolio_constructor.target_weights(candidates, policy, assessment.effective_equity_cap)
     orders: list[PaperOrderData] = []
-    market_allocations: dict[str, float] = {}
+    portfolio_total_equity = max(0.0, float(paper_portfolio.total_equity)) if paper_portfolio else 0.0
+    existing_instrument_values = {
+        position.instrument_id: float(position.market_value)
+        for position in (paper_portfolio.positions if paper_portfolio else [])
+    }
+    existing_market_values: dict[str, float] = {}
+    for position in (paper_portfolio.positions if paper_portfolio else []):
+        existing_market_values[position.market] = (
+            existing_market_values.get(position.market, 0.0) + float(position.market_value)
+        )
+    planned_instrument_values: dict[str, float] = {}
+    planned_market_values: dict[str, float] = {}
     for candidate in candidates:
         requested = proposed_budget * weights.get(candidate.instrument_id, 0.0)
-        decision = risk_manager.check(candidate, requested, proposed_budget, policy, assessment.as_of_date)
+        decision = risk_manager.check(
+            candidate,
+            requested,
+            policy,
+            assessment.as_of_date,
+            PreTradeRiskContext(
+                post_trade_total_equity=portfolio_total_equity + proposed_budget,
+                existing_instrument_values=existing_instrument_values,
+                existing_market_values=existing_market_values,
+                planned_instrument_values=planned_instrument_values,
+                planned_market_values=planned_market_values,
+            ),
+        )
         if not decision.allowed:
             reasons.append(f"{candidate.instrument.name}：{decision.reason}")
             continue
-        market_cap = proposed_budget * policy.max_single_market_ratio
-        market_remaining = max(0.0, market_cap - market_allocations.get(candidate.instrument.market, 0.0))
-        approved_amount = min(decision.maximum_amount, market_remaining)
-        if approved_amount <= 0:
-            reasons.append(f"{candidate.instrument.name}：所在市场已达到单市场集中度上限。")
-            continue
         order = execution_planner.plan(
             candidate,
-            approved_amount,
+            decision.maximum_amount,
             policy,
             f"月度定投 · {assessment.state} 风险状态 · {decision.reason} · 使用 {candidate.price_date} 已确认收盘价估算。",
         )
         if order is not None:
             orders.append(order)
-            market_allocations[candidate.instrument.market] = market_allocations.get(candidate.instrument.market, 0.0) + order.order_amount
+            planned_instrument_values[candidate.instrument_id] = (
+                planned_instrument_values.get(candidate.instrument_id, 0.0) + order.order_amount
+            )
+            planned_market_values[candidate.instrument.market] = (
+                planned_market_values.get(candidate.instrument.market, 0.0) + order.order_amount
+            )
         else:
             reasons.append(f"{candidate.instrument.name}：订单金额不足以满足最小交易单位 {candidate.instrument.lot_size}。")
     rebalance_triggered = False
@@ -352,6 +416,8 @@ def build_quant_monthly_proposal(
             reasons.append("季度再平衡已触发：当前权益比例偏离目标超过阈值，订单只在模拟账户内调整。")
             candidate_by_id = {candidate.instrument_id: candidate for candidate in candidates}
             position_by_id = {position.instrument_id: position for position in paper_portfolio.positions}
+            planned_sell_instrument_values: dict[str, float] = {}
+            planned_sell_market_values: dict[str, float] = {}
             for position in paper_portfolio.positions:
                 candidate = candidate_by_id.get(position.instrument_id)
                 if candidate is None:
@@ -365,8 +431,41 @@ def build_quant_monthly_proposal(
                 if order is not None:
                     orders = [existing for existing in orders if existing.instrument_id != position.instrument_id]
                     orders.insert(0, order)
+                    planned_sell_instrument_values[position.instrument_id] = (
+                        planned_sell_instrument_values.get(position.instrument_id, 0.0) + order.order_amount
+                    )
+                    planned_sell_market_values[position.market] = (
+                        planned_sell_market_values.get(position.market, 0.0) + order.order_amount
+                    )
             available_cash = max(0.0, float(paper_portfolio.cash_balance))
             external_instrument_ids = {order.instrument_id for order in orders if order.funding_source == "external_contribution"}
+            adjusted_existing_instrument_values = {
+                instrument_id: max(0.0, value - planned_sell_instrument_values.get(instrument_id, 0.0))
+                for instrument_id, value in existing_instrument_values.items()
+            }
+            adjusted_existing_market_values = {
+                market: max(0.0, value - planned_sell_market_values.get(market, 0.0))
+                for market, value in existing_market_values.items()
+            }
+            planned_buy_instrument_values: dict[str, float] = {}
+            planned_buy_market_values: dict[str, float] = {}
+            for planned_order in orders:
+                if planned_order.side != "buy":
+                    continue
+                planned_candidate = candidate_by_id.get(planned_order.instrument_id)
+                if planned_candidate is None:
+                    continue
+                planned_buy_instrument_values[planned_order.instrument_id] = (
+                    planned_buy_instrument_values.get(planned_order.instrument_id, 0.0)
+                    + planned_order.order_amount
+                )
+                planned_buy_market_values[planned_candidate.instrument.market] = (
+                    planned_buy_market_values.get(planned_candidate.instrument.market, 0.0)
+                    + planned_order.order_amount
+                )
+            external_budget = proposed_budget if any(
+                order.funding_source == "external_contribution" for order in orders
+            ) else 0.0
             for candidate in candidates:
                 if candidate.instrument_id in external_instrument_ids:
                     continue
@@ -376,10 +475,33 @@ def build_quant_monthly_proposal(
                 buy_amount = min(available_cash, max(0.0, target_weight - actual_weight - policy.rebalance_threshold) * total_equity)
                 if buy_amount <= 0:
                     continue
-                order = execution_planner.plan(candidate, buy_amount, policy, "季度再平衡买入低配持仓", side="buy", funding_source="paper_cash", is_rebalance=True)
+                decision = risk_manager.check(
+                    candidate,
+                    buy_amount,
+                    policy,
+                    assessment.as_of_date,
+                    PreTradeRiskContext(
+                        post_trade_total_equity=total_equity + external_budget,
+                        existing_instrument_values=adjusted_existing_instrument_values,
+                        existing_market_values=adjusted_existing_market_values,
+                        planned_instrument_values=planned_buy_instrument_values,
+                        planned_market_values=planned_buy_market_values,
+                    ),
+                )
+                if not decision.allowed:
+                    reasons.append(f"{candidate.instrument.name} 再平衡买入：{decision.reason}")
+                    continue
+                order = execution_planner.plan(candidate, decision.maximum_amount, policy, "季度再平衡买入低配持仓", side="buy", funding_source="paper_cash", is_rebalance=True)
                 if order is not None:
                     orders.append(order)
                     available_cash = max(0.0, available_cash - order.order_amount)
+                    planned_buy_instrument_values[candidate.instrument_id] = (
+                        planned_buy_instrument_values.get(candidate.instrument_id, 0.0) + order.order_amount
+                    )
+                    planned_buy_market_values[candidate.instrument.market] = (
+                        planned_buy_market_values.get(candidate.instrument.market, 0.0) + order.order_amount
+                    )
+    orders = _assign_external_cash_contributions(orders, proposed_budget=proposed_budget)
     if not orders and proposed_budget > 0:
         reasons.append("没有通过交易、集中度、溢价和最小交易单位校验的标的，本月不生成买入订单。")
 
@@ -389,7 +511,7 @@ def build_quant_monthly_proposal(
         as_of_date=assessment.as_of_date,
         protected_cash=round(protected_cash, 2),
         investable_cash=round(investable_cash, 2),
-        proposed_budget=round(sum(order.order_amount for order in orders if order.funding_source == "external_contribution"), 2),
+        proposed_budget=round(sum(order.cash_contribution_amount for order in orders), 2),
         effective_equity_cap=assessment.effective_equity_cap,
         estimated_drawdown=round(assessment.drawdown, 6),
         risk_state=assessment.state,
