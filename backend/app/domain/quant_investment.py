@@ -9,13 +9,14 @@ from typing import Iterable
 from ..schemas import (
     HouseholdData,
     InvestmentInstrumentData,
+    InvestmentMarketBarData,
     InvestmentMarketSnapshotData,
     QuantBacktestResult,
     QuantInvestmentPolicyData,
 )
 
 
-QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v5"
+QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v6"
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,22 @@ def market_trading_day_age(
     return (end - start).days
 
 
+def effective_nav_available_date(
+    snapshot: InvestmentMarketSnapshotData,
+    bar: InvestmentMarketBarData,
+) -> str:
+    """Return a conservative NAV availability date for old or incomplete snapshots."""
+    if not bar.nav_date:
+        return bar.nav_available_date
+    available_date = bar.nav_available_date
+    if not available_date or (snapshot.schema_version < 3 and available_date == bar.nav_date):
+        try:
+            return (date.fromisoformat(bar.nav_date) + timedelta(days=1)).isoformat()
+        except ValueError:
+            return available_date or bar.nav_date
+    return available_date
+
+
 def assess_quant_risk(
     policy: QuantInvestmentPolicyData,
     equity_snapshots: Iterable[InvestmentMarketSnapshotData],
@@ -191,10 +208,11 @@ def instrument_is_buyable(
     if latest.purchase_limited:
         return False, "该交易日存在申购或交易额度限制。"
     if instrument.market == "qdii_etf":
-        if latest.nav is None or not latest.nav_date or not latest.nav_available_date:
+        nav_available_date = effective_nav_available_date(snapshot, latest)
+        if latest.nav is None or not latest.nav_date or not nav_available_date:
             return False, "跨境 QDII ETF 缺少净值，不能判断溢价风险。"
         try:
-            available_date = date.fromisoformat(latest.nav_available_date)
+            available_date = date.fromisoformat(nav_available_date)
             if available_date > date.fromisoformat(as_of_date):
                 return False, "跨境 QDII ETF 净值在决策日尚不可得，禁止使用未来净值。"
             nav_age = market_trading_day_age(snapshot, start_date=latest.nav_date, end_date=as_of_date)

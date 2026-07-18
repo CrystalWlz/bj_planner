@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 import uuid
 
@@ -2388,12 +2388,25 @@ class InvestmentMarketBarData(BaseModel):
         if not self.price_date:
             self.price_date = self.date
         if self.nav is not None and self.nav_date and not self.nav_available_date:
-            self.nav_available_date = self.nav_date
+            try:
+                self.nav_available_date = (
+                    date.fromisoformat(self.nav_date) + timedelta(days=1)
+                ).isoformat()
+            except ValueError:
+                raise ValueError("净值估值日期必须是有效的 YYYY-MM-DD 日期") from None
+        if self.nav_date and self.nav_available_date:
+            try:
+                nav_date = date.fromisoformat(self.nav_date)
+                available_date = date.fromisoformat(self.nav_available_date)
+            except ValueError:
+                raise ValueError("净值日期必须是有效的 YYYY-MM-DD 日期") from None
+            if available_date < nav_date:
+                raise ValueError("净值可得日期不能早于净值估值日期")
         return self
 
 
 class InvestmentMarketSnapshotData(BaseModel):
-    schema_version: int = Field(2, ge=1)
+    schema_version: int = Field(3, ge=1)
     source: Literal["tushare_pro", "manual"] = "tushare_pro"
     api_name: str = ""
     fetched_at: str = ""

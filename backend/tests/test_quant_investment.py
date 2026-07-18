@@ -780,7 +780,7 @@ def test_external_order_batch_contributes_budget_once_and_keeps_round_lot_cash()
 
 
 def test_qdii_nav_not_yet_available_is_never_used() -> None:
-    from app.domain.quant_investment import instrument_is_buyable
+    from app.domain.quant_investment import effective_nav_available_date, instrument_is_buyable
     from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
 
     instrument = InvestmentInstrumentData(symbol="513500.SH", name="示例跨境 ETF", market="qdii_etf", asset_class="equity")
@@ -798,6 +798,99 @@ def test_qdii_nav_not_yet_available_is_never_used() -> None:
     allowed, reason = instrument_is_buyable(instrument, snapshot, QuantInvestmentPolicyData(), as_of_date="2026-07-17")
     assert not allowed
     assert "未来净值" in reason
+
+    missing_announcement = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-17",
+        bars=[{
+            "date": "2026-07-17",
+            "close": 1.1,
+            "nav": 1.1,
+            "nav_date": "2026-07-17",
+        }],
+    )
+    assert missing_announcement.schema_version == 3
+    assert missing_announcement.bars[0].nav_available_date == "2026-07-18"
+    allowed, reason = instrument_is_buyable(
+        instrument,
+        missing_announcement,
+        QuantInvestmentPolicyData(),
+        as_of_date="2026-07-17",
+    )
+    assert not allowed
+    assert "未来净值" in reason
+
+    legacy_same_day = InvestmentMarketSnapshotData(
+        schema_version=2,
+        source="manual",
+        snapshot_date="2026-07-17",
+        bars=[{
+            "date": "2026-07-17",
+            "close": 1.1,
+            "nav": 1.1,
+            "nav_date": "2026-07-17",
+            "nav_available_date": "2026-07-17",
+        }],
+    )
+    assert effective_nav_available_date(legacy_same_day, legacy_same_day.bars[0]) == "2026-07-18"
+    allowed, _reason = instrument_is_buyable(
+        instrument,
+        legacy_same_day,
+        QuantInvestmentPolicyData(),
+        as_of_date="2026-07-17",
+    )
+    assert not allowed
+
+
+def test_post_trade_risk_freezes_qdii_nav_not_available_today() -> None:
+    from app.domain.paper_portfolio import build_paper_portfolio_summary
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData, QuantInvestmentPolicyData
+
+    today = date.today()
+    instrument = InvestmentInstrumentData(
+        symbol="513500.SH",
+        name="示例跨境 ETF",
+        market="qdii_etf",
+        asset_class="equity",
+    )
+    fill = PaperFillData(
+        order_id="order-qdii",
+        client_order_id="client-order-qdii",
+        proposal_id="proposal-qdii",
+        instrument_id="instrument-qdii",
+        side="buy",
+        executed_date=today.isoformat(),
+        executed_price=1,
+        executed_quantity=100,
+        gross_amount=100,
+        fee=0,
+        cash_change=-100,
+        contribution_amount=100,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date=today.isoformat(),
+        bars=[{
+            "date": today.isoformat(),
+            "close": 1,
+            "nav": 1,
+            "nav_date": today.isoformat(),
+            "nav_available_date": (today + timedelta(days=1)).isoformat(),
+        }],
+    )
+
+    summary = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[fill],
+        instruments={"instrument-qdii": instrument},
+        snapshots={"instrument-qdii": snapshot},
+        policy=QuantInvestmentPolicyData(),
+    )
+
+    assert summary.frozen
+    assert "qdii_nav_not_available" in {
+        issue.code for issue in summary.post_trade_risk_issues
+    }
 
 
 def test_post_trade_reconciliation_mismatch_freezes_only_new_orders() -> None:

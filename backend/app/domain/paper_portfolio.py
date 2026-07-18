@@ -20,7 +20,11 @@ from ..schemas import (
     QuantInvestmentPolicyData,
     VisualizationBreakdownItem,
 )
-from .quant_investment import _drawdown_from_prices, market_trading_day_age
+from .quant_investment import (
+    _drawdown_from_prices,
+    effective_nav_available_date,
+    market_trading_day_age,
+)
 
 
 @dataclass
@@ -479,7 +483,7 @@ def build_paper_portfolio_summary(
                 latest_price = float(latest_bar.adjusted_close or latest_bar.close)
                 latest_price_date = latest_bar.price_date or latest_bar.date
                 if policy and instrument.market == "qdii_etf":
-                    nav_available_date = latest_bar.nav_available_date or latest_bar.nav_date
+                    nav_available_date = effective_nav_available_date(snapshot, latest_bar)
                     if not nav_available_date or latest_bar.nav is None:
                         frozen = True
                         add_issue(
@@ -488,6 +492,15 @@ def build_paper_portfolio_summary(
                             source="market_data",
                             instrument_id=instrument_id,
                             message=f"{instrument.name} 的最新可得净值缺失，已冻结新增提案",
+                        )
+                    elif nav_available_date > date.today().isoformat():
+                        frozen = True
+                        add_issue(
+                            code="qdii_nav_not_available",
+                            severity="freeze",
+                            source="market_data",
+                            instrument_id=instrument_id,
+                            message=f"{instrument.name} 的最新净值尚未公告，已冻结新增提案",
                         )
                     elif latest_bar.nav_date:
                         try:
