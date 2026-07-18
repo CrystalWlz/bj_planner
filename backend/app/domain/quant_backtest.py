@@ -37,6 +37,7 @@ class _PortfolioState:
     fees: float = 0.0
     traded_value: float = 0.0
     trade_count: int = 0
+    monthly_buy_amounts: dict[tuple[str, str], float] = field(default_factory=dict)
     minimum_cash: float = float("inf")
     twr_index: float = 1.0
     twr_history: list[float] = field(default_factory=lambda: [1.0])
@@ -138,10 +139,21 @@ def _buy_with_budget(
     budget: float,
     policy: QuantInvestmentPolicyData,
 ) -> None:
+    purchase_key = (_month_key(bar.price_date or bar.date), asset.instrument_id)
+    effective_budget = min(max(0.0, budget), policy.max_order_amount, state.cash)
+    if asset.instrument.monthly_purchase_limit is not None:
+        remaining_limit = max(
+            0.0,
+            asset.instrument.monthly_purchase_limit
+            - state.monthly_buy_amounts.get(purchase_key, 0.0),
+        )
+        effective_budget = min(effective_budget, remaining_limit)
+    if effective_budget <= 0:
+        return
     execution_price = _price(bar) * (1 + policy.slippage_rate)
     lot_size = max(1, asset.instrument.lot_size)
     fee_rate = max(0.0, asset.instrument.buy_fee_rate)
-    quantity = floor((budget / (execution_price * (1 + fee_rate))) / lot_size) * lot_size
+    quantity = floor((effective_budget / (execution_price * (1 + fee_rate))) / lot_size) * lot_size
     if quantity <= 0:
         return
     gross = quantity * execution_price
@@ -154,6 +166,9 @@ def _buy_with_budget(
     state.fees += fee
     state.traded_value += gross
     state.trade_count += 1
+    state.monthly_buy_amounts[purchase_key] = (
+        state.monthly_buy_amounts.get(purchase_key, 0.0) + total
+    )
 
 
 def _rebalance_portfolio(

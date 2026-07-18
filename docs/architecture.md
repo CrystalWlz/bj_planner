@@ -58,6 +58,8 @@ flowchart LR
 
   `execution_session_is_allowed` 是 Paper 成交与回测撮合共享的执行日市场门禁。行情覆盖范围内的闭市、停牌、开放日缺价会拒绝买卖，执行日限购只拒绝买入；行情尚未覆盖时允许人工成交确认。月度投入和季度再平衡都必须经过该门禁，回测引擎/执行规划版本随语义变化递增，保证 Recorder 可区分旧结果。
 
+  回测组合状态通过 `_PortfolioState.monthly_buy_amounts` 按自然月和标的累计含费用买入总额。策略单笔订单上限与标的月累计申购额度同时生效，月度投入和季度再平衡共享累计额度；整手取整或额度不足形成的未使用预算继续保留为现金，不自动转配到其它标的。
+
   Recorder schema v2 保存不可变 `universe_snapshot`、逐标的 `execution_assumptions`、全局成本、策略/引擎版本、数据集版本与完整结果，使历史运行可以脱离当前标的配置解释。Recorder schema 版本进入指纹，修改当前费率只生成新运行、不回写旧记录；v1 记录通过新增字段默认值继续只读兼容。
 
   `client_order_id` 由 SQLite 全局唯一索引强制，而不只依赖 UUID 默认值。数据库迁移先规范缺失、非法或重复的历史订单号并同步成交/取消事件引用，再创建索引；同订单重试复用原记录，不同订单号冲突由 API 返回 `409`。这使 `LocalFirstBrokerGateway` 的持久化校验拥有稳定且唯一的券商幂等键。Gateway 还要求动作级状态校验：`submit` 仅接受 `proposed`，`cancel` 仅接受 `cancel_requested`；身份匹配但状态不符仍禁止调用适配器，QMT 启用前还需另建持久化提交事件/outbox。

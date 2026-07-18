@@ -16,7 +16,7 @@ from ..schemas import (
 )
 
 
-QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v7"
+QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v8"
 QUANT_RECORDER_SCHEMA_VERSION = 2
 
 

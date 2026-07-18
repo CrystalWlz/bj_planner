@@ -675,6 +675,45 @@ def test_backtest_rebalance_does_not_buy_purchase_limited_asset() -> None:
     assert state.cash > 0
 
 
+def test_backtest_buy_budget_respects_order_and_monthly_purchase_limits() -> None:
+    from app.domain.quant_backtest import BacktestAsset, _PortfolioState, _buy_with_budget
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketBarData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例限额 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+        buy_fee_rate=0,
+        monthly_purchase_limit=600,
+    )
+    asset = BacktestAsset(
+        "equity",
+        instrument,
+        InvestmentMarketSnapshotData(
+            source="manual",
+            snapshot_date="2026-08-01",
+            bars=[{"date": "2026-07-01", "close": 1}, {"date": "2026-08-01", "close": 1}],
+        ),
+    )
+    state = _PortfolioState(cash=2000)
+    policy = QuantInvestmentPolicyData(slippage_rate=0, max_order_amount=500)
+    july_bar = InvestmentMarketBarData(date="2026-07-01", close=1)
+    august_bar = InvestmentMarketBarData(date="2026-08-01", close=1)
+
+    _buy_with_budget(state, asset, july_bar, 1000, policy)
+    _buy_with_budget(state, asset, july_bar, 1000, policy)
+    _buy_with_budget(state, asset, july_bar, 1000, policy)
+    _buy_with_budget(state, asset, august_bar, 1000, policy)
+
+    assert state.quantities["equity"] == pytest.approx(1100)
+    assert state.cash == pytest.approx(900)
+    assert state.trade_count == 3
+    assert state.monthly_buy_amounts[("2026-07", "equity")] == pytest.approx(600)
+    assert state.monthly_buy_amounts[("2026-08", "equity")] == pytest.approx(500)
+
+
 def test_min_variance_research_uses_only_trailing_training_window(monkeypatch) -> None:
     from app.domain import quant_backtest
     from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
