@@ -8,11 +8,17 @@ import type {
   GeneratedStrategyBatchRequest,
   GeneratedStrategyRecord,
   HouseholdData,
+  InvestmentInstrumentData,
+  InvestmentInstrumentRecord,
+  InvestmentMarketSnapshotData,
+  InvestmentMarketSnapshotRecord,
   MarketSnapshotData,
   PropertyValuationRecord,
   PropertyValuationRefreshResponse,
   PersonalPensionReturnRefreshResponse,
   PersonalPensionReturnSnapshotRecord,
+  PaperOrderData,
+  PaperOrderRecord,
   PlanningGoalData,
   PlanningFoundationSummary,
   PlanningGoalRecord,
@@ -20,6 +26,10 @@ import type {
   PlanningSequenceResult,
   RecordEnvelope,
   RulePackData,
+  QuantBacktestResult,
+  QuantInvestmentPolicyData,
+  QuantInvestmentPolicyRecord,
+  QuantInvestmentProposalRecord,
   ScenarioData,
   SourceDocumentRecord
 } from "./types";
@@ -95,6 +105,89 @@ export function fetchHouseholds() {
 
 export function fetchMarketSnapshots() {
   return request<RecordEnvelope<MarketSnapshotData>[]>("/api/market-snapshots");
+}
+
+export function fetchQuantInvestmentPolicies(householdId: string) {
+  return request<QuantInvestmentPolicyRecord[]>(`/api/quant-investment/policies?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function createQuantInvestmentPolicy(householdId: string, data: QuantInvestmentPolicyData) {
+  return request<QuantInvestmentPolicyRecord>("/api/quant-investment/policies", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, data })
+  });
+}
+
+export function saveQuantInvestmentPolicy(id: string, householdId: string, data: QuantInvestmentPolicyData) {
+  return request<QuantInvestmentPolicyRecord>(`/api/quant-investment/policies/${id}`, {
+    method: "PUT",
+    body: JSON.stringify({ household_id: householdId, data })
+  });
+}
+
+export function fetchQuantInvestmentInstruments(householdId: string) {
+  return request<InvestmentInstrumentRecord[]>(`/api/quant-investment/instruments?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function createQuantInvestmentInstrument(householdId: string, data: InvestmentInstrumentData) {
+  return request<InvestmentInstrumentRecord>("/api/quant-investment/instruments", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, data })
+  });
+}
+
+export function saveQuantInvestmentInstrument(id: string, householdId: string, data: InvestmentInstrumentData) {
+  return request<InvestmentInstrumentRecord>(`/api/quant-investment/instruments/${id}`, {
+    method: "PUT",
+    body: JSON.stringify({ household_id: householdId, data })
+  });
+}
+
+export function fetchQuantMarketSnapshots(householdId: string) {
+  return request<InvestmentMarketSnapshotRecord[]>(`/api/quant-investment/market-snapshots?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function createQuantMarketSnapshot(householdId: string, instrumentId: string, data: InvestmentMarketSnapshotData) {
+  return request<InvestmentMarketSnapshotRecord>("/api/quant-investment/market-snapshots", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, instrument_id: instrumentId, data })
+  });
+}
+
+export function refreshQuantMarketData(householdId: string, startDate = "") {
+  return request<{ records: InvestmentMarketSnapshotRecord[]; warnings: string[] }>("/api/quant-investment/market-data/refresh", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, start_date: startDate })
+  });
+}
+
+export function fetchQuantInvestmentProposals(householdId: string) {
+  return request<QuantInvestmentProposalRecord[]>(`/api/quant-investment/proposals?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function createQuantInvestmentProposal(householdId: string, policyId: string) {
+  return request<QuantInvestmentProposalRecord>("/api/quant-investment/proposals", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, policy_id: policyId })
+  });
+}
+
+export function runQuantInvestmentBacktest(householdId: string, policyId: string, monthlyContribution: number) {
+  return request<QuantBacktestResult>("/api/quant-investment/backtests", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, policy_id: policyId, monthly_contribution: monthlyContribution })
+  });
+}
+
+export function fetchQuantPaperOrders(householdId: string) {
+  return request<PaperOrderRecord[]>(`/api/quant-investment/paper-orders?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function simulateQuantPaperOrder(id: string, householdId: string, executedPrice?: number) {
+  return request<PaperOrderRecord>(`/api/quant-investment/paper-orders/${id}/simulate`, {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, executed_price: executedPrice ?? null })
+  });
 }
 
 export function createMarketSnapshot(data: MarketSnapshotData) {

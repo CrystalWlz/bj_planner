@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import {
   AlertTriangle,
@@ -138,7 +138,7 @@ import {
   refreshPersonalPensionReturns,
 } from "./api";
 import { money, numberInput, percent } from "./format";
-import { PropertyMonitorPage } from "./PropertyMonitorPage";
+import { QuantInvestmentPanel } from "./QuantInvestmentPanel";
 import type {
   AccountCalibrationData,
   AccountCalibrationScope,
@@ -211,6 +211,11 @@ const visualColors = {
   warning: "var(--chart-warning)",
   danger: "var(--chart-danger)"
 };
+
+const PropertyMonitorPage = lazy(async () => {
+  const module = await import("./PropertyMonitorPage");
+  return { default: module.PropertyMonitorPage };
+});
 
 function hashPieName(name: string) {
   const baseHash = Array.from(name).reduce((hash, char) => {
@@ -3017,9 +3022,22 @@ export function App() {
     if (activePage === "税务") return <TaxPage household={household.data} incomeMembers={incomeMembers} childPlans={childPlans} specialDeductions={specialDeductions} result={result} taxStrategyItems={taxStrategyItemsForPage} taxStrategyTimeline={taxStrategyTimelineForPage} taxStrategySourceLabel={taxStrategySourceLabel} updateHousehold={updateHousehold} updateChildPlan={updateChildPlan} updateSpecialDeduction={updateSpecialDeduction} addSpecialDeduction={addSpecialDeduction} removeSpecialDeduction={removeSpecialDeduction} />;
     if (activePage === "记账校准") return <AccountCalibrationPage household={household.data} result={result} planningGoals={planningGoals} planningSequence={planningSequence} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} generatedStrategies={generatedStrategies} updateHousehold={updateHousehold} />;
     if (activePage === "养娃计划") return <ChildPlanPage incomeMembers={incomeMembers} childPlans={childPlans} childPlanStrategies={childPlanStrategiesForPage} childPlanStrategySourceLabel={childPlanStrategySourceLabel} updateChildPlan={updateChildPlan} updateChildPlanPatch={updateChildPlanPatch} applyChildStrategyPatch={applyChildStrategyPatch} addChildPlan={addChildPlan} duplicateChildPlan={duplicateChildPlan} removeChildPlan={removeChildPlan} openPlanningGoals={() => setActivePage("规划目标")} />;
-    if (activePage === "理财计划") return <InvestmentPlanPage household={household.data} scenario={selectedScenario.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} investmentRecommendations={investmentRecommendationsForPage} investmentRecommendationSourceLabel={investmentRecommendationSourceLabel} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
+    if (activePage === "理财计划") return <InvestmentPlanPage householdId={household.id} household={household.data} scenario={selectedScenario.data} result={result} accountConcepts={result?.account_concepts ?? accountConcepts} investmentRecommendations={investmentRecommendationsForPage} investmentRecommendationSourceLabel={investmentRecommendationSourceLabel} updateHousehold={updateHousehold} updateHouseholdPatch={updateHouseholdPatch} updateInvestmentAnnualReturn={updateInvestmentAnnualReturn} />;
     if (activePage === "购房计划") return <ScenarioPage scenarios={scenarios} hasPurchaseTargets={scenarios.length > 0} selectedScenario={selectedScenario} setSelectedScenarioId={setSelectedScenarioId} updateScenario={updateScenario} updateScenarioRecord={updateScenarioRecord} addScenario={addScenario} removeScenario={removeScenario} removeScenarios={removeScenarios} result={result} planningSequence={planningSequence} scenarioComparisons={scenarioComparisons} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={selectedScenarioHomePurchasePlans} purchasePlanSourceLabel={purchasePlanSourceLabel} calculationPending={calculationPending} openPlanningGoals={() => setActivePage("规划目标")} />;
-    if (activePage === "房产监测") return <PropertyMonitorPage householdId={household.id} scenarios={scenarios} marketSnapshots={marketSnapshots} purchasePlans={propertyMonitorPurchasePlans} onUpdateScenario={updateScenarioRecord} onMarketSnapshotCreated={(snapshot) => setMarketSnapshots((items) => [...items, snapshot])} />;
+    if (activePage === "房产监测") {
+      return (
+        <Suspense fallback={<div className="loading-screen"><Loader2 className="spin" size={18} /> 正在加载房产监测工具</div>}>
+          <PropertyMonitorPage
+            householdId={household.id}
+            scenarios={scenarios}
+            marketSnapshots={marketSnapshots}
+            purchasePlans={propertyMonitorPurchasePlans}
+            onUpdateScenario={updateScenarioRecord}
+            onMarketSnapshotCreated={(snapshot) => setMarketSnapshots((items) => [...items, snapshot])}
+          />
+        </Suspense>
+      );
+    }
     if (activePage === "购车计划") return <CarPlanPage carPlan={carPlan} result={result} planningSequence={planningSequence} carStrategies={carStrategiesForPage} carStrategySourceLabel={carStrategySourceLabel} updateCarPlan={updateCarPlan} updateCarPlanPatch={updateCarPlanPatch} updateCarPlanSelection={updateCarPlanSelection} createVehiclePlanningGoal={createVehiclePlanningGoal} saveVehiclePlanningGoal={saveVehiclePlanningGoal} deleteVehiclePlanningGoal={deleteVehiclePlanningGoal} savePlanningGoalData={savePlanningGoalData} calculationPending={calculationPending} openPlanningGoals={() => setActivePage("规划目标")} />;
     if (activePage === "政策规则") return <RulePage activeRulePack={activeRulePack.data} ruleNumber={ruleNumber} updateRulePack={updateRulePack} updateRuleParam={updateRuleParam} sourceUrl={sourceUrl} setSourceUrl={setSourceUrl} sourcePreview={sourcePreview} previewSource={() => void previewSource()} saving={saving} />;
     if (activePage === "可视化") return <VisualizationPage result={result} household={household.data} selectedScenario={selectedScenario} scenarioComparisons={scenarioComparisons} setSelectedScenarioId={setSelectedScenarioId} selectedPlan={selectedPlan} selectedPlanVariant={selectedPlanVariant} setSelectedPlanVariant={setSelectedPlanVariant} availablePlans={visualizationPlans} accountConcepts={result?.account_concepts ?? accountConcepts} coreObjectGroups={result?.core_object_groups ?? coreObjectGroups} activeRulePack={activeRulePack.data} calculationPending={calculationPending} timelineState={visualizationTimelineState} onTimelineStateChange={updateVisualizationTimelineState} />;
@@ -6933,6 +6951,7 @@ function TaxPage({
 }
 
 function InvestmentPlanPage({
+  householdId,
   household,
   scenario,
   result,
@@ -6943,6 +6962,7 @@ function InvestmentPlanPage({
   updateHouseholdPatch,
   updateInvestmentAnnualReturn
 }: {
+  householdId: string;
   household: HouseholdData;
   scenario: ScenarioData;
   result: AffordabilityResult | null;
@@ -7103,6 +7123,8 @@ function InvestmentPlanPage({
           <Metric label="最近目标窗口" value={recommendedInvestment?.liquidity_horizon_months !== undefined && recommendedInvestment?.liquidity_horizon_months !== null ? `${recommendedInvestment.liquidity_horizon_months} 个月` : "无近期目标"} />
         </div>
       </section>
+
+      <QuantInvestmentPanel householdId={householdId} />
 
       {portfolioStrategy ? (
         <section className="workflow-section portfolio-strategy-summary">

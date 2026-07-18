@@ -24,6 +24,11 @@ RenovationFundingMode = Literal[
     "upfront_cash",
 ]
 InvestmentWithdrawalMode = Literal["auto", "full_liquidation", "manual_reserve"]
+InvestmentInstrumentMarket = Literal["mainland_etf", "hong_kong_connect", "qdii_etf", "qdii_fund"]
+InvestmentTradingMode = Literal["exchange", "fund_subscription"]
+InvestmentAssetClass = Literal["equity", "defensive"]
+InvestmentMarketDataStatus = Literal["complete", "partial", "empty"]
+InvestmentOrderStatus = Literal["proposed", "simulated", "confirmed", "cancelled", "blocked"]
 RetirementCategory = Literal["male_60", "female_55", "female_50"]
 MemberSex = Literal["female", "male", "unspecified"]
 ProvidentAccountManagementCenter = Literal["beijing_municipal", "national"]
@@ -817,6 +822,7 @@ class HouseholdData(BaseModel):
     monthly_debt_payment: float = Field(0, ge=0)
     cash_account_balance: float = Field(0, ge=0)
     investments: float = Field(0, ge=0)
+    quant_investment_data_version: int = Field(0, ge=0)
     income_projection_year: int = Field(2027, ge=2024, le=2050)
     monthly_rent_from_housing_fund: float = Field(0, ge=0)
     family_provident_support_enabled: bool = False
@@ -2265,6 +2271,215 @@ class InvestmentPlanRecommendation(BaseModel):
     lifecycle_risk_note: str = ""
     score: int = Field(0, ge=0, le=100)
     reasons: list[str] = Field(default_factory=list)
+
+
+class QuantInvestmentPolicyData(BaseModel):
+    """家庭量化定投的风险边界；不包含任何券商或数据服务凭据。"""
+
+    schema_version: int = Field(1, ge=1)
+    name: str = "港股通 / QDII ETF 月度定投"
+    enabled: bool = True
+    frequency: Literal["monthly"] = "monthly"
+    equity_cap: float = Field(0.35, ge=0, le=1)
+    defensive_min: float = Field(0.65, ge=0, le=1)
+    rebalance_threshold: float = Field(0.05, ge=0, le=0.5)
+    drawdown_reduce_threshold: float = Field(0.08, ge=0, le=1)
+    drawdown_pause_threshold: float = Field(0.12, ge=0, le=1)
+    drawdown_freeze_threshold: float = Field(0.15, ge=0, le=1)
+    drawdown_reduced_equity_cap: float = Field(0.20, ge=0, le=1)
+    qdii_premium_threshold: float = Field(0.03, ge=0, le=0.2)
+    qdii_nav_max_stale_days: int = Field(3, ge=0, le=20)
+    default_monthly_budget: float = Field(0, ge=0)
+    slippage_rate: float = Field(0.001, ge=0, le=0.05)
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def validate_risk_boundaries(self) -> "QuantInvestmentPolicyData":
+        if self.equity_cap + self.defensive_min > 1.000001:
+            raise ValueError("权益上限与防御资产下限之和不能超过 100%")
+        if not (
+            self.drawdown_reduce_threshold
+            <= self.drawdown_pause_threshold
+            <= self.drawdown_freeze_threshold
+        ):
+            raise ValueError("回撤阈值必须按降仓、暂停、冻结顺序递增")
+        return self
+
+
+class QuantInvestmentPolicyRecord(BaseModel):
+    id: str
+    household_id: str
+    data: QuantInvestmentPolicyData
+    created_at: datetime
+    updated_at: datetime
+
+
+class QuantInvestmentPolicyCreate(BaseModel):
+    household_id: str
+    data: QuantInvestmentPolicyData
+
+
+class InvestmentInstrumentData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    symbol: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=100)
+    market: InvestmentInstrumentMarket
+    trading_mode: InvestmentTradingMode = "exchange"
+    asset_class: InvestmentAssetClass
+    currency: Literal["CNY", "HKD", "USD"] = "CNY"
+    enabled: bool = True
+    hong_kong_connect_eligible: bool = False
+    purchase_suspended: bool = False
+    monthly_purchase_limit: float | None = Field(default=None, ge=0)
+    buy_fee_rate: float = Field(0.0015, ge=0, le=0.05)
+    sell_fee_rate: float = Field(0.005, ge=0, le=0.05)
+    qdii_premium_threshold: float | None = Field(default=None, ge=0, le=0.2)
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def validate_trading_route(self) -> "InvestmentInstrumentData":
+        if self.market == "qdii_fund" and self.trading_mode != "fund_subscription":
+            raise ValueError("场外 QDII 只能使用基金申购方式")
+        if self.market != "qdii_fund" and self.trading_mode != "exchange":
+            raise ValueError("一期场内标的必须使用交易所交易方式")
+        return self
+
+
+class InvestmentInstrumentRecord(BaseModel):
+    id: str
+    household_id: str
+    data: InvestmentInstrumentData
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestmentInstrumentCreate(BaseModel):
+    household_id: str
+    data: InvestmentInstrumentData
+
+
+class InvestmentMarketBarData(BaseModel):
+    date: str
+    close: float = Field(gt=0)
+    adjusted_close: float | None = Field(default=None, gt=0)
+    nav: float | None = Field(default=None, gt=0)
+    nav_date: str = ""
+    premium_rate: float | None = Field(default=None, ge=-1, le=1)
+    is_trading: bool = True
+
+
+class InvestmentMarketSnapshotData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    source: Literal["tushare_pro", "manual"] = "tushare_pro"
+    snapshot_date: str
+    status: InvestmentMarketDataStatus = "complete"
+    bars: list[InvestmentMarketBarData] = Field(default_factory=list, max_length=5000)
+    warning: str = ""
+
+
+class InvestmentMarketSnapshotRecord(BaseModel):
+    id: str
+    instrument_id: str
+    snapshot_date: str
+    data: InvestmentMarketSnapshotData
+    created_at: datetime
+    updated_at: datetime
+
+
+class QuantMarketRefreshRequest(BaseModel):
+    household_id: str
+    start_date: str = ""
+
+
+class QuantMarketRefreshResponse(BaseModel):
+    records: list[InvestmentMarketSnapshotRecord] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class InvestmentMarketSnapshotCreate(BaseModel):
+    household_id: str
+    instrument_id: str
+    data: InvestmentMarketSnapshotData
+
+
+class QuantInvestmentProposalData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    policy_id: str
+    snapshot_ids: list[str] = Field(default_factory=list)
+    as_of_date: str
+    protected_cash: float = Field(ge=0)
+    investable_cash: float = Field(ge=0)
+    proposed_budget: float = Field(ge=0)
+    effective_equity_cap: float = Field(ge=0, le=1)
+    estimated_drawdown: float = Field(ge=0, le=1)
+    risk_state: Literal["normal", "reduced", "paused", "frozen", "blocked"]
+    reasons: list[str] = Field(default_factory=list)
+
+
+class QuantInvestmentProposalRecord(BaseModel):
+    id: str
+    household_id: str
+    data: QuantInvestmentProposalData
+    created_at: datetime
+    updated_at: datetime
+
+
+class QuantInvestmentProposalRequest(BaseModel):
+    household_id: str
+    policy_id: str
+
+
+class PaperOrderData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    proposal_id: str
+    instrument_id: str
+    side: Literal["buy", "sell"] = "buy"
+    order_amount: float = Field(gt=0)
+    estimated_price: float = Field(gt=0)
+    estimated_quantity: float = Field(gt=0)
+    estimated_fee: float = Field(ge=0)
+    status: InvestmentOrderStatus = "proposed"
+    reason: str = ""
+    executed_date: str = ""
+    executed_price: float | None = Field(default=None, gt=0)
+    executed_quantity: float | None = Field(default=None, gt=0)
+
+
+class PaperOrderRecord(BaseModel):
+    id: str
+    household_id: str
+    data: PaperOrderData
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaperOrderCreate(BaseModel):
+    household_id: str
+    data: PaperOrderData
+
+
+class PaperOrderSimulateRequest(BaseModel):
+    household_id: str
+    executed_date: str = ""
+    executed_price: float | None = Field(default=None, gt=0)
+
+
+class QuantBacktestRequest(BaseModel):
+    household_id: str
+    policy_id: str
+    monthly_contribution: float = Field(1000, gt=0)
+
+
+class QuantBacktestResult(BaseModel):
+    policy_id: str
+    start_date: str
+    end_date: str
+    months: int = Field(ge=0)
+    strategy_terminal_value: float = Field(ge=0)
+    static_terminal_value: float = Field(ge=0)
+    strategy_max_drawdown: float = Field(ge=0, le=1)
+    static_max_drawdown: float = Field(ge=0, le=1)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class PortfolioStrategyRecommendation(BaseModel):

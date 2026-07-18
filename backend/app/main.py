@@ -13,6 +13,8 @@ from .cache import affordability_cache_key, calculation_code_fingerprints
 from .calculator import calculate_affordability
 from .database import (
     delete_record,
+    bump_quant_investment_data_version,
+    delete_quant_scoped_record,
     delete_planning_goal_record,
     delete_scenario_record,
     generated_strategies_exist_for_cache,
@@ -21,6 +23,8 @@ from .database import (
     insert_household_record,
     insert_planning_goal_record,
     insert_record,
+    insert_paper_investment_order,
+    insert_quant_scoped_record,
     insert_scenario_record,
     list_core_object_records,
     list_generated_strategies,
@@ -29,12 +33,16 @@ from .database import (
     list_property_valuations,
     list_personal_pension_return_snapshots,
     list_records,
+    list_investment_market_snapshots,
+    list_paper_investment_orders,
+    list_quant_scoped_records,
     list_scenario_records,
     normalize_household_data,
     normalize_market_snapshot_data,
     normalize_planning_goal_data,
     normalize_rule_pack_data,
     normalize_scenario_data,
+    upsert_investment_market_snapshot,
     latest_property_valuation,
     latest_personal_pension_return_snapshot,
     update_household_record,
@@ -44,10 +52,16 @@ from .database import (
     upsert_property_valuation,
     upsert_personal_pension_return_snapshot,
     update_record,
+    update_paper_investment_order,
+    update_quant_scoped_record,
     update_scenario_record,
 )
 from .domain.property_valuation import estimate_property_value
 from .domain.personal_pension_returns import refresh_personal_pension_return_snapshot
+from .domain.quant_investment import run_monthly_backtest
+from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot
+from .broker_adapters import PaperBrokerAdapter
+from .strategies.quant_investment import build_quant_monthly_proposal
 from .planning_context import (
     apply_planning_goal_constraints,
     core_object_snapshot_from_record,
@@ -97,6 +111,22 @@ from .schemas import (
     ScenarioRecord,
     SourceDocumentRecord,
     SourceFetchRequest,
+    InvestmentInstrumentCreate,
+    InvestmentInstrumentRecord,
+    InvestmentMarketSnapshotCreate,
+    InvestmentMarketSnapshotData,
+    InvestmentMarketSnapshotRecord,
+    PaperOrderCreate,
+    PaperOrderRecord,
+    PaperOrderSimulateRequest,
+    QuantBacktestRequest,
+    QuantBacktestResult,
+    QuantInvestmentPolicyCreate,
+    QuantInvestmentPolicyRecord,
+    QuantInvestmentProposalRecord,
+    QuantInvestmentProposalRequest,
+    QuantMarketRefreshRequest,
+    QuantMarketRefreshResponse,
 )
 from .source_monitor import fetch_preview
 from .policies import with_personal_pension_return_snapshot
@@ -334,6 +364,259 @@ def save_rule_pack(record_id: str, payload: RulePackCreate) -> dict:
     record = update_record("rule_packs", record_id, normalize_rule_pack_data(payload.data.model_dump(mode="json")))
     if record is None:
         raise HTTPException(status_code=404, detail="Rule pack not found")
+    return record
+
+
+def _quant_household_data(household_id: str) -> HouseholdData:
+    record = next((item for item in list_household_records() if item["id"] == household_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到家庭记录")
+    return HouseholdData.model_validate(record["data"])
+
+
+def _quant_policy_record(household_id: str, policy_id: str) -> dict:
+    record = next(
+        (item for item in list_quant_scoped_records("quant_investment_policies", household_id=household_id) if item["id"] == policy_id),
+        None,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到量化定投策略")
+    return record
+
+
+@app.get("/api/quant-investment/policies", response_model=list[QuantInvestmentPolicyRecord])
+def get_quant_investment_policies(household_id: str) -> list[dict]:
+    return list_quant_scoped_records("quant_investment_policies", household_id=household_id)
+
+
+@app.post("/api/quant-investment/policies", response_model=QuantInvestmentPolicyRecord)
+def create_quant_investment_policy(payload: QuantInvestmentPolicyCreate) -> dict:
+    _quant_household_data(payload.household_id)
+    record = insert_quant_scoped_record(
+        "quant_investment_policies",
+        household_id=payload.household_id,
+        data=payload.data.model_dump(mode="json"),
+    )
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.put("/api/quant-investment/policies/{record_id}", response_model=QuantInvestmentPolicyRecord)
+def save_quant_investment_policy(record_id: str, payload: QuantInvestmentPolicyCreate) -> dict:
+    record = update_quant_scoped_record(
+        "quant_investment_policies",
+        record_id,
+        household_id=payload.household_id,
+        data=payload.data.model_dump(mode="json"),
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到量化定投策略")
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.delete("/api/quant-investment/policies/{record_id}")
+def remove_quant_investment_policy(record_id: str, household_id: str) -> dict[str, bool]:
+    if not delete_quant_scoped_record("quant_investment_policies", record_id, household_id=household_id):
+        raise HTTPException(status_code=404, detail="未找到量化定投策略")
+    bump_quant_investment_data_version(household_id)
+    return {"deleted": True}
+
+
+@app.get("/api/quant-investment/instruments", response_model=list[InvestmentInstrumentRecord])
+def get_quant_investment_instruments(household_id: str) -> list[dict]:
+    return list_quant_scoped_records("investment_instruments", household_id=household_id)
+
+
+@app.post("/api/quant-investment/instruments", response_model=InvestmentInstrumentRecord)
+def create_quant_investment_instrument(payload: InvestmentInstrumentCreate) -> dict:
+    _quant_household_data(payload.household_id)
+    record = insert_quant_scoped_record(
+        "investment_instruments",
+        household_id=payload.household_id,
+        data=payload.data.model_dump(mode="json"),
+    )
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.put("/api/quant-investment/instruments/{record_id}", response_model=InvestmentInstrumentRecord)
+def save_quant_investment_instrument(record_id: str, payload: InvestmentInstrumentCreate) -> dict:
+    record = update_quant_scoped_record(
+        "investment_instruments",
+        record_id,
+        household_id=payload.household_id,
+        data=payload.data.model_dump(mode="json"),
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到量化投资标的")
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.delete("/api/quant-investment/instruments/{record_id}")
+def remove_quant_investment_instrument(record_id: str, household_id: str) -> dict[str, bool]:
+    if not delete_quant_scoped_record("investment_instruments", record_id, household_id=household_id):
+        raise HTTPException(status_code=404, detail="未找到量化投资标的")
+    bump_quant_investment_data_version(household_id)
+    return {"deleted": True}
+
+
+@app.get("/api/quant-investment/market-snapshots", response_model=list[InvestmentMarketSnapshotRecord])
+def get_quant_market_snapshots(household_id: str) -> list[dict]:
+    instruments = list_quant_scoped_records("investment_instruments", household_id=household_id)
+    return list_investment_market_snapshots(instrument_ids=[item["id"] for item in instruments])
+
+
+@app.post("/api/quant-investment/market-snapshots", response_model=InvestmentMarketSnapshotRecord)
+def create_quant_market_snapshot(payload: InvestmentMarketSnapshotCreate) -> dict:
+    instrument_exists = any(
+        item["id"] == payload.instrument_id
+        for item in list_quant_scoped_records("investment_instruments", household_id=payload.household_id)
+    )
+    if not instrument_exists:
+        raise HTTPException(status_code=404, detail="未找到该家庭的投资标的")
+    record = upsert_investment_market_snapshot(
+        instrument_id=payload.instrument_id,
+        snapshot_date=payload.data.snapshot_date,
+        source=payload.data.source,
+        data=payload.data.model_dump(mode="json"),
+    )
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.post("/api/quant-investment/market-data/refresh", response_model=QuantMarketRefreshResponse)
+def refresh_quant_market_data(payload: QuantMarketRefreshRequest) -> dict:
+    instruments = list_quant_scoped_records("investment_instruments", household_id=payload.household_id)
+    records: list[dict] = []
+    warnings: list[str] = []
+    for instrument_record in instruments:
+        instrument = InvestmentInstrumentRecord.model_validate(instrument_record)
+        if not instrument.data.enabled:
+            continue
+        try:
+            snapshot = fetch_tushare_snapshot(instrument.data, start_date=payload.start_date)
+            records.append(
+                upsert_investment_market_snapshot(
+                    instrument_id=instrument.id,
+                    snapshot_date=snapshot.snapshot_date,
+                    source=snapshot.source,
+                    data=snapshot.model_dump(mode="json"),
+                )
+            )
+        except MarketDataConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:  # external provider failures must not erase prior snapshots
+            warnings.append(f"{instrument.data.name}：{exc}")
+    if records:
+        bump_quant_investment_data_version(payload.household_id)
+    return {"records": records, "warnings": warnings}
+
+
+def _quant_snapshot_map(household_id: str) -> tuple[list[tuple[str, object]], dict[str, tuple[str, InvestmentMarketSnapshotData]]]:
+    instruments = list_quant_scoped_records("investment_instruments", household_id=household_id)
+    snapshots = list_investment_market_snapshots(instrument_ids=[item["id"] for item in instruments])
+    parsed_instruments = [
+        (item["id"], InvestmentInstrumentRecord.model_validate(item).data)
+        for item in instruments
+    ]
+    parsed_snapshots = {
+        item["instrument_id"]: (item["id"], InvestmentMarketSnapshotRecord.model_validate(item).data)
+        for item in snapshots
+    }
+    return parsed_instruments, parsed_snapshots
+
+
+@app.get("/api/quant-investment/proposals", response_model=list[QuantInvestmentProposalRecord])
+def get_quant_investment_proposals(household_id: str) -> list[dict]:
+    return list_quant_scoped_records("quant_investment_proposals", household_id=household_id)
+
+
+@app.post("/api/quant-investment/proposals", response_model=QuantInvestmentProposalRecord)
+def create_quant_investment_proposal(payload: QuantInvestmentProposalRequest) -> dict:
+    household = _quant_household_data(payload.household_id)
+    policy_record = _quant_policy_record(payload.household_id, payload.policy_id)
+    policy = QuantInvestmentPolicyRecord.model_validate(policy_record)
+    instruments, snapshots = _quant_snapshot_map(payload.household_id)
+    result = build_quant_monthly_proposal(
+        household=household,
+        policy_id=policy.id,
+        policy=policy.data,
+        instruments=instruments,
+        snapshots=snapshots,
+    )
+    proposal_record = insert_quant_scoped_record(
+        "quant_investment_proposals",
+        household_id=payload.household_id,
+        data=result.proposal.model_dump(mode="json"),
+    )
+    for order in result.orders:
+        order_data = order.model_copy(update={"proposal_id": proposal_record["id"]})
+        insert_paper_investment_order(
+            household_id=payload.household_id,
+            proposal_id=proposal_record["id"],
+            instrument_id=order_data.instrument_id,
+            data=order_data.model_dump(mode="json"),
+        )
+    return proposal_record
+
+
+@app.post("/api/quant-investment/backtests", response_model=QuantBacktestResult)
+def run_quant_investment_backtest(payload: QuantBacktestRequest) -> QuantBacktestResult:
+    policy_record = _quant_policy_record(payload.household_id, payload.policy_id)
+    policy = QuantInvestmentPolicyRecord.model_validate(policy_record)
+    instruments, snapshots = _quant_snapshot_map(payload.household_id)
+    equity_snapshots = [
+        snapshot
+        for instrument_id, (_snapshot_id, snapshot) in snapshots.items()
+        if any(item_id == instrument_id and item.asset_class == "equity" for item_id, item in instruments)
+    ]
+    try:
+        result = run_monthly_backtest(policy.data, equity_snapshots, monthly_contribution=payload.monthly_contribution)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result.model_copy(update={"policy_id": policy.id})
+
+
+@app.get("/api/quant-investment/paper-orders", response_model=list[PaperOrderRecord])
+def get_quant_paper_orders(household_id: str) -> list[dict]:
+    return list_paper_investment_orders(household_id=household_id)
+
+
+@app.post("/api/quant-investment/paper-orders", response_model=PaperOrderRecord)
+def create_quant_paper_order(payload: PaperOrderCreate) -> dict:
+    return insert_paper_investment_order(
+        household_id=payload.household_id,
+        proposal_id=payload.data.proposal_id,
+        instrument_id=payload.data.instrument_id,
+        data=payload.data.model_dump(mode="json"),
+    )
+
+
+@app.post("/api/quant-investment/paper-orders/{record_id}/simulate", response_model=PaperOrderRecord)
+def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateRequest) -> dict:
+    existing = next((item for item in list_paper_investment_orders(household_id=payload.household_id) if item["id"] == record_id), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="未找到模拟订单")
+    order = PaperOrderRecord.model_validate(existing)
+    if order.data.status == "simulated":
+        return existing
+    try:
+        simulated = PaperBrokerAdapter().simulate(
+            order.data,
+            executed_date=payload.executed_date,
+            executed_price=payload.executed_price,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record = update_paper_investment_order(
+        record_id,
+        household_id=payload.household_id,
+        data=simulated.model_dump(mode="json"),
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到模拟订单")
     return record
 
 

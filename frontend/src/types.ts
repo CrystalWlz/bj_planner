@@ -215,6 +215,132 @@ export interface InvestmentPlanRecommendation {
   reasons: string[];
 }
 
+export type InvestmentInstrumentMarket = "mainland_etf" | "hong_kong_connect" | "qdii_etf" | "qdii_fund";
+export type InvestmentTradingMode = "exchange" | "fund_subscription";
+export type InvestmentAssetClass = "equity" | "defensive";
+export type InvestmentOrderStatus = "proposed" | "simulated" | "confirmed" | "cancelled" | "blocked";
+
+export interface QuantInvestmentPolicyData {
+  schema_version: number;
+  name: string;
+  enabled: boolean;
+  frequency: "monthly";
+  equity_cap: number;
+  defensive_min: number;
+  rebalance_threshold: number;
+  drawdown_reduce_threshold: number;
+  drawdown_pause_threshold: number;
+  drawdown_freeze_threshold: number;
+  drawdown_reduced_equity_cap: number;
+  qdii_premium_threshold: number;
+  qdii_nav_max_stale_days: number;
+  default_monthly_budget: number;
+  slippage_rate: number;
+  notes: string;
+}
+
+export interface InvestmentInstrumentData {
+  schema_version: number;
+  symbol: string;
+  name: string;
+  market: InvestmentInstrumentMarket;
+  trading_mode: InvestmentTradingMode;
+  asset_class: InvestmentAssetClass;
+  currency: "CNY" | "HKD" | "USD";
+  enabled: boolean;
+  hong_kong_connect_eligible: boolean;
+  purchase_suspended: boolean;
+  monthly_purchase_limit: number | null;
+  buy_fee_rate: number;
+  sell_fee_rate: number;
+  qdii_premium_threshold: number | null;
+  notes: string;
+}
+
+export interface InvestmentMarketBarData {
+  date: string;
+  close: number;
+  adjusted_close: number | null;
+  nav: number | null;
+  nav_date: string;
+  premium_rate: number | null;
+  is_trading: boolean;
+}
+
+export interface InvestmentMarketSnapshotData {
+  schema_version: number;
+  source: "tushare_pro" | "manual";
+  snapshot_date: string;
+  status: "complete" | "partial" | "empty";
+  bars: InvestmentMarketBarData[];
+  warning: string;
+}
+
+export interface QuantInvestmentProposalData {
+  schema_version: number;
+  policy_id: string;
+  snapshot_ids: string[];
+  as_of_date: string;
+  protected_cash: number;
+  investable_cash: number;
+  proposed_budget: number;
+  effective_equity_cap: number;
+  estimated_drawdown: number;
+  risk_state: "normal" | "reduced" | "paused" | "frozen" | "blocked";
+  reasons: string[];
+}
+
+export interface PaperOrderData {
+  schema_version: number;
+  proposal_id: string;
+  instrument_id: string;
+  side: "buy" | "sell";
+  order_amount: number;
+  estimated_price: number;
+  estimated_quantity: number;
+  estimated_fee: number;
+  status: InvestmentOrderStatus;
+  reason: string;
+  executed_date: string;
+  executed_price: number | null;
+  executed_quantity: number | null;
+}
+
+export interface QuantBacktestResult {
+  policy_id: string;
+  start_date: string;
+  end_date: string;
+  months: number;
+  strategy_terminal_value: number;
+  static_terminal_value: number;
+  strategy_max_drawdown: number;
+  static_max_drawdown: number;
+  warnings: string[];
+}
+
+export interface QuantInvestmentPolicyRecord extends RecordEnvelope<QuantInvestmentPolicyData> {
+  household_id: string;
+}
+
+export interface InvestmentInstrumentRecord extends RecordEnvelope<InvestmentInstrumentData> {
+  household_id: string;
+}
+
+export interface InvestmentMarketSnapshotRecord extends RecordEnvelope<InvestmentMarketSnapshotData> {
+  instrument_id: string;
+  snapshot_date: string;
+}
+
+export interface QuantInvestmentProposalRecord extends RecordEnvelope<QuantInvestmentProposalData> {
+  household_id: string;
+}
+
+export interface PaperOrderRecord extends RecordEnvelope<PaperOrderData> {
+  household_id: string;
+  proposal_id: string;
+  instrument_id: string;
+}
+
 export interface PortfolioStrategyRecommendation {
   plan_name: string;
   title: string;
@@ -616,6 +742,7 @@ export interface HouseholdData {
   monthly_debt_payment: number;
   cash_account_balance: number;
   investments: number;
+  quant_investment_data_version?: number;
   income_projection_year: number;
   monthly_rent_from_housing_fund: number;
   family_provident_support_enabled: boolean;

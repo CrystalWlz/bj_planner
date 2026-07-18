@@ -45,6 +45,9 @@ flowchart LR
 - `backend/app/profiling.py`
   后端性能观测层。默认关闭，不进入 API 响应，也不影响业务缓存；设置 `HOUSE_PLANNER_PROFILE=1` 后，`main.py`、`calculator.py`、`strategy_pipeline.py` 和 `planning_pipeline.py` 会在后端日志中输出计算上下文、缓存、策略生成、账本投影、可视化、响应组装和缓存写入等阶段耗时，供优化时对比冷启动、缓存命中和不同输入规模。
 
+- `backend/app/market_data.py`、`domain/quant_investment.py`、`strategies/quant_investment.py`、`broker_adapters.py`
+  量化定投一期的独立边界。`market_data.py` 只通过本机 `TUSHARE_TOKEN` 拉取日频行情并保存版本化快照；环境变量优先，未设置时仅读取用户私有的 `%APPDATA%\house-planner\tushare.env`（首次缺失时会创建无 Token 模板），绝不写入项目、SQLite 家庭数据或前端。领域层只计算现金保护线、回撤与可交易性，策略层只生成月度提案和模拟订单。`PaperBrokerAdapter` 是唯一可执行适配器，永远不会向外部券商发送订单；`QmtBrokerAdapter` 仅作为禁用占位，等待券商书面确认权限、额度、交易时段和人工双重确认后才能实现。行情/标的/风险政策变化会递增 `HouseholdData.quant_investment_data_version`，因此进入 affordability input cache 指纹；前端通过专用 API 展示后端提案、回测和模拟成交，不自行计算仓位或回撤。详细流程与凭据边界见 `docs/investment-quant-plan.md`。
+
 - `scripts/perf_calculation_sample.py`
   固定性能样例脚本。它强制使用临时 SQLite 数据库，默认开启 `HOUSE_PLANNER_PROFILE=1`，通过 FastAPI TestClient 对同一份基准输入连续执行冷启动和缓存命中两次计算，并输出总耗时、cache layer、策略数量和月度账本行数。做计算速度优化前后，应先运行这个脚本保存对比口径，再决定是否需要更完整的业务一致性回归。
 
@@ -172,7 +175,7 @@ flowchart LR
 ### 前端
 
 - `frontend/src/App.tsx`  
-  当前主要页面和交互集中在这里。它负责组织页面、维护表单状态、调用 API、展示图表和策略说明。注意：这里不应该重新推演现金、贷款、税务或账户曲线。
+  当前主要页面和交互集中在这里。它负责组织页面、维护表单状态、调用 API、展示图表和策略说明。房产监测页已经独立为 `PropertyMonitorPage.tsx`，并在用户进入“房产监测”时按需加载，避免主规划工作流首次加载独立监测页和其图表依赖；后续拆分页面时应继续沿用“独立页面模块 + 按需加载 + 明确加载态”的边界，而不是把页面逻辑重新并回入口。注意：这里不应该重新推演现金、贷款、税务或账户曲线。
 
 - `frontend/src/types.ts`  
   前端类型契约，应与 `backend/app/schemas.py` 对齐。

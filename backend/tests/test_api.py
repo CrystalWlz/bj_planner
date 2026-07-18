@@ -644,6 +644,14 @@ def test_architecture_tracks_major_goal_areas() -> None:
         assert section in architecture
 
 
+def test_property_monitor_page_is_loaded_on_demand() -> None:
+    app_source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert 'lazy(async () => {' in app_source
+    assert 'import("./PropertyMonitorPage")' in app_source
+    assert '<Suspense fallback=' in app_source
+
+
 def test_cache_layer_hashes_propagate_input_changes_downstream() -> None:
     from app.cache import affordability_cache_layers
     from app.schemas import AffordabilityRequest, HouseholdData, RulePackData, ScenarioData
