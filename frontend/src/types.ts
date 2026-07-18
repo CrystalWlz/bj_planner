@@ -367,6 +367,8 @@ export interface PaperPortfolioSummary {
   realized_pnl: number;
   total_fees: number;
   fill_count: number;
+  current_drawdown: number;
+  max_drawdown: number;
   frozen: boolean;
   reconciliation_status: "not_required" | "matched" | "mismatch";
   positions: PaperPositionData[];

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 
 from ..schemas import (
     AccountSnapshotPoint,
@@ -16,6 +15,7 @@ from ..schemas import (
     QuantInvestmentPolicyData,
     VisualizationBreakdownItem,
 )
+from .quant_investment import _drawdown_from_prices, market_trading_day_age
 
 
 @dataclass
@@ -24,6 +24,65 @@ class _PositionState:
     total_cost: float = 0.0
     realized_pnl: float = 0.0
     total_fees: float = 0.0
+
+
+def _paper_nav_drawdowns(
+    fills: list[PaperFillData],
+    snapshots: dict[str, InvestmentMarketSnapshotData],
+) -> tuple[float, float]:
+    if not fills:
+        return 0.0, 0.0
+    ordered_fills = sorted(fills, key=lambda item: (item.executed_date, item.order_id))
+    first_fill_date = ordered_fills[0].executed_date
+    fills_by_date: dict[str, list[PaperFillData]] = {}
+    for fill in ordered_fills:
+        fills_by_date.setdefault(fill.executed_date, []).append(fill)
+    price_updates: dict[str, dict[str, float]] = {}
+    for instrument_id, snapshot in snapshots.items():
+        for bar in snapshot.bars:
+            price_date = bar.price_date or bar.date
+            if price_date < first_fill_date or not bar.is_trading or bar.is_suspended:
+                continue
+            price_updates.setdefault(price_date, {})[instrument_id] = float(bar.adjusted_close or bar.close)
+
+    timeline = sorted(set(fills_by_date) | set(price_updates))
+    quantities: dict[str, float] = {}
+    latest_prices: dict[str, float] = {}
+    cash = 0.0
+    units = 0.0
+    nav_history: list[float] = []
+    for current_date in timeline:
+        updated_instruments = set(price_updates.get(current_date, {}))
+        latest_prices.update(price_updates.get(current_date, {}))
+        equity_before_contribution = cash + sum(
+            quantity * latest_prices.get(instrument_id, 0.0)
+            for instrument_id, quantity in quantities.items()
+        )
+        day_fills = fills_by_date.get(current_date, [])
+        contribution = sum(fill.contribution_amount for fill in day_fills)
+        nav_before_contribution = equity_before_contribution / units if units > 0 else 1.0
+        if contribution > 0:
+            units += contribution / max(nav_before_contribution, 1e-9)
+        for fill in day_fills:
+            cash += fill.contribution_amount + fill.cash_change
+            current_quantity = quantities.get(fill.instrument_id, 0.0)
+            if fill.side == "buy":
+                quantities[fill.instrument_id] = current_quantity + fill.executed_quantity
+            else:
+                quantities[fill.instrument_id] = max(0.0, current_quantity - fill.executed_quantity)
+            if fill.instrument_id not in updated_instruments:
+                latest_prices[fill.instrument_id] = fill.executed_price
+        total_equity = cash + sum(
+            quantity * latest_prices.get(instrument_id, 0.0)
+            for instrument_id, quantity in quantities.items()
+        )
+        if units > 0 and total_equity > 0:
+            nav_history.append(total_equity / units)
+    if not nav_history:
+        return 0.0, 0.0
+    peak = max(nav_history)
+    current_drawdown = (peak - nav_history[-1]) / peak if peak > 0 else 0.0
+    return current_drawdown, _drawdown_from_prices(nav_history)
 
 
 def paper_fill_from_order(order_id: str, order: PaperOrderData) -> PaperFillData:
@@ -82,6 +141,8 @@ def _paper_ledger_artifacts(
     total_equity: float,
     unrealized_pnl: float,
     realized_pnl: float,
+    current_drawdown: float,
+    max_drawdown: float,
 ) -> tuple[list[MonthlyLedgerEntry], list[AccountSnapshotPoint], list[MonthlyVisualizationDetail]]:
     if not fills:
         return [], [], []
@@ -153,8 +214,23 @@ def _paper_ledger_artifacts(
                 month=month,
                 cash_flow_items=cash_flow_items,
                 cash_flow_drivers=sorted(cash_flow_items, key=lambda item: item.value, reverse=True)[:5],
-                advisor_text=f"模拟账户第 {month} 期净值 {snapshot_total:.2f} 元；该账户与家庭真实现金、投资账户相互隔离。",
-                explanation_items=[{"title": "模拟账本", "body": "提案生成订单意图，成交事件进入账本，再由账本派生账户快照和可视化；任何异常只冻结新增订单。"}],
+                advisor_text=(
+                    f"模拟账户第 {month} 期净值 {snapshot_total:.2f} 元；"
+                    + (
+                        f"当前回撤 {current_drawdown:.1%}，历史最大回撤 {max_drawdown:.1%}；"
+                        if is_last
+                        else ""
+                    )
+                    + "该账户与家庭真实现金、投资账户相互隔离。"
+                ),
+                explanation_items=[
+                    {"title": "模拟账本", "body": "提案生成订单意图，成交事件进入账本，再由账本派生账户快照和可视化；任何异常只冻结新增订单。"},
+                    *(
+                        [{"title": "组合回撤", "body": "回撤按资金流中性的模拟账户单位净值计算，追加资金不会掩盖既有亏损。"}]
+                        if is_last
+                        else []
+                    ),
+                ],
             )
         )
     return entries, snapshots, details
@@ -213,9 +289,13 @@ def build_paper_portfolio_summary(
         latest_price_date = ""
         snapshot = snapshots.get(instrument_id)
         if snapshot is not None:
-            bars = [bar for bar in snapshot.bars if bar.is_trading and (bar.adjusted_close or bar.close) > 0]
+            bars = [
+                bar
+                for bar in snapshot.bars
+                if bar.is_trading and not bar.is_suspended and (bar.adjusted_close or bar.close) > 0
+            ]
             if bars:
-                latest_bar = max(bars, key=lambda bar: bar.date)
+                latest_bar = max(bars, key=lambda bar: bar.price_date or bar.date)
                 latest_price = float(latest_bar.adjusted_close or latest_bar.close)
                 latest_price_date = latest_bar.price_date or latest_bar.date
                 if policy and instrument.market == "qdii_etf":
@@ -223,9 +303,18 @@ def build_paper_portfolio_summary(
                     if not nav_available_date or latest_bar.nav is None:
                         frozen = True
                         warnings.append(f"{instrument.name} 的最新可得净值缺失，已冻结新增提案")
-                    elif latest_bar.nav_date and (date.fromisoformat(snapshot.snapshot_date) - date.fromisoformat(latest_bar.nav_date)).days > policy.qdii_nav_max_stale_days:
-                        frozen = True
-                        warnings.append(f"{instrument.name} 的最新可得净值已过期，已冻结新增提案")
+                    elif latest_bar.nav_date:
+                        try:
+                            nav_age = market_trading_day_age(
+                                snapshot,
+                                start_date=latest_bar.nav_date,
+                                end_date=latest_price_date,
+                            )
+                        except ValueError:
+                            nav_age = policy.qdii_nav_max_stale_days + 1
+                        if nav_age > policy.qdii_nav_max_stale_days:
+                            frozen = True
+                            warnings.append(f"{instrument.name} 的最新可得净值已过期，已冻结新增提案")
         if not latest_price_date:
             warnings.append(f"{instrument.name} 缺少最新行情，暂按持仓成本估值")
         market_value = state.quantity * latest_price
@@ -253,6 +342,12 @@ def build_paper_portfolio_summary(
     unrealized_pnl = sum(item.unrealized_pnl for item in positions)
     realized_pnl = sum(state.realized_pnl for state in states.values())
     total_fees = sum(state.total_fees for state in states.values())
+    current_drawdown, max_drawdown = _paper_nav_drawdowns(fills, snapshots)
+    if policy and max_drawdown >= policy.drawdown_freeze_threshold:
+        frozen = True
+        warnings.append(
+            f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已暂停新增并等待人工复核"
+        )
     ledger_entries, account_snapshots, visualization_details = _paper_ledger_artifacts(
         fills,
         cash_balance=max(0.0, cash_balance),
@@ -260,6 +355,8 @@ def build_paper_portfolio_summary(
         total_equity=max(0.0, cash_balance) + market_value,
         unrealized_pnl=unrealized_pnl,
         realized_pnl=realized_pnl,
+        current_drawdown=current_drawdown,
+        max_drawdown=max_drawdown,
     )
     return PaperPortfolioSummary(
         household_id=household_id,
@@ -271,6 +368,8 @@ def build_paper_portfolio_summary(
         realized_pnl=round(realized_pnl, 2),
         total_fees=round(total_fees, 2),
         fill_count=len(fills),
+        current_drawdown=round(current_drawdown, 6),
+        max_drawdown=round(max_drawdown, 6),
         frozen=frozen,
         reconciliation_status="not_required" if not fills else ("mismatch" if reconciliation_mismatch else "matched"),
         positions=positions,

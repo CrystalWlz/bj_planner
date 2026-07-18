@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from math import floor
 from typing import Protocol
 
@@ -22,9 +23,9 @@ from ..schemas import (
 )
 
 
-SIGNAL_MODEL_VERSION = "monthly-drawdown-v1"
+SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
 PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v2"
-PRE_TRADE_RISK_VERSION = "cash-concentration-v1"
+PRE_TRADE_RISK_VERSION = "cash-concentration-v2"
 EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v2"
 
 
@@ -36,6 +37,7 @@ class QuantInstrumentCandidate:
     snapshot: InvestmentMarketSnapshotData
     price: float
     price_date: str
+    execution_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,7 +201,7 @@ class PaperLotExecutionPlanner:
             estimated_quantity=round(quantity, 6),
             estimated_fee=round(fee, 2),
             lot_size=lot_size,
-            expected_trade_date=candidate.price_date,
+            expected_trade_date=candidate.execution_date or _next_weekday(candidate.price_date),
             status="proposed",
             reason=reason,
         )
@@ -211,12 +213,42 @@ class QuantProposalBuildResult:
     orders: list[PaperOrderData]
 
 
-def _latest_price(snapshot: InvestmentMarketSnapshotData) -> tuple[float, str] | None:
-    bars = [bar for bar in snapshot.bars if bar.is_trading and not bar.is_suspended and (bar.adjusted_close or bar.close) > 0]
+def _latest_price(snapshot: InvestmentMarketSnapshotData, *, as_of_date: str) -> tuple[float, str] | None:
+    bars = [
+        bar
+        for bar in snapshot.bars
+        if bar.is_trading
+        and not bar.is_suspended
+        and (bar.adjusted_close or bar.close) > 0
+        and (bar.price_date or bar.date) <= as_of_date
+    ]
     if not bars:
         return None
     latest = max(bars, key=lambda bar: bar.price_date or bar.date)
     return latest.adjusted_close or latest.close, latest.price_date or latest.date
+
+
+def _next_weekday(value: str) -> str:
+    current = date.fromisoformat(value) + timedelta(days=1)
+    while current.weekday() >= 5:
+        current += timedelta(days=1)
+    return current.isoformat()
+
+
+def _next_common_execution_date(
+    candidates: list[QuantInstrumentCandidate],
+    *,
+    signal_date: str,
+) -> tuple[str, bool]:
+    future_calendars = [
+        {day for day in candidate.snapshot.trading_days if day > signal_date}
+        for candidate in candidates
+    ]
+    if future_calendars and all(future_calendars):
+        common_dates = set.intersection(*future_calendars)
+        if common_dates:
+            return min(common_dates), True
+    return _next_weekday(signal_date), False
 
 
 def build_quant_monthly_proposal(
@@ -258,12 +290,29 @@ def build_quant_monthly_proposal(
             reasons.append(f"{instrument.name} 缺少行情快照，已排除。")
             continue
         snapshot_id, snapshot = snapshot_entry
-        price_data = _latest_price(snapshot)
+        historical_snapshot = snapshot.model_copy(
+            update={
+                "bars": [
+                    bar
+                    for bar in snapshot.bars
+                    if (bar.price_date or bar.date) <= assessment.as_of_date
+                ]
+            }
+        )
+        price_data = _latest_price(historical_snapshot, as_of_date=assessment.as_of_date)
         if price_data is None:
             reasons.append(f"{instrument.name} 缺少有效收盘价，已排除。")
             continue
         price, price_date = price_data
-        candidates.append(QuantInstrumentCandidate(instrument_id, instrument, snapshot_id, snapshot, price, price_date))
+        candidates.append(QuantInstrumentCandidate(instrument_id, instrument, snapshot_id, historical_snapshot, price, price_date))
+
+    execution_date, execution_date_confirmed = _next_common_execution_date(
+        candidates,
+        signal_date=assessment.as_of_date,
+    )
+    candidates = [replace(candidate, execution_date=execution_date) for candidate in candidates]
+    if candidates and not execution_date_confirmed:
+        reasons.append("行情快照未覆盖下一共同开放日，订单日期按下一工作日估计，模拟成交前仍需人工确认交易日历。")
 
     weights = portfolio_constructor.target_weights(candidates, policy, assessment.effective_equity_cap)
     orders: list[PaperOrderData] = []

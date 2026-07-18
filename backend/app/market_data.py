@@ -174,12 +174,14 @@ def fetch_tushare_snapshot(instrument: InvestmentInstrumentData, *, start_date: 
             calendar = fetch_tushare_trading_calendar(
                 instrument,
                 start_date=observed_days[0] if observed_days else f"{start[:4]}-{start[4:6]}-{start[6:]}",
-                end_date=observed_days[-1] if observed_days else date.today().isoformat(),
+                end_date=(date.today() + timedelta(days=14)).isoformat(),
                 query=_tushare_query,
             )
         except Exception as exc:
             calendar_warning = f"交易日历接口不可用，已回退到实际价格日期：{exc}"
-    suspension_dates = sorted(set(calendar.trading_days) - set(observed_days)) if calendar.source == "provider" else []
+    observation_cutoff = observed_days[-1] if observed_days else date.today().isoformat()
+    observed_calendar = {day for day in calendar.trading_days if day <= observation_cutoff}
+    suspension_dates = sorted(observed_calendar - set(observed_days)) if calendar.source == "provider" else []
     warning_parts = []
     if not bars:
         warning_parts.append("数据源未返回可用日线，请检查标的代码和数据权限。")
@@ -200,7 +202,7 @@ def fetch_tushare_snapshot(instrument: InvestmentInstrumentData, *, start_date: 
             trading_days=calendar.trading_days,
             suspension_dates=suspension_dates,
             adjustment="provider" if instrument.market != "hong_kong_connect" else "none",
-            expected_bar_count=len(calendar.trading_days) or None,
+            expected_bar_count=len(observed_calendar) or None,
             status="complete" if bars else "empty",
             bars=bars,
             warning="；".join(warning_parts),
@@ -213,7 +215,12 @@ def trace_market_snapshot(snapshot: InvestmentMarketSnapshotData) -> InvestmentM
     bars = [bar.model_copy(update={"price_date": bar.price_date or bar.date}) for bar in snapshot.bars]
     observed_days = sorted({bar.price_date or bar.date for bar in bars if bar.is_trading})
     trading_days = sorted(set(snapshot.trading_days or observed_days))
-    suspension_dates = sorted(set(snapshot.suspension_dates or []) | (set(trading_days) - set(observed_days) if snapshot.calendar_source == "provider" else set()))
+    observation_cutoff = observed_days[-1] if observed_days else snapshot.snapshot_date
+    observed_calendar = {day for day in trading_days if day <= observation_cutoff}
+    suspension_dates = sorted(
+        set(snapshot.suspension_dates or [])
+        | (observed_calendar - set(observed_days) if snapshot.calendar_source == "provider" else set())
+    )
     completeness_ratio = (
         min(1.0, len(bars) / snapshot.expected_bar_count)
         if snapshot.expected_bar_count

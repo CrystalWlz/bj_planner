@@ -353,7 +353,11 @@ def run_calendar_backtest(
         raise ValueError("标的池中存在没有交易日历的资产，不能建立共同回测时钟。")
     common_calendar = set.intersection(*calendar_by_asset.values())
     first_observation = max(min(values) for values in bars_by_asset.values())
-    common_dates = sorted(day for day in common_calendar if day >= first_observation)
+    last_observation = min(max(values) for values in bars_by_asset.values())
+    common_dates = sorted(
+        day for day in common_calendar
+        if first_observation <= day <= last_observation
+    )
     joint_tradable_dates = [
         day
         for day in common_dates

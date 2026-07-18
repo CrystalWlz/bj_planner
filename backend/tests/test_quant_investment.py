@@ -95,6 +95,25 @@ def test_tushare_exchange_calendar_filters_closed_days() -> None:
     assert result.trading_days == ["2026-07-16", "2026-07-18"]
 
 
+def test_snapshot_trace_does_not_mark_future_calendar_days_as_suspensions() -> None:
+    from app.market_data import trace_market_snapshot
+    from app.schemas import InvestmentMarketSnapshotData
+
+    snapshot = trace_market_snapshot(
+        InvestmentMarketSnapshotData(
+            source="manual",
+            snapshot_date="2026-07-17",
+            calendar_source="provider",
+            trading_days=["2026-07-17", "2026-07-20"],
+            expected_bar_count=1,
+            bars=[{"date": "2026-07-17", "close": 1}],
+        )
+    )
+
+    assert snapshot.suspension_dates == []
+    assert snapshot.trading_days == ["2026-07-17", "2026-07-20"]
+
+
 def test_quant_investment_proposal_and_paper_order_are_safe_and_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
     from app import database
@@ -273,6 +292,159 @@ def test_qdii_stale_nav_blocks_new_buy() -> None:
     assert "净值已过期" in reason
 
 
+def test_qdii_nav_age_counts_open_trading_days_instead_of_weekend_days() -> None:
+    from app.domain.quant_investment import instrument_is_buyable
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+
+    instrument = InvestmentInstrumentData(
+        symbol="513000.SH",
+        name="示例跨境 ETF",
+        market="qdii_etf",
+        asset_class="equity",
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-20",
+        trading_days=["2026-07-17", "2026-07-20"],
+        bars=[{
+            "date": "2026-07-20",
+            "close": 1.1,
+            "nav": 1.1,
+            "nav_date": "2026-07-17",
+            "nav_available_date": "2026-07-20",
+        }],
+    )
+
+    allowed, reason = instrument_is_buyable(
+        instrument,
+        snapshot,
+        QuantInvestmentPolicyData(qdii_nav_max_stale_days=1),
+        as_of_date="2026-07-20",
+    )
+
+    assert allowed
+    assert reason == "可交易。"
+
+
+def test_quant_risk_basket_aligns_assets_by_common_market_dates() -> None:
+    from app.domain.quant_investment import assess_quant_risk
+    from app.schemas import InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+
+    mainland = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-03",
+        bars=[
+            {"date": "2026-07-01", "close": 100},
+            {"date": "2026-07-02", "close": 50},
+            {"date": "2026-07-03", "close": 100},
+        ],
+    )
+    hong_kong = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-04",
+        bars=[
+            {"date": "2026-07-01", "close": 100},
+            {"date": "2026-07-03", "close": 100},
+            {"date": "2026-07-04", "close": 50},
+        ],
+    )
+
+    assessment = assess_quant_risk(QuantInvestmentPolicyData(), [mainland, hong_kong])
+
+    assert assessment.as_of_date == "2026-07-03"
+    assert assessment.drawdown == pytest.approx(0)
+    assert assessment.state == "normal"
+
+
+def test_quant_risk_blocks_when_any_equity_asset_has_insufficient_history() -> None:
+    from app.domain.quant_investment import assess_quant_risk
+    from app.schemas import InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+
+    sufficient = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-02",
+        bars=[{"date": "2026-07-01", "close": 1}, {"date": "2026-07-02", "close": 1}],
+    )
+    insufficient = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-02",
+        bars=[{"date": "2026-07-02", "close": 1}],
+    )
+
+    assessment = assess_quant_risk(QuantInvestmentPolicyData(), [sufficient, insufficient])
+
+    assert assessment.state == "blocked"
+    assert assessment.effective_equity_cap == 0
+    assert "不能绕过" in assessment.reasons[0]
+
+
+def test_research_constructor_receives_only_data_available_on_common_signal_date(monkeypatch) -> None:
+    from app.schemas import HouseholdData, InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+    from app.strategies import quant_investment
+
+    captured_dates: dict[str, list[str]] = {}
+
+    def fake_optimizer(snapshots: list[tuple[str, InvestmentMarketSnapshotData]]) -> dict[str, float]:
+        for instrument_id, snapshot in snapshots:
+            captured_dates[instrument_id] = [bar.price_date for bar in snapshot.bars]
+        return {instrument_id: 1 / len(snapshots) for instrument_id, _snapshot in snapshots}
+
+    monkeypatch.setattr(quant_investment, "optimized_equity_weights", fake_optimizer)
+    instrument_a = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF A",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+    )
+    instrument_b = instrument_a.model_copy(update={"symbol": "159915.SZ", "name": "示例权益 ETF B"})
+    snapshot_a = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-03",
+        trading_days=["2026-07-01", "2026-07-02", "2026-07-03"],
+        bars=[
+            {"date": "2026-07-01", "close": 1},
+            {"date": "2026-07-02", "close": 1},
+            {"date": "2026-07-03", "close": 10},
+        ],
+    )
+    snapshot_b = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-02",
+        trading_days=["2026-07-01", "2026-07-02", "2026-07-03"],
+        bars=[
+            {"date": "2026-07-01", "close": 1},
+            {"date": "2026-07-02", "close": 1},
+        ],
+    )
+
+    result = quant_investment.build_quant_monthly_proposal(
+        household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
+        policy_id="policy-1",
+        policy=QuantInvestmentPolicyData(
+            default_monthly_budget=1000,
+            research_strategy="min_variance",
+            max_single_instrument_ratio=1,
+            max_single_market_ratio=1,
+        ),
+        instruments=[("equity-a", instrument_a), ("equity-b", instrument_b)],
+        snapshots={
+            "equity-a": ("snapshot-a", snapshot_a),
+            "equity-b": ("snapshot-b", snapshot_b),
+        },
+    )
+
+    assert result.proposal.as_of_date == "2026-07-02"
+    assert captured_dates == {
+        "equity-a": ["2026-07-01", "2026-07-02"],
+        "equity-b": ["2026-07-01", "2026-07-02"],
+    }
+    assert result.orders
+    assert all(order.estimated_price < 2 for order in result.orders)
+    assert all(order.expected_trade_date == "2026-07-03" for order in result.orders)
+    assert not any("下一工作日估计" in reason for reason in result.proposal.reasons)
+
+
 def test_quant_backtest_requires_three_year_history_and_has_no_future_lookahead() -> None:
     from app.domain.quant_investment import run_monthly_backtest
     from app.schemas import InvestmentMarketSnapshotData, QuantInvestmentPolicyData
@@ -314,11 +486,12 @@ def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None
         if first != suspended_date:
             bars.append({"date": first, "close": 1.0})
         bars.append({"date": second, "close": 1.0})
+    future_calendar_date = "2025-03-03"
     snapshot = InvestmentMarketSnapshotData(
         source="manual",
         snapshot_date=trading_days[-1],
         calendar_source="provider",
-        trading_days=trading_days,
+        trading_days=[*trading_days, future_calendar_date],
         suspension_dates=[suspended_date],
         bars=bars,
     )
@@ -329,6 +502,7 @@ def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None
     )
     assert result.months == 37
     assert result.trade_count == 37
+    assert result.end_date == trading_days[-1]
 
 
 def test_min_variance_research_uses_only_trailing_training_window(monkeypatch) -> None:
@@ -580,6 +754,72 @@ def test_post_trade_reconciliation_mismatch_freezes_only_new_orders() -> None:
     assert summary.positions
     assert summary.ledger_entries
     assert summary.account_snapshots[-1].net_worth == pytest.approx(summary.total_equity)
+
+
+def test_paper_portfolio_drawdown_is_cashflow_neutral_and_freezes_new_orders() -> None:
+    from app.domain.paper_portfolio import build_paper_portfolio_summary
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData, QuantInvestmentPolicyData
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+    )
+    fills = [
+        PaperFillData(
+            order_id="order-1",
+            client_order_id="client-order-1",
+            proposal_id="proposal-1",
+            instrument_id="instrument-1",
+            side="buy",
+            executed_date="2026-07-01",
+            executed_price=10,
+            executed_quantity=100,
+            gross_amount=1000,
+            fee=0,
+            cash_change=-1000,
+            contribution_amount=1000,
+        ),
+        PaperFillData(
+            order_id="order-2",
+            client_order_id="client-order-2",
+            proposal_id="proposal-2",
+            instrument_id="instrument-1",
+            side="buy",
+            executed_date="2026-07-03",
+            executed_price=8,
+            executed_quantity=125,
+            gross_amount=1000,
+            fee=0,
+            cash_change=-1000,
+            contribution_amount=1000,
+        ),
+    ]
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-03",
+        bars=[
+            {"date": "2026-07-01", "close": 10},
+            {"date": "2026-07-02", "close": 8},
+            {"date": "2026-07-03", "close": 8},
+        ],
+    )
+
+    summary = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=fills,
+        instruments={"instrument-1": instrument},
+        snapshots={"instrument-1": snapshot},
+        policy=QuantInvestmentPolicyData(),
+    )
+
+    assert summary.net_contributions == pytest.approx(2000)
+    assert summary.total_equity == pytest.approx(1800)
+    assert summary.current_drawdown == pytest.approx(0.2)
+    assert summary.max_drawdown == pytest.approx(0.2)
+    assert summary.frozen
+    assert any("历史最大回撤" in warning for warning in summary.warnings)
 
 
 def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:

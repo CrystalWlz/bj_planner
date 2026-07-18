@@ -15,7 +15,7 @@ from ..schemas import (
 )
 
 
-QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v4"
+QUANT_BACKTEST_ENGINE_VERSION = "calendar-risk-v5"
 
 
 @dataclass(frozen=True)
@@ -78,8 +78,14 @@ def protected_cash_for_quant_investment(
     return round(monthly_expense * reserve_months + scheduled_next_24 + max(0.0, additional_goal_cash), 2)
 
 
-def _latest_trading_bar(snapshot: InvestmentMarketSnapshotData):
-    bars = [bar for bar in snapshot.bars if bar.is_trading and not bar.is_suspended]
+def _latest_trading_bar(snapshot: InvestmentMarketSnapshotData, *, as_of_date: str = ""):
+    bars = [
+        bar
+        for bar in snapshot.bars
+        if bar.is_trading
+        and not bar.is_suspended
+        and (not as_of_date or (bar.price_date or bar.date) <= as_of_date)
+    ]
     return max(bars, key=lambda bar: bar.price_date or bar.date) if bars else None
 
 
@@ -95,34 +101,63 @@ def _drawdown_from_prices(prices: Iterable[float]) -> float:
     return maximum
 
 
+def market_trading_day_age(
+    snapshot: InvestmentMarketSnapshotData,
+    *,
+    start_date: str,
+    end_date: str,
+) -> int:
+    """Count open market days after start_date through end_date."""
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError:
+        raise ValueError("行情日期格式无效") from None
+    if end <= start:
+        return 0
+    trading_days = sorted(set(snapshot.trading_days))
+    if trading_days and trading_days[0] <= start_date and trading_days[-1] >= end_date:
+        return sum(start_date < trading_day <= end_date for trading_day in trading_days)
+    return (end - start).days
+
+
 def assess_quant_risk(
     policy: QuantInvestmentPolicyData,
     equity_snapshots: Iterable[InvestmentMarketSnapshotData],
 ) -> QuantRiskAssessment:
-    series: list[list[float]] = []
-    dates: set[str] = set()
-    for snapshot in equity_snapshots:
-        usable = [bar for bar in snapshot.bars if bar.is_trading and (bar.adjusted_close or bar.close) > 0]
-        if len(usable) < 2:
-            continue
-        usable.sort(key=lambda bar: bar.date)
-        series.append([bar.adjusted_close or bar.close for bar in usable])
-        dates.add(usable[-1].date)
-    as_of_date = max(dates) if dates else date.today().isoformat()
-    if not series:
+    snapshots = list(equity_snapshots)
+    price_series: list[dict[str, float]] = []
+    for snapshot in snapshots:
+        prices = {
+            bar.price_date or bar.date: float(bar.adjusted_close or bar.close)
+            for bar in snapshot.bars
+            if bar.is_trading and not bar.is_suspended and (bar.adjusted_close or bar.close) > 0
+        }
+        if len(prices) < 2:
+            latest_date = max(prices) if prices else date.today().isoformat()
+            return QuantRiskAssessment(
+                as_of_date=latest_date,
+                drawdown=0.0,
+                effective_equity_cap=0.0,
+                state="blocked",
+                reasons=["至少一个权益标的不足两个有效交易日，不能绕过风险篮子校验。"],
+            )
+        price_series.append(prices)
+    common_dates = sorted(set.intersection(*(set(prices) for prices in price_series))) if price_series else []
+    as_of_date = common_dates[-1] if common_dates else date.today().isoformat()
+    if len(common_dates) < 2:
         return QuantRiskAssessment(
             as_of_date=as_of_date,
             drawdown=0.0,
             effective_equity_cap=0.0,
             state="blocked",
-            reasons=["没有足够的权益标的日线数据，不能生成量化定投提案。"],
+            reasons=["权益标的没有至少两个共同交易日，不能生成跨市场量化定投提案。"],
         )
 
-    # Normalize each price series, then use the equal-weighted basket only as a
-    # risk sensor.  It is not a claim that the family currently holds it.
-    common_length = min(len(values) for values in series)
-    normalized = [values[-common_length:] for values in series]
-    basket = [sum(values[index] / values[0] for values in normalized) / len(normalized) for index in range(common_length)]
+    basket = [
+        sum(prices[day] / prices[common_dates[0]] for prices in price_series) / len(price_series)
+        for day in common_dates
+    ]
     drawdown = _drawdown_from_prices(basket)
     if drawdown >= policy.drawdown_freeze_threshold:
         return QuantRiskAssessment(as_of_date, drawdown, 0.0, "frozen", ["权益风险篮子回撤达到冻结阈值，停止生成风险资产买入提案并等待人工复核。"])
@@ -148,7 +183,7 @@ def instrument_is_buyable(
         return False, "该标的已标记为暂停申购或交易。"
     if instrument.market == "hong_kong_connect" and not instrument.hong_kong_connect_eligible:
         return False, "尚未确认该标的为港股通合资格证券。"
-    latest = _latest_trading_bar(snapshot)
+    latest = _latest_trading_bar(snapshot, as_of_date=as_of_date)
     if latest is None:
         return False, "没有可用的交易日价格。"
     if instrument.market == "qdii_fund":
@@ -162,7 +197,7 @@ def instrument_is_buyable(
             available_date = date.fromisoformat(latest.nav_available_date)
             if available_date > date.fromisoformat(as_of_date):
                 return False, "跨境 QDII ETF 净值在决策日尚不可得，禁止使用未来净值。"
-            nav_age = (date.fromisoformat(as_of_date) - date.fromisoformat(latest.nav_date)).days
+            nav_age = market_trading_day_age(snapshot, start_date=latest.nav_date, end_date=as_of_date)
         except ValueError:
             return False, "跨境 QDII ETF 的净值日期格式无效。"
         if nav_age > policy.qdii_nav_max_stale_days:

@@ -2565,6 +2565,8 @@ class PaperPortfolioSummary(BaseModel):
     realized_pnl: float
     total_fees: float = Field(ge=0)
     fill_count: int = Field(ge=0)
+    current_drawdown: float = Field(0, ge=0, le=1)
+    max_drawdown: float = Field(0, ge=0, le=1)
     frozen: bool = False
     reconciliation_status: Literal["not_required", "matched", "mismatch"] = "not_required"
     positions: list[PaperPositionData] = Field(default_factory=list)
