@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
+import json
 from typing import Protocol
 
 from .schemas import PaperOrderData, PaperPositionData
@@ -12,6 +14,97 @@ class BrokerReconciliationResult:
     matched: bool
     freeze_new_orders: bool
     differences: list[str]
+    local_state_hash: str
+    remote_state_hash: str
+
+
+def _order_state(order: PaperOrderData) -> dict[str, object]:
+    return {
+        "client_order_id": order.client_order_id,
+        "instrument_id": order.instrument_id,
+        "side": order.side,
+        "status": order.status,
+        "order_amount": round(float(order.order_amount), 2),
+        "executed_date": order.executed_date,
+        "executed_price": round(float(order.executed_price), 6) if order.executed_price is not None else None,
+        "executed_quantity": round(float(order.executed_quantity), 6) if order.executed_quantity is not None else None,
+    }
+
+
+def _position_state(position: PaperPositionData) -> dict[str, object]:
+    return {
+        "instrument_id": position.instrument_id,
+        "quantity": round(float(position.quantity), 6),
+    }
+
+
+def broker_state_hash(
+    *,
+    orders: list[PaperOrderData],
+    positions: list[PaperPositionData],
+    cash: float,
+) -> str:
+    payload = {
+        "orders": sorted((_order_state(order) for order in orders), key=lambda item: str(item["client_order_id"])),
+        "positions": sorted((_position_state(position) for position in positions), key=lambda item: str(item["instrument_id"])),
+        "cash": round(float(max(0.0, cash)), 2),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def reconcile_broker_state(
+    *,
+    local_orders: list[PaperOrderData],
+    local_positions: list[PaperPositionData],
+    local_cash: float,
+    remote_orders: list[PaperOrderData],
+    remote_positions: list[PaperPositionData],
+    remote_cash: float,
+) -> BrokerReconciliationResult:
+    differences: list[str] = []
+    local_order_map = {order.client_order_id: order for order in local_orders}
+    remote_order_map = {order.client_order_id: order for order in remote_orders}
+    if len(local_order_map) != len(local_orders):
+        differences.append("本地订单存在重复 client_order_id")
+    if len(remote_order_map) != len(remote_orders):
+        differences.append("适配器订单查询结果存在重复 client_order_id")
+    for client_order_id in sorted(local_order_map.keys() - remote_order_map.keys()):
+        differences.append(f"本地订单 {client_order_id} 未出现在适配器订单查询结果中")
+    for client_order_id in sorted(remote_order_map.keys() - local_order_map.keys()):
+        differences.append(f"适配器返回未在本地落账的订单 {client_order_id}")
+    for client_order_id in sorted(local_order_map.keys() & remote_order_map.keys()):
+        if _order_state(local_order_map[client_order_id]) != _order_state(remote_order_map[client_order_id]):
+            differences.append(f"订单 {client_order_id} 的状态或成交字段与本地记录不一致")
+
+    local_position_map = {position.instrument_id: position for position in local_positions}
+    remote_position_map = {position.instrument_id: position for position in remote_positions}
+    if len(local_position_map) != len(local_positions):
+        differences.append("本地持仓存在重复标的记录")
+    if len(remote_position_map) != len(remote_positions):
+        differences.append("适配器持仓查询结果存在重复标的记录")
+    for instrument_id in sorted(local_position_map.keys() | remote_position_map.keys()):
+        local_position = local_position_map.get(instrument_id)
+        remote_position = remote_position_map.get(instrument_id)
+        if local_position is None:
+            differences.append(f"适配器返回本地不存在的持仓 {instrument_id}")
+        elif remote_position is None:
+            differences.append(f"本地持仓 {instrument_id} 未出现在适配器持仓查询结果中")
+        elif abs(local_position.quantity - remote_position.quantity) > 1e-6:
+            differences.append(f"持仓 {instrument_id} 的数量与本地账本不一致")
+    if abs(local_cash - remote_cash) > 0.01:
+        differences.append("适配器现金余额与本地模拟现金不一致")
+
+    local_hash = broker_state_hash(orders=local_orders, positions=local_positions, cash=local_cash)
+    remote_hash = broker_state_hash(orders=remote_orders, positions=remote_positions, cash=remote_cash)
+    matched = not differences and local_hash == remote_hash
+    return BrokerReconciliationResult(
+        matched=matched,
+        freeze_new_orders=not matched,
+        differences=differences,
+        local_state_hash=local_hash,
+        remote_state_hash=remote_hash,
+    )
 
 
 class BrokerAdapter(Protocol):
@@ -39,6 +132,10 @@ class BrokerAdapter(Protocol):
 @dataclass(frozen=True)
 class PaperBrokerAdapter:
     """The only executable adapter; it never sends an order externally."""
+
+    orders: tuple[PaperOrderData, ...] = ()
+    positions: tuple[PaperPositionData, ...] = ()
+    cash_balance: float = 0.0
 
     def simulate(self, order: PaperOrderData, *, executed_date: str = "", executed_price: float | None = None) -> PaperOrderData:
         price = executed_price if executed_price is not None else order.estimated_price
@@ -70,16 +167,19 @@ class PaperBrokerAdapter:
         return self.simulate(order)
 
     def cancel(self, client_order_id: str) -> bool:
-        return bool(client_order_id)
+        return any(
+            order.client_order_id == client_order_id and order.status == "proposed"
+            for order in self.orders
+        )
 
     def query_orders(self) -> list[PaperOrderData]:
-        return []
+        return list(self.orders)
 
     def query_positions(self) -> list[PaperPositionData]:
-        return []
+        return list(self.positions)
 
     def query_cash(self) -> float:
-        return 0.0
+        return max(0.0, self.cash_balance)
 
     def reconcile(
         self,
@@ -88,7 +188,14 @@ class PaperBrokerAdapter:
         local_positions: list[PaperPositionData],
         local_cash: float,
     ) -> BrokerReconciliationResult:
-        return BrokerReconciliationResult(matched=True, freeze_new_orders=False, differences=[])
+        return reconcile_broker_state(
+            local_orders=local_orders,
+            local_positions=local_positions,
+            local_cash=local_cash,
+            remote_orders=self.query_orders(),
+            remote_positions=self.query_positions(),
+            remote_cash=self.query_cash(),
+        )
 
 
 @dataclass(frozen=True)
@@ -103,6 +210,19 @@ class LocalFirstBrokerGateway:
         if not order.client_order_id:
             raise RuntimeError("订单缺少唯一 client_order_id")
         return self.adapter.submit(order)
+
+    def reconcile(
+        self,
+        *,
+        local_orders: list[PaperOrderData],
+        local_positions: list[PaperPositionData],
+        local_cash: float,
+    ) -> BrokerReconciliationResult:
+        return self.adapter.reconcile(
+            local_orders=local_orders,
+            local_positions=local_positions,
+            local_cash=local_cash,
+        )
 
 
 class QmtBrokerAdapter:

@@ -9,16 +9,19 @@ import {
   fetchQuantInvestmentPolicies,
   fetchQuantInvestmentProposals,
   fetchQuantBacktestRuns,
+  fetchQuantBrokerReconciliations,
   fetchQuantMarketSnapshots,
   fetchQuantPaperOrders,
   fetchQuantPaperPortfolio,
   refreshQuantMarketData,
+  reconcileQuantPaperBroker,
   runQuantInvestmentBacktest,
   saveQuantInvestmentPolicy,
   simulateQuantPaperOrder,
 } from "./api";
 import { money, numberInput, percent } from "./format";
 import type {
+  BrokerReconciliationRunRecord,
   InvestmentInstrumentData,
   InvestmentInstrumentRecord,
   InvestmentMarketSnapshotData,
@@ -92,6 +95,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const [portfolio, setPortfolio] = useState<PaperPortfolioSummary | null>(null);
   const [backtest, setBacktest] = useState<QuantBacktestResult | null>(null);
   const [backtestRuns, setBacktestRuns] = useState<QuantBacktestRunRecord[]>([]);
+  const [reconciliations, setReconciliations] = useState<BrokerReconciliationRunRecord[]>([]);
   const [instrumentDraft, setInstrumentDraft] = useState<InvestmentInstrumentData>(defaultInstrument);
   const [manualPrice, setManualPrice] = useState(1);
   const [manualNav, setManualNav] = useState(1);
@@ -99,7 +103,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    const [nextPolicies, nextInstruments, nextSnapshots, nextProposals, nextOrders, nextPortfolio, nextBacktestRuns] = await Promise.all([
+    const [nextPolicies, nextInstruments, nextSnapshots, nextProposals, nextOrders, nextPortfolio, nextBacktestRuns, nextReconciliations] = await Promise.all([
       fetchQuantInvestmentPolicies(householdId),
       fetchQuantInvestmentInstruments(householdId),
       fetchQuantMarketSnapshots(householdId),
@@ -107,6 +111,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       fetchQuantPaperOrders(householdId),
       fetchQuantPaperPortfolio(householdId),
       fetchQuantBacktestRuns(householdId),
+      fetchQuantBrokerReconciliations(householdId),
     ]);
     setPolicies(nextPolicies);
     setInstruments(nextInstruments);
@@ -115,6 +120,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     setOrders(nextOrders);
     setPortfolio(nextPortfolio);
     setBacktestRuns(nextBacktestRuns);
+    setReconciliations(nextReconciliations);
     setError("");
   }, [householdId]);
 
@@ -125,6 +131,8 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const activePolicy = policies[0] ?? null;
   const latestProposal = proposals[0] ?? null;
   const latestBacktestRun = backtestRuns[0] ?? null;
+  const latestReconciliation = reconciliations[0] ?? null;
+  const displayedReconciliation = reconciliations.find((item) => item.data.review_status === "pending") ?? latestReconciliation;
   const displayedBacktest = backtest ?? latestBacktestRun?.data.result ?? null;
   const instrumentById = useMemo(() => new Map(instruments.map((item) => [item.id, item])), [instruments]);
   const snapshotByInstrumentId = useMemo(() => new Map(snapshots.map((item) => [item.instrument_id, item])), [snapshots]);
@@ -158,6 +166,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     setBacktest(result);
   });
   const simulateOrder = (id: string) => runAction(async () => { await simulateQuantPaperOrder(id, householdId); });
+  const reconcilePaperBroker = () => runAction(async () => { await reconcileQuantPaperBroker(householdId); });
   const writeManualSnapshot = (instrument: InvestmentInstrumentRecord) => runAction(async () => {
     const today = new Date();
     const yesterday = new Date(today);
@@ -238,7 +247,9 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
 
       {orders.length ? <div className="setting-group"><strong className="setting-group-title">模拟订单</strong>{orders.map((order) => <div className="strategy-card" key={order.id}><strong>{instrumentById.get(order.data.instrument_id)?.data.name ?? "未知标的"} · {order.data.side === "buy" ? "买入" : "卖出"} · {order.data.status === "simulated" ? "已模拟成交" : "待模拟"}</strong><p>{money(order.data.order_amount)}，预计价格 {order.data.estimated_price}，费用 {money(order.data.estimated_fee)}，预计交易日 {order.data.expected_trade_date || "待确认"}。{order.data.funding_source === "external_contribution" ? `模拟现金投入 ${money(order.data.cash_contribution_amount || order.data.order_amount)}。` : ""}{order.data.is_rebalance ? "季度再平衡；" : ""}{order.data.reason}</p>{order.data.status === "proposed" ? <button className="secondary-button" type="button" onClick={() => void simulateOrder(order.id)} disabled={busy}>按估算价模拟成交</button> : <span className="status-badge success">成交价 {order.data.executed_price}</span>}</div>)}</div> : null}
 
-      {portfolio ? <div className="setting-group"><strong className="setting-group-title">模拟投资账户</strong><div className="metric-grid"><Metric label="累计投入" value={money(portfolio.net_contributions)} /><Metric label="模拟现金" value={money(portfolio.cash_balance)} /><Metric label="持仓市值" value={money(portfolio.market_value)} /><Metric label="浮动盈亏" value={money(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl >= 0 ? "good" : "bad"} /><Metric label="当前回撤" value={percent(portfolio.current_drawdown ?? 0)} tone={(portfolio.current_drawdown ?? 0) >= 0.12 ? "bad" : (portfolio.current_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="历史最大回撤" value={percent(portfolio.max_drawdown ?? 0)} tone={(portfolio.max_drawdown ?? 0) >= 0.15 ? "bad" : (portfolio.max_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="累计费用" value={money(portfolio.total_fees)} /><Metric label="账本流水" value={`${portfolio.ledger_entries.length} 条`} /><Metric label="事后风控" value={portfolio.frozen ? "已冻结新增" : "正常"} tone={portfolio.frozen ? "bad" : "good"} /></div>{portfolio.positions.length ? <div className="strategy-grid horizontal-card-list">{portfolio.positions.map((position) => <article className="strategy-card" key={position.instrument_id}><div className="quant-instrument-heading"><strong>{position.name}</strong><span>{position.symbol} · {position.quantity} 份</span></div><p>成本 {money(position.total_cost)}，市值 {money(position.market_value)}，最新价 {position.latest_price}（{position.latest_price_date || "按成本估值"}）</p><span className={`status-badge ${position.unrealized_pnl >= 0 ? "success" : "warning"}`}>浮动盈亏 {money(position.unrealized_pnl)}</span></article>)}</div> : <p className="field-hint">尚无已模拟成交持仓。</p>}{portfolio.warnings.length ? <div className="warning-list">{portfolio.warnings.map((warning) => <span key={warning}>{warning}</span>)}</div> : null}</div> : null}
+      {portfolio ? <div className="setting-group"><div className="section-header"><strong className="setting-group-title">对账与事后风控</strong><button className="secondary-button" type="button" onClick={() => void reconcilePaperBroker()} disabled={busy}><ShieldCheck size={16} /> 核验模拟账本</button></div><div className="metric-grid"><Metric label="对账日期" value={displayedReconciliation?.data.reconciliation_date || "尚未运行"} /><Metric label="对账范围" value={displayedReconciliation?.data.adapter === "qmt" ? "QMT 只读" : "模拟盘"} /><Metric label="对账结果" value={!displayedReconciliation ? "待核验" : displayedReconciliation.data.matched ? "一致" : "存在差异"} tone={!displayedReconciliation ? undefined : displayedReconciliation.data.matched ? "good" : "bad"} /><Metric label="复核状态" value={!displayedReconciliation ? "无需复核" : displayedReconciliation.data.review_status === "pending" ? "待人工复核" : displayedReconciliation.data.review_status === "resolved" ? "已复核" : "无需复核"} tone={displayedReconciliation?.data.review_status === "pending" ? "bad" : "good"} /></div>{portfolio.post_trade_risk_issues.length ? <div className="warning-list">{portfolio.post_trade_risk_issues.map((issue) => <span key={`${issue.code}-${issue.order_id}-${issue.instrument_id}`} className={issue.severity === "freeze" ? "error-text" : undefined}>{issue.message}</span>)}</div> : null}</div> : null}
+
+      {portfolio ? <div className="setting-group"><strong className="setting-group-title">模拟投资账户</strong><div className="metric-grid"><Metric label="累计投入" value={money(portfolio.net_contributions)} /><Metric label="模拟现金" value={money(portfolio.cash_balance)} /><Metric label="持仓市值" value={money(portfolio.market_value)} /><Metric label="浮动盈亏" value={money(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl >= 0 ? "good" : "bad"} /><Metric label="当前回撤" value={percent(portfolio.current_drawdown ?? 0)} tone={(portfolio.current_drawdown ?? 0) >= 0.12 ? "bad" : (portfolio.current_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="历史最大回撤" value={percent(portfolio.max_drawdown ?? 0)} tone={(portfolio.max_drawdown ?? 0) >= 0.15 ? "bad" : (portfolio.max_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="累计费用" value={money(portfolio.total_fees)} /><Metric label="账本流水" value={`${portfolio.ledger_entries.length} 条`} /><Metric label="事后风控" value={portfolio.frozen ? "已冻结新增" : "正常"} tone={portfolio.frozen ? "bad" : "good"} /></div>{portfolio.positions.length ? <div className="strategy-grid horizontal-card-list">{portfolio.positions.map((position) => <article className="strategy-card" key={position.instrument_id}><div className="quant-instrument-heading"><strong>{position.name}</strong><span>{position.symbol} · {position.quantity} 份</span></div><p>成本 {money(position.total_cost)}，市值 {money(position.market_value)}，最新价 {position.latest_price}（{position.latest_price_date || "按成本估值"}）</p><span className={`status-badge ${position.unrealized_pnl >= 0 ? "success" : "warning"}`}>浮动盈亏 {money(position.unrealized_pnl)}</span></article>)}</div> : <p className="field-hint">尚无已模拟成交持仓。</p>}{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).length ? <div className="warning-list">{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).map((warning) => <span key={warning}>{warning}</span>)}</div> : null}</div> : null}
 
       {displayedBacktest ? <div className="setting-group"><strong className="setting-group-title">三年历史回测{latestBacktestRun ? ` · 运行记录 ${latestBacktestRun.data_fingerprint.slice(0, 10)}` : ""}</strong><div className="metric-grid"><Metric label="策略终值" value={money(displayedBacktest.strategy_terminal_value)} /><Metric label="静态配置终值" value={money(displayedBacktest.static_terminal_value)} /><Metric label="策略 CAGR" value={percent(displayedBacktest.strategy_cagr)} /><Metric label="年化波动" value={percent(displayedBacktest.strategy_annualized_volatility)} /><Metric label="策略最大回撤" value={percent(displayedBacktest.strategy_max_drawdown)} /><Metric label="换手率" value={percent(displayedBacktest.strategy_turnover)} /><Metric label="累计费用" value={money(displayedBacktest.strategy_total_fees)} /><Metric label="样本外分段" value={`${displayedBacktest.walk_forward_folds.length} 段`} /></div>{displayedBacktest.benchmarks.length ? <div className="strategy-grid horizontal-card-list">{displayedBacktest.benchmarks.map((benchmark) => <article className="strategy-card" key={benchmark.benchmark_id}><strong>{benchmark.name}</strong><p>终值 {money(benchmark.terminal_value)}，CAGR {percent(benchmark.cagr)}，最大回撤 {percent(benchmark.max_drawdown)}，费用 {money(benchmark.total_fees)}</p></article>)}</div> : null}<p className="field-hint">{displayedBacktest.warnings.join(" ")}</p></div> : null}
     </section>

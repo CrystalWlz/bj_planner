@@ -358,6 +358,43 @@ export interface PaperPositionData {
   total_fees: number;
 }
 
+export interface PostTradeRiskIssueData {
+  code: string;
+  severity: "warning" | "freeze";
+  source: "fill" | "market_data" | "portfolio" | "reconciliation";
+  message: string;
+  order_id: string;
+  instrument_id: string;
+  observed_value: number | null;
+  threshold: number | null;
+}
+
+export interface BrokerReconciliationRunData {
+  schema_version: number;
+  adapter: "paper" | "qmt";
+  reconciliation_date: string;
+  matched: boolean;
+  freeze_new_orders: boolean;
+  review_status: "not_required" | "pending" | "resolved";
+  local_state_hash: string;
+  remote_state_hash: string;
+  local_order_count: number;
+  remote_order_count: number;
+  local_position_count: number;
+  remote_position_count: number;
+  local_cash: number;
+  remote_cash: number;
+  differences: string[];
+  reviewed_at: string;
+  review_note: string;
+}
+
+export interface BrokerReconciliationRunRecord extends RecordEnvelope<BrokerReconciliationRunData> {
+  household_id: string;
+  adapter: "paper" | "qmt";
+  reconciliation_date: string;
+}
+
 export interface PaperPortfolioSummary {
   household_id: string;
   net_contributions: number;
@@ -371,7 +408,9 @@ export interface PaperPortfolioSummary {
   current_drawdown: number;
   max_drawdown: number;
   frozen: boolean;
-  reconciliation_status: "not_required" | "matched" | "mismatch";
+  reconciliation_status: "not_required" | "matched" | "mismatch" | "reviewed";
+  latest_reconciliation_id: string;
+  post_trade_risk_issues: PostTradeRiskIssueData[];
   positions: PaperPositionData[];
   ledger_entries: MonthlyLedgerEntry[];
   account_snapshots: AccountSnapshotPoint[];

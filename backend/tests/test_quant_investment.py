@@ -799,6 +799,7 @@ def test_post_trade_reconciliation_mismatch_freezes_only_new_orders() -> None:
     )
     assert summary.frozen
     assert summary.reconciliation_status == "mismatch"
+    assert {issue.code for issue in summary.post_trade_risk_issues} == {"reconciliation_mismatch"}
     assert summary.positions
     assert summary.ledger_entries
     assert summary.account_snapshots[-1].net_worth == pytest.approx(summary.total_equity)
@@ -908,6 +909,161 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
             estimated_fee=5,
             cash_contribution_amount=1000,
         )
+
+
+def test_broker_reconciliation_compares_orders_positions_and_cash() -> None:
+    from app.broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter
+    from app.schemas import PaperOrderData, PaperPositionData
+
+    local_order = PaperOrderData(
+        proposal_id="proposal-1",
+        instrument_id="instrument-1",
+        order_amount=1000,
+        estimated_price=1,
+        estimated_quantity=995,
+        estimated_fee=5,
+    )
+    remote_order = local_order.model_copy(update={"status": "simulated", "executed_date": "2026-07-19", "executed_price": 1, "executed_quantity": 995})
+    local_position = PaperPositionData(
+        instrument_id="instrument-1",
+        symbol="510300.SH",
+        name="示例对账 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        currency="CNY",
+        quantity=100,
+        average_cost=1,
+        total_cost=100,
+        latest_price=1,
+        market_value=100,
+        unrealized_pnl=0,
+        total_fees=0,
+    )
+    remote_position = local_position.model_copy(update={"quantity": 99, "market_value": 99})
+    adapter = PaperBrokerAdapter(
+        orders=(remote_order,),
+        positions=(remote_position,),
+        cash_balance=10,
+    )
+
+    result = LocalFirstBrokerGateway(adapter).reconcile(
+        local_orders=[local_order],
+        local_positions=[local_position],
+        local_cash=20,
+    )
+
+    assert not result.matched
+    assert result.freeze_new_orders
+    assert result.local_state_hash != result.remote_state_hash
+    assert any("状态或成交字段" in difference for difference in result.differences)
+    assert any("持仓" in difference for difference in result.differences)
+    assert any("现金余额" in difference for difference in result.differences)
+
+    noisy_remote_order = remote_order.model_copy(
+        update={"executed_price": 1.00000001, "executed_quantity": 995.00000001}
+    )
+    noisy_remote_position = local_position.model_copy(
+        update={"quantity": 100.00000001, "market_value": 100.00000001}
+    )
+    matched_result = LocalFirstBrokerGateway(
+        PaperBrokerAdapter(
+            orders=(noisy_remote_order,),
+            positions=(noisy_remote_position,),
+            cash_balance=20.004,
+        )
+    ).reconcile(
+        local_orders=[remote_order],
+        local_positions=[local_position],
+        local_cash=20,
+    )
+    assert matched_result.matched
+    assert not matched_result.freeze_new_orders
+    assert matched_result.local_state_hash == matched_result.remote_state_hash
+
+
+def test_persisted_reconciliation_mismatch_latches_freeze_until_manual_review(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        policy = client.post(
+            "/api/quant-investment/policies",
+            json={"household_id": household_id, "data": {}},
+        ).json()
+        mismatch = database.insert_broker_reconciliation_run(
+            household_id=household_id,
+            adapter="qmt",
+            reconciliation_date="2026-07-19",
+            data={
+                "adapter": "qmt",
+                "reconciliation_date": "2026-07-19",
+                "matched": False,
+                "freeze_new_orders": True,
+                "review_status": "pending",
+                "local_state_hash": "a" * 64,
+                "remote_state_hash": "b" * 64,
+                "local_order_count": 1,
+                "remote_order_count": 0,
+                "local_position_count": 1,
+                "remote_position_count": 0,
+                "local_cash": 100,
+                "remote_cash": 0,
+                "differences": ["示例订单、持仓和现金差异"],
+            },
+        )
+        frozen_portfolio = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        frozen_proposal = client.post(
+            "/api/quant-investment/proposals",
+            json={"household_id": household_id, "policy_id": policy["id"]},
+        ).json()
+        matched = client.post(
+            "/api/quant-investment/broker-reconciliations/paper",
+            json={"household_id": household_id},
+        )
+        still_frozen = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        review = client.post(
+            f"/api/quant-investment/broker-reconciliations/{mismatch['id']}/review",
+            json={"household_id": household_id, "review_note": "已逐项核对本地订单、持仓和现金"},
+        )
+        released = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        runs = client.get(
+            "/api/quant-investment/broker-reconciliations",
+            params={"household_id": household_id},
+        ).json()
+        repeated_review = client.post(
+            f"/api/quant-investment/broker-reconciliations/{mismatch['id']}/review",
+            json={"household_id": household_id, "review_note": "重复复核"},
+        )
+
+    assert frozen_portfolio["frozen"]
+    assert frozen_portfolio["reconciliation_status"] == "mismatch"
+    assert frozen_portfolio["post_trade_risk_issues"][0]["code"] == "reconciliation_mismatch"
+    assert frozen_proposal["data"]["risk_state"] == "frozen"
+    assert matched.status_code == 200
+    assert matched.json()["data"]["matched"]
+    assert still_frozen["frozen"]
+    assert still_frozen["reconciliation_status"] == "mismatch"
+    assert still_frozen["latest_reconciliation_id"] == mismatch["id"]
+    assert review.status_code == 200
+    assert review.json()["data"]["review_status"] == "resolved"
+    assert review.json()["data"]["review_note"]
+    assert not released["frozen"]
+    assert released["reconciliation_status"] == "matched"
+    assert not released["post_trade_risk_issues"]
+    assert len(runs) == 2
+    assert repeated_review.status_code == 409
 
 
 def test_protected_cash_expands_real_scheduled_expenses_only_within_24_months() -> None:

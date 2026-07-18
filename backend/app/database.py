@@ -221,6 +221,19 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_quant_backtest_runs_household
                 ON quant_backtest_runs(household_id, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS broker_reconciliation_runs (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                reconciliation_date TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_broker_reconciliation_runs_household
+                ON broker_reconciliation_runs(household_id, reconciliation_date DESC, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS property_valuations (
                 id TEXT PRIMARY KEY,
                 household_id TEXT NOT NULL,
@@ -1204,6 +1217,86 @@ def list_quant_backtest_runs(*, household_id: str) -> list[dict[str, Any]]:
             (household_id,),
         ).fetchall()
     return [_quant_backtest_run_record(row) for row in rows]
+
+
+def insert_broker_reconciliation_run(
+    *,
+    household_id: str,
+    adapter: str,
+    reconciliation_date: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    record_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO broker_reconciliation_runs
+                (id, household_id, adapter, reconciliation_date, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                household_id,
+                adapter,
+                reconciliation_date,
+                json.dumps(data, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = conn.execute("SELECT * FROM broker_reconciliation_runs WHERE id = ?", (record_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("Broker reconciliation run insert failed")
+    return _broker_reconciliation_run_record(row)
+
+
+def _broker_reconciliation_run_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["data"] = _load_json(record["data"])
+    return record
+
+
+def list_broker_reconciliation_runs(*, household_id: str) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM broker_reconciliation_runs
+            WHERE household_id = ?
+            ORDER BY reconciliation_date DESC, created_at DESC, id DESC
+            """,
+            (household_id,),
+        ).fetchall()
+    return [_broker_reconciliation_run_record(row) for row in rows]
+
+
+def resolve_broker_reconciliation_run(
+    record_id: str,
+    *,
+    household_id: str,
+    review_note: str,
+) -> dict[str, Any] | None:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM broker_reconciliation_runs WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+        if row is None:
+            return None
+        data = _load_json(row["data"])
+        if data.get("review_status") != "pending":
+            return _broker_reconciliation_run_record(row)
+        data["review_status"] = "resolved"
+        data["freeze_new_orders"] = False
+        data["reviewed_at"] = timestamp
+        data["review_note"] = review_note
+        conn.execute(
+            "UPDATE broker_reconciliation_runs SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(data, ensure_ascii=False), timestamp, record_id),
+        )
+        row = conn.execute("SELECT * FROM broker_reconciliation_runs WHERE id = ?", (record_id,)).fetchone()
+    return _broker_reconciliation_run_record(row) if row else None
 
 
 def list_property_valuations(

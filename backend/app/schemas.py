@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Literal
 import uuid
 
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 RepaymentMethod = Literal["equal_installment", "equal_principal"]
@@ -2569,6 +2569,76 @@ class PaperPositionData(BaseModel):
     total_fees: float = Field(ge=0)
 
 
+class PostTradeRiskIssueData(BaseModel):
+    code: str = Field(min_length=1, max_length=100)
+    severity: Literal["warning", "freeze"]
+    source: Literal["fill", "market_data", "portfolio", "reconciliation"]
+    message: str = Field(min_length=1, max_length=500)
+    order_id: str = ""
+    instrument_id: str = ""
+    observed_value: float | None = None
+    threshold: float | None = None
+
+
+class BrokerReconciliationRunData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    adapter: Literal["paper", "qmt"]
+    reconciliation_date: str
+    matched: bool
+    freeze_new_orders: bool
+    review_status: Literal["not_required", "pending", "resolved"]
+    local_state_hash: str = Field(min_length=64, max_length=64)
+    remote_state_hash: str = Field(min_length=64, max_length=64)
+    local_order_count: int = Field(ge=0)
+    remote_order_count: int = Field(ge=0)
+    local_position_count: int = Field(ge=0)
+    remote_position_count: int = Field(ge=0)
+    local_cash: float = Field(ge=0)
+    remote_cash: float = Field(ge=0)
+    differences: list[str] = Field(default_factory=list, max_length=100)
+    reviewed_at: str = ""
+    review_note: str = Field("", max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_reconciliation_state(self) -> "BrokerReconciliationRunData":
+        if self.matched and (self.freeze_new_orders or self.review_status != "not_required"):
+            raise ValueError("一致的对账结果不能冻结新增或进入人工复核")
+        if not self.matched and self.review_status == "not_required":
+            raise ValueError("存在差异的对账结果必须进入人工复核")
+        if self.review_status == "pending" and not self.freeze_new_orders:
+            raise ValueError("待人工复核的对账差异必须保持冻结")
+        if self.review_status == "resolved" and self.freeze_new_orders:
+            raise ValueError("已复核的对账记录不能继续标记为冻结")
+        return self
+
+
+class BrokerReconciliationRunRecord(BaseModel):
+    id: str
+    household_id: str
+    adapter: Literal["paper", "qmt"]
+    reconciliation_date: str
+    data: BrokerReconciliationRunData
+    created_at: datetime
+    updated_at: datetime
+
+
+class BrokerReconciliationRequest(BaseModel):
+    household_id: str
+
+
+class BrokerReconciliationReviewRequest(BaseModel):
+    household_id: str
+    review_note: str = Field(min_length=2, max_length=1000)
+
+    @field_validator("review_note")
+    @classmethod
+    def validate_review_note(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 2:
+            raise ValueError("人工复核说明不能为空")
+        return normalized
+
+
 class PaperPortfolioSummary(BaseModel):
     household_id: str
     net_contributions: float = Field(ge=0)
@@ -2582,7 +2652,9 @@ class PaperPortfolioSummary(BaseModel):
     current_drawdown: float = Field(0, ge=0, le=1)
     max_drawdown: float = Field(0, ge=0, le=1)
     frozen: bool = False
-    reconciliation_status: Literal["not_required", "matched", "mismatch"] = "not_required"
+    reconciliation_status: Literal["not_required", "matched", "mismatch", "reviewed"] = "not_required"
+    latest_reconciliation_id: str = ""
+    post_trade_risk_issues: list[PostTradeRiskIssueData] = Field(default_factory=list)
     positions: list[PaperPositionData] = Field(default_factory=list)
     ledger_entries: list[MonthlyLedgerEntry] = Field(default_factory=list)
     account_snapshots: list[AccountSnapshotPoint] = Field(default_factory=list)

@@ -1,6 +1,7 @@
 import type {
   AccountConceptSummary,
   AffordabilityResult,
+  BrokerReconciliationRunRecord,
   CoreObjectGroupSummary,
   CoreObjectRecord,
   CoreObjectCategory,
@@ -191,6 +192,17 @@ export function fetchQuantPaperOrders(householdId: string) {
 
 export function fetchQuantPaperPortfolio(householdId: string) {
   return request<PaperPortfolioSummary>(`/api/quant-investment/paper-portfolio?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function fetchQuantBrokerReconciliations(householdId: string) {
+  return request<BrokerReconciliationRunRecord[]>(`/api/quant-investment/broker-reconciliations?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function reconcileQuantPaperBroker(householdId: string) {
+  return request<BrokerReconciliationRunRecord>("/api/quant-investment/broker-reconciliations/paper", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId })
+  });
 }
 
 export function simulateQuantPaperOrder(id: string, householdId: string, executedPrice?: number) {

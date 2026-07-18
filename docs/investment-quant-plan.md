@@ -43,11 +43,13 @@
 
 `PaperPortfolioLedger` 把成交事件转换成现有 `MonthlyLedgerEntry → AccountSnapshotPoint → MonthlyVisualizationDetail` 数据结构，并作为 `AffordabilityResult.paper_portfolio` 进入主计算结果。模拟账户回撤按资金流中性的单位净值计算，追加资金不会掩盖既有亏损；历史最大回撤达到 15% 时与成交偏离过大、净值过期、对账不一致一样，只冻结新增订单，不会自动卖出、补仓或修改真实家庭账户。
 
+事后风控同时输出机器可读的 `PostTradeRiskIssue`：稳定 code 区分组合回撤、成交价格偏离、QDII 净值缺失/过期、卖出超过持仓和对账差异，前端只展示后端给出的严重级别、观测值、阈值与说明。对账差异会形成不可变 `BrokerReconciliationRun`，保存适配器、本地/远端订单数、持仓数、现金、状态哈希和差异清单。`mismatch` 采用锁存冻结：后续一次 `matched` 不会自动清除旧异常，必须针对原运行记录填写人工复核说明后才解除该次冻结。
+
 每次三年回测保存独立运行记录。记录包含回测引擎版本、四个策略组件版本、标的池版本、行情快照 ID/数据版本、完整参数、起止日期、成本假设、结果和警告；运行指纹覆盖这些输入。输入完全相同时复用原记录，任一数据、参数或引擎版本变化都会生成新的指纹。该记录用于复盘计算口径，不代表策略通过实盘验证。
 
 ## QMT 边界与阶段门槛
 
-`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 要求订单先取得本地落库 ID 和唯一 `client_order_id` 才能调用适配器；任何对账差异都冻结新增订单。当前 `QmtBrokerAdapter` 的所有方法均主动报错，未读取账号、路径或凭据。
+`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 要求订单先取得本地落库 ID 和唯一 `client_order_id` 才能调用适配器；对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
 
 - 二期 B：已具备手工防御资产池、季度阈值再平衡、现金/权益基准、独立交易日历、滚动样本外分段和最小方差逐信号日训练；最小方差仍仅限研究且默认关闭。
 - 三期：仅在券商书面确认 QMT/XtQuant 权限后，实现只读订单、持仓、现金查询和每日对账。

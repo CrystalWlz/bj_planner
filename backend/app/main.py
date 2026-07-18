@@ -22,12 +22,14 @@ from .database import (
     get_calculation_cache_payload,
     initialize_database,
     insert_household_record,
+    insert_broker_reconciliation_run,
     insert_planning_goal_record,
     insert_record,
     insert_paper_investment_order,
     insert_quant_scoped_record,
     insert_scenario_record,
     list_core_object_records,
+    list_broker_reconciliation_runs,
     list_generated_strategies,
     list_generated_strategies_for_cache_layers,
     list_household_records,
@@ -58,6 +60,7 @@ from .database import (
     update_quant_scoped_record,
     update_scenario_record,
     record_paper_fill_atomic,
+    resolve_broker_reconciliation_run,
     upsert_quant_backtest_run,
 )
 from .domain.property_valuation import estimate_property_value
@@ -89,6 +92,10 @@ from .schemas import (
     AffordabilityResult,
     AccountConceptSummary,
     CacheLayerHashes,
+    BrokerReconciliationRequest,
+    BrokerReconciliationReviewRequest,
+    BrokerReconciliationRunData,
+    BrokerReconciliationRunRecord,
     CalculationContextSnapshot,
     CoreObjectGroupSummary,
     CoreObjectRecord,
@@ -693,6 +700,91 @@ def get_quant_backtest_runs(household_id: str) -> list[dict]:
     return list_quant_backtest_runs(household_id=household_id)
 
 
+@app.get("/api/quant-investment/broker-reconciliations", response_model=list[BrokerReconciliationRunRecord])
+def get_quant_broker_reconciliations(household_id: str) -> list[dict]:
+    return list_broker_reconciliation_runs(household_id=household_id)
+
+
+@app.post("/api/quant-investment/broker-reconciliations/paper", response_model=BrokerReconciliationRunRecord)
+def reconcile_quant_paper_broker(payload: BrokerReconciliationRequest) -> dict:
+    local_orders = [
+        PaperOrderRecord.model_validate(item).data
+        for item in list_paper_investment_orders(household_id=payload.household_id)
+    ]
+    portfolio = _paper_portfolio_for_household(payload.household_id)
+    adapter = PaperBrokerAdapter(
+        orders=tuple(local_orders),
+        positions=tuple(portfolio.positions),
+        cash_balance=portfolio.cash_balance,
+    )
+    remote_orders = adapter.query_orders()
+    remote_positions = adapter.query_positions()
+    remote_cash = adapter.query_cash()
+    result = adapter.reconcile(
+        local_orders=local_orders,
+        local_positions=portfolio.positions,
+        local_cash=portfolio.cash_balance,
+    )
+    reconciliation_date = date.today().isoformat()
+    data = BrokerReconciliationRunData(
+        adapter="paper",
+        reconciliation_date=reconciliation_date,
+        matched=result.matched,
+        freeze_new_orders=result.freeze_new_orders,
+        review_status="not_required" if result.matched else "pending",
+        local_state_hash=result.local_state_hash,
+        remote_state_hash=result.remote_state_hash,
+        local_order_count=len(local_orders),
+        remote_order_count=len(remote_orders),
+        local_position_count=len(portfolio.positions),
+        remote_position_count=len(remote_positions),
+        local_cash=portfolio.cash_balance,
+        remote_cash=remote_cash,
+        differences=result.differences,
+    )
+    record = insert_broker_reconciliation_run(
+        household_id=payload.household_id,
+        adapter=data.adapter,
+        reconciliation_date=reconciliation_date,
+        data=data.model_dump(mode="json"),
+    )
+    if result.freeze_new_orders:
+        bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
+@app.post(
+    "/api/quant-investment/broker-reconciliations/{record_id}/review",
+    response_model=BrokerReconciliationRunRecord,
+)
+def review_quant_broker_reconciliation(
+    record_id: str,
+    payload: BrokerReconciliationReviewRequest,
+) -> dict:
+    existing = next(
+        (
+            item
+            for item in list_broker_reconciliation_runs(household_id=payload.household_id)
+            if item["id"] == record_id
+        ),
+        None,
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail="未找到券商对账运行记录")
+    existing_data = BrokerReconciliationRunRecord.model_validate(existing).data
+    if existing_data.review_status != "pending":
+        raise HTTPException(status_code=409, detail="该对账记录不处于待人工复核状态")
+    record = resolve_broker_reconciliation_run(
+        record_id,
+        household_id=payload.household_id,
+        review_note=payload.review_note,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到券商对账运行记录")
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
 @app.get("/api/quant-investment/paper-orders", response_model=list[PaperOrderRecord])
 def get_quant_paper_orders(household_id: str) -> list[dict]:
     return list_paper_investment_orders(household_id=household_id)
@@ -728,12 +820,17 @@ def _paper_portfolio_for_household(
         PaperFillRecord.model_validate(item).data
         for item in list_paper_investment_fills(household_id=household_id)
     ]
+    reconciliations = [
+        (item["id"], BrokerReconciliationRunRecord.model_validate(item).data)
+        for item in list_broker_reconciliation_runs(household_id=household_id)
+    ]
     return build_paper_portfolio_summary(
         household_id=household_id,
         fills=fills,
         instruments=instruments,
         snapshots=snapshots,
         policy=policy,
+        reconciliations=reconciliations,
     )
 
 

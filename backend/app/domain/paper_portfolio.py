@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from ..schemas import (
     AccountSnapshotPoint,
+    BrokerReconciliationRunData,
     InvestmentInstrumentData,
     InvestmentMarketSnapshotData,
     MonthlyLedgerEntry,
@@ -12,6 +13,7 @@ from ..schemas import (
     PaperOrderData,
     PaperPortfolioSummary,
     PaperPositionData,
+    PostTradeRiskIssueData,
     QuantInvestmentPolicyData,
     VisualizationBreakdownItem,
 )
@@ -246,21 +248,100 @@ def build_paper_portfolio_summary(
     instruments: dict[str, InvestmentInstrumentData],
     snapshots: dict[str, InvestmentMarketSnapshotData],
     policy: QuantInvestmentPolicyData | None = None,
+    reconciliations: list[tuple[str, BrokerReconciliationRunData]] | None = None,
 ) -> PaperPortfolioSummary:
     states: dict[str, _PositionState] = {}
     warnings: list[str] = []
+    risk_issues: list[PostTradeRiskIssueData] = []
     frozen = False
     reconciliation_mismatch = False
+    reconciliation_status = "not_required"
+    latest_reconciliation_id = ""
+
+    def add_issue(
+        *,
+        code: str,
+        severity: str,
+        source: str,
+        message: str,
+        order_id: str = "",
+        instrument_id: str = "",
+        observed_value: float | None = None,
+        threshold: float | None = None,
+    ) -> None:
+        risk_issues.append(
+            PostTradeRiskIssueData(
+                code=code,
+                severity=severity,
+                source=source,
+                message=message,
+                order_id=order_id,
+                instrument_id=instrument_id,
+                observed_value=observed_value,
+                threshold=threshold,
+            )
+        )
+        warnings.append(message)
+
+    reconciliation_records = reconciliations or []
+    if reconciliation_records:
+        latest_reconciliation_id, latest_reconciliation = reconciliation_records[0]
+        pending_reconciliation = next(
+            (
+                (record_id, reconciliation)
+                for record_id, reconciliation in reconciliation_records
+                if reconciliation.freeze_new_orders and reconciliation.review_status == "pending"
+            ),
+            None,
+        )
+        if pending_reconciliation is not None:
+            pending_id, pending_data = pending_reconciliation
+            latest_reconciliation_id = pending_id
+            frozen = True
+            reconciliation_mismatch = True
+            reconciliation_status = "mismatch"
+            add_issue(
+                code="reconciliation_mismatch",
+                severity="freeze",
+                source="reconciliation",
+                message=(
+                    f"对账运行 {pending_id} 存在未复核差异，已锁存冻结新增；"
+                    + ("；".join(pending_data.differences) if pending_data.differences else "请人工核对订单、持仓和现金")
+                ),
+            )
+        elif latest_reconciliation.matched:
+            reconciliation_status = "matched"
+        elif latest_reconciliation.review_status == "resolved":
+            reconciliation_status = "reviewed"
+
     contributions = 0.0
     cash_balance = 0.0
     for fill in fills:
         if fill.reconciliation_status == "mismatch":
             reconciliation_mismatch = True
             frozen = True
-            warnings.append(f"订单 {fill.client_order_id or fill.order_id} 存在对账差异，已冻结新增提案")
+            reconciliation_status = "mismatch"
+            add_issue(
+                code="reconciliation_mismatch",
+                severity="freeze",
+                source="fill",
+                order_id=fill.order_id,
+                instrument_id=fill.instrument_id,
+                message=f"订单 {fill.client_order_id or fill.order_id} 存在对账差异，已冻结新增提案",
+            )
         if policy and fill.gross_amount > 0 and fill.slippage_amount / fill.gross_amount > policy.post_trade_price_deviation_limit:
             frozen = True
-            warnings.append(f"订单 {fill.client_order_id or fill.order_id} 的成交偏离超过阈值，已冻结新增提案")
+            deviation = fill.slippage_amount / fill.gross_amount
+            add_issue(
+                code="execution_price_deviation",
+                severity="freeze",
+                source="fill",
+                order_id=fill.order_id,
+                instrument_id=fill.instrument_id,
+                observed_value=deviation,
+                threshold=policy.post_trade_price_deviation_limit,
+                message=f"订单 {fill.client_order_id or fill.order_id} 的成交偏离超过阈值，已冻结新增提案",
+            )
         state = states.setdefault(fill.instrument_id, _PositionState())
         contributions += fill.contribution_amount
         cash_balance += fill.cash_change + fill.contribution_amount
@@ -271,7 +352,16 @@ def build_paper_portfolio_summary(
             continue
         sold_quantity = min(state.quantity, fill.executed_quantity)
         if sold_quantity < fill.executed_quantity:
-            warnings.append(f"{fill.instrument_id} 的卖出成交超过模拟持仓，已按可用持仓计算")
+            add_issue(
+                code="position_oversell",
+                severity="warning",
+                source="fill",
+                order_id=fill.order_id,
+                instrument_id=fill.instrument_id,
+                observed_value=fill.executed_quantity,
+                threshold=state.quantity,
+                message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，已按可用持仓计算",
+            )
         average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
         removed_cost = average_cost * sold_quantity
         sale_proceeds = fill.executed_price * sold_quantity - fill.fee
@@ -305,7 +395,13 @@ def build_paper_portfolio_summary(
                     nav_available_date = latest_bar.nav_available_date or latest_bar.nav_date
                     if not nav_available_date or latest_bar.nav is None:
                         frozen = True
-                        warnings.append(f"{instrument.name} 的最新可得净值缺失，已冻结新增提案")
+                        add_issue(
+                            code="qdii_nav_missing",
+                            severity="freeze",
+                            source="market_data",
+                            instrument_id=instrument_id,
+                            message=f"{instrument.name} 的最新可得净值缺失，已冻结新增提案",
+                        )
                     elif latest_bar.nav_date:
                         try:
                             nav_age = market_trading_day_age(
@@ -317,9 +413,23 @@ def build_paper_portfolio_summary(
                             nav_age = policy.qdii_nav_max_stale_days + 1
                         if nav_age > policy.qdii_nav_max_stale_days:
                             frozen = True
-                            warnings.append(f"{instrument.name} 的最新可得净值已过期，已冻结新增提案")
+                            add_issue(
+                                code="qdii_nav_stale",
+                                severity="freeze",
+                                source="market_data",
+                                instrument_id=instrument_id,
+                                observed_value=float(nav_age),
+                                threshold=float(policy.qdii_nav_max_stale_days),
+                                message=f"{instrument.name} 的最新可得净值已过期，已冻结新增提案",
+                            )
         if not latest_price_date:
-            warnings.append(f"{instrument.name} 缺少最新行情，暂按持仓成本估值")
+            add_issue(
+                code="market_price_missing",
+                severity="warning",
+                source="market_data",
+                instrument_id=instrument_id,
+                message=f"{instrument.name} 缺少最新行情，暂按持仓成本估值",
+            )
         market_value = state.quantity * latest_price
         positions.append(
             PaperPositionData(
@@ -348,8 +458,13 @@ def build_paper_portfolio_summary(
     current_drawdown, max_drawdown = _paper_nav_drawdowns(fills, snapshots)
     if policy and max_drawdown >= policy.drawdown_freeze_threshold:
         frozen = True
-        warnings.append(
-            f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已暂停新增并等待人工复核"
+        add_issue(
+            code="portfolio_drawdown_limit",
+            severity="freeze",
+            source="portfolio",
+            observed_value=max_drawdown,
+            threshold=policy.drawdown_freeze_threshold,
+            message=f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已暂停新增并等待人工复核",
         )
     ledger_entries, account_snapshots, visualization_details = _paper_ledger_artifacts(
         fills,
@@ -374,7 +489,17 @@ def build_paper_portfolio_summary(
         current_drawdown=round(current_drawdown, 6),
         max_drawdown=round(max_drawdown, 6),
         frozen=frozen,
-        reconciliation_status="not_required" if not fills else ("mismatch" if reconciliation_mismatch else "matched"),
+        reconciliation_status=(
+            "mismatch"
+            if reconciliation_mismatch
+            else reconciliation_status
+            if reconciliation_status != "not_required"
+            else "matched"
+            if fills
+            else "not_required"
+        ),
+        latest_reconciliation_id=latest_reconciliation_id,
+        post_trade_risk_issues=risk_issues,
         positions=positions,
         ledger_entries=ledger_entries,
         account_snapshots=account_snapshots,
