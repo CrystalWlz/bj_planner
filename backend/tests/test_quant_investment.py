@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import json
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -639,6 +640,32 @@ def test_quant_backtest_requires_three_year_history_and_has_no_future_lookahead(
     assert {item.benchmark_id for item in result.benchmarks} == {"cash_contribution", "equity_dca"}
     assert result.walk_forward_folds
     assert any("下一可交易日" in warning for warning in result.warnings)
+
+
+def test_backtest_frontend_compares_backend_strategy_and_static_metrics() -> None:
+    source = Path("frontend/src/QuantInvestmentPanel.tsx").read_text(encoding="utf-8")
+    expected_fields = (
+        "strategy_terminal_value",
+        "static_terminal_value",
+        "strategy_cagr",
+        "static_cagr",
+        "strategy_annualized_volatility",
+        "static_annualized_volatility",
+        "strategy_max_drawdown",
+        "static_max_drawdown",
+        "strategy_turnover",
+        "static_turnover",
+        "strategy_total_fees",
+        "static_total_fees",
+        "strategy_min_cash_balance",
+        "static_min_cash_balance",
+    )
+
+    assert all(f"result.{field}" in source for field in expected_fields)
+    assert '<table className="quant-backtest-table"' in source
+    assert "风险控制策略与静态 35/65 同口径比较" in source
+    assert "最差现金" in source
+    assert "minimumFractionDigits: 2" in source
 
 
 def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None:

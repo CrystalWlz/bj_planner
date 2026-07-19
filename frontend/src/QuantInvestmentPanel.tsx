@@ -272,7 +272,13 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       {portfolio ? <div className="setting-group"><strong className="setting-group-title">模拟投资账户</strong><div className="metric-grid"><Metric label="累计投入" value={money(portfolio.net_contributions)} /><Metric label="模拟现金" value={money(portfolio.cash_balance)} /><Metric label="持仓市值" value={money(portfolio.market_value)} /><Metric label="浮动盈亏" value={money(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl >= 0 ? "good" : "bad"} /><Metric label="当前回撤" value={percent(portfolio.current_drawdown ?? 0)} tone={(portfolio.current_drawdown ?? 0) >= 0.12 ? "bad" : (portfolio.current_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="历史最大回撤" value={percent(portfolio.max_drawdown ?? 0)} tone={(portfolio.max_drawdown ?? 0) >= 0.15 ? "bad" : (portfolio.max_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="累计费用" value={money(portfolio.total_fees)} /><Metric label="账本流水" value={`${portfolio.ledger_entries.length} 条`} /><Metric label="事后风控" value={portfolio.frozen ? "已冻结新增" : "正常"} tone={portfolio.frozen ? "bad" : "good"} /></div>{portfolio.positions.length ? <div className="strategy-grid horizontal-card-list">{portfolio.positions.map((position) => <article className="strategy-card" key={position.instrument_id}><div className="quant-instrument-heading"><strong>{position.name}</strong><span>{position.symbol} · {position.quantity} 份</span></div><p>成本 {money(position.total_cost)}，市值 {money(position.market_value)}，最新价 {position.latest_price}（{position.latest_price_date || "按成本估值"}）</p><span className={`status-badge ${position.unrealized_pnl >= 0 ? "success" : "warning"}`}>浮动盈亏 {money(position.unrealized_pnl)}</span></article>)}</div> : <p className="field-hint">尚无已模拟成交持仓。</p>}{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).length ? <div className="warning-list">{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).map((warning) => <span key={warning}>{warning}</span>)}</div> : null}</div> : null}
       {portfolio ? <PaperPortfolioHistory portfolio={portfolio} /> : null}
 
-      {displayedBacktest ? <div className="setting-group"><strong className="setting-group-title">三年历史回测{latestBacktestRun ? ` · 运行记录 ${latestBacktestRun.data_fingerprint.slice(0, 10)}` : ""}</strong><div className="metric-grid"><Metric label="研究模型" value={(latestBacktestRun?.data.policy_snapshot.research_strategy ?? activePolicy?.data.research_strategy) === "min_variance" ? "最小方差" : "固定规则"} /><Metric label="策略终值" value={money(displayedBacktest.strategy_terminal_value)} /><Metric label="静态配置终值" value={money(displayedBacktest.static_terminal_value)} /><Metric label="策略 CAGR" value={percent(displayedBacktest.strategy_cagr)} /><Metric label="年化波动" value={percent(displayedBacktest.strategy_annualized_volatility)} /><Metric label="策略最大回撤" value={percent(displayedBacktest.strategy_max_drawdown)} /><Metric label="换手率" value={percent(displayedBacktest.strategy_turnover)} /><Metric label="累计费用" value={money(displayedBacktest.strategy_total_fees)} /><Metric label="样本外分段" value={`${displayedBacktest.walk_forward_folds.length} 段`} /></div>{displayedBacktest.benchmarks.length ? <div className="strategy-grid horizontal-card-list">{displayedBacktest.benchmarks.map((benchmark) => <article className="strategy-card" key={benchmark.benchmark_id}><strong>{benchmark.name}</strong><p>终值 {money(benchmark.terminal_value)}，CAGR {percent(benchmark.cagr)}，最大回撤 {percent(benchmark.max_drawdown)}，费用 {money(benchmark.total_fees)}</p></article>)}</div> : null}<p className="field-hint">{displayedBacktest.warnings.join(" ")}</p></div> : null}
+      {displayedBacktest ? (
+        <BacktestResultPanel
+          result={displayedBacktest}
+          runFingerprint={latestBacktestRun?.data_fingerprint ?? ""}
+          researchStrategy={latestBacktestRun?.data.policy_snapshot.research_strategy ?? activePolicy?.data.research_strategy ?? "disabled"}
+        />
+      ) : null}
       {uncertainDispatches.length ? (
         <div className="setting-group">
           <strong className="setting-group-title">待复核券商动作</strong>
@@ -305,6 +311,109 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
         </div>
       ) : null}
     </section>
+  );
+}
+
+function BacktestResultPanel({
+  result,
+  runFingerprint,
+  researchStrategy,
+}: {
+  result: QuantBacktestResult;
+  runFingerprint: string;
+  researchStrategy: QuantInvestmentPolicyData["research_strategy"];
+}) {
+  const preciseCash = (value: number) => value.toLocaleString("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const comparisonRows = [
+    {
+      id: "risk-controlled",
+      name: "回撤风控策略",
+      note: "月度定投、35/65 与回撤降风险",
+      terminalValue: result.strategy_terminal_value,
+      cagr: result.strategy_cagr,
+      volatility: result.strategy_annualized_volatility,
+      maxDrawdown: result.strategy_max_drawdown,
+      turnover: result.strategy_turnover,
+      totalFees: result.strategy_total_fees,
+      minCashBalance: result.strategy_min_cash_balance,
+    },
+    {
+      id: "static-35-65",
+      name: "静态 35/65",
+      note: "固定配置，不执行回撤降风险",
+      terminalValue: result.static_terminal_value,
+      cagr: result.static_cagr,
+      volatility: result.static_annualized_volatility,
+      maxDrawdown: result.static_max_drawdown,
+      turnover: result.static_turnover,
+      totalFees: result.static_total_fees,
+      minCashBalance: result.static_min_cash_balance,
+    },
+  ];
+
+  return (
+    <div className="setting-group quant-backtest-result">
+      <strong className="setting-group-title">三年历史回测{runFingerprint ? ` · 运行记录 ${runFingerprint.slice(0, 10)}` : ""}</strong>
+      <div className="metric-grid">
+        <Metric label="回测区间" value={`${result.start_date} 至 ${result.end_date}`} />
+        <Metric label="研究模型" value={researchStrategy === "min_variance" ? "最小方差" : "固定规则"} />
+        <Metric label="模拟成交" value={`${result.trade_count} 笔`} />
+        <Metric label="样本外分段" value={`${result.walk_forward_folds.length} 段`} />
+      </div>
+      <div className="quant-backtest-table-frame">
+        <div className="quant-backtest-table-title">风险控制策略与静态 35/65 同口径比较</div>
+        <div className="quant-backtest-table-scroll">
+          <table className="quant-backtest-table" aria-label="风险控制策略与静态 35/65 同口径比较">
+            <thead>
+              <tr>
+                <th scope="col">方案</th>
+                <th scope="col">终值</th>
+                <th scope="col">CAGR</th>
+                <th scope="col">年化波动</th>
+                <th scope="col">最大回撤</th>
+                <th scope="col">换手率</th>
+                <th scope="col">累计费用</th>
+                <th scope="col">最差现金</th>
+              </tr>
+            </thead>
+            <tbody>
+              {comparisonRows.map((row) => (
+                <tr key={row.id}>
+                  <th scope="row">
+                    <span>{row.name}</span>
+                    <small>{row.note}</small>
+                  </th>
+                  <td>{money(row.terminalValue)}</td>
+                  <td>{percent(row.cagr)}</td>
+                  <td>{percent(row.volatility)}</td>
+                  <td>{percent(row.maxDrawdown)}</td>
+                  <td>{percent(row.turnover)}</td>
+                  <td>{money(row.totalFees)}</td>
+                  <td>{preciseCash(row.minCashBalance)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {result.benchmarks.length ? (
+        <div className="quant-backtest-benchmarks">
+          <strong>补充基准</strong>
+          <div className="strategy-grid horizontal-card-list">
+            {result.benchmarks.map((benchmark) => (
+              <article className="strategy-card" key={benchmark.benchmark_id}>
+                <strong>{benchmark.name}</strong>
+                <p>终值 {money(benchmark.terminal_value)}，CAGR {percent(benchmark.cagr)}，年化波动 {percent(benchmark.annualized_volatility)}，最大回撤 {percent(benchmark.max_drawdown)}，费用 {money(benchmark.total_fees)}</p>
+              </article>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {result.warnings.length ? <p className="field-hint">{result.warnings.join(" ")}</p> : null}
+    </div>
   );
 }
 

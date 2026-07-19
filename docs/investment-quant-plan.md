@@ -61,6 +61,8 @@
 
 每次三年回测保存独立运行记录。Recorder schema v2 除回测引擎版本、四个策略组件版本、标的池版本、行情快照 ID/数据版本、完整参数、起止日期、结果和警告外，还保存不可变 `universe_snapshot` 与逐标的 `execution_assumptions`，覆盖代码、市场、币种、资产类别、交易方式、整手单位、买卖费率、月度限额、QDII 溢价阈值、暂停申购和港股通资格；全局成本假设同时记录滑点及最大买卖费率。运行记录可以脱离当前标的池解释旧结果，修改当前费率不会回写历史记录。Recorder schema 版本进入运行指纹，输入完全相同时复用原记录，任一数据、参数、标的配置、引擎或 Recorder schema 变化都会生成新指纹；v1 历史记录继续只读兼容。该记录用于复盘计算口径，不代表策略通过实盘验证。
 
+回测页面必须把回撤风控策略与静态 35/65 放在同一张比较表中，逐项展示后端给出的终值、CAGR、年化波动、最大回撤、换手率、累计费用和最差现金余额；现金定投与 100% 权益定投作为补充基准单独展示。前端只格式化这些字段，不根据终值或行情重新推导任何回测指标。
+
 ## QMT 边界与阶段门槛
 
 `BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：调用适配器前既要确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配，也要通过动作状态校验并原子认领已持久化 outbox；`submit` 只允许本地 `proposed`，`cancel` 只允许已原子写入 `cancel_requested` 的订单。缺少任一持久化校验器、outbox 回调或状态不符都主动拒绝，已取消、已成交订单不能重新发送。对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
