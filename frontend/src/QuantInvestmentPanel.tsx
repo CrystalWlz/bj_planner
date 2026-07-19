@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Database, PlayCircle, Plus, RefreshCw, ShieldCheck, XCircle } from "lucide-react";
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   cancelQuantPaperOrder,
   createQuantInvestmentInstrument,
@@ -269,6 +270,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       {portfolio ? <div className="setting-group"><div className="section-header"><strong className="setting-group-title">对账与事后风控</strong><button className="secondary-button" type="button" onClick={() => void reconcilePaperBroker()} disabled={busy}><ShieldCheck size={16} /> 核验模拟账本</button></div><div className="metric-grid"><Metric label="对账日期" value={displayedReconciliation?.data.reconciliation_date || "尚未运行"} /><Metric label="对账范围" value={displayedReconciliation?.data.adapter === "qmt" ? "QMT 只读" : "模拟盘"} /><Metric label="对账结果" value={!displayedReconciliation ? "待核验" : displayedReconciliation.data.matched ? "一致" : "存在差异"} tone={!displayedReconciliation ? undefined : displayedReconciliation.data.matched ? "good" : "bad"} /><Metric label="复核状态" value={!displayedReconciliation ? "无需复核" : displayedReconciliation.data.review_status === "pending" ? "待人工复核" : displayedReconciliation.data.review_status === "resolved" ? "已复核" : "无需复核"} tone={displayedReconciliation?.data.review_status === "pending" ? "bad" : "good"} /></div>{portfolio.post_trade_risk_issues.length ? <div className="warning-list">{portfolio.post_trade_risk_issues.map((issue) => <span key={`${issue.code}-${issue.order_id}-${issue.instrument_id}`} className={issue.severity === "freeze" ? "error-text" : undefined}>{issue.message}</span>)}</div> : null}</div> : null}
 
       {portfolio ? <div className="setting-group"><strong className="setting-group-title">模拟投资账户</strong><div className="metric-grid"><Metric label="累计投入" value={money(portfolio.net_contributions)} /><Metric label="模拟现金" value={money(portfolio.cash_balance)} /><Metric label="持仓市值" value={money(portfolio.market_value)} /><Metric label="浮动盈亏" value={money(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl >= 0 ? "good" : "bad"} /><Metric label="当前回撤" value={percent(portfolio.current_drawdown ?? 0)} tone={(portfolio.current_drawdown ?? 0) >= 0.12 ? "bad" : (portfolio.current_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="历史最大回撤" value={percent(portfolio.max_drawdown ?? 0)} tone={(portfolio.max_drawdown ?? 0) >= 0.15 ? "bad" : (portfolio.max_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="累计费用" value={money(portfolio.total_fees)} /><Metric label="账本流水" value={`${portfolio.ledger_entries.length} 条`} /><Metric label="事后风控" value={portfolio.frozen ? "已冻结新增" : "正常"} tone={portfolio.frozen ? "bad" : "good"} /></div>{portfolio.positions.length ? <div className="strategy-grid horizontal-card-list">{portfolio.positions.map((position) => <article className="strategy-card" key={position.instrument_id}><div className="quant-instrument-heading"><strong>{position.name}</strong><span>{position.symbol} · {position.quantity} 份</span></div><p>成本 {money(position.total_cost)}，市值 {money(position.market_value)}，最新价 {position.latest_price}（{position.latest_price_date || "按成本估值"}）</p><span className={`status-badge ${position.unrealized_pnl >= 0 ? "success" : "warning"}`}>浮动盈亏 {money(position.unrealized_pnl)}</span></article>)}</div> : <p className="field-hint">尚无已模拟成交持仓。</p>}{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).length ? <div className="warning-list">{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).map((warning) => <span key={warning}>{warning}</span>)}</div> : null}</div> : null}
+      {portfolio ? <PaperPortfolioHistory portfolio={portfolio} /> : null}
 
       {displayedBacktest ? <div className="setting-group"><strong className="setting-group-title">三年历史回测{latestBacktestRun ? ` · 运行记录 ${latestBacktestRun.data_fingerprint.slice(0, 10)}` : ""}</strong><div className="metric-grid"><Metric label="研究模型" value={(latestBacktestRun?.data.policy_snapshot.research_strategy ?? activePolicy?.data.research_strategy) === "min_variance" ? "最小方差" : "固定规则"} /><Metric label="策略终值" value={money(displayedBacktest.strategy_terminal_value)} /><Metric label="静态配置终值" value={money(displayedBacktest.static_terminal_value)} /><Metric label="策略 CAGR" value={percent(displayedBacktest.strategy_cagr)} /><Metric label="年化波动" value={percent(displayedBacktest.strategy_annualized_volatility)} /><Metric label="策略最大回撤" value={percent(displayedBacktest.strategy_max_drawdown)} /><Metric label="换手率" value={percent(displayedBacktest.strategy_turnover)} /><Metric label="累计费用" value={money(displayedBacktest.strategy_total_fees)} /><Metric label="样本外分段" value={`${displayedBacktest.walk_forward_folds.length} 段`} /></div>{displayedBacktest.benchmarks.length ? <div className="strategy-grid horizontal-card-list">{displayedBacktest.benchmarks.map((benchmark) => <article className="strategy-card" key={benchmark.benchmark_id}><strong>{benchmark.name}</strong><p>终值 {money(benchmark.terminal_value)}，CAGR {percent(benchmark.cagr)}，最大回撤 {percent(benchmark.max_drawdown)}，费用 {money(benchmark.total_fees)}</p></article>)}</div> : null}<p className="field-hint">{displayedBacktest.warnings.join(" ")}</p></div> : null}
       {uncertainDispatches.length ? (
@@ -304,6 +306,73 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       ) : null}
     </section>
   );
+}
+
+function PaperPortfolioHistory({ portfolio }: { portfolio: PaperPortfolioSummary }) {
+  const [selectedMonth, setSelectedMonth] = useState<number | null>(null);
+  const details = portfolio.visualization_details;
+  const fallbackDetail = details.length ? details[details.length - 1] : null;
+  const selectedDetail = details.find((item) => item.month === selectedMonth) ?? fallbackDetail;
+  if (!portfolio.account_snapshots.length && !selectedDetail) return null;
+
+  return (
+    <div className="setting-group paper-portfolio-history">
+      <div className="paper-portfolio-history-head">
+        <strong className="setting-group-title">账户曲线与月度归因</strong>
+        {selectedDetail ? (
+          <label className="field compact-field">
+            <span>查看月份</span>
+            <select value={selectedDetail.month} onChange={(event) => setSelectedMonth(Number(event.target.value))}>
+              {details.map((item) => <option key={item.month} value={item.month}>第 {item.month} 月</option>)}
+            </select>
+          </label>
+        ) : null}
+      </div>
+      {portfolio.account_snapshots.length ? (
+        <div className="paper-portfolio-chart-scroll">
+          <div className="paper-portfolio-chart-canvas">
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={portfolio.account_snapshots} margin={{ top: 8, right: 16, left: 0, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="month" tickFormatter={(value) => `第${value}月`} />
+                <YAxis width={62} tickFormatter={compactPaperMoneyTick} />
+                <Tooltip formatter={(value) => money(Number(value))} labelFormatter={(value) => `第 ${value} 月`} />
+                <Legend verticalAlign="top" height={30} iconType="line" />
+                <Line type="monotone" dataKey="cash_balance" name="模拟现金" stroke="var(--chart-cash)" strokeWidth={2.2} dot={false} />
+                <Line type="monotone" dataKey="investment_balance" name="持仓市值" stroke="var(--chart-investment)" strokeWidth={2.2} dot={false} />
+                <Line type="monotone" dataKey="net_worth" name="账户权益" stroke="var(--chart-total-asset)" strokeWidth={2.6} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      ) : null}
+      {selectedDetail ? (
+        <div className="paper-portfolio-month-review">
+          <p>{selectedDetail.advisor_text}</p>
+          <div className="paper-portfolio-driver-list">
+            {selectedDetail.cash_flow_drivers.map((item) => (
+              <div key={`${selectedDetail.month}-${item.name}`}>
+                <span>{item.name}</span>
+                <strong>{money(item.amount ?? item.value)}</strong>
+              </div>
+            ))}
+          </div>
+          {selectedDetail.explanation_items.length ? (
+            <div className="paper-portfolio-explanations">
+              {selectedDetail.explanation_items.map((item) => <p key={item.title}><strong>{item.title}</strong><span>{item.body}</span></p>)}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function compactPaperMoneyTick(value: unknown) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "";
+  if (Math.abs(amount) >= 10000) return `${(amount / 10000).toFixed(0)}万`;
+  return amount.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
 }
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: "good" | "warn" | "bad" }) {
