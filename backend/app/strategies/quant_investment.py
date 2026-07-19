@@ -9,7 +9,6 @@ from ..domain.quant_investment import (
     QuantRiskAssessment,
     assess_quant_risk,
     instrument_is_buyable,
-    optimized_equity_weights,
     protected_cash_for_quant_investment,
 )
 from ..schemas import (
@@ -26,7 +25,7 @@ from ..schemas import (
 
 
 SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
-PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v2"
+PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v3"
 PRE_TRADE_RISK_VERSION = "cash-concentration-v5"
 EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v3"
 
@@ -144,10 +143,7 @@ class Fixed3565PortfolioConstructor:
         defensive = [item for item in candidates if item.instrument.asset_class == "defensive"]
         weights: dict[str, float] = {}
         if equity:
-            if policy.research_strategy == "min_variance":
-                relative = optimized_equity_weights([(item.instrument_id, item.snapshot) for item in equity])
-            else:
-                relative = {item.instrument_id: 1 / len(equity) for item in equity}
+            relative = {item.instrument_id: 1 / len(equity) for item in equity}
             for item in equity:
                 weights[item.instrument_id] = max(0.0, effective_equity_ratio) * relative.get(item.instrument_id, 0.0)
         defensive_ratio = max(0.0, 1 - effective_equity_ratio)

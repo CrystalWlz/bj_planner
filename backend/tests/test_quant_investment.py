@@ -547,18 +547,9 @@ def test_quant_risk_blocks_when_any_equity_asset_has_insufficient_history() -> N
     assert "不能绕过" in assessment.reasons[0]
 
 
-def test_research_constructor_receives_only_data_available_on_common_signal_date(monkeypatch) -> None:
+def test_production_proposal_ignores_research_strategy_and_uses_common_signal_date() -> None:
     from app.schemas import HouseholdData, InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
     from app.strategies import quant_investment
-
-    captured_dates: dict[str, list[str]] = {}
-
-    def fake_optimizer(snapshots: list[tuple[str, InvestmentMarketSnapshotData]]) -> dict[str, float]:
-        for instrument_id, snapshot in snapshots:
-            captured_dates[instrument_id] = [bar.price_date for bar in snapshot.bars]
-        return {instrument_id: 1 / len(snapshots) for instrument_id, _snapshot in snapshots}
-
-    monkeypatch.setattr(quant_investment, "optimized_equity_weights", fake_optimizer)
     instrument_a = InvestmentInstrumentData(
         symbol="510300.SH",
         name="示例权益 ETF A",
@@ -587,31 +578,42 @@ def test_research_constructor_receives_only_data_available_on_common_signal_date
         ],
     )
 
-    result = quant_investment.build_quant_monthly_proposal(
-        household=HouseholdData(cash_account_balance=100000, monthly_expense=1000),
-        policy_id="policy-1",
-        policy=QuantInvestmentPolicyData(
-            default_monthly_budget=1000,
-            research_strategy="min_variance",
-            max_single_instrument_ratio=1,
-            max_single_market_ratio=1,
-        ),
-        instruments=[("equity-a", instrument_a), ("equity-b", instrument_b)],
-        snapshots={
+    household = HouseholdData(cash_account_balance=100000, monthly_expense=1000)
+    policy = QuantInvestmentPolicyData(
+        default_monthly_budget=1000,
+        research_strategy="min_variance",
+        max_single_instrument_ratio=1,
+        max_single_market_ratio=1,
+    )
+    common_inputs = {
+        "household": household,
+        "policy_id": "policy-1",
+        "instruments": [("equity-a", instrument_a), ("equity-b", instrument_b)],
+        "snapshots": {
             "equity-a": ("snapshot-a", snapshot_a),
             "equity-b": ("snapshot-b", snapshot_b),
         },
+    }
+    research_enabled = quant_investment.build_quant_monthly_proposal(
+        policy=policy,
+        **common_inputs,
+    )
+    production_default = quant_investment.build_quant_monthly_proposal(
+        policy=policy.model_copy(update={"research_strategy": "disabled"}),
+        **common_inputs,
     )
 
-    assert result.proposal.as_of_date == "2026-07-02"
-    assert captured_dates == {
-        "equity-a": ["2026-07-01", "2026-07-02"],
-        "equity-b": ["2026-07-01", "2026-07-02"],
-    }
-    assert result.orders
-    assert all(order.estimated_price < 2 for order in result.orders)
-    assert all(order.expected_trade_date == "2026-07-03" for order in result.orders)
-    assert not any("下一工作日估计" in reason for reason in result.proposal.reasons)
+    assert research_enabled.proposal.as_of_date == "2026-07-02"
+    assert research_enabled.proposal.strategy_versions["portfolio_constructor"] == "fixed-35-65-v3"
+    assert research_enabled.proposal.target_weights == production_default.proposal.target_weights
+    assert research_enabled.proposal.target_weights == {"equity-a": pytest.approx(0.175), "equity-b": pytest.approx(0.175)}
+    assert [order.model_dump(exclude={"client_order_id"}) for order in research_enabled.orders] == [
+        order.model_dump(exclude={"client_order_id"}) for order in production_default.orders
+    ]
+    assert research_enabled.orders
+    assert all(order.estimated_price < 2 for order in research_enabled.orders)
+    assert all(order.expected_trade_date == "2026-07-03" for order in research_enabled.orders)
+    assert not any("下一工作日估计" in reason for reason in research_enabled.proposal.reasons)
 
 
 def test_quant_backtest_requires_three_year_history_and_has_no_future_lookahead() -> None:
@@ -964,7 +966,7 @@ def test_market_snapshot_table_migrates_existing_rows_without_rebuild_loss(tmp_p
     assert reused["id"] == "legacy-snapshot"
 
 
-def test_default_strategy_interfaces_disable_research_optimizer_and_plan_round_lots(monkeypatch) -> None:
+def test_default_strategy_interfaces_use_fixed_weights_and_plan_round_lots() -> None:
     from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
     from app.strategies import quant_investment
 
@@ -981,12 +983,13 @@ def test_default_strategy_interfaces_disable_research_optimizer_and_plan_round_l
         bars=[{"date": "2026-07-17", "close": 1.0}],
     )
     candidate = quant_investment.QuantInstrumentCandidate("instrument-1", instrument, "snapshot-1", snapshot, 1.0, "2026-07-17")
-    monkeypatch.setattr(quant_investment, "optimized_equity_weights", lambda _snapshots: (_ for _ in ()).throw(AssertionError("研究优化器默认不应调用")))
     policy = QuantInvestmentPolicyData()
     defensive_instrument = instrument.model_copy(update={"symbol": "511010.SH", "name": "示例防御 ETF", "asset_class": "defensive"})
     defensive_candidate = quant_investment.QuantInstrumentCandidate("instrument-2", defensive_instrument, "snapshot-2", snapshot, 1.0, "2026-07-17")
-    weights = quant_investment.Fixed3565PortfolioConstructor().target_weights([candidate, defensive_candidate], policy, policy.equity_cap)
+    constructor = quant_investment.Fixed3565PortfolioConstructor()
+    weights = constructor.target_weights([candidate, defensive_candidate], policy, policy.equity_cap)
     order = quant_investment.PaperLotExecutionPlanner().plan(candidate, 1000, policy, "测试整手执行")
+    assert constructor.version == "fixed-35-65-v3"
     assert weights == pytest.approx({"instrument-1": 0.35, "instrument-2": 0.65})
     assert order is not None
     assert order.estimated_price == pytest.approx(1.001)
