@@ -10,18 +10,21 @@ import {
   fetchQuantInvestmentPolicies,
   fetchQuantInvestmentProposals,
   fetchQuantBacktestRuns,
+  fetchQuantBrokerOrderDispatches,
   fetchQuantBrokerReconciliations,
   fetchQuantMarketSnapshots,
   fetchQuantPaperOrders,
   fetchQuantPaperPortfolio,
   refreshQuantMarketData,
   reconcileQuantPaperBroker,
+  retryQuantBrokerOrderDispatch,
   runQuantInvestmentBacktest,
   saveQuantInvestmentPolicy,
   simulateQuantPaperOrder,
 } from "./api";
 import { money, numberInput, percent } from "./format";
 import type {
+  BrokerOrderDispatchRecord,
   BrokerReconciliationRunRecord,
   InvestmentInstrumentData,
   InvestmentInstrumentRecord,
@@ -96,7 +99,9 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const [portfolio, setPortfolio] = useState<PaperPortfolioSummary | null>(null);
   const [backtest, setBacktest] = useState<QuantBacktestResult | null>(null);
   const [backtestRuns, setBacktestRuns] = useState<QuantBacktestRunRecord[]>([]);
+  const [dispatches, setDispatches] = useState<BrokerOrderDispatchRecord[]>([]);
   const [reconciliations, setReconciliations] = useState<BrokerReconciliationRunRecord[]>([]);
+  const [dispatchReviewNotes, setDispatchReviewNotes] = useState<Record<string, string>>({});
   const [instrumentDraft, setInstrumentDraft] = useState<InvestmentInstrumentData>(defaultInstrument);
   const [manualPrice, setManualPrice] = useState(1);
   const [manualNav, setManualNav] = useState(1);
@@ -104,7 +109,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    const [nextPolicies, nextInstruments, nextSnapshots, nextProposals, nextOrders, nextPortfolio, nextBacktestRuns, nextReconciliations] = await Promise.all([
+    const [nextPolicies, nextInstruments, nextSnapshots, nextProposals, nextOrders, nextPortfolio, nextBacktestRuns, nextDispatches, nextReconciliations] = await Promise.all([
       fetchQuantInvestmentPolicies(householdId),
       fetchQuantInvestmentInstruments(householdId),
       fetchQuantMarketSnapshots(householdId),
@@ -112,6 +117,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       fetchQuantPaperOrders(householdId),
       fetchQuantPaperPortfolio(householdId),
       fetchQuantBacktestRuns(householdId),
+      fetchQuantBrokerOrderDispatches(householdId),
       fetchQuantBrokerReconciliations(householdId),
     ]);
     setPolicies(nextPolicies);
@@ -121,6 +127,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     setOrders(nextOrders);
     setPortfolio(nextPortfolio);
     setBacktestRuns(nextBacktestRuns);
+    setDispatches(nextDispatches);
     setReconciliations(nextReconciliations);
     setError("");
   }, [householdId]);
@@ -137,6 +144,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const displayedBacktest = backtest ?? latestBacktestRun?.data.result ?? null;
   const instrumentById = useMemo(() => new Map(instruments.map((item) => [item.id, item])), [instruments]);
   const snapshotByInstrumentId = useMemo(() => new Map(snapshots.map((item) => [item.instrument_id, item])), [snapshots]);
+  const uncertainDispatches = dispatches.filter((item) => item.data.status === "dispatching" || item.data.status === "uncertain");
 
   const runAction = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -169,6 +177,14 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const simulateOrder = (id: string) => runAction(async () => { await simulateQuantPaperOrder(id, householdId); });
   const cancelOrder = (id: string) => runAction(async () => { await cancelQuantPaperOrder(id, householdId); });
   const reconcilePaperBroker = () => runAction(async () => { await reconcileQuantPaperBroker(householdId); });
+  const allowDispatchRetry = (dispatch: BrokerOrderDispatchRecord) => runAction(async () => {
+    if (!dispatch.retry_eligible || !dispatch.eligible_reconciliation_id) {
+      throw new Error(dispatch.retry_block_reason || "该券商动作尚不允许重试。 ");
+    }
+    const reviewNote = (dispatchReviewNotes[dispatch.id] ?? "").trim();
+    if (!reviewNote) throw new Error("请填写本次人工复核结论。 ");
+    await retryQuantBrokerOrderDispatch(dispatch.id, householdId, dispatch.eligible_reconciliation_id, reviewNote);
+  });
   const writeManualSnapshot = (instrument: InvestmentInstrumentRecord) => runAction(async () => {
     const today = new Date();
     const yesterday = new Date(today);
@@ -254,6 +270,37 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       {portfolio ? <div className="setting-group"><strong className="setting-group-title">模拟投资账户</strong><div className="metric-grid"><Metric label="累计投入" value={money(portfolio.net_contributions)} /><Metric label="模拟现金" value={money(portfolio.cash_balance)} /><Metric label="持仓市值" value={money(portfolio.market_value)} /><Metric label="浮动盈亏" value={money(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl >= 0 ? "good" : "bad"} /><Metric label="当前回撤" value={percent(portfolio.current_drawdown ?? 0)} tone={(portfolio.current_drawdown ?? 0) >= 0.12 ? "bad" : (portfolio.current_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="历史最大回撤" value={percent(portfolio.max_drawdown ?? 0)} tone={(portfolio.max_drawdown ?? 0) >= 0.15 ? "bad" : (portfolio.max_drawdown ?? 0) >= 0.08 ? "warn" : "good"} /><Metric label="累计费用" value={money(portfolio.total_fees)} /><Metric label="账本流水" value={`${portfolio.ledger_entries.length} 条`} /><Metric label="事后风控" value={portfolio.frozen ? "已冻结新增" : "正常"} tone={portfolio.frozen ? "bad" : "good"} /></div>{portfolio.positions.length ? <div className="strategy-grid horizontal-card-list">{portfolio.positions.map((position) => <article className="strategy-card" key={position.instrument_id}><div className="quant-instrument-heading"><strong>{position.name}</strong><span>{position.symbol} · {position.quantity} 份</span></div><p>成本 {money(position.total_cost)}，市值 {money(position.market_value)}，最新价 {position.latest_price}（{position.latest_price_date || "按成本估值"}）</p><span className={`status-badge ${position.unrealized_pnl >= 0 ? "success" : "warning"}`}>浮动盈亏 {money(position.unrealized_pnl)}</span></article>)}</div> : <p className="field-hint">尚无已模拟成交持仓。</p>}{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).length ? <div className="warning-list">{portfolio.warnings.filter((warning) => !portfolio.post_trade_risk_issues.some((issue) => issue.message === warning)).map((warning) => <span key={warning}>{warning}</span>)}</div> : null}</div> : null}
 
       {displayedBacktest ? <div className="setting-group"><strong className="setting-group-title">三年历史回测{latestBacktestRun ? ` · 运行记录 ${latestBacktestRun.data_fingerprint.slice(0, 10)}` : ""}</strong><div className="metric-grid"><Metric label="策略终值" value={money(displayedBacktest.strategy_terminal_value)} /><Metric label="静态配置终值" value={money(displayedBacktest.static_terminal_value)} /><Metric label="策略 CAGR" value={percent(displayedBacktest.strategy_cagr)} /><Metric label="年化波动" value={percent(displayedBacktest.strategy_annualized_volatility)} /><Metric label="策略最大回撤" value={percent(displayedBacktest.strategy_max_drawdown)} /><Metric label="换手率" value={percent(displayedBacktest.strategy_turnover)} /><Metric label="累计费用" value={money(displayedBacktest.strategy_total_fees)} /><Metric label="样本外分段" value={`${displayedBacktest.walk_forward_folds.length} 段`} /></div>{displayedBacktest.benchmarks.length ? <div className="strategy-grid horizontal-card-list">{displayedBacktest.benchmarks.map((benchmark) => <article className="strategy-card" key={benchmark.benchmark_id}><strong>{benchmark.name}</strong><p>终值 {money(benchmark.terminal_value)}，CAGR {percent(benchmark.cagr)}，最大回撤 {percent(benchmark.max_drawdown)}，费用 {money(benchmark.total_fees)}</p></article>)}</div> : null}<p className="field-hint">{displayedBacktest.warnings.join(" ")}</p></div> : null}
+      {uncertainDispatches.length ? (
+        <div className="setting-group">
+          <strong className="setting-group-title">待复核券商动作</strong>
+          {uncertainDispatches.map((dispatch) => {
+            return (
+              <article className="strategy-card" key={dispatch.id}>
+                <strong>{dispatch.data.action === "submit" ? "提交" : "取消"} · {brokerDispatchStatusLabel(dispatch.data.status)}</strong>
+                <p>{dispatch.data.client_order_id} · 已尝试 {dispatch.data.attempt_count} 次。{dispatch.data.error_message} {dispatch.retry_block_reason}</p>
+                <div className="form-grid two">
+                  <label className="field">
+                    <span>人工复核结论</span>
+                    <input
+                      value={dispatchReviewNotes[dispatch.id] ?? ""}
+                      onChange={(event) => setDispatchReviewNotes((items) => ({ ...items, [dispatch.id]: event.target.value }))}
+                      placeholder="记录订单、持仓和现金核对结果"
+                    />
+                  </label>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => void allowDispatchRetry(dispatch)}
+                    disabled={busy || !dispatch.retry_eligible || !(dispatchReviewNotes[dispatch.id] ?? "").trim()}
+                  >
+                    <ShieldCheck size={16} /> 允许按原请求重试
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -269,4 +316,12 @@ function orderStatusLabel(status: PaperOrderRecord["data"]["status"]) {
   if (status === "confirmed") return "已确认成交";
   if (status === "cancelled") return "已取消";
   return "已冻结";
+}
+
+function brokerDispatchStatusLabel(status: BrokerOrderDispatchRecord["data"]["status"]) {
+  if (status === "pending") return "待发送";
+  if (status === "dispatching") return "发送结果待确认";
+  if (status === "acknowledged") return "适配器已确认";
+  if (status === "uncertain") return "发送结果不确定";
+  return "已复核，可重试";
 }

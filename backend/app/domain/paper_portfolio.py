@@ -6,6 +6,7 @@ from datetime import date
 
 from ..schemas import (
     AccountSnapshotPoint,
+    BrokerOrderDispatchData,
     BrokerReconciliationRunData,
     InvestmentInstrumentData,
     InvestmentMarketBarData,
@@ -354,6 +355,7 @@ def build_paper_portfolio_summary(
     snapshots: dict[str, InvestmentMarketSnapshotData],
     policy: QuantInvestmentPolicyData | None = None,
     reconciliations: list[tuple[str, BrokerReconciliationRunData]] | None = None,
+    broker_dispatches: list[tuple[str, BrokerOrderDispatchData]] | None = None,
 ) -> PaperPortfolioSummary:
     states: dict[str, _PositionState] = {}
     warnings: list[str] = []
@@ -418,6 +420,24 @@ def build_paper_portfolio_summary(
             reconciliation_status = "matched"
         elif latest_reconciliation.review_status == "resolved":
             reconciliation_status = "reviewed"
+
+    for dispatch_id, dispatch in broker_dispatches or []:
+        if dispatch.status not in {"dispatching", "uncertain"}:
+            continue
+        frozen = True
+        reconciliation_mismatch = True
+        reconciliation_status = "mismatch"
+        state_text = "发送中断" if dispatch.status == "dispatching" else "返回结果不确定"
+        add_issue(
+            code="broker_dispatch_uncertain",
+            severity="freeze",
+            source="reconciliation",
+            order_id=dispatch.order_id,
+            message=(
+                f"券商动作 {dispatch_id}（{dispatch.action}）{state_text}，已冻结新增；"
+                f"client_order_id={dispatch.client_order_id}，请先查询订单并完成对账"
+            ),
+        )
 
     contributions = 0.0
     cash_balance = 0.0

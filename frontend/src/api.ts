@@ -1,6 +1,7 @@
 import type {
   AccountConceptSummary,
   AffordabilityResult,
+  BrokerOrderDispatchRecord,
   BrokerReconciliationRunRecord,
   CoreObjectGroupSummary,
   CoreObjectRecord,
@@ -192,6 +193,22 @@ export function fetchQuantPaperOrders(householdId: string) {
 
 export function fetchQuantPaperPortfolio(householdId: string) {
   return request<PaperPortfolioSummary>(`/api/quant-investment/paper-portfolio?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function fetchQuantBrokerOrderDispatches(householdId: string) {
+  return request<BrokerOrderDispatchRecord[]>(`/api/quant-investment/broker-order-dispatches?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function retryQuantBrokerOrderDispatch(
+  id: string,
+  householdId: string,
+  reconciliationId: string,
+  reviewNote: string,
+) {
+  return request<BrokerOrderDispatchRecord>(`/api/quant-investment/broker-order-dispatches/${id}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, reconciliation_id: reconciliationId, review_note: reviewNote })
+  });
 }
 
 export function fetchQuantBrokerReconciliations(householdId: string) {

@@ -1316,19 +1316,41 @@ def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
             is_order_persisted=lambda _local_order_id, _client_order_id: True,
             is_order_action_allowed=lambda _local_order_id, _client_order_id, _action: False,
         ).submit(local_order_id="local-order-1", order=order)
+    with pytest.raises(RuntimeError, match="outbox 认领器"):
+        LocalFirstBrokerGateway(
+            PaperBrokerAdapter(),
+            is_order_persisted=lambda _local_order_id, _client_order_id: True,
+            is_order_action_allowed=lambda _local_order_id, _client_order_id, action: action == "submit",
+        ).submit(local_order_id="local-order-1", order=order)
+    completed_actions: list[tuple[str, str, dict[str, object]]] = []
     submitted = LocalFirstBrokerGateway(
         PaperBrokerAdapter(),
         is_order_persisted=lambda _local_order_id, _client_order_id: True,
         is_order_action_allowed=lambda _local_order_id, _client_order_id, action: action == "submit",
+        claim_order_action=lambda _local_order_id, _client_order_id, action: action == "submit",
+        complete_order_action=(
+            lambda _local_order_id, _client_order_id, action, status, response, _error: (
+                completed_actions.append((action, status, response)) or True
+            )
+        ),
     ).submit(local_order_id="local-order-1", order=order)
     assert submitted.status == "simulated"
+    assert completed_actions[0][0:2] == ("submit", "acknowledged")
+    assert completed_actions[0][2]["order"]["client_order_id"] == order.client_order_id
     cancel_requested = order.model_copy(update={"status": "cancel_requested"})
     cancelled = LocalFirstBrokerGateway(
         PaperBrokerAdapter(orders=(cancel_requested,)),
         is_order_persisted=lambda _local_order_id, _client_order_id: True,
         is_order_action_allowed=lambda _local_order_id, _client_order_id, action: action == "cancel",
+        claim_order_action=lambda _local_order_id, _client_order_id, action: action == "cancel",
+        complete_order_action=(
+            lambda _local_order_id, _client_order_id, action, status, response, _error: (
+                completed_actions.append((action, status, response)) or True
+            )
+        ),
     ).cancel(local_order_id="local-order-1", client_order_id=order.client_order_id)
     assert cancelled
+    assert completed_actions[1] == ("cancel", "acknowledged", {"acknowledged": True})
     with pytest.raises(RuntimeError, match="尚未启用"):
         QmtBrokerAdapter().query_cash()
     with pytest.raises(ValueError, match="不能小于订单成交预算"):
@@ -1900,6 +1922,335 @@ def test_persisted_broker_action_gate_follows_order_state_machine(tmp_path, monk
     assert cancel_status == "cancelled"
     assert not allowed("submit")
     assert not allowed("cancel")
+
+
+def test_broker_order_dispatch_is_immutable_and_claimed_once(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.schemas import BrokerOrderDispatchRecord, PaperOrderData
+
+    database.DB_PATH = database.default_db_path()
+    database.initialize_database()
+    order = PaperOrderData(
+        proposal_id="dispatch-proposal",
+        instrument_id="dispatch-instrument",
+        order_amount=1000,
+        estimated_price=1,
+        estimated_quantity=995,
+        estimated_fee=5,
+        cash_contribution_amount=1000,
+    )
+    order_record = database.insert_paper_investment_order(
+        household_id="household-a",
+        proposal_id=order.proposal_id,
+        instrument_id=order.instrument_id,
+        data=order.model_dump(mode="json"),
+    )
+    first, first_status = database.prepare_broker_order_dispatch(
+        order_record["id"],
+        household_id="household-a",
+        client_order_id=order.client_order_id,
+        adapter="paper",
+        action="submit",
+        request_data={"executed_date": "2026-07-01"},
+    )
+    second, second_status = database.prepare_broker_order_dispatch(
+        order_record["id"],
+        household_id="household-a",
+        client_order_id=order.client_order_id,
+        adapter="paper",
+        action="submit",
+        request_data={"executed_date": "2026-07-02"},
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first_status == second_status == "pending"
+    assert first["id"] == second["id"]
+    assert second["data"]["request_data"] == {"executed_date": "2026-07-01"}
+    assert database.claim_broker_order_dispatch(
+        order_record["id"],
+        household_id="household-a",
+        client_order_id=order.client_order_id,
+        adapter="paper",
+        action="submit",
+    )
+    assert not database.claim_broker_order_dispatch(
+        order_record["id"],
+        household_id="household-a",
+        client_order_id=order.client_order_id,
+        adapter="paper",
+        action="submit",
+    )
+    reconciliation = database.insert_broker_reconciliation_run(
+        household_id="household-a",
+        adapter="paper",
+        reconciliation_date="2026-07-19",
+        data={
+            "adapter": "paper",
+            "reconciliation_date": "2026-07-19",
+            "matched": True,
+            "freeze_new_orders": False,
+            "review_status": "not_required",
+            "local_state_hash": "a" * 64,
+            "remote_state_hash": "a" * 64,
+            "local_order_count": 1,
+            "remote_order_count": 1,
+            "local_position_count": 0,
+            "remote_position_count": 0,
+            "local_cash": 0,
+            "remote_cash": 0,
+        },
+    )
+    _active_dispatch, active_review_status = database.review_broker_order_dispatch_for_retry(
+        first["id"],
+        household_id="household-a",
+        reconciliation_id=reconciliation["id"],
+        review_note="发送仍在失联窗口内，不应提前解锁",
+    )
+    assert active_review_status == "dispatch_still_active"
+    assert database.complete_broker_order_dispatch(
+        order_record["id"],
+        household_id="household-a",
+        client_order_id=order.client_order_id,
+        adapter="paper",
+        action="submit",
+        status="acknowledged",
+        response_data={"order": order.model_copy(update={"status": "simulated"}).model_dump(mode="json")},
+    )
+    dispatch = BrokerOrderDispatchRecord.model_validate(
+        database.list_broker_order_dispatches(household_id="household-a")[0]
+    )
+    assert dispatch.data.status == "acknowledged"
+    assert dispatch.data.attempt_count == 1
+    assert dispatch.data.acknowledged_at
+    assert dispatch.data.response_data["order"]["client_order_id"] == order.client_order_id
+
+
+def test_acknowledged_broker_dispatch_recovers_fill_without_resubmission(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.broker_adapters import PaperBrokerAdapter
+    from app.main import app
+    from app.schemas import PaperOrderData
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        created = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "recovery-proposal",
+                    "instrument_id": "recovery-instrument",
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                    "cash_contribution_amount": 1000,
+                },
+            },
+        ).json()
+        order = PaperOrderData.model_validate(created["data"])
+        trade_date = date.today().isoformat()
+        request_data = {
+            "order": order.model_dump(mode="json"),
+            "executed_date": trade_date,
+            "executed_price": None,
+        }
+        simulated = PaperBrokerAdapter(execution_date=trade_date).submit(order)
+        dispatch, _status = database.prepare_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+            request_data=request_data,
+        )
+        assert dispatch is not None
+        assert database.claim_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+        )
+        assert database.complete_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+            status="acknowledged",
+            response_data={"order": simulated.model_dump(mode="json")},
+        )
+        recovered = client.post(
+            f"/api/quant-investment/paper-orders/{created['id']}/simulate",
+            json={"household_id": household_id, "executed_date": trade_date},
+        )
+        repeated = client.post(
+            f"/api/quant-investment/paper-orders/{created['id']}/simulate",
+            json={"household_id": household_id, "executed_date": trade_date},
+        )
+        fills = client.get(
+            "/api/quant-investment/paper-fills",
+            params={"household_id": household_id},
+        ).json()
+        dispatches = client.get(
+            "/api/quant-investment/broker-order-dispatches",
+            params={"household_id": household_id, "order_id": created["id"]},
+        ).json()
+
+    assert recovered.status_code == 200
+    assert recovered.json()["data"]["status"] == "simulated"
+    assert repeated.json() == recovered.json()
+    assert len(fills) == 1
+    assert len(dispatches) == 1
+    assert dispatches[0]["data"]["status"] == "acknowledged"
+    assert dispatches[0]["data"]["attempt_count"] == 1
+
+
+def test_uncertain_broker_dispatch_requires_new_reconciliation_before_retry(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+    from app.schemas import PaperOrderData
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        created = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "uncertain-proposal",
+                    "instrument_id": "uncertain-instrument",
+                    "order_amount": 1000,
+                    "estimated_price": 1,
+                    "estimated_quantity": 995,
+                    "estimated_fee": 5,
+                    "cash_contribution_amount": 1000,
+                },
+            },
+        ).json()
+        order = PaperOrderData.model_validate(created["data"])
+        trade_date = date.today().isoformat()
+        dispatch, _status = database.prepare_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+            request_data={
+                "order": order.model_dump(mode="json"),
+                "executed_date": trade_date,
+                "executed_price": None,
+            },
+        )
+        assert dispatch is not None
+        assert database.claim_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+        )
+        assert database.complete_broker_order_dispatch(
+            created["id"],
+            household_id=household_id,
+            client_order_id=order.client_order_id,
+            adapter="paper",
+            action="submit",
+            status="uncertain",
+            error_message="连接在适配器返回前中断",
+        )
+        portfolio = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        blocked_dispatch = client.get(
+            "/api/quant-investment/broker-order-dispatches",
+            params={"household_id": household_id, "order_id": created["id"]},
+        ).json()[0]
+        retry = client.post(
+            f"/api/quant-investment/paper-orders/{created['id']}/simulate",
+            json={"household_id": household_id, "executed_date": trade_date},
+        )
+        wrong_adapter_reconciliation = database.insert_broker_reconciliation_run(
+            household_id=household_id,
+            adapter="qmt",
+            reconciliation_date=trade_date,
+            data={
+                "adapter": "qmt",
+                "reconciliation_date": trade_date,
+                "matched": True,
+                "freeze_new_orders": False,
+                "review_status": "not_required",
+                "local_state_hash": "a" * 64,
+                "remote_state_hash": "a" * 64,
+                "local_order_count": 1,
+                "remote_order_count": 1,
+                "local_position_count": 0,
+                "remote_position_count": 0,
+                "local_cash": 0,
+                "remote_cash": 0,
+            },
+        )
+        wrong_adapter_review = client.post(
+            f"/api/quant-investment/broker-order-dispatches/{dispatch['id']}/retry",
+            json={
+                "household_id": household_id,
+                "reconciliation_id": wrong_adapter_reconciliation["id"],
+                "review_note": "错误适配器的对账不能解除冻结",
+            },
+        )
+        reconciliation = client.post(
+            "/api/quant-investment/broker-reconciliations/paper",
+            json={"household_id": household_id},
+        )
+        eligible_dispatch = client.get(
+            "/api/quant-investment/broker-order-dispatches",
+            params={"household_id": household_id, "order_id": created["id"]},
+        ).json()[0]
+        reviewed = client.post(
+            f"/api/quant-investment/broker-order-dispatches/{dispatch['id']}/retry",
+            json={
+                "household_id": household_id,
+                "reconciliation_id": reconciliation.json()["id"],
+                "review_note": "已核对订单、持仓和现金，确认可以按原 client_order_id 重试",
+            },
+        )
+        released = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        resubmitted = client.post(
+            f"/api/quant-investment/paper-orders/{created['id']}/simulate",
+            json={"household_id": household_id, "executed_date": trade_date},
+        )
+
+    assert portfolio["frozen"]
+    assert portfolio["reconciliation_status"] == "mismatch"
+    assert {issue["code"] for issue in portfolio["post_trade_risk_issues"]} == {"broker_dispatch_uncertain"}
+    assert not blocked_dispatch["retry_eligible"]
+    assert blocked_dispatch["retry_block_reason"]
+    assert retry.status_code == 409
+    assert "事后风控已冻结" in retry.json()["detail"]
+    assert wrong_adapter_review.status_code == 409
+    assert "不属于同一适配器" in wrong_adapter_review.json()["detail"]
+    assert reconciliation.status_code == 200
+    assert reconciliation.json()["data"]["matched"]
+    assert eligible_dispatch["retry_eligible"]
+    assert eligible_dispatch["eligible_reconciliation_id"] == reconciliation.json()["id"]
+    assert reviewed.status_code == 200
+    assert reviewed.json()["data"]["status"] == "retryable"
+    assert reviewed.json()["data"]["reconciliation_id"] == reconciliation.json()["id"]
+    assert reviewed.json()["data"]["review_note"]
+    assert not released["frozen"]
+    assert resubmitted.status_code == 200
+    assert resubmitted.json()["data"]["status"] == "simulated"
 
 
 def test_persisted_reconciliation_mismatch_latches_freeze_until_manual_review(tmp_path, monkeypatch) -> None:

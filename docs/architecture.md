@@ -62,7 +62,9 @@ flowchart LR
 
   Recorder schema v2 保存不可变 `universe_snapshot`、逐标的 `execution_assumptions`、全局成本、策略/引擎版本、数据集版本与完整结果，使历史运行可以脱离当前标的配置解释。Recorder schema 版本进入指纹，修改当前费率只生成新运行、不回写旧记录；v1 记录通过新增字段默认值继续只读兼容。
 
-  `client_order_id` 由 SQLite 全局唯一索引强制，而不只依赖 UUID 默认值。数据库迁移先规范缺失、非法或重复的历史订单号并同步成交/取消事件引用，再创建索引；同订单重试复用原记录，不同订单号冲突由 API 返回 `409`。这使 `LocalFirstBrokerGateway` 的持久化校验拥有稳定且唯一的券商幂等键。Gateway 还要求动作级状态校验：`submit` 仅接受 `proposed`，`cancel` 仅接受 `cancel_requested`；身份匹配但状态不符仍禁止调用适配器，QMT 启用前还需另建持久化提交事件/outbox。
+  `client_order_id` 由 SQLite 全局唯一索引强制，而不只依赖 UUID 默认值。数据库迁移先规范缺失、非法或重复的历史订单号并同步成交/取消事件引用，再创建索引；同订单重试复用原记录，不同订单号冲突由 API 返回 `409`。这使 `LocalFirstBrokerGateway` 的持久化校验拥有稳定且唯一的券商幂等键。Gateway 还要求动作级状态校验：`submit` 仅接受 `proposed`，`cancel` 仅接受 `cancel_requested`；身份匹配但状态不符仍禁止调用适配器。
+
+  `broker_order_dispatches` 是券商动作的持久化 outbox。请求参数先以 `pending` 状态不可变落库，Gateway 原子认领为 `dispatching` 后才调用适配器，响应再保存为 `acknowledged`；调用异常或进程中断形成的 `dispatching/uncertain` 会进入 `PostTradeRiskIssue` 并冻结新增，不能自动重发。已确认响应与成交事务之间中断时，模拟成交 API 从 outbox 响应补齐唯一成交。仍在五分钟发送窗口内的 `dispatching` 不允许复核为可重试；只有同一适配器、晚于异常或失联窗口的一致对账和人工复核说明同时存在，动作才转为 `retryable`，并继续使用原请求及原 `client_order_id`。API 派生 `retry_eligible`、可用对账记录和阻塞原因，前端只展示后端判定，不自行计算发送窗口或对账资格。outbox 状态变化与家庭量化数据版本在同一 SQLite 事务更新，使缓存不会掩盖发送异常。QMT 仍保持禁用；后续接入时复用该边界，不另建绕过 outbox 的发送路径。
 
 - `scripts/perf_calculation_sample.py`
   固定性能样例脚本。它强制使用临时 SQLite 数据库，默认开启 `HOUSE_PLANNER_PROFILE=1`，通过 FastAPI TestClient 对同一份基准输入连续执行冷启动和缓存命中两次计算，并输出总耗时、cache layer、策略数量和月度账本行数。做计算速度优化前后，应先运行这个脚本保存对比口径，再决定是否需要更完整的业务一致性回归。

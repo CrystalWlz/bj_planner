@@ -17,6 +17,9 @@ from .database import (
     InvalidClientOrderIdError,
     delete_record,
     bump_quant_investment_data_version,
+    broker_order_dispatch_retry_eligibility,
+    claim_broker_order_dispatch,
+    complete_broker_order_dispatch,
     confirm_paper_order_cancel,
     delete_quant_scoped_record,
     delete_planning_goal_record,
@@ -33,6 +36,7 @@ from .database import (
     insert_scenario_record,
     list_core_object_records,
     list_broker_reconciliation_runs,
+    list_broker_order_dispatches,
     list_generated_strategies,
     list_generated_strategies_for_cache_layers,
     list_household_records,
@@ -66,7 +70,9 @@ from .database import (
     record_paper_fill_atomic,
     paper_order_action_is_allowed,
     paper_order_is_persisted,
+    prepare_broker_order_dispatch,
     request_paper_order_cancel,
+    review_broker_order_dispatch_for_retry,
     resolve_broker_reconciliation_run,
     upsert_quant_backtest_run,
 )
@@ -107,6 +113,9 @@ from .schemas import (
     BrokerReconciliationReviewRequest,
     BrokerReconciliationRunData,
     BrokerReconciliationRunRecord,
+    BrokerOrderDispatchData,
+    BrokerOrderDispatchRecord,
+    BrokerOrderDispatchRetryRequest,
     CalculationContextSnapshot,
     CoreObjectGroupSummary,
     CoreObjectRecord,
@@ -148,7 +157,9 @@ from .schemas import (
     InvestmentMarketSnapshotRecord,
     PaperOrderCreate,
     PaperOrderCancelRequest,
+    PaperOrderData,
     PaperOrderEventRecord,
+    PaperFillData,
     PaperFillRecord,
     PaperOrderRecord,
     PaperOrderSimulateRequest,
@@ -761,6 +772,99 @@ def get_quant_backtest_runs(household_id: str) -> list[dict]:
     return list_quant_backtest_runs(household_id=household_id)
 
 
+def _paper_broker_gateway(
+    *,
+    household_id: str,
+    adapter: PaperBrokerAdapter,
+) -> LocalFirstBrokerGateway:
+    return LocalFirstBrokerGateway(
+        adapter,
+        is_order_persisted=lambda local_order_id, client_order_id: paper_order_is_persisted(
+            local_order_id,
+            household_id=household_id,
+            client_order_id=client_order_id,
+        ),
+        is_order_action_allowed=lambda local_order_id, client_order_id, action: paper_order_action_is_allowed(
+            local_order_id,
+            household_id=household_id,
+            client_order_id=client_order_id,
+            action=action,
+        ),
+        claim_order_action=lambda local_order_id, client_order_id, action: claim_broker_order_dispatch(
+            local_order_id,
+            household_id=household_id,
+            client_order_id=client_order_id,
+            adapter="paper",
+            action=action,
+        ),
+        complete_order_action=(
+            lambda local_order_id, client_order_id, action, status, response_data, error_message: complete_broker_order_dispatch(
+                local_order_id,
+                household_id=household_id,
+                client_order_id=client_order_id,
+                adapter="paper",
+                action=action,
+                status=status,
+                response_data=response_data,
+                error_message=error_message,
+            )
+        ),
+    )
+
+
+@app.get("/api/quant-investment/broker-order-dispatches", response_model=list[BrokerOrderDispatchRecord])
+def get_quant_broker_order_dispatches(
+    household_id: str,
+    order_id: str | None = None,
+) -> list[dict]:
+    dispatches = list_broker_order_dispatches(household_id=household_id, order_id=order_id)
+    reconciliations = list_broker_reconciliation_runs(household_id=household_id)
+    result: list[dict] = []
+    for dispatch in dispatches:
+        retry_eligible, reconciliation_id, block_reason = broker_order_dispatch_retry_eligibility(
+            dispatch,
+            reconciliations,
+        )
+        result.append(
+            {
+                **dispatch,
+                "retry_eligible": retry_eligible,
+                "eligible_reconciliation_id": reconciliation_id,
+                "retry_block_reason": block_reason,
+            }
+        )
+    return result
+
+
+@app.post(
+    "/api/quant-investment/broker-order-dispatches/{record_id}/retry",
+    response_model=BrokerOrderDispatchRecord,
+)
+def retry_quant_broker_order_dispatch(
+    record_id: str,
+    payload: BrokerOrderDispatchRetryRequest,
+) -> dict:
+    record, status = review_broker_order_dispatch_for_retry(
+        record_id,
+        household_id=payload.household_id,
+        reconciliation_id=payload.reconciliation_id,
+        review_note=payload.review_note,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="未找到券商发送动作")
+    error_messages = {
+        "not_reviewable": "该券商发送动作不处于结果不确定状态",
+        "dispatch_still_active": "券商动作仍可能处于发送中，请等待失联窗口结束后重新对账",
+        "reconciliation_not_found": "未找到用于复核的对账记录",
+        "reconciliation_adapter_mismatch": "对账记录与券商发送动作不属于同一适配器",
+        "reconciliation_not_matched": "对账仍存在差异，不能重新发送订单",
+        "reconciliation_too_old": "对账记录早于本次发送异常，请重新执行对账",
+    }
+    if status in error_messages:
+        raise HTTPException(status_code=409, detail=error_messages[status])
+    return record
+
+
 @app.get("/api/quant-investment/broker-reconciliations", response_model=list[BrokerReconciliationRunRecord])
 def get_quant_broker_reconciliations(household_id: str) -> list[dict]:
     return list_broker_reconciliation_runs(household_id=household_id)
@@ -890,6 +994,10 @@ def _paper_portfolio_for_household(
         (item["id"], BrokerReconciliationRunRecord.model_validate(item).data)
         for item in list_broker_reconciliation_runs(household_id=household_id)
     ]
+    dispatches = [
+        (item["id"], BrokerOrderDispatchRecord.model_validate(item).data)
+        for item in list_broker_order_dispatches(household_id=household_id)
+    ]
     return build_paper_portfolio_summary(
         household_id=household_id,
         fills=fills,
@@ -897,6 +1005,7 @@ def _paper_portfolio_for_household(
         snapshots=snapshots,
         policy=policy,
         reconciliations=reconciliations,
+        broker_dispatches=dispatches,
     )
 
 
@@ -924,28 +1033,33 @@ def cancel_quant_paper_order(record_id: str, payload: PaperOrderCancelRequest) -
     if request_status == "already_cancelled":
         return requested
     requested_order = PaperOrderRecord.model_validate(requested)
-    adapter = PaperBrokerAdapter(orders=(requested_order.data,))
-    gateway = LocalFirstBrokerGateway(
-        adapter,
-        is_order_persisted=lambda local_order_id, client_order_id: paper_order_is_persisted(
-            local_order_id,
-            household_id=payload.household_id,
-            client_order_id=client_order_id,
-        ),
-        is_order_action_allowed=lambda local_order_id, client_order_id, action: paper_order_action_is_allowed(
-            local_order_id,
-            household_id=payload.household_id,
-            client_order_id=client_order_id,
-            action=action,
-        ),
+    dispatch, dispatch_status = prepare_broker_order_dispatch(
+        record_id,
+        household_id=payload.household_id,
+        client_order_id=requested_order.data.client_order_id,
+        adapter="paper",
+        action="cancel",
+        request_data={"client_order_id": requested_order.data.client_order_id},
     )
-    try:
-        acknowledged = gateway.cancel(
-            local_order_id=record_id,
-            client_order_id=requested_order.data.client_order_id,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if dispatch is None:
+        if dispatch_status == "action_not_allowed":
+            raise HTTPException(status_code=409, detail="订单当前状态不允许发送取消动作")
+        raise HTTPException(status_code=409, detail="模拟订单取消动作未能写入本地 outbox")
+    if dispatch_status in {"dispatching", "uncertain"}:
+        raise HTTPException(status_code=409, detail="取消结果尚未确定，请先核验模拟账户状态后再重试")
+    if dispatch_status == "acknowledged":
+        acknowledged = bool(dispatch["data"].get("response_data", {}).get("acknowledged"))
+    else:
+        adapter = PaperBrokerAdapter(orders=(requested_order.data,))
+        gateway = _paper_broker_gateway(household_id=payload.household_id, adapter=adapter)
+        try:
+            acknowledged = gateway.cancel(
+                local_order_id=record_id,
+                client_order_id=requested_order.data.client_order_id,
+            )
+        except RuntimeError as exc:
+            bump_quant_investment_data_version(payload.household_id)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not acknowledged:
         raise HTTPException(status_code=409, detail="适配器尚未确认取消，订单保持取消请求状态")
     cancelled, confirm_status = confirm_paper_order_cancel(
@@ -960,6 +1074,40 @@ def cancel_quant_paper_order(record_id: str, payload: PaperOrderCancelRequest) -
     if confirm_status == "cancelled":
         bump_quant_investment_data_version(payload.household_id)
     return cancelled
+
+
+def _validate_paper_fill_before_persist(
+    *,
+    household_id: str,
+    order: PaperOrderData,
+    fill: PaperFillData,
+    fill_records: list[dict],
+) -> None:
+    _instruments, market_snapshots = _quant_snapshot_map(household_id)
+    market_snapshot_entry = market_snapshots.get(order.instrument_id)
+    if market_snapshot_entry is not None:
+        execution_allowed, execution_reason = execution_session_is_allowed(
+            market_snapshot_entry[1],
+            execution_date=fill.executed_date,
+            side=fill.side,
+        )
+        if not execution_allowed:
+            raise HTTPException(status_code=409, detail=execution_reason)
+    persisted_fills = [PaperFillRecord.model_validate(item).data for item in fill_records]
+    prior_fills = [item for item in persisted_fills if item.executed_date <= fill.executed_date]
+    if order.side == "buy" and order.funding_source == "paper_cash":
+        available_cash = sum(item.contribution_amount + item.cash_change for item in prior_fills)
+        required_cash = max(0.0, -fill.cash_change)
+        if required_cash > available_cash + 1e-6:
+            raise HTTPException(status_code=409, detail="成交日模拟现金不足；请先成交更早的再平衡卖出订单或降低买入金额")
+    if order.side == "sell":
+        available_quantity = sum(
+            item.executed_quantity if item.side == "buy" else -item.executed_quantity
+            for item in prior_fills
+            if item.instrument_id == order.instrument_id
+        )
+        if fill.executed_quantity > available_quantity + 1e-6:
+            raise HTTPException(status_code=409, detail="成交日模拟卖出数量超过当前可用持仓")
 
 
 @app.post("/api/quant-investment/paper-orders/{record_id}/simulate", response_model=PaperOrderRecord)
@@ -977,49 +1125,114 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
         raise HTTPException(status_code=409, detail="模拟账户事后风控已冻结新增买入；请先人工复核异常")
     fill_records = list_paper_investment_fills(household_id=payload.household_id)
     fill_existed = any(item["order_id"] == record_id for item in fill_records)
+    dispatch: dict | None = None
+    dispatch_status = ""
+    adapter: PaperBrokerAdapter | None = None
     if order.data.status == "simulated":
         simulated = order.data
     else:
-        try:
-            simulated = PaperBrokerAdapter().simulate(
-                order.data,
-                executed_date=payload.executed_date,
-                executed_price=payload.executed_price,
+        requested_data = {
+            "order": order.data.model_dump(mode="json"),
+            "executed_date": payload.executed_date,
+            "executed_price": payload.executed_price,
+        }
+        dispatch = next(
+            (
+                item
+                for item in list_broker_order_dispatches(
+                    household_id=payload.household_id,
+                    order_id=record_id,
+                )
+                if item["adapter"] == "paper" and item["action"] == "submit"
+            ),
+            None,
+        )
+        if dispatch is None:
+            preview_adapter = PaperBrokerAdapter(
+                execution_date=payload.executed_date,
+                execution_price=payload.executed_price,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                preview_order = preview_adapter.simulate(
+                    order.data,
+                    executed_date=preview_adapter.execution_date,
+                    executed_price=preview_adapter.execution_price,
+                )
+                preview_fill = paper_fill_from_order(record_id, preview_order)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            _validate_paper_fill_before_persist(
+                household_id=payload.household_id,
+                order=order.data,
+                fill=preview_fill,
+                fill_records=fill_records,
+            )
+            dispatch, dispatch_status = prepare_broker_order_dispatch(
+                record_id,
+                household_id=payload.household_id,
+                client_order_id=order.data.client_order_id,
+                adapter="paper",
+                action="submit",
+                request_data=requested_data,
+            )
+            if dispatch is None:
+                if dispatch_status == "action_not_allowed":
+                    raise HTTPException(status_code=409, detail="订单当前状态不允许发送模拟成交动作")
+                raise HTTPException(status_code=409, detail="模拟成交动作未能写入本地 outbox")
+        else:
+            dispatch_status = str(dispatch["status"])
+        if dispatch_status in {"dispatching", "uncertain"}:
+            raise HTTPException(status_code=409, detail="模拟成交结果尚未确定，请先核验模拟账户状态后再重试")
+        dispatch_data = BrokerOrderDispatchData.model_validate(dispatch["data"])
+        request_data = dispatch_data.request_data
+        if dispatch_status in {"pending", "retryable"} and request_data != requested_data:
+            raise HTTPException(status_code=409, detail="该订单已有不同参数的待发送动作；请按原成交日期和价格重试")
+        try:
+            if dispatch_status == "acknowledged":
+                simulated = PaperOrderData.model_validate(dispatch_data.response_data["order"])
+            else:
+                adapter = PaperBrokerAdapter(
+                    execution_date=str(request_data.get("executed_date") or ""),
+                    execution_price=request_data.get("executed_price"),
+                )
+                simulated = adapter.simulate(
+                    order.data,
+                    executed_date=adapter.execution_date,
+                    executed_price=adapter.execution_price,
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"模拟成交 outbox 数据无效：{exc}") from exc
     try:
         fill = paper_fill_from_order(record_id, simulated)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if order.data.status == "proposed":
-        _instruments, market_snapshots = _quant_snapshot_map(payload.household_id)
-        market_snapshot_entry = market_snapshots.get(order.data.instrument_id)
-        if market_snapshot_entry is not None:
-            execution_allowed, execution_reason = execution_session_is_allowed(
-                market_snapshot_entry[1],
-                execution_date=fill.executed_date,
-                side=fill.side,
+        _validate_paper_fill_before_persist(
+            household_id=payload.household_id,
+            order=order.data,
+            fill=fill,
+            fill_records=fill_records,
+        )
+        if dispatch_status in {"pending", "retryable"}:
+            if adapter is None:
+                raise HTTPException(status_code=409, detail="模拟成交适配器尚未准备完成")
+            gateway = _paper_broker_gateway(household_id=payload.household_id, adapter=adapter)
+            try:
+                simulated = gateway.submit(local_order_id=record_id, order=order.data)
+            except (RuntimeError, ValueError) as exc:
+                bump_quant_investment_data_version(payload.household_id)
+                status_code = 422 if isinstance(exc, ValueError) else 409
+                raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+            try:
+                fill = paper_fill_from_order(record_id, simulated)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            _validate_paper_fill_before_persist(
+                household_id=payload.household_id,
+                order=order.data,
+                fill=fill,
+                fill_records=fill_records,
             )
-            if not execution_allowed:
-                raise HTTPException(status_code=409, detail=execution_reason)
-        persisted_fills = [PaperFillRecord.model_validate(item).data for item in fill_records]
-        prior_fills = [
-            item for item in persisted_fills if item.executed_date <= fill.executed_date
-        ]
-        if order.data.side == "buy" and order.data.funding_source == "paper_cash":
-            available_cash = sum(item.contribution_amount + item.cash_change for item in prior_fills)
-            required_cash = max(0.0, -fill.cash_change)
-            if required_cash > available_cash + 1e-6:
-                raise HTTPException(status_code=409, detail="成交日模拟现金不足；请先成交更早的再平衡卖出订单或降低买入金额")
-        if order.data.side == "sell":
-            available_quantity = sum(
-                item.executed_quantity if item.side == "buy" else -item.executed_quantity
-                for item in prior_fills
-                if item.instrument_id == order.data.instrument_id
-            )
-            if fill.executed_quantity > available_quantity + 1e-6:
-                raise HTTPException(status_code=409, detail="成交日模拟卖出数量超过当前可用持仓")
     record, fill_record = record_paper_fill_atomic(
         record_id,
         household_id=payload.household_id,

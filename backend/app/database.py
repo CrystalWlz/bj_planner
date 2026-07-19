@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 import zlib
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -223,6 +223,24 @@ def initialize_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_paper_investment_order_events_household
                 ON paper_investment_order_events(household_id, created_at ASC);
+
+            CREATE TABLE IF NOT EXISTS broker_order_dispatches (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                client_order_id TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(order_id, adapter, action),
+                UNIQUE(client_order_id, adapter, action)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_broker_order_dispatches_household
+                ON broker_order_dispatches(household_id, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS quant_backtest_runs (
                 id TEXT PRIMARY KEY,
@@ -1062,16 +1080,23 @@ def delete_quant_scoped_record(table: str, record_id: str, *, household_id: str)
 def bump_quant_investment_data_version(household_id: str) -> None:
     """Invalidate affordability input cache when a selected local market input changes."""
     with get_connection() as conn:
-        row = conn.execute("SELECT data FROM households WHERE id = ?", (household_id,)).fetchone()
-        if row is None:
-            return
-        household = _load_json(row["data"])
-        household["quant_investment_data_version"] = max(0, int(household.get("quant_investment_data_version") or 0)) + 1
-        normalized = _normalize_household(household)
-        conn.execute(
-            "UPDATE households SET data = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(normalized, ensure_ascii=False), now_iso(), household_id),
-        )
+        _bump_quant_investment_data_version_in_connection(conn, household_id)
+
+
+def _bump_quant_investment_data_version_in_connection(
+    conn: sqlite3.Connection,
+    household_id: str,
+) -> None:
+    row = conn.execute("SELECT data FROM households WHERE id = ?", (household_id,)).fetchone()
+    if row is None:
+        return
+    household = _load_json(row["data"])
+    household["quant_investment_data_version"] = max(0, int(household.get("quant_investment_data_version") or 0)) + 1
+    normalized = _normalize_household(household)
+    conn.execute(
+        "UPDATE households SET data = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(normalized, ensure_ascii=False), now_iso(), household_id),
+    )
 
 
 def upsert_investment_market_snapshot(
@@ -1380,6 +1405,333 @@ def list_paper_order_events(*, household_id: str, order_id: str | None = None) -
         record["data"] = _load_json(record["data"])
         result.append(record)
     return result
+
+
+def _broker_order_dispatch_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["data"] = _load_json(record["data"])
+    return record
+
+
+def list_broker_order_dispatches(
+    *,
+    household_id: str,
+    order_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["household_id = ?"]
+    params: list[Any] = [household_id]
+    if order_id:
+        clauses.append("order_id = ?")
+        params.append(order_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM broker_order_dispatches
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            """,
+            params,
+        ).fetchall()
+    return [_broker_order_dispatch_record(row) for row in rows]
+
+
+def broker_order_dispatch_retry_eligibility(
+    dispatch: dict[str, Any],
+    reconciliations: list[dict[str, Any]],
+    *,
+    current_time: datetime | None = None,
+) -> tuple[bool, str, str]:
+    status = str(dispatch.get("status") or "")
+    if status not in {"dispatching", "uncertain"}:
+        return False, "", "券商动作不处于结果待复核状态"
+    data = dispatch.get("data") if isinstance(dispatch.get("data"), dict) else {}
+    now = current_time or datetime.now(timezone.utc)
+    try:
+        if status == "dispatching":
+            minimum_reconciliation_at = datetime.fromisoformat(str(data.get("last_attempt_at") or "")) + timedelta(minutes=5)
+            if minimum_reconciliation_at.tzinfo is None:
+                minimum_reconciliation_at = minimum_reconciliation_at.replace(tzinfo=timezone.utc)
+            if now < minimum_reconciliation_at:
+                return False, "", "券商动作仍在五分钟发送窗口内"
+        else:
+            minimum_reconciliation_at = datetime.fromisoformat(str(dispatch.get("updated_at") or ""))
+            if minimum_reconciliation_at.tzinfo is None:
+                minimum_reconciliation_at = minimum_reconciliation_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False, "", "券商动作时间记录无效"
+    for reconciliation in reconciliations:
+        if str(reconciliation.get("adapter") or "") != str(dispatch.get("adapter") or ""):
+            continue
+        reconciliation_data = (
+            reconciliation.get("data")
+            if isinstance(reconciliation.get("data"), dict)
+            else {}
+        )
+        if not bool(reconciliation_data.get("matched")) or bool(reconciliation_data.get("freeze_new_orders")):
+            continue
+        try:
+            created_at = datetime.fromisoformat(str(reconciliation.get("created_at") or ""))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if created_at >= minimum_reconciliation_at:
+            return True, str(reconciliation.get("id") or ""), ""
+    return False, "", "缺少同一适配器在发送异常之后的一致对账"
+
+
+def prepare_broker_order_dispatch(
+    order_id: str,
+    *,
+    household_id: str,
+    client_order_id: str,
+    adapter: str,
+    action: str,
+    request_data: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    if adapter not in {"paper", "qmt"} or action not in {"submit", "cancel"}:
+        raise ValueError("不支持的券商适配器或订单动作")
+    timestamp = now_iso()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order_row = conn.execute(
+            "SELECT data FROM paper_investment_orders WHERE id = ? AND household_id = ?",
+            (order_id, household_id),
+        ).fetchone()
+        if order_row is None:
+            return None, "not_found"
+        order_data = _load_json(order_row["data"])
+        if str(order_data.get("client_order_id") or "") != client_order_id:
+            return None, "identity_mismatch"
+        existing = conn.execute(
+            """
+            SELECT * FROM broker_order_dispatches
+            WHERE order_id = ? AND adapter = ? AND action = ?
+            """,
+            (order_id, adapter, action),
+        ).fetchone()
+        if existing is not None:
+            return _broker_order_dispatch_record(existing), str(existing["status"])
+        allowed_status = {"submit": "proposed", "cancel": "cancel_requested"}[action]
+        if str(order_data.get("status") or "proposed") != allowed_status:
+            return None, "action_not_allowed"
+        record_id = str(uuid.uuid4())
+        data = {
+            "schema_version": 1,
+            "adapter": adapter,
+            "action": action,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "status": "pending",
+            "attempt_count": 0,
+            "last_attempt_at": "",
+            "acknowledged_at": "",
+            "reviewed_at": "",
+            "review_note": "",
+            "reconciliation_id": "",
+            "error_message": "",
+            "request_data": request_data or {},
+            "response_data": {},
+        }
+        conn.execute(
+            """
+            INSERT INTO broker_order_dispatches
+                (id, household_id, order_id, client_order_id, adapter, action, status, data, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                record_id,
+                household_id,
+                order_id,
+                client_order_id,
+                adapter,
+                action,
+                json.dumps(data, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+        _bump_quant_investment_data_version_in_connection(conn, household_id)
+        row = conn.execute("SELECT * FROM broker_order_dispatches WHERE id = ?", (record_id,)).fetchone()
+    return (_broker_order_dispatch_record(row) if row else None), "pending"
+
+
+def claim_broker_order_dispatch(
+    order_id: str,
+    *,
+    household_id: str,
+    client_order_id: str,
+    adapter: str,
+    action: str,
+) -> bool:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM broker_order_dispatches
+            WHERE household_id = ? AND order_id = ? AND client_order_id = ?
+              AND adapter = ? AND action = ?
+            """,
+            (household_id, order_id, client_order_id, adapter, action),
+        ).fetchone()
+        if row is None or str(row["status"]) not in {"pending", "retryable"}:
+            return False
+        data = _load_json(row["data"])
+        data.update(
+            {
+                "status": "dispatching",
+                "attempt_count": int(data.get("attempt_count") or 0) + 1,
+                "last_attempt_at": timestamp,
+                "error_message": "",
+            }
+        )
+        cursor = conn.execute(
+            """
+            UPDATE broker_order_dispatches
+            SET status = 'dispatching', data = ?, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'retryable')
+            """,
+            (json.dumps(data, ensure_ascii=False), timestamp, row["id"]),
+        )
+        if cursor.rowcount == 1:
+            _bump_quant_investment_data_version_in_connection(conn, household_id)
+    return cursor.rowcount == 1
+
+
+def complete_broker_order_dispatch(
+    order_id: str,
+    *,
+    household_id: str,
+    client_order_id: str,
+    adapter: str,
+    action: str,
+    status: str,
+    response_data: dict[str, Any] | None = None,
+    error_message: str = "",
+) -> bool:
+    if status not in {"acknowledged", "uncertain"}:
+        raise ValueError("券商动作只能完成为 acknowledged 或 uncertain")
+    if status == "uncertain" and not error_message:
+        error_message = "适配器调用结果不确定，未返回错误说明"
+    timestamp = now_iso()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM broker_order_dispatches
+            WHERE household_id = ? AND order_id = ? AND client_order_id = ?
+              AND adapter = ? AND action = ?
+            """,
+            (household_id, order_id, client_order_id, adapter, action),
+        ).fetchone()
+        if row is None:
+            return False
+        if str(row["status"]) == status:
+            return True
+        if str(row["status"]) != "dispatching":
+            return False
+        data = _load_json(row["data"])
+        data.update(
+            {
+                "status": status,
+                "acknowledged_at": timestamp if status == "acknowledged" else "",
+                "error_message": error_message if status == "uncertain" else "",
+                "response_data": response_data or {},
+            }
+        )
+        cursor = conn.execute(
+            """
+            UPDATE broker_order_dispatches
+            SET status = ?, data = ?, updated_at = ?
+            WHERE id = ? AND status = 'dispatching'
+            """,
+            (status, json.dumps(data, ensure_ascii=False), timestamp, row["id"]),
+        )
+        if cursor.rowcount == 1:
+            _bump_quant_investment_data_version_in_connection(conn, household_id)
+    return cursor.rowcount == 1
+
+
+def review_broker_order_dispatch_for_retry(
+    record_id: str,
+    *,
+    household_id: str,
+    reconciliation_id: str,
+    review_note: str,
+) -> tuple[dict[str, Any] | None, str]:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM broker_order_dispatches WHERE id = ? AND household_id = ?",
+            (record_id, household_id),
+        ).fetchone()
+        if row is None:
+            return None, "not_found"
+        if str(row["status"]) == "retryable":
+            return _broker_order_dispatch_record(row), "already_retryable"
+        if str(row["status"]) not in {"dispatching", "uncertain"}:
+            return _broker_order_dispatch_record(row), "not_reviewable"
+        minimum_reconciliation_at: datetime
+        if str(row["status"]) == "dispatching":
+            data = _load_json(row["data"])
+            try:
+                last_attempt_at = datetime.fromisoformat(str(data.get("last_attempt_at") or ""))
+                if last_attempt_at.tzinfo is None:
+                    last_attempt_at = last_attempt_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return _broker_order_dispatch_record(row), "dispatch_still_active"
+            minimum_reconciliation_at = last_attempt_at + timedelta(minutes=5)
+            if datetime.now(timezone.utc) < minimum_reconciliation_at:
+                return _broker_order_dispatch_record(row), "dispatch_still_active"
+        else:
+            try:
+                minimum_reconciliation_at = datetime.fromisoformat(str(row["updated_at"]))
+                if minimum_reconciliation_at.tzinfo is None:
+                    minimum_reconciliation_at = minimum_reconciliation_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return _broker_order_dispatch_record(row), "reconciliation_too_old"
+        reconciliation = conn.execute(
+            "SELECT * FROM broker_reconciliation_runs WHERE id = ? AND household_id = ?",
+            (reconciliation_id, household_id),
+        ).fetchone()
+        if reconciliation is None:
+            return _broker_order_dispatch_record(row), "reconciliation_not_found"
+        if str(reconciliation["adapter"]) != str(row["adapter"]):
+            return _broker_order_dispatch_record(row), "reconciliation_adapter_mismatch"
+        reconciliation_data = _load_json(reconciliation["data"])
+        if not bool(reconciliation_data.get("matched")) or bool(reconciliation_data.get("freeze_new_orders")):
+            return _broker_order_dispatch_record(row), "reconciliation_not_matched"
+        try:
+            reconciliation_created_at = datetime.fromisoformat(str(reconciliation["created_at"]))
+            if reconciliation_created_at.tzinfo is None:
+                reconciliation_created_at = reconciliation_created_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return _broker_order_dispatch_record(row), "reconciliation_too_old"
+        if reconciliation_created_at < minimum_reconciliation_at:
+            return _broker_order_dispatch_record(row), "reconciliation_too_old"
+        data = _load_json(row["data"])
+        data.update(
+            {
+                "status": "retryable",
+                "reviewed_at": timestamp,
+                "review_note": review_note,
+                "reconciliation_id": reconciliation_id,
+            }
+        )
+        cursor = conn.execute(
+            """
+            UPDATE broker_order_dispatches
+            SET status = 'retryable', data = ?, updated_at = ?
+            WHERE id = ? AND status IN ('dispatching', 'uncertain')
+            """,
+            (json.dumps(data, ensure_ascii=False), timestamp, record_id),
+        )
+        if cursor.rowcount == 1:
+            _bump_quant_investment_data_version_in_connection(conn, household_id)
+        row = conn.execute("SELECT * FROM broker_order_dispatches WHERE id = ?", (record_id,)).fetchone()
+    return (_broker_order_dispatch_record(row) if row else None), "retryable"
 
 
 def record_paper_fill_atomic(

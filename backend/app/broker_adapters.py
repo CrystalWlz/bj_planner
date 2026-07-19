@@ -136,6 +136,8 @@ class PaperBrokerAdapter:
     orders: tuple[PaperOrderData, ...] = ()
     positions: tuple[PaperPositionData, ...] = ()
     cash_balance: float = 0.0
+    execution_date: str = ""
+    execution_price: float | None = None
 
     def simulate(self, order: PaperOrderData, *, executed_date: str = "", executed_price: float | None = None) -> PaperOrderData:
         trade_date = executed_date or order.expected_trade_date or date.today().isoformat()
@@ -174,7 +176,11 @@ class PaperBrokerAdapter:
         )
 
     def submit(self, order: PaperOrderData) -> PaperOrderData:
-        return self.simulate(order)
+        return self.simulate(
+            order,
+            executed_date=self.execution_date,
+            executed_price=self.execution_price,
+        )
 
     def cancel(self, client_order_id: str) -> bool:
         return any(
@@ -210,11 +216,13 @@ class PaperBrokerAdapter:
 
 @dataclass(frozen=True)
 class LocalFirstBrokerGateway:
-    """Reject submission unless a local immutable order id already exists."""
+    """Claim a durable local action before calling a broker adapter."""
 
     adapter: BrokerAdapter
     is_order_persisted: Callable[[str, str], bool] | None = None
     is_order_action_allowed: Callable[[str, str, str], bool] | None = None
+    claim_order_action: Callable[[str, str, str], bool] | None = None
+    complete_order_action: Callable[[str, str, str, str, dict[str, object], str], bool] | None = None
 
     def _require_persisted(
         self,
@@ -236,13 +244,89 @@ class LocalFirstBrokerGateway:
         if not self.is_order_action_allowed(local_order_id, client_order_id, action):
             raise RuntimeError(f"本地订单当前状态不允许执行 {action} 动作")
 
+    def _claim(self, local_order_id: str, client_order_id: str, *, action: str) -> None:
+        if self.claim_order_action is None:
+            raise RuntimeError("未提供券商动作 outbox 认领器，禁止调用券商适配器")
+        if not self.claim_order_action(local_order_id, client_order_id, action):
+            raise RuntimeError("券商动作尚未持久化、已在发送或结果待对账，禁止重复调用适配器")
+
+    def _complete(
+        self,
+        local_order_id: str,
+        client_order_id: str,
+        *,
+        action: str,
+        status: str,
+        response_data: dict[str, object] | None = None,
+        error_message: str = "",
+    ) -> None:
+        if self.complete_order_action is None:
+            raise RuntimeError("未提供券商动作 outbox 完成器，无法安全记录适配器结果")
+        if not self.complete_order_action(
+            local_order_id,
+            client_order_id,
+            action,
+            status,
+            response_data or {},
+            error_message,
+        ):
+            raise RuntimeError("券商适配器已返回，但本地无法持久化结果；动作保持发送中并禁止重发")
+
     def submit(self, *, local_order_id: str, order: PaperOrderData) -> PaperOrderData:
         self._require_persisted(local_order_id, order.client_order_id, action="submit")
-        return self.adapter.submit(order)
+        self._claim(local_order_id, order.client_order_id, action="submit")
+        try:
+            result = self.adapter.submit(order)
+        except Exception as exc:
+            self._complete(
+                local_order_id,
+                order.client_order_id,
+                action="submit",
+                status="uncertain",
+                error_message=str(exc),
+            )
+            raise
+        self._complete(
+            local_order_id,
+            order.client_order_id,
+            action="submit",
+            status="acknowledged",
+            response_data={"order": result.model_dump(mode="json")},
+        )
+        return result
 
     def cancel(self, *, local_order_id: str, client_order_id: str) -> bool:
         self._require_persisted(local_order_id, client_order_id, action="cancel")
-        return self.adapter.cancel(client_order_id)
+        self._claim(local_order_id, client_order_id, action="cancel")
+        try:
+            acknowledged = self.adapter.cancel(client_order_id)
+        except Exception as exc:
+            self._complete(
+                local_order_id,
+                client_order_id,
+                action="cancel",
+                status="uncertain",
+                error_message=str(exc),
+            )
+            raise
+        if not acknowledged:
+            self._complete(
+                local_order_id,
+                client_order_id,
+                action="cancel",
+                status="uncertain",
+                response_data={"acknowledged": False},
+                error_message="适配器未确认取消结果",
+            )
+            return False
+        self._complete(
+            local_order_id,
+            client_order_id,
+            action="cancel",
+            status="acknowledged",
+            response_data={"acknowledged": True},
+        )
+        return True
 
     def reconcile(
         self,

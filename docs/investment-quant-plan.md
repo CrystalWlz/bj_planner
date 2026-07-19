@@ -47,6 +47,8 @@
 
 `client_order_id` 是跨本地账本与券商适配器的全局幂等键。SQLite 使用唯一表达式索引强制约束；同一订单的重复请求复用原记录，不同订单复用同一客户端订单号时 API 返回 `409`。数据库升级会在创建索引前修复缺失、非法或重复的旧订单号，并同步对应成交与取消事件中的引用，二次迁移不再改写。
 
+券商动作先写入 `broker_order_dispatches` outbox，再允许调用适配器。outbox 固化适配器、动作、`local_order_id + client_order_id` 和完整请求参数，状态按 `pending → dispatching → acknowledged` 推进；适配器调用抛错或进程在返回前中断时保持 `dispatching/uncertain`，冻结新增且禁止盲目重发。适配器确认响应先写入 outbox，随后才写成交或取消结果；即使进程在两次事务之间中断，也可用已确认响应补齐成交而不再次提交。仍处于短暂发送窗口的 `dispatching` 不能被提前解锁；只有同一适配器在异常或失联窗口之后完成订单、持仓、现金一致对账并记录人工复核结论，动作才转为 `retryable`，继续沿用原请求和原 `client_order_id`。
+
 模拟订单持久化格式为 schema v2。数据库启动迁移会就地为旧外部买入订单补入等于原 `order_amount` 的模拟现金投入，为旧模拟现金买入和卖出订单补 0；迁移保留订单 ID、状态和已有成交关系，并可重复执行。运行期只消费迁移后的显式字段，旧订单回退逻辑仅用于迁移前的读取保护。
 
 `PaperPortfolioLedger` 先按 `executed_date + order_id` 重放不可变成交，再转换成现有 `MonthlyLedgerEntry → AccountSnapshotPoint → MonthlyVisualizationDetail` 数据结构，并作为 `AffordabilityResult.paper_portfolio` 进入主计算结果。每个月末的现金、持仓市值、已实现和未实现盈亏都使用当月末最近已确认价格派生；没有成交的月份也保留估值快照，不再用累计买入额减累计卖出额近似投资余额。模拟卖出和模拟现金买入按实际成交日校验当时可用持仓与现金，不能借用未来成交。模拟账户回撤按资金流中性的单位净值计算，追加资金不会掩盖既有亏损，未来行情不能进入估值或回撤；历史最大回撤达到 15% 时与成交偏离过大、净值过期、对账不一致一样，只冻结新增订单，不会自动卖出、补仓或修改真实家庭账户。
@@ -57,7 +59,7 @@
 
 ## QMT 边界与阶段门槛
 
-`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：调用适配器前既要确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配，也要通过动作状态校验；`submit` 只允许本地 `proposed`，`cancel` 只允许已原子写入 `cancel_requested` 的订单。缺少任一持久化校验器或状态不符都主动拒绝，已取消、已成交订单不能重新发送。对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
+`BrokerAdapter` 固定提供 `submit / cancel / query_orders / query_positions / query_cash / reconcile`。`LocalFirstBrokerGateway` 不再只检查 ID 非空：调用适配器前既要确认 `local_order_id + client_order_id` 与 SQLite 订单真实匹配，也要通过动作状态校验并原子认领已持久化 outbox；`submit` 只允许本地 `proposed`，`cancel` 只允许已原子写入 `cancel_requested` 的订单。缺少任一持久化校验器、outbox 回调或状态不符都主动拒绝，已取消、已成交订单不能重新发送。对账按订单状态/成交、持仓数量和现金余额生成双侧状态哈希，任何差异都锁存冻结新增订单。当前可执行的“核验模拟账本”只让 `PaperBrokerAdapter` 比较本地派生状态并保存运行记录，不读取外部账户；`QmtBrokerAdapter` 的所有方法仍主动报错，未读取账号、路径或凭据。
 
 - 二期 B：已具备手工防御资产池、季度阈值再平衡、现金/权益基准、独立交易日历、滚动样本外分段和最小方差逐信号日训练；最小方差仍仅限研究且默认关闭。
 - 三期：仅在券商书面确认 QMT/XtQuant 权限后，实现只读订单、持仓、现金查询和每日对账。

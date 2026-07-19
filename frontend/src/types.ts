@@ -358,6 +358,36 @@ export interface PaperPositionData {
   total_fees: number;
 }
 
+export interface BrokerOrderDispatchData {
+  schema_version: number;
+  adapter: "paper" | "qmt";
+  action: "submit" | "cancel";
+  order_id: string;
+  client_order_id: string;
+  status: "pending" | "dispatching" | "acknowledged" | "uncertain" | "retryable";
+  attempt_count: number;
+  last_attempt_at: string;
+  acknowledged_at: string;
+  reviewed_at: string;
+  review_note: string;
+  reconciliation_id: string;
+  error_message: string;
+  request_data: Record<string, unknown>;
+  response_data: Record<string, unknown>;
+}
+
+export interface BrokerOrderDispatchRecord extends RecordEnvelope<BrokerOrderDispatchData> {
+  household_id: string;
+  order_id: string;
+  client_order_id: string;
+  adapter: "paper" | "qmt";
+  action: "submit" | "cancel";
+  status: BrokerOrderDispatchData["status"];
+  retry_eligible: boolean;
+  eligible_reconciliation_id: string;
+  retry_block_reason: string;
+}
+
 export interface PostTradeRiskIssueData {
   code: string;
   severity: "warning" | "freeze";

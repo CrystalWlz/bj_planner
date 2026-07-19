@@ -2566,6 +2566,68 @@ class PaperOrderEventRecord(BaseModel):
     created_at: datetime
 
 
+class BrokerOrderDispatchData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    adapter: Literal["paper", "qmt"]
+    action: Literal["submit", "cancel"]
+    order_id: str = Field(min_length=1, max_length=100)
+    client_order_id: str = Field(min_length=8, max_length=100)
+    status: Literal["pending", "dispatching", "acknowledged", "uncertain", "retryable"] = "pending"
+    attempt_count: int = Field(0, ge=0)
+    last_attempt_at: str = ""
+    acknowledged_at: str = ""
+    reviewed_at: str = ""
+    review_note: str = Field("", max_length=500)
+    reconciliation_id: str = ""
+    error_message: str = Field("", max_length=500)
+    request_data: dict[str, Any] = Field(default_factory=dict)
+    response_data: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_dispatch_state(self) -> "BrokerOrderDispatchData":
+        if self.status == "pending" and self.attempt_count != 0:
+            raise ValueError("待发送券商动作不能已有发送次数")
+        if self.status in {"dispatching", "acknowledged", "uncertain", "retryable"} and self.attempt_count < 1:
+            raise ValueError("已发送券商动作必须记录发送次数")
+        if self.status == "acknowledged" and not self.acknowledged_at:
+            raise ValueError("已确认券商动作必须记录确认时间")
+        if self.status == "uncertain" and not self.error_message:
+            raise ValueError("结果不确定的券商动作必须记录错误原因")
+        if self.status == "retryable" and not (self.reviewed_at and self.review_note and self.reconciliation_id):
+            raise ValueError("可重试券商动作必须关联一致的对账记录和人工复核说明")
+        return self
+
+
+class BrokerOrderDispatchRecord(BaseModel):
+    id: str
+    household_id: str
+    order_id: str
+    client_order_id: str
+    adapter: Literal["paper", "qmt"]
+    action: Literal["submit", "cancel"]
+    status: Literal["pending", "dispatching", "acknowledged", "uncertain", "retryable"]
+    retry_eligible: bool = False
+    eligible_reconciliation_id: str = ""
+    retry_block_reason: str = ""
+    data: BrokerOrderDispatchData
+    created_at: datetime
+    updated_at: datetime
+
+
+class BrokerOrderDispatchRetryRequest(BaseModel):
+    household_id: str
+    reconciliation_id: str = Field(min_length=1, max_length=100)
+    review_note: str = Field(min_length=1, max_length=500)
+
+    @field_validator("review_note")
+    @classmethod
+    def validate_review_note(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("人工复核说明不能为空")
+        return cleaned
+
+
 class PaperFillData(BaseModel):
     schema_version: int = Field(1, ge=1)
     order_id: str
