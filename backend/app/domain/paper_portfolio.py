@@ -37,25 +37,55 @@ class _PositionState:
     total_fees: float = 0.0
 
 
+@dataclass(frozen=True)
+class _AppliedFill:
+    """成交在当前模拟持仓上的实际影响；超卖时按可用持仓截断。"""
+
+    executed_quantity: float
+    gross_amount: float
+    fee: float
+    cash_change: float
+
+
 def _ordered_fills(fills: list[PaperFillData]) -> list[PaperFillData]:
     return sorted(fills, key=lambda item: (item.executed_date, item.order_id))
 
 
-def _apply_fill_to_position(state: _PositionState, fill: PaperFillData) -> tuple[float, float]:
-    state.total_fees += fill.fee
+def _apply_fill_to_position(state: _PositionState, fill: PaperFillData) -> _AppliedFill:
     if fill.side == "buy":
+        state.total_fees += fill.fee
         state.quantity += fill.executed_quantity
         state.total_cost += fill.gross_amount + fill.fee
-        return fill.executed_quantity, 0.0
+        return _AppliedFill(
+            executed_quantity=fill.executed_quantity,
+            gross_amount=fill.gross_amount,
+            fee=fill.fee,
+            cash_change=fill.cash_change,
+        )
     sold_quantity = min(state.quantity, fill.executed_quantity)
     average_cost = state.total_cost / state.quantity if state.quantity > 0 else 0.0
     removed_cost = average_cost * sold_quantity
-    allocated_fee = fill.fee * sold_quantity / fill.executed_quantity if fill.executed_quantity > 0 else 0.0
-    sale_proceeds = fill.executed_price * sold_quantity - allocated_fee
+    quantity_ratio = sold_quantity / fill.executed_quantity if fill.executed_quantity > 0 else 0.0
+    applied_fee = fill.fee * quantity_ratio
+    applied_gross = fill.gross_amount * quantity_ratio
+    # A normal sell keeps the recorded cash change. For an oversell, only the
+    # portion backed by the simulated position may affect cash or P&L.
+    applied_cash_change = (
+        fill.cash_change
+        if sold_quantity >= fill.executed_quantity - 1e-9
+        else applied_gross - applied_fee
+    )
+    sale_proceeds = applied_gross - applied_fee
+    state.total_fees += applied_fee
     state.realized_pnl += sale_proceeds - removed_cost
     state.quantity = max(0.0, state.quantity - sold_quantity)
     state.total_cost = max(0.0, state.total_cost - removed_cost)
-    return sold_quantity, removed_cost
+    return _AppliedFill(
+        executed_quantity=sold_quantity,
+        gross_amount=applied_gross,
+        fee=applied_fee,
+        cash_change=applied_cash_change,
+    )
 
 
 def _month_keys_between(start_month: str, end_month: str) -> list[str]:
@@ -113,6 +143,7 @@ def _paper_nav_drawdowns(
 
     timeline = sorted(set(fills_by_date) | set(price_updates))
     quantities: dict[str, float] = {}
+    states: dict[str, _PositionState] = {}
     latest_prices: dict[str, float] = {}
     cash = 0.0
     units = 0.0
@@ -130,12 +161,15 @@ def _paper_nav_drawdowns(
         if contribution > 0:
             units += contribution / max(nav_before_contribution, 1e-9)
         for fill in day_fills:
-            cash += fill.contribution_amount + fill.cash_change
+            applied = _apply_fill_to_position(
+                states.setdefault(fill.instrument_id, _PositionState()), fill
+            )
+            cash += fill.contribution_amount + applied.cash_change
             current_quantity = quantities.get(fill.instrument_id, 0.0)
             if fill.side == "buy":
-                quantities[fill.instrument_id] = current_quantity + fill.executed_quantity
+                quantities[fill.instrument_id] = current_quantity + applied.executed_quantity
             else:
-                quantities[fill.instrument_id] = max(0.0, current_quantity - fill.executed_quantity)
+                quantities[fill.instrument_id] = max(0.0, current_quantity - applied.executed_quantity)
             if fill.instrument_id not in updated_instruments:
                 latest_prices[fill.instrument_id] = fill.executed_price
         total_equity = cash + sum(
@@ -243,19 +277,21 @@ def _paper_ledger_artifacts(
         month = month_index[key]
         month_entries: list[MonthlyLedgerEntry] = []
         for fill in fills_by_month[key]:
-            running_cash += fill.contribution_amount + fill.cash_change
+            applied = _apply_fill_to_position(
+                states.setdefault(fill.instrument_id, _PositionState()), fill
+            )
+            running_cash += fill.contribution_amount + applied.cash_change
             latest_execution_prices[fill.instrument_id] = fill.executed_price
             if fill.contribution_amount:
                 month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_contribution", label="模拟账户资金投入", amount=fill.contribution_amount, direction="inflow"))
             if fill.side == "buy":
-                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_buy", label="模拟买入现金划出", amount=-fill.gross_amount, direction="transfer"))
-                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_buy", label="模拟投资持仓增加", amount=fill.gross_amount, direction="transfer"))
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_buy", label="模拟买入现金划出", amount=-applied.gross_amount, direction="transfer"))
+                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_buy", label="模拟投资持仓增加", amount=applied.gross_amount, direction="transfer"))
             else:
-                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_sell", label="模拟投资持仓卖出", amount=-fill.gross_amount, direction="transfer"))
-                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_sell", label="模拟卖出现金到账", amount=fill.gross_amount, direction="transfer"))
-            if fill.fee:
-                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_fee", label="模拟交易手续费", amount=-fill.fee, direction="outflow"))
-            _apply_fill_to_position(states.setdefault(fill.instrument_id, _PositionState()), fill)
+                month_entries.append(_ledger_entry(month=month, account="paper_investment", category="paper_sell", label="模拟投资持仓卖出", amount=-applied.gross_amount, direction="transfer"))
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_sell", label="模拟卖出现金到账", amount=applied.gross_amount, direction="transfer"))
+            if applied.fee:
+                month_entries.append(_ledger_entry(month=month, account="paper_cash", category="paper_fee", label="模拟交易手续费", amount=-applied.fee, direction="outflow"))
 
         year, month_of_year = (int(item) for item in key.split("-", 1))
         valuation_date = min(
@@ -482,19 +518,20 @@ def build_paper_portfolio_summary(
             )
         state = states.setdefault(fill.instrument_id, _PositionState())
         contributions += fill.contribution_amount
-        cash_balance += fill.cash_change + fill.contribution_amount
         available_quantity = state.quantity
-        sold_quantity, _removed_cost = _apply_fill_to_position(state, fill)
-        if fill.side == "sell" and sold_quantity < fill.executed_quantity:
+        applied = _apply_fill_to_position(state, fill)
+        cash_balance += applied.cash_change + fill.contribution_amount
+        if fill.side == "sell" and applied.executed_quantity < fill.executed_quantity:
+            frozen = True
             add_issue(
                 code="position_oversell",
-                severity="warning",
+                severity="freeze",
                 source="fill",
                 order_id=fill.order_id,
                 instrument_id=fill.instrument_id,
                 observed_value=fill.executed_quantity,
                 threshold=available_quantity,
-                message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，已按可用持仓计算",
+                message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，现金、费用和盈亏已按可用持仓计算，并冻结新增提案等待人工核对",
             )
 
     positions: list[PaperPositionData] = []
@@ -620,7 +657,7 @@ def build_paper_portfolio_summary(
         )
     return PaperPortfolioSummary(
         household_id=household_id,
-        ledger_version="paper-portfolio-v2",
+        ledger_version="paper-portfolio-v3",
         valuation_price_basis="raw_close",
         valuation_date=valuation_date,
         ledger_start_month=ordered_fills[0].executed_date[:7] if ordered_fills else "",

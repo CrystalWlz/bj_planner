@@ -2746,7 +2746,7 @@ class BrokerReconciliationReviewRequest(BaseModel):
 
 class PaperPortfolioSummary(BaseModel):
     household_id: str
-    ledger_version: str = "paper-portfolio-v2"
+    ledger_version: str = "paper-portfolio-v3"
     valuation_price_basis: Literal["raw_close"] = "raw_close"
     valuation_date: str = ""
     ledger_start_month: str = ""

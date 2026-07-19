@@ -1597,7 +1597,7 @@ def test_paper_ledger_uses_raw_close_and_exports_current_backend_artifacts(monke
         as_of_date="2026-01-31",
     )
 
-    assert portfolio.ledger_version == "paper-portfolio-v2"
+    assert portfolio.ledger_version == "paper-portfolio-v3"
     assert portfolio.valuation_price_basis == "raw_close"
     assert portfolio.valuation_date == "2026-01-31"
     assert portfolio.ledger_start_month == "2026-01"
@@ -1639,6 +1639,75 @@ def test_paper_ledger_uses_raw_close_and_exports_current_backend_artifacts(monke
     assert "旧量化导出" not in {sheet.title for sheet in attached.export_sheets}
     assert len([sheet for sheet in attached.export_sheets if sheet.plan_variant == "paper_quant"]) == 5
     assert [item.filename for item in attached.export_texts] == ["quant-paper-portfolio.txt"]
+
+
+def test_paper_portfolio_oversell_caps_cash_and_pnl_to_available_position() -> None:
+    from app.domain.paper_portfolio import build_paper_portfolio_summary
+    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例超卖校验 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+    )
+    buy = PaperFillData(
+        order_id="order-oversell-buy",
+        client_order_id="client-oversell-buy",
+        proposal_id="proposal-oversell",
+        instrument_id="instrument-oversell",
+        side="buy",
+        executed_date="2026-01-05",
+        executed_price=10,
+        executed_quantity=10,
+        gross_amount=100,
+        fee=0,
+        cash_change=-100,
+        contribution_amount=100,
+    )
+    oversell = PaperFillData(
+        order_id="order-oversell-sell",
+        client_order_id="client-oversell-sell",
+        proposal_id="proposal-oversell",
+        instrument_id="instrument-oversell",
+        side="sell",
+        executed_date="2026-01-20",
+        executed_price=12,
+        executed_quantity=20,
+        gross_amount=240,
+        fee=2.4,
+        cash_change=237.6,
+        contribution_amount=0,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-01-31",
+        bars=[{"date": "2026-01-31", "close": 12}],
+    )
+
+    summary = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[buy, oversell],
+        instruments={"instrument-oversell": instrument},
+        snapshots={"instrument-oversell": snapshot},
+        as_of_date="2026-01-31",
+    )
+
+    assert summary.positions == []
+    assert summary.cash_balance == pytest.approx(118.8)
+    assert summary.market_value == pytest.approx(0)
+    assert summary.total_equity == pytest.approx(118.8)
+    assert summary.realized_pnl == pytest.approx(18.8)
+    assert summary.total_fees == pytest.approx(1.2)
+    oversell_issue = next(
+        issue for issue in summary.post_trade_risk_issues if issue.code == "position_oversell"
+    )
+    assert summary.frozen
+    assert oversell_issue.severity == "freeze"
+    sell_entries = [entry for entry in summary.ledger_entries if entry.category == "paper_sell"]
+    assert [entry.amount for entry in sell_entries] == pytest.approx([-120, 120])
+    assert summary.account_snapshots[-1].cash_balance == pytest.approx(118.8)
+    assert summary.account_snapshots[-1].net_worth == pytest.approx(118.8)
 
 
 def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
