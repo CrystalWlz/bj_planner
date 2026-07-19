@@ -13205,6 +13205,12 @@ function ExportPage({
   availablePlans: PurchasePlanAnalysis[];
   runCalculation: () => void;
 }) {
+  const paperPortfolio = result?.paper_portfolio ?? null;
+  const paperExportReady = Boolean(
+    paperPortfolio
+    && (result?.export_sheets ?? []).some((sheet) => sheet.plan_variant === "paper_quant")
+    && (result?.export_texts ?? []).some((document) => document.plan_variant === "paper_quant")
+  );
   const exportTargets = [
     {
       key: "current_plan",
@@ -13223,6 +13229,12 @@ function ExportPage({
       title: "税务年度明细",
       description: "跟随详细表格一起导出年度税务、成员税负和税务策略结果。",
       ready: Boolean(result?.tax_year_summaries?.length),
+    },
+    {
+      key: "paper_quant",
+      title: "量化模拟账户",
+      description: "独立导出模拟持仓、账户快照、账本流水和事后风控，不并入真实家庭账户。",
+      ready: paperExportReady,
     },
   ];
 
@@ -13344,6 +13356,30 @@ function ExportPage({
             </div>
           </WorkflowSection>
         </>
+      ) : null}
+      {result && paperPortfolio && paperExportReady ? (
+        <WorkflowSection
+          icon={<Database size={18} />}
+          title="量化模拟账户导出"
+          description="数据直接来自后端 PaperPortfolioLedger；复权价只用于研究，持仓与盈亏按原始收盘价估值。"
+        >
+          <div className="metric-grid">
+            <Metric label="账户权益" value={money(paperPortfolio.total_equity)} />
+            <Metric label="模拟现金" value={money(paperPortfolio.cash_balance)} />
+            <Metric label="模拟成交" value={`${paperPortfolio.fill_count} 笔`} />
+            <Metric label="账本版本" value={paperPortfolio.ledger_version} />
+            <Metric label="估值日期" value={paperPortfolio.valuation_date || "暂无"} />
+            <Metric label="新增状态" value={paperPortfolio.frozen ? "已冻结" : "正常"} tone={paperPortfolio.frozen ? "bad" : "good"} />
+          </div>
+          <div className="export-actions">
+            <button className="secondary-button" onClick={() => exportPaperPortfolioText(result)}>
+              <Download size={16} /> 导出量化文字
+            </button>
+            <button className="ghost-button" onClick={() => exportPaperPortfolioCsv(result)}>
+              <Download size={16} /> 导出量化账本
+            </button>
+          </div>
+        </WorkflowSection>
       ) : null}
     </PlannerPageShell>
   );
@@ -13471,6 +13507,22 @@ function exportCsv(result: AffordabilityResult, _scenario: ScenarioData, plan: P
           ])
         ];
   downloadFile(`house-plan-${plan.variant}-detailed.csv`, `\uFEFF${sections.join("\n")}`, "text/csv;charset=utf-8");
+}
+
+function exportPaperPortfolioText(result: AffordabilityResult) {
+  const document = (result.export_texts ?? []).find((item) => item.plan_variant === "paper_quant");
+  if (!document) return;
+  downloadFile(document.filename, document.lines.join("\n"), "text/plain;charset=utf-8");
+}
+
+function exportPaperPortfolioCsv(result: AffordabilityResult) {
+  const exportSheets = (result.export_sheets ?? []).filter((sheet) => sheet.plan_variant === "paper_quant");
+  if (exportSheets.length === 0) return;
+  const sections = [
+    "sep=,",
+    ...exportSheets.flatMap((sheet) => csvSection(sheet.title, sheet.headers, sheet.rows)),
+  ];
+  downloadFile("quant-paper-portfolio.csv", `\uFEFF${sections.join("\n")}`, "text/csv;charset=utf-8");
 }
 
 function SectionHeader({

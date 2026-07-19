@@ -29,6 +29,16 @@ class QuantRiskAssessment:
     reasons: list[str]
 
 
+def execution_market_price(bar: InvestmentMarketBarData) -> float:
+    """Return the actual close used for executable orders and paper valuation."""
+    return float(bar.close)
+
+
+def research_market_price(bar: InvestmentMarketBarData) -> float:
+    """Return the total-return research price without changing executable quotes."""
+    return float(bar.adjusted_close or bar.close)
+
+
 def _month_ordinal(value: str) -> int:
     year_text, month_text = value[:7].split("-", 1)
     return int(year_text) * 12 + int(month_text) - 1
@@ -147,9 +157,9 @@ def assess_quant_risk(
     price_series: list[dict[str, float]] = []
     for snapshot in snapshots:
         prices = {
-            bar.price_date or bar.date: float(bar.adjusted_close or bar.close)
+            bar.price_date or bar.date: research_market_price(bar)
             for bar in snapshot.bars
-            if bar.is_trading and not bar.is_suspended and (bar.adjusted_close or bar.close) > 0
+            if bar.is_trading and not bar.is_suspended and research_market_price(bar) > 0
         }
         if len(prices) < 2:
             latest_date = max(prices) if prices else date.today().isoformat()
@@ -290,9 +300,9 @@ def optimized_equity_weights(
     price_by_instrument: dict[str, dict[str, float]] = {}
     for instrument_id, snapshot in snapshots:
         price_by_instrument[instrument_id] = {
-            bar.date: float(bar.adjusted_close or bar.close)
+            bar.date: research_market_price(bar)
             for bar in snapshot.bars
-            if bar.is_trading and (bar.adjusted_close or bar.close) > 0
+            if bar.is_trading and research_market_price(bar) > 0
         }
     common_dates = set.intersection(*(set(values) for values in price_by_instrument.values())) if price_by_instrument else set()
     if len(common_dates) < 60:

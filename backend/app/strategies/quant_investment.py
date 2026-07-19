@@ -8,6 +8,7 @@ from typing import Protocol
 from ..domain.quant_investment import (
     QuantRiskAssessment,
     assess_quant_risk,
+    execution_market_price,
     instrument_is_buyable,
     protected_cash_for_quant_investment,
 )
@@ -27,7 +28,7 @@ from ..schemas import (
 SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
 PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v3"
 PRE_TRADE_RISK_VERSION = "cash-concentration-v5"
-EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v3"
+EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v4"
 
 
 @dataclass(frozen=True)
@@ -385,13 +386,13 @@ def _latest_price(snapshot: InvestmentMarketSnapshotData, *, as_of_date: str) ->
         for bar in snapshot.bars
         if bar.is_trading
         and not bar.is_suspended
-        and (bar.adjusted_close or bar.close) > 0
+        and execution_market_price(bar) > 0
         and (bar.price_date or bar.date) <= as_of_date
     ]
     if not bars:
         return None
     latest = max(bars, key=lambda bar: bar.price_date or bar.date)
-    return latest.adjusted_close or latest.close, latest.price_date or latest.date
+    return execution_market_price(latest), latest.price_date or latest.date
 
 
 def _next_weekday(value: str) -> str:

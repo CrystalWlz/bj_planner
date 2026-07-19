@@ -2746,6 +2746,10 @@ class BrokerReconciliationReviewRequest(BaseModel):
 
 class PaperPortfolioSummary(BaseModel):
     household_id: str
+    ledger_version: str = "paper-portfolio-v2"
+    valuation_price_basis: Literal["raw_close"] = "raw_close"
+    valuation_date: str = ""
+    ledger_start_month: str = ""
     net_contributions: float = Field(ge=0)
     cash_balance: float = Field(ge=0)
     market_value: float = Field(ge=0)

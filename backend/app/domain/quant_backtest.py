@@ -20,6 +20,7 @@ from .quant_investment import (
     execution_session_is_allowed,
     instrument_is_buyable,
     optimized_equity_weights,
+    research_market_price,
 )
 
 
@@ -47,7 +48,7 @@ class _PortfolioState:
 
 
 def _price(bar: InvestmentMarketBarData) -> float:
-    return float(bar.adjusted_close or bar.close)
+    return research_market_price(bar)
 
 
 def _month_key(value: str) -> str:

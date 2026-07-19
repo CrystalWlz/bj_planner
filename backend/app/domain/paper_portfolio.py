@@ -24,6 +24,7 @@ from ..schemas import (
 from .quant_investment import (
     _drawdown_from_prices,
     effective_nav_available_date,
+    execution_market_price,
     market_trading_day_age,
 )
 
@@ -78,7 +79,7 @@ def _latest_confirmed_bar(
         for bar in snapshot.bars
         if bar.is_trading
         and not bar.is_suspended
-        and (bar.adjusted_close or bar.close) > 0
+        and execution_market_price(bar) > 0
         and (bar.price_date or bar.date) <= as_of_date
     ]
     return max(bars, key=lambda bar: bar.price_date or bar.date) if bars else None
@@ -108,7 +109,7 @@ def _paper_nav_drawdowns(
                 or bar.is_suspended
             ):
                 continue
-            price_updates.setdefault(price_date, {})[instrument_id] = float(bar.adjusted_close or bar.close)
+            price_updates.setdefault(price_date, {})[instrument_id] = execution_market_price(bar)
 
     timeline = sorted(set(fills_by_date) | set(price_updates))
     quantities: dict[str, float] = {}
@@ -274,7 +275,7 @@ def _paper_ledger_artifacts(
             if market_snapshot is not None:
                 latest_bar = _latest_confirmed_bar(market_snapshot, as_of_date=valuation_date)
                 if latest_bar is not None:
-                    latest_price = float(latest_bar.adjusted_close or latest_bar.close)
+                    latest_price = execution_market_price(latest_bar)
             snapshot_market_value += state.quantity * latest_price
         snapshot_cash = max(0.0, running_cash)
         snapshot_total = snapshot_cash + snapshot_market_value
@@ -511,7 +512,7 @@ def build_paper_portfolio_summary(
         if snapshot is not None:
             latest_bar = _latest_confirmed_bar(snapshot, as_of_date=valuation_date)
             if latest_bar is not None:
-                latest_price = float(latest_bar.adjusted_close or latest_bar.close)
+                latest_price = execution_market_price(latest_bar)
                 latest_price_date = latest_bar.price_date or latest_bar.date
                 if policy and instrument.market == "qdii_etf":
                     nav_available_date = effective_nav_available_date(snapshot, latest_bar)
@@ -619,6 +620,10 @@ def build_paper_portfolio_summary(
         )
     return PaperPortfolioSummary(
         household_id=household_id,
+        ledger_version="paper-portfolio-v2",
+        valuation_price_basis="raw_close",
+        valuation_date=valuation_date,
+        ledger_start_month=ordered_fills[0].executed_date[:7] if ordered_fills else "",
         net_contributions=round(contributions, 2),
         cash_balance=round(max(0.0, cash_balance), 2),
         market_value=round(market_value, 2),

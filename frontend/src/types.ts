@@ -427,6 +427,10 @@ export interface BrokerReconciliationRunRecord extends RecordEnvelope<BrokerReco
 
 export interface PaperPortfolioSummary {
   household_id: string;
+  ledger_version: string;
+  valuation_price_basis: "raw_close";
+  valuation_date: string;
+  ledger_start_month: string;
   net_contributions: number;
   cash_balance: number;
   market_value: number;

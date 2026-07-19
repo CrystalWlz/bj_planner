@@ -27,6 +27,7 @@ from .schemas import (
     LoanVisualizationPoint,
     MonthlyCashflowPoint,
     MonthlyLedgerEntry,
+    PaperPortfolioSummary,
     ProvidentVisualizationPoint,
     PurchasePlanAnalysis,
     ScenarioData,
@@ -723,6 +724,244 @@ def _sheet(
         headers=headers,
         rows=rows,
     )
+
+
+def _paper_month_label(portfolio: PaperPortfolioSummary, month: int) -> str:
+    try:
+        year, month_number = (int(item) for item in portfolio.ledger_start_month.split("-", 1))
+        return month_label(date(year, month_number, 1), max(0, month - 1))
+    except (TypeError, ValueError):
+        return f"第 {month} 月"
+
+
+def _paper_export_label(value: str, labels: dict[str, str]) -> str:
+    return labels.get(value, value)
+
+
+_PAPER_MARKET_LABELS = {
+    "mainland_etf": "境内 ETF",
+    "hong_kong_connect": "港股通",
+    "qdii_etf": "场内跨境 QDII ETF",
+    "qdii_fund": "场外 QDII 基金",
+}
+_PAPER_ASSET_CLASS_LABELS = {"equity": "权益资产", "defensive": "防御资产"}
+_PAPER_CURRENCY_LABELS = {"CNY": "人民币", "HKD": "港币", "USD": "美元"}
+_PAPER_RECONCILIATION_LABELS = {
+    "not_required": "无需对账",
+    "matched": "对账一致",
+    "mismatch": "对账异常",
+    "reviewed": "已人工复核",
+}
+_PAPER_ACCOUNT_LABELS = {
+    "paper_cash": "模拟现金账户",
+    "paper_investment": "模拟投资账户",
+}
+_PAPER_CATEGORY_LABELS = {
+    "paper_contribution": "模拟资金投入",
+    "paper_buy": "模拟买入",
+    "paper_sell": "模拟卖出",
+    "paper_fee": "模拟交易费用",
+    "paper_unrealized_pnl": "未实现盈亏变动",
+    "paper_realized_pnl": "已实现盈亏",
+}
+_PAPER_DIRECTION_LABELS = {
+    "inflow": "流入",
+    "outflow": "流出",
+    "transfer": "账户划转",
+    "valuation": "估值变动",
+}
+_PAPER_SOURCE_LABELS = {
+    "paper_portfolio_ledger": "模拟投资账本",
+    "fill": "成交事件",
+    "market_data": "行情数据",
+    "portfolio": "模拟组合",
+    "reconciliation": "券商对账",
+}
+_PAPER_SEVERITY_LABELS = {"warning": "警告", "freeze": "冻结新增"}
+
+
+def build_paper_portfolio_export_sheets(portfolio: PaperPortfolioSummary | None) -> list[ExportSheet]:
+    if portfolio is None or not (
+        portfolio.fill_count
+        or portfolio.positions
+        or portfolio.ledger_entries
+        or portfolio.post_trade_risk_issues
+        or portfolio.warnings
+    ):
+        return []
+    return [
+        _sheet(
+            plan_variant="paper_quant",
+            title="量化模拟账户摘要",
+            headers=["项目", "内容"],
+            rows=[
+                ["账本版本", portfolio.ledger_version],
+                ["估值日期", portfolio.valuation_date],
+                ["估值价格口径", "交易日原始收盘价"],
+                ["账本起始月份", portfolio.ledger_start_month],
+                ["累计模拟投入", portfolio.net_contributions],
+                ["模拟现金", portfolio.cash_balance],
+                ["持仓市值", portfolio.market_value],
+                ["账户权益", portfolio.total_equity],
+                ["已实现盈亏", portfolio.realized_pnl],
+                ["未实现盈亏", portfolio.unrealized_pnl],
+                ["累计手续费", portfolio.total_fees],
+                ["当前回撤", portfolio.current_drawdown],
+                ["历史最大回撤", portfolio.max_drawdown],
+                ["是否冻结新增", portfolio.frozen],
+                ["对账状态", _paper_export_label(portfolio.reconciliation_status, _PAPER_RECONCILIATION_LABELS)],
+                *[["警告", warning] for warning in portfolio.warnings],
+            ],
+        ),
+        _sheet(
+            plan_variant="paper_quant",
+            title="量化模拟持仓",
+            headers=[
+                "标的代码",
+                "标的名称",
+                "市场",
+                "资产类别",
+                "币种",
+                "数量",
+                "平均成本",
+                "剩余成本",
+                "最新原始收盘价",
+                "最新价格日期",
+                "持仓市值",
+                "已实现盈亏",
+                "未实现盈亏",
+                "累计手续费",
+            ],
+            rows=[
+                [
+                    row.symbol,
+                    row.name,
+                    _paper_export_label(row.market, _PAPER_MARKET_LABELS),
+                    _paper_export_label(row.asset_class, _PAPER_ASSET_CLASS_LABELS),
+                    _paper_export_label(row.currency, _PAPER_CURRENCY_LABELS),
+                    row.quantity,
+                    row.average_cost,
+                    row.total_cost,
+                    row.latest_price,
+                    row.latest_price_date,
+                    row.market_value,
+                    row.realized_pnl,
+                    row.unrealized_pnl,
+                    row.total_fees,
+                ]
+                for row in portfolio.positions
+            ],
+        ),
+        _sheet(
+            plan_variant="paper_quant",
+            title="量化模拟账户快照",
+            headers=["账本月份序号", "真实年月", "模拟现金", "持仓市值", "流动资产", "总资产", "净资产"],
+            rows=[
+                [
+                    row.month,
+                    _paper_month_label(portfolio, row.month),
+                    row.cash_balance,
+                    row.investment_balance,
+                    row.liquid_asset_value,
+                    row.total_asset_value,
+                    row.net_worth,
+                ]
+                for row in portfolio.account_snapshots
+            ],
+        ),
+        _sheet(
+            plan_variant="paper_quant",
+            title="量化模拟账本流水",
+            headers=["账本月份序号", "真实年月", "账户", "类别", "项目", "金额", "方向", "来源"],
+            rows=[
+                [
+                    row.month,
+                    _paper_month_label(portfolio, row.month),
+                    _paper_export_label(row.account, _PAPER_ACCOUNT_LABELS),
+                    _paper_export_label(row.category, _PAPER_CATEGORY_LABELS),
+                    row.label,
+                    row.amount,
+                    _paper_export_label(row.direction, _PAPER_DIRECTION_LABELS),
+                    _paper_export_label(row.source, _PAPER_SOURCE_LABELS),
+                ]
+                for row in portfolio.ledger_entries
+            ],
+        ),
+        _sheet(
+            plan_variant="paper_quant",
+            title="量化模拟事后风控",
+            headers=["代码", "级别", "来源", "标的ID", "订单ID", "观测值", "阈值", "说明"],
+            rows=[
+                [
+                    row.code,
+                    _paper_export_label(row.severity, _PAPER_SEVERITY_LABELS),
+                    _paper_export_label(row.source, _PAPER_SOURCE_LABELS),
+                    row.instrument_id,
+                    row.order_id,
+                    "" if row.observed_value is None else row.observed_value,
+                    "" if row.threshold is None else row.threshold,
+                    row.message,
+                ]
+                for row in portfolio.post_trade_risk_issues
+            ],
+        ),
+    ]
+
+
+def build_paper_portfolio_export_texts(portfolio: PaperPortfolioSummary | None) -> list[ExportTextDocument]:
+    if portfolio is None or not (
+        portfolio.fill_count
+        or portfolio.positions
+        or portfolio.ledger_entries
+        or portfolio.post_trade_risk_issues
+        or portfolio.warnings
+    ):
+        return []
+    position_lines = [
+        (
+            f"- {row.name}（{row.symbol}）：{row.quantity:g} 份，平均成本 {money_text(row.average_cost)}，"
+            f"{row.latest_price_date or '无最新行情'} 的原始收盘价 {money_text(row.latest_price)}，"
+            f"市值 {money_text(row.market_value)}，未实现盈亏 {money_text(row.unrealized_pnl)}。"
+        )
+        for row in portfolio.positions
+    ]
+    risk_lines = [
+        f"- [{_paper_export_label(row.severity, _PAPER_SEVERITY_LABELS)}] {row.message}"
+        for row in portfolio.post_trade_risk_issues
+    ]
+    warning_lines = [f"- {warning}" for warning in portfolio.warnings]
+    return [
+        ExportTextDocument(
+            plan_variant="paper_quant",
+            filename="quant-paper-portfolio.txt",
+            lines=[
+                "量化定投模拟账户",
+                f"账本版本：{portfolio.ledger_version}",
+                f"估值日期：{portfolio.valuation_date or '暂无'}",
+                "估值价格口径：交易日原始收盘价；复权价只用于研究信号和回测。",
+                f"累计模拟投入：{money_text(portfolio.net_contributions)}",
+                f"模拟现金：{money_text(portfolio.cash_balance)}",
+                f"持仓市值：{money_text(portfolio.market_value)}",
+                f"账户权益：{money_text(portfolio.total_equity)}",
+                f"已实现盈亏：{money_text(portfolio.realized_pnl)}",
+                f"未实现盈亏：{money_text(portfolio.unrealized_pnl)}",
+                f"累计手续费：{money_text(portfolio.total_fees)}",
+                f"当前回撤：{portfolio.current_drawdown:.1%}，历史最大回撤：{portfolio.max_drawdown:.1%}",
+                f"新增状态：{'已冻结' if portfolio.frozen else '正常'}；对账状态：{_paper_export_label(portfolio.reconciliation_status, _PAPER_RECONCILIATION_LABELS)}",
+                "",
+                "当前持仓：",
+                *(position_lines or ["- 暂无持仓。"]),
+                "",
+                "事后风控：",
+                *(risk_lines or ["- 当前没有结构化事后风控异常。"]),
+                "",
+                "其它警告：",
+                *(warning_lines or ["- 无。"]),
+                "",
+                "该模拟账户与家庭真实现金、投资账户相互隔离，不构成真实交易凭证。",
+            ],
+        )
+    ]
 
 
 def build_export_sheets(

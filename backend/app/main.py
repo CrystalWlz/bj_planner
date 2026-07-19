@@ -107,7 +107,12 @@ from .planning_context import (
     planning_goal_sequence_for_request,
 )
 from .profiling import calculation_profile, profile_span
-from .reporting import build_account_concepts_from_core_object_snapshots, build_core_object_group_summaries
+from .reporting import (
+    build_account_concepts_from_core_object_snapshots,
+    build_core_object_group_summaries,
+    build_paper_portfolio_export_sheets,
+    build_paper_portfolio_export_texts,
+)
 from .schemas import (
     AffordabilityRequest,
     AffordabilityResult,
@@ -256,7 +261,16 @@ def _attach_paper_portfolio(result: AffordabilityResult, household_id: str) -> A
         return result
     policy_records = list_quant_scoped_records("quant_investment_policies", household_id=household_id)
     policy = QuantInvestmentPolicyRecord.model_validate(policy_records[0]).data if policy_records else None
-    return result.model_copy(update={"paper_portfolio": _paper_portfolio_for_household(household_id, policy)})
+    portfolio = _paper_portfolio_for_household(household_id, policy)
+    export_sheets = [item for item in result.export_sheets if item.plan_variant != "paper_quant"]
+    export_texts = [item for item in result.export_texts if item.plan_variant != "paper_quant"]
+    return result.model_copy(
+        update={
+            "paper_portfolio": portfolio,
+            "export_sheets": [*export_sheets, *build_paper_portfolio_export_sheets(portfolio)],
+            "export_texts": [*export_texts, *build_paper_portfolio_export_texts(portfolio)],
+        }
+    )
 
 
 @asynccontextmanager

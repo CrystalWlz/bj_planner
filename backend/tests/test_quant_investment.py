@@ -221,6 +221,56 @@ def test_adjustment_is_not_partially_applied_when_factor_dates_are_incomplete() 
     assert "缺少 1 个价格交易日" in warning
 
 
+def test_research_price_and_executable_price_use_separate_fields() -> None:
+    from app.domain.quant_investment import execution_market_price, research_market_price
+    from app.schemas import InvestmentMarketBarData
+
+    bar = InvestmentMarketBarData(date="2026-07-17", close=10, adjusted_close=12.5)
+
+    assert execution_market_price(bar) == pytest.approx(10)
+    assert research_market_price(bar) == pytest.approx(12.5)
+
+
+def test_production_proposal_uses_raw_close_instead_of_adjusted_research_price() -> None:
+    from app.schemas import HouseholdData, InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
+    from app.strategies.quant_investment import build_quant_monthly_proposal
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例权益 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+        lot_size=1,
+        buy_fee_rate=0,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-07-31",
+        bars=[
+            {"date": "2026-06-30", "close": 10, "adjusted_close": 100},
+            {"date": "2026-07-31", "close": 10, "adjusted_close": 100},
+        ],
+    )
+    result = build_quant_monthly_proposal(
+        household=HouseholdData(cash_account_balance=100000, monthly_expense=0),
+        policy_id="policy-1",
+        policy=QuantInvestmentPolicyData(
+            equity_cap=1,
+            defensive_min=0,
+            default_monthly_budget=1000,
+            slippage_rate=0,
+            max_single_instrument_ratio=1,
+            max_single_market_ratio=1,
+        ),
+        instruments=[("instrument-1", instrument)],
+        snapshots={"instrument-1": ("snapshot-1", snapshot)},
+    )
+
+    assert result.orders
+    assert result.orders[0].estimated_price == pytest.approx(10)
+    assert result.orders[0].estimated_quantity == pytest.approx(100)
+
+
 def test_tushare_exchange_calendar_filters_closed_days() -> None:
     from app.market_calendar import fetch_tushare_trading_calendar
     from app.schemas import InvestmentInstrumentData
@@ -769,6 +819,17 @@ def test_market_refresh_frontend_surfaces_backend_adjustment_warnings() -> None:
     assert "snapshot?.data.warning" in source
     assert "后复权" in source
     assert "原始价格" in source
+
+
+def test_export_frontend_downloads_backend_paper_portfolio_artifacts() -> None:
+    source = Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert 'document.plan_variant === "paper_quant"' in source
+    assert 'sheet.plan_variant === "paper_quant"' in source
+    assert "exportPaperPortfolioText(result)" in source
+    assert "exportPaperPortfolioCsv(result)" in source
+    assert "量化模拟账户导出" in source
+    assert "复权价只用于研究" in source
 
 
 def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None:
@@ -1487,6 +1548,97 @@ def test_paper_portfolio_replays_out_of_order_fills_into_month_end_snapshots() -
     assert cost_valued.positions[0].market_value == pytest.approx(1010)
     assert cost_valued.account_snapshots[-1].investment_balance == pytest.approx(1010)
     assert cost_valued.account_snapshots[-1].net_worth == pytest.approx(cost_valued.total_equity)
+
+
+def test_paper_ledger_uses_raw_close_and_exports_current_backend_artifacts(monkeypatch) -> None:
+    from app import main
+    from app.domain.paper_portfolio import build_paper_portfolio_summary
+    from app.reporting import build_paper_portfolio_export_sheets, build_paper_portfolio_export_texts
+    from app.schemas import (
+        AffordabilityResult,
+        ExportSheet,
+        ExportTextDocument,
+        InvestmentInstrumentData,
+        InvestmentMarketSnapshotData,
+        PaperFillData,
+    )
+
+    instrument = InvestmentInstrumentData(
+        symbol="510300.SH",
+        name="示例账本 ETF",
+        market="mainland_etf",
+        asset_class="equity",
+    )
+    fill = PaperFillData(
+        order_id="order-raw-close",
+        client_order_id="client-raw-close",
+        proposal_id="proposal-raw-close",
+        instrument_id="instrument-1",
+        side="buy",
+        executed_date="2026-01-10",
+        executed_price=10,
+        executed_quantity=10,
+        gross_amount=100,
+        fee=0,
+        cash_change=-100,
+        contribution_amount=100,
+    )
+    snapshot = InvestmentMarketSnapshotData(
+        source="manual",
+        snapshot_date="2026-01-31",
+        adjustment="backward",
+        bars=[{"date": "2026-01-31", "close": 8, "adjusted_close": 16}],
+    )
+    portfolio = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[fill],
+        instruments={"instrument-1": instrument},
+        snapshots={"instrument-1": snapshot},
+        as_of_date="2026-01-31",
+    )
+
+    assert portfolio.ledger_version == "paper-portfolio-v2"
+    assert portfolio.valuation_price_basis == "raw_close"
+    assert portfolio.valuation_date == "2026-01-31"
+    assert portfolio.ledger_start_month == "2026-01"
+    assert portfolio.positions[0].latest_price == pytest.approx(8)
+    assert portfolio.market_value == pytest.approx(80)
+    assert portfolio.unrealized_pnl == pytest.approx(-20)
+    assert portfolio.account_snapshots[-1].investment_balance == pytest.approx(80)
+    assert portfolio.max_drawdown == pytest.approx(0.2)
+
+    sheets = build_paper_portfolio_export_sheets(portfolio)
+    texts = build_paper_portfolio_export_texts(portfolio)
+    assert {sheet.title for sheet in sheets} == {
+        "量化模拟账户摘要",
+        "量化模拟持仓",
+        "量化模拟账户快照",
+        "量化模拟账本流水",
+        "量化模拟事后风控",
+    }
+    snapshot_sheet = next(sheet for sheet in sheets if sheet.title == "量化模拟账户快照")
+    position_sheet = next(sheet for sheet in sheets if sheet.title == "量化模拟持仓")
+    ledger_sheet = next(sheet for sheet in sheets if sheet.title == "量化模拟账本流水")
+    assert snapshot_sheet.rows[0][1] == "2026-01"
+    assert position_sheet.rows[0][2:5] == ["境内 ETF", "权益资产", "人民币"]
+    assert ledger_sheet.rows[0][2:4] == ["模拟现金账户", "模拟资金投入"]
+    assert ledger_sheet.rows[0][6:8] == ["流入", "模拟投资账本"]
+    assert texts[0].filename == "quant-paper-portfolio.txt"
+    assert any("复权价只用于研究信号和回测" in line for line in texts[0].lines)
+    assert any("对账状态：对账一致" in line for line in texts[0].lines)
+
+    stale_sheet = ExportSheet(plan_variant="paper_quant", title="旧量化导出", headers=[], rows=[])
+    stale_text = ExportTextDocument(plan_variant="paper_quant", filename="old.txt", lines=[])
+    result = AffordabilityResult.model_construct(
+        export_sheets=[stale_sheet],
+        export_texts=[stale_text],
+    )
+    monkeypatch.setattr(main, "list_quant_scoped_records", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "_paper_portfolio_for_household", lambda *_args, **_kwargs: portfolio)
+    attached = main._attach_paper_portfolio(result, "household-1")
+    assert "旧量化导出" not in {sheet.title for sheet in attached.export_sheets}
+    assert len([sheet for sheet in attached.export_sheets if sheet.plan_variant == "paper_quant"]) == 5
+    assert [item.filename for item in attached.export_texts] == ["quant-paper-portfolio.txt"]
 
 
 def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:
