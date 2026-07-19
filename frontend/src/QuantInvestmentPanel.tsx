@@ -108,6 +108,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const [manualNav, setManualNav] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   const refresh = useCallback(async () => {
     const [nextPolicies, nextInstruments, nextSnapshots, nextProposals, nextOrders, nextPortfolio, nextBacktestRuns, nextDispatches, nextReconciliations] = await Promise.all([
@@ -150,6 +151,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
   const runAction = async (action: () => Promise<void>) => {
     setBusy(true);
     setError("");
+    setNotice("");
     try {
       await action();
       await refresh();
@@ -169,7 +171,10 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     await createQuantInvestmentInstrument(householdId, instrumentDraft);
     setInstrumentDraft(defaultInstrument());
   });
-  const refreshMarketData = () => runAction(async () => { await refreshQuantMarketData(householdId); });
+  const refreshMarketData = () => runAction(async () => {
+    const response = await refreshQuantMarketData(householdId);
+    setNotice(response.warnings.length ? response.warnings.join(" ") : "行情数据集已刷新并完成来源、日历、复权口径和内容哈希记录。");
+  });
   const generateProposal = () => activePolicy && runAction(async () => { await createQuantInvestmentProposal(householdId, activePolicy.id); });
   const runBacktest = () => activePolicy && runAction(async () => {
     const result = await runQuantInvestmentBacktest(householdId, activePolicy.id, Math.max(1, activePolicy.data.default_monthly_budget || 1000));
@@ -192,7 +197,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
     yesterday.setDate(today.getDate() - 1);
     const nav = instrument.data.market === "qdii_etf" ? manualNav : null;
     const data: InvestmentMarketSnapshotData = {
-      schema_version: 2,
+      schema_version: 3,
       source: "manual",
       api_name: "manual_snapshot",
       fetched_at: "",
@@ -225,6 +230,7 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
       </div>
       <p className="field-hint">后端按现金安全垫、近期重大目标、35% 权益上限和回撤阈值生成提案。这里不会保存券商或 Tushare 凭据，也不会提交真实订单。</p>
       {error ? <p className="error-text">{error}</p> : null}
+      {notice ? <div className="warning-list"><span>{notice}</span></div> : null}
 
       {!activePolicy ? (
         <button className="primary-button" type="button" onClick={() => void addPolicy()} disabled={busy}><Plus size={16} /> 创建默认月度策略</button>
@@ -259,7 +265,8 @@ export function QuantInvestmentPanel({ householdId }: { householdId: string }) {
         </div>
         <div className="strategy-grid horizontal-card-list">{instruments.map((instrument) => {
           const snapshot = snapshotByInstrumentId.get(instrument.id);
-          return <article className="strategy-card" key={instrument.id}><div className="quant-instrument-heading"><strong>{instrument.data.name}</strong><span>{instrument.data.symbol} · {instrument.data.market} · {instrument.data.asset_class === "equity" ? "权益" : "防御"}</span></div><p>{snapshot ? `快照 ${snapshot.data.snapshot_date} · ${snapshot.data.bars.length} 条日线` : "尚无行情快照"}</p><div className="inline-actions"><label className="field compact-field"><span>测试价</span><input type="number" min="0.0001" step="0.01" value={numberInput(manualPrice)} onChange={(event) => setManualPrice(Number(event.target.value))} /></label>{instrument.data.market === "qdii_etf" ? <label className="field compact-field"><span>测试净值</span><input type="number" min="0.0001" step="0.01" value={numberInput(manualNav)} onChange={(event) => setManualNav(Number(event.target.value))} /></label> : null}<button className="ghost-button" type="button" onClick={() => void writeManualSnapshot(instrument)} disabled={busy}>录入测试快照</button></div></article>;
+          const adjustmentLabel = snapshot?.data.adjustment === "backward" ? "后复权" : snapshot?.data.adjustment === "forward" ? "前复权" : snapshot?.data.adjustment === "provider" ? "数据源复权" : "原始价格";
+          return <article className="strategy-card" key={instrument.id}><div className="quant-instrument-heading"><strong>{instrument.data.name}</strong><span>{instrument.data.symbol} · {instrument.data.market} · {instrument.data.asset_class === "equity" ? "权益" : "防御"}</span></div><p>{snapshot ? `快照 ${snapshot.data.snapshot_date} · ${snapshot.data.bars.length} 条日线 · ${adjustmentLabel}` : "尚无行情快照"}</p>{snapshot?.data.warning ? <p className="field-hint">{snapshot.data.warning}</p> : null}<div className="inline-actions"><label className="field compact-field"><span>测试价</span><input type="number" min="0.0001" step="0.01" value={numberInput(manualPrice)} onChange={(event) => setManualPrice(Number(event.target.value))} /></label>{instrument.data.market === "qdii_etf" ? <label className="field compact-field"><span>测试净值</span><input type="number" min="0.0001" step="0.01" value={numberInput(manualNav)} onChange={(event) => setManualNav(Number(event.target.value))} /></label> : null}<button className="ghost-button" type="button" onClick={() => void writeManualSnapshot(instrument)} disabled={busy}>录入测试快照</button></div></article>;
         })}</div>
       </div>
 

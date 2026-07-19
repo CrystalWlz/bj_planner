@@ -119,7 +119,6 @@ def _fund_daily_bars(
             InvestmentMarketBarData(
                 date=trade_date,
                 close=close,
-                adjusted_close=close,
                 nav=latest_nav[2] if latest_nav else None,
                 nav_date=latest_nav[0] if latest_nav else "",
                 nav_available_date=latest_nav[1] if latest_nav else "",
@@ -128,10 +127,56 @@ def _fund_daily_bars(
     return bars
 
 
+def _apply_backward_adjustment(
+    bars: list[InvestmentMarketBarData],
+    factor_rows: list[dict[str, Any]],
+    *,
+    factor_field: str,
+) -> tuple[list[InvestmentMarketBarData], bool, str]:
+    factors: dict[str, float] = {}
+    for row in factor_rows:
+        factor_date = _iso_tushare_date(row.get("trade_date"))
+        try:
+            factor = float(row.get(factor_field) or 0)
+        except (TypeError, ValueError):
+            continue
+        if factor_date and factor > 0:
+            factors[factor_date] = factor
+    if not factors:
+        return bars, False, "复权因子接口未返回可用数据，已保留原始收盘价。"
+    missing_dates = [
+        bar.price_date or bar.date
+        for bar in bars
+        if (bar.price_date or bar.date) not in factors
+    ]
+    if missing_dates:
+        return (
+            bars,
+            False,
+            f"复权因子缺少 {len(missing_dates)} 个价格交易日，已整段保留原始收盘价，避免混用口径。",
+        )
+    return (
+        [
+            bar.model_copy(
+                update={
+                    "adjusted_close": bar.close * factors[bar.price_date or bar.date],
+                }
+            )
+            for bar in bars
+        ],
+        True,
+        "",
+    )
+
+
 def fetch_tushare_snapshot(instrument: InvestmentInstrumentData, *, start_date: str = "") -> InvestmentMarketSnapshotData:
     start = start_date.replace("-", "") or f"{date.today().year - 3}0101"
+    api_names: list[str] = []
+    adjustment = "none"
+    adjustment_warning = ""
     if instrument.market in {"mainland_etf", "qdii_etf"}:
         rows = _tushare_query("fund_daily", {"ts_code": instrument.symbol, "start_date": start}, "ts_code,trade_date,close")
+        api_names.append("fund_daily")
         nav_rows = (
             _tushare_query(
                 "fund_nav",
@@ -141,12 +186,52 @@ def fetch_tushare_snapshot(instrument: InvestmentInstrumentData, *, start_date: 
             if instrument.market == "qdii_etf"
             else []
         )
+        if instrument.market == "qdii_etf":
+            api_names.append("fund_nav")
         bars = _fund_daily_bars(rows, nav_rows)
+        try:
+            factor_rows = _tushare_query(
+                "fund_adj",
+                {"ts_code": instrument.symbol, "start_date": start},
+                "ts_code,trade_date,adj_factor",
+            )
+            bars, adjusted, adjustment_warning = _apply_backward_adjustment(
+                bars,
+                factor_rows,
+                factor_field="adj_factor",
+            )
+            if adjusted:
+                adjustment = "backward"
+                api_names.append("fund_adj")
+        except Exception as exc:
+            adjustment_warning = f"fund_adj 复权因子不可用，已使用原始收盘价：{exc}"
     elif instrument.market == "hong_kong_connect":
         rows = _tushare_query("hk_daily", {"ts_code": instrument.symbol, "start_date": start}, "ts_code,trade_date,close")
-        bars = [InvestmentMarketBarData(date=f"{row['trade_date'][:4]}-{row['trade_date'][4:6]}-{row['trade_date'][6:]}", close=float(row["close"]), adjusted_close=float(row["close"])) for row in rows if row.get("close")]
+        api_names.append("hk_daily")
+        bars = [InvestmentMarketBarData(date=f"{row['trade_date'][:4]}-{row['trade_date'][4:6]}-{row['trade_date'][6:]}", close=float(row["close"])) for row in rows if row.get("close")]
+        try:
+            factor_rows = _tushare_query(
+                "hk_adjfactor",
+                {"ts_code": instrument.symbol, "start_date": start},
+                "ts_code,trade_date,cum_adjfactor,close_price",
+            )
+            bars, adjusted, adjustment_warning = _apply_backward_adjustment(
+                bars,
+                factor_rows,
+                factor_field="cum_adjfactor",
+            )
+            if adjusted:
+                adjustment = "backward"
+                api_names.append("hk_adjfactor")
+        except Exception as exc:
+            adjustment_warning = f"hk_adjfactor 复权因子不可用，已使用原始收盘价：{exc}"
     else:
         rows = _tushare_query("fund_nav", {"ts_code": instrument.symbol, "start_date": start, "market": "O"}, "ts_code,nav_date,ann_date,unit_nav,accum_nav,adj_nav")
+        api_names.append("fund_nav")
+        has_adjusted_nav = any(row.get("adj_nav") or row.get("accum_nav") for row in rows)
+        adjustment = "provider" if has_adjusted_nav else "none"
+        if rows and not has_adjusted_nav:
+            adjustment_warning = "fund_nav 未返回累计或复权净值，已使用单位净值。"
         bars = [
             InvestmentMarketBarData(
                 date=_iso_tushare_date(row.get("nav_date")),
@@ -187,21 +272,18 @@ def fetch_tushare_snapshot(instrument: InvestmentInstrumentData, *, start_date: 
         warning_parts.append("数据源未返回可用日线，请检查标的代码和数据权限。")
     if calendar_warning:
         warning_parts.append(calendar_warning)
+    if adjustment_warning:
+        warning_parts.append(adjustment_warning)
     return trace_market_snapshot(
         InvestmentMarketSnapshotData(
             source="tushare_pro",
-            api_name={
-                "qdii_etf": "fund_daily+fund_nav",
-                "mainland_etf": "fund_daily",
-                "hong_kong_connect": "hk_daily",
-                "qdii_fund": "fund_nav",
-            }[instrument.market],
+            api_name="+".join(api_names),
             snapshot_date=date.today().isoformat(),
             trading_calendar=calendar.calendar_name,
             calendar_source=calendar.source,
             trading_days=calendar.trading_days,
             suspension_dates=suspension_dates,
-            adjustment="provider" if instrument.market != "hong_kong_connect" else "none",
+            adjustment=adjustment,
             expected_bar_count=len(observed_calendar) or None,
             status="complete" if bars else "empty",
             bars=bars,

@@ -569,6 +569,8 @@ def refresh_quant_market_data(payload: QuantMarketRefreshRequest) -> dict:
             )
             records.append(record)
             changed = changed or inserted
+            if snapshot.warning:
+                warnings.append(f"{instrument.data.name}：{snapshot.warning}")
         except MarketDataConfigurationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:  # external provider failures must not erase prior snapshots

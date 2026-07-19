@@ -109,6 +109,11 @@ def test_qdii_etf_refresh_uses_official_fund_daily_and_joins_latest_nav(monkeypa
                 {"nav_date": "20260715", "unit_nav": 1.10, "adj_nav": 1.12},
                 {"nav_date": "20260717", "unit_nav": 1.15, "adj_nav": 1.17},
             ]
+        if api_name == "fund_adj":
+            return [
+                {"trade_date": "20260716", "adj_factor": 1.1},
+                {"trade_date": "20260717", "adj_factor": 1.2},
+            ]
         raise AssertionError(api_name)
 
     monkeypatch.setattr(market_data, "_tushare_query", fake_query)
@@ -117,15 +122,103 @@ def test_qdii_etf_refresh_uses_official_fund_daily_and_joins_latest_nav(monkeypa
         start_date="2026-07-01",
     )
 
-    assert [api_name for api_name, _params in calls[:2]] == ["fund_daily", "fund_nav"]
-    assert calls[2][0] == "trade_cal"
+    assert [api_name for api_name, _params in calls[:3]] == ["fund_daily", "fund_nav", "fund_adj"]
+    assert calls[3][0] == "trade_cal"
     assert calls[1][1]["market"] == "E"
     assert [(bar.date, bar.nav, bar.nav_date, bar.nav_available_date) for bar in snapshot.bars] == [
         ("2026-07-16", 1.10, "2026-07-15", "2026-07-16"),
         ("2026-07-17", 1.10, "2026-07-15", "2026-07-16"),
     ]
+    assert [bar.adjusted_close for bar in snapshot.bars] == pytest.approx([1.32, 1.5])
+    assert snapshot.adjustment == "backward"
+    assert snapshot.api_name == "fund_daily+fund_nav+fund_adj"
     assert snapshot.calendar_source == "observed_prices"
     assert "交易日历接口不可用" in snapshot.warning
+
+
+def test_etf_refresh_keeps_raw_prices_when_adjustment_permission_is_missing(monkeypatch) -> None:
+    from app import market_data
+    from app.schemas import InvestmentInstrumentData
+
+    def fake_query(api_name: str, params: dict, fields: str) -> list[dict]:
+        if api_name == "fund_daily":
+            return [{"trade_date": "20260717", "close": 1.25}]
+        if api_name == "fund_adj":
+            raise RuntimeError("需要至少 600 积分")
+        if api_name == "trade_cal":
+            return [{"cal_date": "20260717", "is_open": 1}]
+        raise AssertionError(api_name)
+
+    monkeypatch.setattr(market_data, "_tushare_query", fake_query)
+    snapshot = market_data.fetch_tushare_snapshot(
+        InvestmentInstrumentData(symbol="510300.SH", name="示例境内 ETF", market="mainland_etf", asset_class="equity"),
+        start_date="2026-07-01",
+    )
+
+    assert snapshot.adjustment == "none"
+    assert snapshot.api_name == "fund_daily"
+    assert snapshot.bars[0].adjusted_close is None
+    assert "fund_adj 复权因子不可用" in snapshot.warning
+    assert "600 积分" in snapshot.warning
+
+
+def test_hong_kong_refresh_applies_causal_backward_adjustment(monkeypatch) -> None:
+    from app import market_data
+    from app.schemas import InvestmentInstrumentData
+
+    def fake_query(api_name: str, params: dict, fields: str) -> list[dict]:
+        if api_name == "hk_daily":
+            return [
+                {"trade_date": "20260716", "close": 10},
+                {"trade_date": "20260717", "close": 11},
+            ]
+        if api_name == "hk_adjfactor":
+            return [
+                {"trade_date": "20260716", "cum_adjfactor": 1.0},
+                {"trade_date": "20260717", "cum_adjfactor": 1.1},
+            ]
+        if api_name == "hk_tradecal":
+            return [
+                {"cal_date": "20260716", "is_open": 1},
+                {"cal_date": "20260717", "is_open": 1},
+            ]
+        raise AssertionError(api_name)
+
+    monkeypatch.setattr(market_data, "_tushare_query", fake_query)
+    snapshot = market_data.fetch_tushare_snapshot(
+        InvestmentInstrumentData(
+            symbol="00700.HK",
+            name="示例港股通标的",
+            market="hong_kong_connect",
+            asset_class="equity",
+            hong_kong_connect_eligible=True,
+        ),
+        start_date="2026-07-01",
+    )
+
+    assert snapshot.adjustment == "backward"
+    assert snapshot.api_name == "hk_daily+hk_adjfactor"
+    assert [bar.adjusted_close for bar in snapshot.bars] == pytest.approx([10, 12.1])
+    assert snapshot.warning == ""
+
+
+def test_adjustment_is_not_partially_applied_when_factor_dates_are_incomplete() -> None:
+    from app.market_data import _apply_backward_adjustment
+    from app.schemas import InvestmentMarketBarData
+
+    bars = [
+        InvestmentMarketBarData(date="2026-07-16", close=1),
+        InvestmentMarketBarData(date="2026-07-17", close=1.1),
+    ]
+    adjusted, applied, warning = _apply_backward_adjustment(
+        bars,
+        [{"trade_date": "20260717", "adj_factor": 1.2}],
+        factor_field="adj_factor",
+    )
+
+    assert not applied
+    assert all(bar.adjusted_close is None for bar in adjusted)
+    assert "缺少 1 个价格交易日" in warning
 
 
 def test_tushare_exchange_calendar_filters_closed_days() -> None:
@@ -666,6 +759,16 @@ def test_backtest_frontend_compares_backend_strategy_and_static_metrics() -> Non
     assert "风险控制策略与静态 35/65 同口径比较" in source
     assert "最差现金" in source
     assert "minimumFractionDigits: 2" in source
+
+
+def test_market_refresh_frontend_surfaces_backend_adjustment_warnings() -> None:
+    source = Path("frontend/src/QuantInvestmentPanel.tsx").read_text(encoding="utf-8")
+
+    assert "response.warnings.length" in source
+    assert "snapshot?.data.adjustment" in source
+    assert "snapshot?.data.warning" in source
+    assert "后复权" in source
+    assert "原始价格" in source
 
 
 def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None:
