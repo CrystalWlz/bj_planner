@@ -2760,6 +2760,128 @@ def test_broker_reconciliation_compares_orders_positions_and_cash() -> None:
     assert matched_result.local_state_hash == matched_result.remote_state_hash
 
 
+def test_paper_reconciliation_detects_order_fill_integrity_breaks() -> None:
+    from app.broker_adapters import paper_ledger_integrity_differences
+    from app.schemas import PaperFillData, PaperOrderData
+
+    filled_order = PaperOrderData(
+        client_order_id="integrity-filled-order",
+        proposal_id="integrity-proposal",
+        instrument_id="integrity-instrument",
+        order_amount=100,
+        estimated_price=1,
+        estimated_quantity=100,
+        estimated_fee=0,
+        status="simulated",
+        executed_date="2026-07-19",
+        executed_price=1,
+        executed_quantity=100,
+    )
+    cancelled_order = filled_order.model_copy(
+        update={
+            "client_order_id": "integrity-cancelled-order",
+            "status": "cancelled",
+            "executed_date": "",
+            "executed_price": None,
+            "executed_quantity": None,
+        }
+    )
+    orphan_fill = PaperFillData(
+        order_id="orphan-fill",
+        client_order_id="missing-order",
+        proposal_id="integrity-proposal",
+        instrument_id="integrity-instrument",
+        side="buy",
+        executed_date="2026-07-19",
+        executed_price=1,
+        executed_quantity=100,
+        gross_amount=100,
+        fee=0,
+        cash_change=-100,
+        contribution_amount=100,
+    )
+    cancelled_fill = orphan_fill.model_copy(
+        update={
+            "order_id": "cancelled-fill",
+            "client_order_id": cancelled_order.client_order_id,
+        }
+    )
+    differences = paper_ledger_integrity_differences(
+        orders=[filled_order, cancelled_order],
+        fills=[orphan_fill, cancelled_fill],
+        order_record_ids={
+            filled_order.client_order_id: "filled-order-record",
+            cancelled_order.client_order_id: "cancelled-order-record",
+        },
+    )
+
+    assert any("缺少不可变成交事件" in difference for difference in differences)
+    assert any("未找到对应的本地 client_order_id" in difference for difference in differences)
+    assert any("未成交订单" in difference for difference in differences)
+
+    linked_fill = orphan_fill.model_copy(
+        update={"order_id": "wrong-record-id", "client_order_id": filled_order.client_order_id}
+    )
+    assert any(
+        "订单记录 ID" in difference
+        for difference in paper_ledger_integrity_differences(
+            orders=[filled_order],
+            fills=[linked_fill],
+            order_record_ids={filled_order.client_order_id: "filled-order-record"},
+        )
+    )
+
+
+def test_paper_reconciliation_api_freezes_order_without_fill(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        created = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "integrity-api-proposal",
+                    "instrument_id": "integrity-api-instrument",
+                    "order_amount": 100,
+                    "estimated_price": 1,
+                    "estimated_quantity": 100,
+                    "estimated_fee": 0,
+                    "status": "proposed",
+                },
+            },
+        )
+        assert created.status_code == 200
+        order = created.json()
+        simulated_data = order["data"] | {
+            "status": "simulated",
+            "executed_date": "2026-07-19",
+            "executed_price": 1,
+            "executed_quantity": 100,
+        }
+        with database.get_connection() as conn:
+            conn.execute(
+                "UPDATE paper_investment_orders SET data = ? WHERE id = ?",
+                (json.dumps(simulated_data, ensure_ascii=False), order["id"]),
+            )
+        reconciliation = client.post(
+            "/api/quant-investment/broker-reconciliations/paper",
+            json={"household_id": household_id},
+        )
+
+    assert reconciliation.status_code == 200
+    assert reconciliation.json()["data"]["matched"] is False
+    assert reconciliation.json()["data"]["freeze_new_orders"] is True
+    assert any(
+        "缺少不可变成交事件" in difference
+        for difference in reconciliation.json()["data"]["differences"]
+    )
+
+
 def test_paper_order_cancel_is_local_first_atomic_and_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
     from app import database

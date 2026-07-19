@@ -6,7 +6,7 @@ from hashlib import sha256
 import json
 from typing import Callable, Protocol
 
-from .schemas import PaperOrderData, PaperPositionData
+from .schemas import PaperFillData, PaperOrderData, PaperPositionData
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,44 @@ class BrokerReconciliationResult:
     differences: list[str]
     local_state_hash: str
     remote_state_hash: str
+
+
+def paper_ledger_integrity_differences(
+    *,
+    orders: list[PaperOrderData],
+    fills: list[PaperFillData],
+    order_record_ids: dict[str, str] | None = None,
+) -> list[str]:
+    """Validate immutable paper fills against their durable local orders."""
+    differences: list[str] = []
+    fills_by_client_order_id: dict[str, list[PaperFillData]] = {}
+    for fill in fills:
+        fills_by_client_order_id.setdefault(fill.client_order_id, []).append(fill)
+        order = next(
+            (item for item in orders if item.client_order_id == fill.client_order_id),
+            None,
+        )
+        if order is None:
+            differences.append(f"成交 {fill.order_id} 未找到对应的本地 client_order_id {fill.client_order_id}")
+            continue
+        expected_record_id = (order_record_ids or {}).get(fill.client_order_id)
+        if expected_record_id and expected_record_id != fill.order_id:
+            differences.append(f"成交 {fill.order_id} 引用的订单记录 ID 与本地订单不一致")
+        if order.instrument_id != fill.instrument_id or order.proposal_id != fill.proposal_id:
+            differences.append(f"成交 {fill.order_id} 的标的或提案与本地订单不一致")
+        if order.client_order_id != fill.client_order_id:
+            differences.append(f"成交 {fill.order_id} 的 client_order_id 与本地订单不一致")
+    for order in orders:
+        linked_fills = fills_by_client_order_id.get(order.client_order_id, [])
+        if order.status in {"simulated", "confirmed"} and not linked_fills:
+            differences.append(f"已成交订单 {order.client_order_id} 缺少不可变成交事件")
+        if order.status in {"proposed", "cancel_requested", "cancelled"}:
+            if any(fill.client_order_id == order.client_order_id for fill in fills):
+                differences.append(f"未成交订单 {order.client_order_id} 已存在成交事件")
+    for client_order_id, linked_fills in fills_by_client_order_id.items():
+        if len(linked_fills) > 1:
+            differences.append(f"订单 {client_order_id} 存在重复成交事件")
+    return sorted(set(differences))
 
 
 def _order_state(order: PaperOrderData) -> dict[str, object]:

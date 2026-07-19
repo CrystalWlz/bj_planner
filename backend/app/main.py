@@ -94,7 +94,11 @@ from .domain.quant_investment import (
     quant_backtest_fingerprint,
 )
 from .market_data import MarketDataConfigurationError, fetch_tushare_snapshot, trace_market_snapshot
-from .broker_adapters import LocalFirstBrokerGateway, PaperBrokerAdapter
+from .broker_adapters import (
+    LocalFirstBrokerGateway,
+    PaperBrokerAdapter,
+    paper_ledger_integrity_differences,
+)
 from .strategies.quant_investment import (
     EXECUTION_PLANNER_VERSION,
     PORTFOLIO_CONSTRUCTOR_VERSION,
@@ -902,9 +906,16 @@ def get_quant_broker_reconciliations(household_id: str) -> list[dict]:
 
 @app.post("/api/quant-investment/broker-reconciliations/paper", response_model=BrokerReconciliationRunRecord)
 def reconcile_quant_paper_broker(payload: BrokerReconciliationRequest) -> dict:
-    local_orders = [
-        PaperOrderRecord.model_validate(item).data
-        for item in list_paper_investment_orders(household_id=payload.household_id)
+    local_order_records = list_paper_investment_orders(household_id=payload.household_id)
+    local_orders = [PaperOrderRecord.model_validate(item).data for item in local_order_records]
+    order_record_ids = {
+        order.client_order_id: str(item["id"])
+        for item in local_order_records
+        for order in [PaperOrderRecord.model_validate(item).data]
+    }
+    local_fills = [
+        PaperFillRecord.model_validate(item).data
+        for item in list_paper_investment_fills(household_id=payload.household_id)
     ]
     portfolio = _paper_portfolio_for_household(payload.household_id)
     adapter = PaperBrokerAdapter(
@@ -920,6 +931,19 @@ def reconcile_quant_paper_broker(payload: BrokerReconciliationRequest) -> dict:
         local_positions=portfolio.positions,
         local_cash=portfolio.cash_balance,
     )
+    integrity_differences = paper_ledger_integrity_differences(
+        orders=local_orders,
+        fills=local_fills,
+        order_record_ids=order_record_ids,
+    )
+    if integrity_differences:
+        result = result.__class__(
+            matched=False,
+            freeze_new_orders=True,
+            differences=sorted(set([*result.differences, *integrity_differences])),
+            local_state_hash=result.local_state_hash,
+            remote_state_hash=result.remote_state_hash,
+        )
     reconciliation_date = date.today().isoformat()
     data = BrokerReconciliationRunData(
         adapter="paper",
