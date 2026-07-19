@@ -465,6 +465,7 @@ def build_paper_portfolio_summary(
     *,
     household_id: str,
     fills: list[PaperFillData],
+    orders: list[tuple[str, PaperOrderData]] | None = None,
     instruments: dict[str, InvestmentInstrumentData],
     snapshots: dict[str, InvestmentMarketSnapshotData],
     policy: QuantInvestmentPolicyData | None = None,
@@ -565,6 +566,33 @@ def build_paper_portfolio_summary(
     ordered_fills = _ordered_fills(
         [fill for fill in fills if fill.executed_date <= valuation_date]
     )
+    if orders is not None:
+        from ..broker_adapters import paper_ledger_integrity_differences
+
+        active_orders = [
+            (record_id, order)
+            for record_id, order in orders
+            if not order.executed_date or order.executed_date <= valuation_date
+        ]
+        integrity_differences = paper_ledger_integrity_differences(
+            orders=[order for _record_id, order in active_orders],
+            fills=ordered_fills,
+            order_record_ids={
+                order.client_order_id: record_id
+                for record_id, order in active_orders
+            },
+        )
+        if integrity_differences:
+            frozen = True
+            reconciliation_mismatch = True
+            reconciliation_status = "mismatch"
+            for difference in integrity_differences:
+                add_issue(
+                    code="paper_ledger_integrity",
+                    severity="freeze",
+                    source="reconciliation",
+                    message=f"模拟账本完整性异常：{difference}；已冻结新增提案",
+                )
     for fill in ordered_fills:
         if fill.reconciliation_status == "mismatch":
             reconciliation_mismatch = True

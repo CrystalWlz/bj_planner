@@ -2868,12 +2868,22 @@ def test_paper_reconciliation_api_freezes_order_without_fill(tmp_path, monkeypat
                 "UPDATE paper_investment_orders SET data = ? WHERE id = ?",
                 (json.dumps(simulated_data, ensure_ascii=False), order["id"]),
             )
+        portfolio_before_reconciliation = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
         reconciliation = client.post(
             "/api/quant-investment/broker-reconciliations/paper",
             json={"household_id": household_id},
         )
 
     assert reconciliation.status_code == 200
+    assert portfolio_before_reconciliation["frozen"] is True
+    assert portfolio_before_reconciliation["reconciliation_status"] == "mismatch"
+    assert any(
+        issue["code"] == "paper_ledger_integrity"
+        for issue in portfolio_before_reconciliation["post_trade_risk_issues"]
+    )
     assert reconciliation.json()["data"]["matched"] is False
     assert reconciliation.json()["data"]["freeze_new_orders"] is True
     assert any(

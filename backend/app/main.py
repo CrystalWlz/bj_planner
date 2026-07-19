@@ -1088,6 +1088,11 @@ def _paper_portfolio_for_household(
         item["instrument_id"]: InvestmentMarketSnapshotRecord.model_validate(item).data
         for item in snapshot_records
     }
+    order_records = list_paper_investment_orders(household_id=household_id)
+    orders = [
+        (str(item["id"]), PaperOrderRecord.model_validate(item).data)
+        for item in order_records
+    ]
     fills = [
         PaperFillRecord.model_validate(item).data
         for item in list_paper_investment_fills(household_id=household_id)
@@ -1107,6 +1112,7 @@ def _paper_portfolio_for_household(
     return build_paper_portfolio_summary(
         household_id=household_id,
         fills=fills,
+        orders=orders,
         instruments=instruments,
         snapshots=snapshots,
         policy=policy,
