@@ -268,6 +268,18 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_broker_reconciliation_runs_household
                 ON broker_reconciliation_runs(household_id, reconciliation_date DESC, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS post_trade_risk_reviews (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                risk_state_hash TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(household_id, risk_state_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_post_trade_risk_reviews_household
+                ON post_trade_risk_reviews(household_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS property_valuations (
                 id TEXT PRIMARY KEY,
                 household_id TEXT NOT NULL,
@@ -1976,6 +1988,73 @@ def resolve_broker_reconciliation_run(
         )
         row = conn.execute("SELECT * FROM broker_reconciliation_runs WHERE id = ?", (record_id,)).fetchone()
     return _broker_reconciliation_run_record(row) if row else None
+
+
+def insert_post_trade_risk_review(
+    *,
+    household_id: str,
+    risk_state_hash: str,
+    reviewed_issue_codes: list[str],
+    review_note: str,
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM post_trade_risk_reviews
+            WHERE household_id = ? AND risk_state_hash = ?
+            """,
+            (household_id, risk_state_hash),
+        ).fetchone()
+        if row is None:
+            record_id = str(uuid.uuid4())
+            data = {
+                "schema_version": 1,
+                "risk_state_hash": risk_state_hash,
+                "reviewed_issue_codes": sorted(set(reviewed_issue_codes)),
+                "review_note": review_note,
+                "reviewed_at": timestamp,
+            }
+            conn.execute(
+                """
+                INSERT INTO post_trade_risk_reviews
+                    (id, household_id, risk_state_hash, data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    household_id,
+                    risk_state_hash,
+                    json.dumps(data, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM post_trade_risk_reviews WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+    if row is None:
+        raise RuntimeError("Post-trade risk review insert failed")
+    return _post_trade_risk_review_record(row)
+
+
+def _post_trade_risk_review_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["data"] = _load_json(record["data"])
+    return record
+
+
+def list_post_trade_risk_reviews(*, household_id: str) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM post_trade_risk_reviews
+            WHERE household_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (household_id,),
+        ).fetchall()
+    return [_post_trade_risk_review_record(row) for row in rows]
 
 
 def list_property_valuations(

@@ -31,6 +31,7 @@ from .database import (
     initialize_database,
     insert_household_record,
     insert_broker_reconciliation_run,
+    insert_post_trade_risk_review,
     insert_planning_goal_record,
     insert_record,
     insert_paper_investment_order,
@@ -49,6 +50,7 @@ from .database import (
     list_paper_investment_fills,
     list_paper_investment_orders,
     list_paper_order_events,
+    list_post_trade_risk_reviews,
     list_quant_backtest_runs,
     list_quant_scoped_records,
     list_scenario_records,
@@ -80,7 +82,11 @@ from .database import (
 )
 from .domain.property_valuation import estimate_property_value
 from .domain.personal_pension_returns import refresh_personal_pension_return_snapshot
-from .domain.paper_portfolio import build_paper_portfolio_summary, paper_fill_from_order
+from .domain.paper_portfolio import (
+    build_paper_portfolio_summary,
+    paper_fill_from_order,
+    post_trade_risk_issue_is_reviewable,
+)
 from .domain.quant_backtest import BacktestAsset, run_calendar_backtest
 from .domain.quant_investment import (
     QUANT_BACKTEST_ENGINE_VERSION,
@@ -173,6 +179,8 @@ from .schemas import (
     PaperOrderRecord,
     PaperOrderSimulateRequest,
     PaperPortfolioSummary,
+    PostTradeRiskReviewRecord,
+    PostTradeRiskReviewRequest,
     QuantBacktestRequest,
     QuantBacktestResult,
     QuantBacktestRunData,
@@ -994,6 +1002,52 @@ def get_quant_paper_portfolio(household_id: str) -> PaperPortfolioSummary:
     return _paper_portfolio_for_household(household_id, policy)
 
 
+@app.get(
+    "/api/quant-investment/post-trade-risk-reviews",
+    response_model=list[PostTradeRiskReviewRecord],
+)
+def get_quant_post_trade_risk_reviews(household_id: str) -> list[dict]:
+    return list_post_trade_risk_reviews(household_id=household_id)
+
+
+@app.post(
+    "/api/quant-investment/post-trade-risk-reviews",
+    response_model=PostTradeRiskReviewRecord,
+)
+def review_quant_post_trade_risk(payload: PostTradeRiskReviewRequest) -> dict:
+    policy_records = list_quant_scoped_records(
+        "quant_investment_policies",
+        household_id=payload.household_id,
+    )
+    policy = (
+        QuantInvestmentPolicyRecord.model_validate(policy_records[0]).data
+        if policy_records
+        else None
+    )
+    portfolio = _paper_portfolio_for_household(payload.household_id, policy)
+    if portfolio.post_trade_review_status != "pending":
+        raise HTTPException(status_code=409, detail="当前没有待人工复核的事后风控状态")
+    if portfolio.post_trade_risk_state_hash != payload.risk_state_hash:
+        raise HTTPException(status_code=409, detail="事后风控状态已变化，请刷新后按最新状态重新复核")
+    reviewed_issue_codes = sorted(
+        {
+            issue.code
+            for issue in portfolio.post_trade_risk_issues
+            if post_trade_risk_issue_is_reviewable(issue)
+        }
+    )
+    if not reviewed_issue_codes:
+        raise HTTPException(status_code=409, detail="当前异常必须通过专用券商对账流程复核")
+    record = insert_post_trade_risk_review(
+        household_id=payload.household_id,
+        risk_state_hash=payload.risk_state_hash,
+        reviewed_issue_codes=reviewed_issue_codes,
+        review_note=payload.review_note,
+    )
+    bump_quant_investment_data_version(payload.household_id)
+    return record
+
+
 def _paper_portfolio_for_household(
     household_id: str,
     policy: QuantInvestmentPolicyData | None = None,
@@ -1022,6 +1076,10 @@ def _paper_portfolio_for_household(
         (item["id"], BrokerOrderDispatchRecord.model_validate(item).data)
         for item in list_broker_order_dispatches(household_id=household_id)
     ]
+    risk_reviews = [
+        (item["id"], PostTradeRiskReviewRecord.model_validate(item).data)
+        for item in list_post_trade_risk_reviews(household_id=household_id)
+    ]
     return build_paper_portfolio_summary(
         household_id=household_id,
         fills=fills,
@@ -1030,6 +1088,7 @@ def _paper_portfolio_for_household(
         policy=policy,
         reconciliations=reconciliations,
         broker_dispatches=dispatches,
+        risk_reviews=risk_reviews,
         as_of_date=as_of_date,
     )
 

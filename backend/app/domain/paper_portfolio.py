@@ -3,6 +3,8 @@ from __future__ import annotations
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
+import json
 
 from ..schemas import (
     AccountSnapshotPoint,
@@ -18,6 +20,7 @@ from ..schemas import (
     PaperPortfolioSummary,
     PaperPositionData,
     PostTradeRiskIssueData,
+    PostTradeRiskReviewData,
     QuantInvestmentPolicyData,
     VisualizationBreakdownItem,
 )
@@ -27,6 +30,13 @@ from .quant_investment import (
     execution_market_price,
     market_trading_day_age,
 )
+
+
+PAPER_PORTFOLIO_LEDGER_VERSION = "paper-portfolio-v3"
+_DEDICATED_RECONCILIATION_ISSUES = {
+    "broker_dispatch_uncertain",
+    "reconciliation_mismatch",
+}
 
 
 @dataclass
@@ -49,6 +59,70 @@ class _AppliedFill:
 
 def _ordered_fills(fills: list[PaperFillData]) -> list[PaperFillData]:
     return sorted(fills, key=lambda item: (item.executed_date, item.order_id))
+
+
+def post_trade_risk_issue_is_reviewable(issue: PostTradeRiskIssueData) -> bool:
+    return (
+        issue.severity == "freeze"
+        and issue.source != "reconciliation"
+        and issue.code not in _DEDICATED_RECONCILIATION_ISSUES
+    )
+
+
+def _post_trade_risk_state_hash(issues: list[PostTradeRiskIssueData]) -> str:
+    reviewable = [issue for issue in issues if post_trade_risk_issue_is_reviewable(issue)]
+    if not reviewable:
+        return ""
+    payload = [
+        {
+            "code": issue.code,
+            "source": issue.source,
+            "order_id": issue.order_id,
+            "instrument_id": issue.instrument_id,
+            "observed_value": (
+                round(issue.observed_value, 8)
+                if issue.observed_value is not None
+                else None
+            ),
+            "threshold": (
+                round(issue.threshold, 8)
+                if issue.threshold is not None
+                else None
+            ),
+        }
+        for issue in reviewable
+    ]
+    payload.sort(
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    encoded = json.dumps(
+        {
+            "ledger_version": PAPER_PORTFOLIO_LEDGER_VERSION,
+            "issues": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _risk_review_is_available(
+    review: PostTradeRiskReviewData,
+    *,
+    valuation_date: str,
+) -> bool:
+    try:
+        reviewed_date = date.fromisoformat(review.reviewed_at[:10])
+        valued_on = date.fromisoformat(valuation_date)
+    except ValueError:
+        return False
+    return reviewed_date <= valued_on
 
 
 def _apply_fill_to_position(state: _PositionState, fill: PaperFillData) -> _AppliedFill:
@@ -396,6 +470,7 @@ def build_paper_portfolio_summary(
     policy: QuantInvestmentPolicyData | None = None,
     reconciliations: list[tuple[str, BrokerReconciliationRunData]] | None = None,
     broker_dispatches: list[tuple[str, BrokerOrderDispatchData]] | None = None,
+    risk_reviews: list[tuple[str, PostTradeRiskReviewData]] | None = None,
     as_of_date: str | None = None,
 ) -> PaperPortfolioSummary:
     valuation_date = as_of_date or date.today().isoformat()
@@ -514,7 +589,7 @@ def build_paper_portfolio_summary(
                 instrument_id=fill.instrument_id,
                 observed_value=deviation,
                 threshold=policy.post_trade_price_deviation_limit,
-                message=f"订单 {fill.client_order_id or fill.order_id} 的成交偏离超过阈值，已冻结新增提案",
+                message=f"订单 {fill.client_order_id or fill.order_id} 的成交偏离超过阈值，已触发新增冻结并等待人工复核",
             )
         state = states.setdefault(fill.instrument_id, _PositionState())
         contributions += fill.contribution_amount
@@ -531,7 +606,7 @@ def build_paper_portfolio_summary(
                 instrument_id=fill.instrument_id,
                 observed_value=fill.executed_quantity,
                 threshold=available_quantity,
-                message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，现金、费用和盈亏已按可用持仓计算，并冻结新增提案等待人工核对",
+                message=f"{fill.instrument_id} 的卖出成交超过模拟持仓，现金、费用和盈亏已按可用持仓计算，并触发新增冻结等待人工核对",
             )
 
     positions: list[PaperPositionData] = []
@@ -560,7 +635,7 @@ def build_paper_portfolio_summary(
                             severity="freeze",
                             source="market_data",
                             instrument_id=instrument_id,
-                            message=f"{instrument.name} 的最新可得净值缺失，已冻结新增提案",
+                            message=f"{instrument.name} 的最新可得净值缺失，已触发新增冻结并等待人工复核",
                         )
                     elif nav_available_date > valuation_date:
                         frozen = True
@@ -569,7 +644,7 @@ def build_paper_portfolio_summary(
                             severity="freeze",
                             source="market_data",
                             instrument_id=instrument_id,
-                            message=f"{instrument.name} 的最新净值尚未公告，已冻结新增提案",
+                            message=f"{instrument.name} 的最新净值尚未公告，已触发新增冻结并等待人工复核",
                         )
                     elif latest_bar.nav_date:
                         try:
@@ -589,7 +664,7 @@ def build_paper_portfolio_summary(
                                 instrument_id=instrument_id,
                                 observed_value=float(nav_age),
                                 threshold=float(policy.qdii_nav_max_stale_days),
-                                message=f"{instrument.name} 的最新可得净值已过期，已冻结新增提案",
+                                message=f"{instrument.name} 的最新可得净值已过期，已触发新增冻结并等待人工复核",
                             )
         if not latest_price_date:
             add_issue(
@@ -637,8 +712,32 @@ def build_paper_portfolio_summary(
             source="portfolio",
             observed_value=max_drawdown,
             threshold=policy.drawdown_freeze_threshold,
-            message=f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已暂停新增并等待人工复核",
+            message=f"模拟账户历史最大回撤 {max_drawdown:.1%} 达到冻结阈值，已触发新增冻结并等待人工复核",
         )
+    post_trade_risk_state_hash = _post_trade_risk_state_hash(risk_issues)
+    matched_review = next(
+        (
+            (record_id, review)
+            for record_id, review in (risk_reviews or [])
+            if post_trade_risk_state_hash
+            and review.risk_state_hash == post_trade_risk_state_hash
+            and _risk_review_is_available(review, valuation_date=valuation_date)
+        ),
+        None,
+    )
+    unreviewable_frozen = any(
+        issue.severity == "freeze" and not post_trade_risk_issue_is_reviewable(issue)
+        for issue in risk_issues
+    )
+    frozen = unreviewable_frozen or bool(post_trade_risk_state_hash and matched_review is None)
+    post_trade_review_status = (
+        "reviewed"
+        if matched_review is not None
+        else "pending"
+        if post_trade_risk_state_hash
+        else "not_required"
+    )
+    latest_post_trade_review_id = matched_review[0] if matched_review is not None else ""
     ledger_entries, account_snapshots, visualization_details = _paper_ledger_artifacts(
         ordered_fills,
         market_snapshots=snapshots,
@@ -657,7 +756,7 @@ def build_paper_portfolio_summary(
         )
     return PaperPortfolioSummary(
         household_id=household_id,
-        ledger_version="paper-portfolio-v3",
+        ledger_version=PAPER_PORTFOLIO_LEDGER_VERSION,
         valuation_price_basis="raw_close",
         valuation_date=valuation_date,
         ledger_start_month=ordered_fills[0].executed_date[:7] if ordered_fills else "",
@@ -676,6 +775,9 @@ def build_paper_portfolio_summary(
         current_drawdown=round(current_drawdown, 6),
         max_drawdown=round(max_drawdown, 6),
         frozen=frozen,
+        post_trade_risk_state_hash=post_trade_risk_state_hash,
+        post_trade_review_status=post_trade_review_status,
+        latest_post_trade_review_id=latest_post_trade_review_id,
         reconciliation_status=(
             "mismatch"
             if reconciliation_mismatch

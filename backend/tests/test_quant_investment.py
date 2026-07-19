@@ -832,6 +832,20 @@ def test_export_frontend_downloads_backend_paper_portfolio_artifacts() -> None:
     assert "复权价只用于研究" in source
 
 
+def test_post_trade_risk_review_frontend_uses_backend_state_hash() -> None:
+    panel_source = Path("frontend/src/QuantInvestmentPanel.tsx").read_text(encoding="utf-8")
+    api_source = Path("frontend/src/api.ts").read_text(encoding="utf-8")
+    type_source = Path("frontend/src/types.ts").read_text(encoding="utf-8")
+
+    assert "reviewQuantPostTradeRisk" in panel_source
+    assert "portfolio.post_trade_risk_state_hash" in panel_source
+    assert 'portfolio.post_trade_review_status === "pending"' in panel_source
+    assert "确认当前风险状态" in panel_source
+    assert "/api/quant-investment/post-trade-risk-reviews" in api_source
+    assert "post_trade_risk_state_hash: string" in type_source
+    assert 'post_trade_review_status: "not_required" | "pending" | "reviewed"' in type_source
+
+
 def test_calendar_clock_waits_until_suspended_asset_has_a_tradable_bar() -> None:
     from app.domain.quant_backtest import BacktestAsset, run_calendar_backtest
     from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, QuantInvestmentPolicyData
@@ -1373,6 +1387,8 @@ def test_post_trade_reconciliation_mismatch_freezes_only_new_orders() -> None:
     )
     assert summary.frozen
     assert summary.reconciliation_status == "mismatch"
+    assert summary.post_trade_review_status == "not_required"
+    assert summary.post_trade_risk_state_hash == ""
     assert {issue.code for issue in summary.post_trade_risk_issues} == {"reconciliation_mismatch"}
     assert summary.positions
     assert summary.ledger_entries
@@ -1381,7 +1397,13 @@ def test_post_trade_reconciliation_mismatch_freezes_only_new_orders() -> None:
 
 def test_paper_portfolio_drawdown_is_cashflow_neutral_and_freezes_new_orders() -> None:
     from app.domain.paper_portfolio import build_paper_portfolio_summary
-    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData, QuantInvestmentPolicyData
+    from app.schemas import (
+        InvestmentInstrumentData,
+        InvestmentMarketSnapshotData,
+        PaperFillData,
+        PostTradeRiskReviewData,
+        QuantInvestmentPolicyData,
+    )
 
     instrument = InvestmentInstrumentData(
         symbol="510300.SH",
@@ -1442,7 +1464,26 @@ def test_paper_portfolio_drawdown_is_cashflow_neutral_and_freezes_new_orders() -
     assert summary.current_drawdown == pytest.approx(0.2)
     assert summary.max_drawdown == pytest.approx(0.2)
     assert summary.frozen
+    assert summary.post_trade_review_status == "pending"
     assert any("历史最大回撤" in warning for warning in summary.warnings)
+
+    review = PostTradeRiskReviewData(
+        risk_state_hash=summary.post_trade_risk_state_hash,
+        reviewed_issue_codes=["portfolio_drawdown_limit"],
+        review_note="已复核历史回撤和当前持仓，仅解除当前风险状态冻结",
+        reviewed_at="2026-07-04T00:00:00+00:00",
+    )
+    reviewed = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=fills,
+        instruments={"instrument-1": instrument},
+        snapshots={"instrument-1": snapshot},
+        policy=QuantInvestmentPolicyData(),
+        risk_reviews=[("drawdown-review-1", review)],
+    )
+    assert not reviewed.frozen
+    assert reviewed.post_trade_review_status == "reviewed"
+    assert reviewed.max_drawdown == pytest.approx(0.2)
 
 
 def test_paper_portfolio_replays_out_of_order_fills_into_month_end_snapshots() -> None:
@@ -1643,7 +1684,12 @@ def test_paper_ledger_uses_raw_close_and_exports_current_backend_artifacts(monke
 
 def test_paper_portfolio_oversell_caps_cash_and_pnl_to_available_position() -> None:
     from app.domain.paper_portfolio import build_paper_portfolio_summary
-    from app.schemas import InvestmentInstrumentData, InvestmentMarketSnapshotData, PaperFillData
+    from app.schemas import (
+        InvestmentInstrumentData,
+        InvestmentMarketSnapshotData,
+        PaperFillData,
+        PostTradeRiskReviewData,
+    )
 
     instrument = InvestmentInstrumentData(
         symbol="510300.SH",
@@ -1704,10 +1750,162 @@ def test_paper_portfolio_oversell_caps_cash_and_pnl_to_available_position() -> N
     )
     assert summary.frozen
     assert oversell_issue.severity == "freeze"
+    assert summary.post_trade_review_status == "pending"
+    assert len(summary.post_trade_risk_state_hash) == 64
     sell_entries = [entry for entry in summary.ledger_entries if entry.category == "paper_sell"]
     assert [entry.amount for entry in sell_entries] == pytest.approx([-120, 120])
     assert summary.account_snapshots[-1].cash_balance == pytest.approx(118.8)
     assert summary.account_snapshots[-1].net_worth == pytest.approx(118.8)
+
+    review = PostTradeRiskReviewData(
+        risk_state_hash=summary.post_trade_risk_state_hash,
+        reviewed_issue_codes=["position_oversell"],
+        review_note="已核对异常成交，仅解除新增冻结，不改写成交历史",
+        reviewed_at="2026-02-01T00:00:00+00:00",
+    )
+    historical_before_review = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[buy, oversell],
+        instruments={"instrument-oversell": instrument},
+        snapshots={"instrument-oversell": snapshot},
+        risk_reviews=[("risk-review-1", review)],
+        as_of_date="2026-01-31",
+    )
+    assert historical_before_review.frozen
+    assert historical_before_review.post_trade_review_status == "pending"
+
+    reviewed = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[buy, oversell],
+        instruments={"instrument-oversell": instrument},
+        snapshots={"instrument-oversell": snapshot},
+        risk_reviews=[("risk-review-1", review)],
+        as_of_date="2026-02-01",
+    )
+    assert not reviewed.frozen
+    assert reviewed.post_trade_review_status == "reviewed"
+    assert reviewed.latest_post_trade_review_id == "risk-review-1"
+    assert any(issue.code == "position_oversell" for issue in reviewed.post_trade_risk_issues)
+
+    new_oversell = oversell.model_copy(
+        update={
+            "order_id": "order-oversell-again",
+            "client_order_id": "client-oversell-again",
+            "executed_date": "2026-01-21",
+        }
+    )
+    changed = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[buy, oversell, new_oversell],
+        instruments={"instrument-oversell": instrument},
+        snapshots={"instrument-oversell": snapshot},
+        risk_reviews=[("risk-review-1", review)],
+        as_of_date="2026-02-01",
+    )
+    assert changed.frozen
+    assert changed.post_trade_review_status == "pending"
+    assert changed.post_trade_risk_state_hash != summary.post_trade_risk_state_hash
+
+
+def test_post_trade_risk_review_requires_current_state_hash_and_refreezes_on_new_issue(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        instrument = _create_unrestricted_paper_buy_instrument(
+            client,
+            household_id,
+            suffix="post-trade-review",
+        )
+
+        def create_and_simulate(proposal_id: str, executed_price: float):
+            order = client.post(
+                "/api/quant-investment/paper-orders",
+                json={
+                    "household_id": household_id,
+                    "data": {
+                        "proposal_id": proposal_id,
+                        "instrument_id": instrument["id"],
+                        "order_amount": 1000,
+                        "estimated_price": 1,
+                        "estimated_quantity": 900,
+                        "estimated_fee": 1.35,
+                        "cash_contribution_amount": 1000,
+                        "lot_size": 100,
+                    },
+                },
+            )
+            assert order.status_code == 200
+            simulated = client.post(
+                f"/api/quant-investment/paper-orders/{order.json()['id']}/simulate",
+                json={
+                    "household_id": household_id,
+                    "executed_price": executed_price,
+                },
+            )
+            assert simulated.status_code == 200
+
+        create_and_simulate("proposal-risk-review-1", 1.1)
+        pending = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        original_hash = pending["post_trade_risk_state_hash"]
+        assert pending["frozen"]
+        assert pending["post_trade_review_status"] == "pending"
+        assert len(original_hash) == 64
+        assert "execution_price_deviation" in {
+            issue["code"] for issue in pending["post_trade_risk_issues"]
+        }
+
+        reviewed = client.post(
+            "/api/quant-investment/post-trade-risk-reviews",
+            json={
+                "household_id": household_id,
+                "risk_state_hash": original_hash,
+                "review_note": "已核对成交价格、现金和持仓，确认仅解除当前状态冻结",
+            },
+        )
+        released = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        reviews = client.get(
+            "/api/quant-investment/post-trade-risk-reviews",
+            params={"household_id": household_id},
+        ).json()
+        assert reviewed.status_code == 200
+        assert released["frozen"] is False
+        assert released["post_trade_review_status"] == "reviewed"
+        assert released["latest_post_trade_review_id"] == reviewed.json()["id"]
+        assert reviews[0]["data"]["risk_state_hash"] == original_hash
+        assert reviews[0]["data"]["reviewed_issue_codes"] == ["execution_price_deviation"]
+
+        create_and_simulate("proposal-risk-review-2", 1.2)
+        changed = client.get(
+            "/api/quant-investment/paper-portfolio",
+            params={"household_id": household_id},
+        ).json()
+        stale_review = client.post(
+            "/api/quant-investment/post-trade-risk-reviews",
+            json={
+                "household_id": household_id,
+                "risk_state_hash": original_hash,
+                "review_note": "尝试沿用旧状态复核",
+            },
+        )
+
+    assert changed["frozen"]
+    assert changed["post_trade_review_status"] == "pending"
+    assert changed["post_trade_risk_state_hash"] != original_hash
+    assert stale_review.status_code == 409
+    assert "状态已变化" in stale_review.json()["detail"]
 
 
 def test_qmt_boundary_requires_local_persistence_and_remains_disabled() -> None:

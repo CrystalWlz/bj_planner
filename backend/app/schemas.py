@@ -2685,6 +2685,36 @@ class PostTradeRiskIssueData(BaseModel):
     threshold: float | None = None
 
 
+class PostTradeRiskReviewData(BaseModel):
+    schema_version: int = Field(1, ge=1)
+    risk_state_hash: str = Field(min_length=64, max_length=64)
+    reviewed_issue_codes: list[str] = Field(min_length=1, max_length=100)
+    review_note: str = Field(min_length=2, max_length=1000)
+    reviewed_at: str
+
+
+class PostTradeRiskReviewRecord(BaseModel):
+    id: str
+    household_id: str
+    risk_state_hash: str
+    data: PostTradeRiskReviewData
+    created_at: datetime
+
+
+class PostTradeRiskReviewRequest(BaseModel):
+    household_id: str
+    risk_state_hash: str = Field(min_length=64, max_length=64)
+    review_note: str = Field(min_length=2, max_length=1000)
+
+    @field_validator("review_note")
+    @classmethod
+    def validate_review_note(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 2:
+            raise ValueError("事后风控复核说明不能为空")
+        return normalized
+
+
 class BrokerReconciliationRunData(BaseModel):
     schema_version: int = Field(1, ge=1)
     adapter: Literal["paper", "qmt"]
@@ -2762,6 +2792,9 @@ class PaperPortfolioSummary(BaseModel):
     current_drawdown: float = Field(0, ge=0, le=1)
     max_drawdown: float = Field(0, ge=0, le=1)
     frozen: bool = False
+    post_trade_risk_state_hash: str = ""
+    post_trade_review_status: Literal["not_required", "pending", "reviewed"] = "not_required"
+    latest_post_trade_review_id: str = ""
     reconciliation_status: Literal["not_required", "matched", "mismatch", "reviewed"] = "not_required"
     latest_reconciliation_id: str = ""
     post_trade_risk_issues: list[PostTradeRiskIssueData] = Field(default_factory=list)

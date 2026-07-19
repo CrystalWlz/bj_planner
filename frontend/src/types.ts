@@ -399,6 +399,19 @@ export interface PostTradeRiskIssueData {
   threshold: number | null;
 }
 
+export interface PostTradeRiskReviewData {
+  schema_version: number;
+  risk_state_hash: string;
+  reviewed_issue_codes: string[];
+  review_note: string;
+  reviewed_at: string;
+}
+
+export interface PostTradeRiskReviewRecord extends RecordEnvelope<PostTradeRiskReviewData> {
+  household_id: string;
+  risk_state_hash: string;
+}
+
 export interface BrokerReconciliationRunData {
   schema_version: number;
   adapter: "paper" | "qmt";
@@ -443,6 +456,9 @@ export interface PaperPortfolioSummary {
   current_drawdown: number;
   max_drawdown: number;
   frozen: boolean;
+  post_trade_risk_state_hash: string;
+  post_trade_review_status: "not_required" | "pending" | "reviewed";
+  latest_post_trade_review_id: string;
   reconciliation_status: "not_required" | "matched" | "mismatch" | "reviewed";
   latest_reconciliation_id: string;
   post_trade_risk_issues: PostTradeRiskIssueData[];

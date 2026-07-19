@@ -778,6 +778,11 @@ _PAPER_SOURCE_LABELS = {
     "reconciliation": "券商对账",
 }
 _PAPER_SEVERITY_LABELS = {"warning": "警告", "freeze": "冻结新增"}
+_PAPER_POST_TRADE_REVIEW_LABELS = {
+    "not_required": "无需复核",
+    "pending": "待人工复核",
+    "reviewed": "已按当前风险状态复核",
+}
 
 
 def build_paper_portfolio_export_sheets(portfolio: PaperPortfolioSummary | None) -> list[ExportSheet]:
@@ -809,6 +814,9 @@ def build_paper_portfolio_export_sheets(portfolio: PaperPortfolioSummary | None)
                 ["当前回撤", portfolio.current_drawdown],
                 ["历史最大回撤", portfolio.max_drawdown],
                 ["是否冻结新增", portfolio.frozen],
+                ["事后风控复核状态", _paper_export_label(portfolio.post_trade_review_status, _PAPER_POST_TRADE_REVIEW_LABELS)],
+                ["事后风控状态哈希", portfolio.post_trade_risk_state_hash],
+                ["最近事后风控复核ID", portfolio.latest_post_trade_review_id],
                 ["对账状态", _paper_export_label(portfolio.reconciliation_status, _PAPER_RECONCILIATION_LABELS)],
                 *[["警告", warning] for warning in portfolio.warnings],
             ],
@@ -947,7 +955,12 @@ def build_paper_portfolio_export_texts(portfolio: PaperPortfolioSummary | None) 
                 f"未实现盈亏：{money_text(portfolio.unrealized_pnl)}",
                 f"累计手续费：{money_text(portfolio.total_fees)}",
                 f"当前回撤：{portfolio.current_drawdown:.1%}，历史最大回撤：{portfolio.max_drawdown:.1%}",
-                f"新增状态：{'已冻结' if portfolio.frozen else '正常'}；对账状态：{_paper_export_label(portfolio.reconciliation_status, _PAPER_RECONCILIATION_LABELS)}",
+                f"新增状态：{'已冻结' if portfolio.frozen else '正常'}；事后风控复核：{_paper_export_label(portfolio.post_trade_review_status, _PAPER_POST_TRADE_REVIEW_LABELS)}；对账状态：{_paper_export_label(portfolio.reconciliation_status, _PAPER_RECONCILIATION_LABELS)}",
+                *(
+                    [f"事后风控状态哈希：{portfolio.post_trade_risk_state_hash}"]
+                    if portfolio.post_trade_risk_state_hash
+                    else []
+                ),
                 "",
                 "当前持仓：",
                 *(position_lines or ["- 暂无持仓。"]),

@@ -22,6 +22,7 @@ import type {
   PaperOrderData,
   PaperOrderRecord,
   PaperPortfolioSummary,
+  PostTradeRiskReviewRecord,
   PlanningGoalData,
   PlanningFoundationSummary,
   PlanningGoalRecord,
@@ -193,6 +194,17 @@ export function fetchQuantPaperOrders(householdId: string) {
 
 export function fetchQuantPaperPortfolio(householdId: string) {
   return request<PaperPortfolioSummary>(`/api/quant-investment/paper-portfolio?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function fetchQuantPostTradeRiskReviews(householdId: string) {
+  return request<PostTradeRiskReviewRecord[]>(`/api/quant-investment/post-trade-risk-reviews?${new URLSearchParams({ household_id: householdId })}`);
+}
+
+export function reviewQuantPostTradeRisk(householdId: string, riskStateHash: string, reviewNote: string) {
+  return request<PostTradeRiskReviewRecord>("/api/quant-investment/post-trade-risk-reviews", {
+    method: "POST",
+    body: JSON.stringify({ household_id: householdId, risk_state_hash: riskStateHash, review_note: reviewNote })
+  });
 }
 
 export function fetchQuantBrokerOrderDispatches(householdId: string) {

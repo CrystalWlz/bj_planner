@@ -390,6 +390,9 @@ def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkey
         property_valuation_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'property_valuations'"
         ).fetchone()
+        post_trade_risk_review_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'post_trade_risk_reviews'"
+        ).fetchone()
         indexes = {
             row["name"]
             for row in conn.execute(
@@ -399,11 +402,13 @@ def test_initialize_database_uses_current_schema_baseline(tmp_path: Path, monkey
     assert versions == [database.CURRENT_SCHEMA_VERSION]
     assert planning_goal_table is not None
     assert property_valuation_table is not None
+    assert post_trade_risk_review_table is not None
     assert "idx_core_objects_owner" in indexes
     assert "idx_calculation_cache_layers" in indexes
     assert "idx_generated_strategies_layers" in indexes
     assert "idx_generated_strategies_owner" in indexes
     assert "idx_property_valuations_household_goal" in indexes
+    assert "idx_post_trade_risk_reviews_household" in indexes
 
 
 def test_property_valuation_refresh_persists_history_and_respects_due_date(tmp_path: Path, monkeypatch) -> None:
