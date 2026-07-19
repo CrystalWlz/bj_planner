@@ -435,6 +435,7 @@ export interface PaperPortfolioSummary {
   realized_pnl: number;
   total_fees: number;
   fill_count: number;
+  current_month_buy_amounts: Record<string, number>;
   current_drawdown: number;
   max_drawdown: number;
   frozen: boolean;

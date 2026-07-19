@@ -87,6 +87,8 @@ def _latest_confirmed_bar(
 def _paper_nav_drawdowns(
     fills: list[PaperFillData],
     snapshots: dict[str, InvestmentMarketSnapshotData],
+    *,
+    as_of_date: str,
 ) -> tuple[float, float]:
     if not fills:
         return 0.0, 0.0
@@ -101,7 +103,7 @@ def _paper_nav_drawdowns(
             price_date = bar.price_date or bar.date
             if (
                 price_date < first_fill_date
-                or price_date > date.today().isoformat()
+                or price_date > as_of_date
                 or not bar.is_trading
                 or bar.is_suspended
             ):
@@ -205,6 +207,7 @@ def _paper_ledger_artifacts(
     market_snapshots: dict[str, InvestmentMarketSnapshotData],
     current_drawdown: float,
     max_drawdown: float,
+    as_of_date: str,
 ) -> tuple[list[MonthlyLedgerEntry], list[AccountSnapshotPoint], list[MonthlyVisualizationDetail]]:
     if not fills:
         return [], [], []
@@ -214,7 +217,7 @@ def _paper_ledger_artifacts(
             bar.price_date or bar.date
             for snapshot in market_snapshots.values()
             for bar in snapshot.bars
-            if bar.is_trading and not bar.is_suspended and (bar.price_date or bar.date) <= date.today().isoformat()
+            if bar.is_trading and not bar.is_suspended and (bar.price_date or bar.date) <= as_of_date
         ),
         default=ordered_fills[-1].executed_date,
     )
@@ -255,7 +258,7 @@ def _paper_ledger_artifacts(
 
         year, month_of_year = (int(item) for item in key.split("-", 1))
         valuation_date = min(
-            date.today().isoformat(),
+            as_of_date,
             f"{key}-{monthrange(year, month_of_year)[1]:02d}",
         )
         snapshot_market_value = 0.0
@@ -356,7 +359,13 @@ def build_paper_portfolio_summary(
     policy: QuantInvestmentPolicyData | None = None,
     reconciliations: list[tuple[str, BrokerReconciliationRunData]] | None = None,
     broker_dispatches: list[tuple[str, BrokerOrderDispatchData]] | None = None,
+    as_of_date: str | None = None,
 ) -> PaperPortfolioSummary:
+    valuation_date = as_of_date or date.today().isoformat()
+    try:
+        date.fromisoformat(valuation_date)
+    except ValueError:
+        raise ValueError("模拟组合估值日期必须是有效的 YYYY-MM-DD 日期") from None
     states: dict[str, _PositionState] = {}
     warnings: list[str] = []
     risk_issues: list[PostTradeRiskIssueData] = []
@@ -441,7 +450,9 @@ def build_paper_portfolio_summary(
 
     contributions = 0.0
     cash_balance = 0.0
-    ordered_fills = _ordered_fills(fills)
+    ordered_fills = _ordered_fills(
+        [fill for fill in fills if fill.executed_date <= valuation_date]
+    )
     for fill in ordered_fills:
         if fill.reconciliation_status == "mismatch":
             reconciliation_mismatch = True
@@ -498,7 +509,7 @@ def build_paper_portfolio_summary(
         latest_price_date = ""
         snapshot = snapshots.get(instrument_id)
         if snapshot is not None:
-            latest_bar = _latest_confirmed_bar(snapshot, as_of_date=date.today().isoformat())
+            latest_bar = _latest_confirmed_bar(snapshot, as_of_date=valuation_date)
             if latest_bar is not None:
                 latest_price = float(latest_bar.adjusted_close or latest_bar.close)
                 latest_price_date = latest_bar.price_date or latest_bar.date
@@ -513,7 +524,7 @@ def build_paper_portfolio_summary(
                             instrument_id=instrument_id,
                             message=f"{instrument.name} 的最新可得净值缺失，已冻结新增提案",
                         )
-                    elif nav_available_date > date.today().isoformat():
+                    elif nav_available_date > valuation_date:
                         frozen = True
                         add_issue(
                             code="qdii_nav_not_available",
@@ -575,7 +586,11 @@ def build_paper_portfolio_summary(
     unrealized_pnl = sum(item.unrealized_pnl for item in positions)
     realized_pnl = sum(state.realized_pnl for state in states.values())
     total_fees = sum(state.total_fees for state in states.values())
-    current_drawdown, max_drawdown = _paper_nav_drawdowns(fills, snapshots)
+    current_drawdown, max_drawdown = _paper_nav_drawdowns(
+        ordered_fills,
+        snapshots,
+        as_of_date=valuation_date,
+    )
     if policy and max_drawdown >= policy.drawdown_freeze_threshold:
         frozen = True
         add_issue(
@@ -591,7 +606,17 @@ def build_paper_portfolio_summary(
         market_snapshots=snapshots,
         current_drawdown=current_drawdown,
         max_drawdown=max_drawdown,
+        as_of_date=valuation_date,
     )
+    current_month_buy_amounts: dict[str, float] = {}
+    for fill in ordered_fills:
+        if fill.side != "buy" or fill.executed_date[:7] != valuation_date[:7]:
+            continue
+        current_month_buy_amounts[fill.instrument_id] = (
+            current_month_buy_amounts.get(fill.instrument_id, 0.0)
+            + fill.gross_amount
+            + fill.fee
+        )
     return PaperPortfolioSummary(
         household_id=household_id,
         net_contributions=round(contributions, 2),
@@ -601,7 +626,11 @@ def build_paper_portfolio_summary(
         unrealized_pnl=round(unrealized_pnl, 2),
         realized_pnl=round(realized_pnl, 2),
         total_fees=round(total_fees, 2),
-        fill_count=len(fills),
+        fill_count=len(ordered_fills),
+        current_month_buy_amounts={
+            instrument_id: round(amount, 2)
+            for instrument_id, amount in current_month_buy_amounts.items()
+        },
         current_drawdown=round(current_drawdown, 6),
         max_drawdown=round(max_drawdown, 6),
         frozen=frozen,

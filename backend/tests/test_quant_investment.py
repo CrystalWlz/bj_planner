@@ -8,6 +8,63 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def _create_unrestricted_paper_buy_instrument(
+    client: TestClient,
+    household_id: str,
+    *,
+    suffix: str,
+    price_dates: list[str] | None = None,
+) -> dict:
+    dates = price_dates or [date.today().isoformat()]
+    policy = client.post(
+        "/api/quant-investment/policies",
+        json={
+            "household_id": household_id,
+            "data": {
+                "max_single_instrument_ratio": 1,
+                "max_single_market_ratio": 1,
+                "max_order_amount": 1_000_000,
+            },
+        },
+    )
+    assert policy.status_code == 200
+    instrument = client.post(
+        "/api/quant-investment/instruments",
+        json={
+            "household_id": household_id,
+            "data": {
+                "symbol": f"TEST-{suffix}",
+                "name": f"示例成交标的 {suffix}",
+                "market": "mainland_etf",
+                "asset_class": "equity",
+                "lot_size": 1,
+                "buy_fee_rate": 0.005,
+                "sell_fee_rate": 0.005,
+            },
+        },
+    )
+    assert instrument.status_code == 200
+    record = instrument.json()
+    snapshot = client.post(
+        "/api/quant-investment/market-snapshots",
+        json={
+            "household_id": household_id,
+            "instrument_id": record["id"],
+            "data": {
+                "source": "manual",
+                "snapshot_date": max(dates),
+                "status": "complete",
+                "bars": [
+                    {"date": price_date, "close": 1, "adjusted_close": 1}
+                    for price_date in dates
+                ],
+            },
+        },
+    )
+    assert snapshot.status_code == 200
+    return record
+
+
 def test_tushare_token_reads_private_user_file_and_prefers_environment(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path))
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
@@ -1273,6 +1330,21 @@ def test_paper_portfolio_replays_out_of_order_fills_into_month_end_snapshots() -
     assert unrealized_changes == pytest.approx([90, 5])
     assert realized_changes == pytest.approx([89])
 
+    january = build_paper_portfolio_summary(
+        household_id="household-1",
+        fills=[sell, buy],
+        instruments={"instrument-1": instrument},
+        snapshots={"instrument-1": snapshot},
+        as_of_date="2026-01-31",
+    )
+    assert january.fill_count == 1
+    assert january.positions[0].quantity == pytest.approx(100)
+    assert january.cash_balance == pytest.approx(90)
+    assert january.market_value == pytest.approx(1100)
+    assert january.total_equity == pytest.approx(1190)
+    assert january.current_month_buy_amounts == {"instrument-1": pytest.approx(1010)}
+    assert len(january.account_snapshots) == 1
+
     cost_valued = build_paper_portfolio_summary(
         household_id="household-1",
         fills=[buy],
@@ -1471,6 +1543,388 @@ def test_paper_execution_rechecks_purchase_limit_before_writing_fill(tmp_path, m
     assert execution.status_code == 409
     assert "限制" in execution.json()["detail"]
     assert fills == []
+
+
+def test_paper_execution_rechecks_policy_universe_limits_and_qdii_risk(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    today = date.today().isoformat()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+
+        ungoverned = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "ungoverned-proposal",
+                    "instrument_id": "ungoverned-instrument",
+                    "order_amount": 100,
+                    "estimated_price": 1,
+                    "estimated_quantity": 100,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 100,
+                    "expected_trade_date": today,
+                },
+            },
+        ).json()
+        ungoverned_execution = client.post(
+            f"/api/quant-investment/paper-orders/{ungoverned['id']}/simulate",
+            json={"household_id": household_id},
+        )
+
+        policy = client.post(
+            "/api/quant-investment/policies",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "max_single_instrument_ratio": 1,
+                    "max_single_market_ratio": 1,
+                    "max_order_amount": 500,
+                },
+            },
+        ).json()
+        mainland = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "TEST-LIMIT.SH",
+                    "name": "示例执行限额 ETF",
+                    "market": "mainland_etf",
+                    "asset_class": "equity",
+                    "lot_size": 1,
+                    "buy_fee_rate": 0,
+                    "monthly_purchase_limit": 600,
+                },
+            },
+        ).json()
+        assert client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": mainland["id"],
+                "data": {
+                    "source": "manual",
+                    "snapshot_date": today,
+                    "status": "complete",
+                    "bars": [{"date": today, "close": 1}],
+                },
+            },
+        ).status_code == 200
+
+        oversized = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "oversized-proposal",
+                    "instrument_id": mainland["id"],
+                    "order_amount": 700,
+                    "estimated_price": 1,
+                    "estimated_quantity": 700,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 700,
+                    "expected_trade_date": today,
+                    "lot_size": 1,
+                },
+            },
+        ).json()
+        oversized_execution = client.post(
+            f"/api/quant-investment/paper-orders/{oversized['id']}/simulate",
+            json={"household_id": household_id},
+        )
+
+        relaxed_policy = {**policy["data"], "max_order_amount": 1000}
+        assert client.put(
+            f"/api/quant-investment/policies/{policy['id']}",
+            json={"household_id": household_id, "data": relaxed_policy},
+        ).status_code == 200
+        first_buy = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "monthly-limit-first",
+                    "instrument_id": mainland["id"],
+                    "order_amount": 400,
+                    "estimated_price": 1,
+                    "estimated_quantity": 400,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 400,
+                    "expected_trade_date": today,
+                    "lot_size": 1,
+                },
+            },
+        ).json()
+        first_execution = client.post(
+            f"/api/quant-investment/paper-orders/{first_buy['id']}/simulate",
+            json={"household_id": household_id},
+        )
+        second_buy = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "monthly-limit-second",
+                    "instrument_id": mainland["id"],
+                    "order_amount": 300,
+                    "estimated_price": 1,
+                    "estimated_quantity": 300,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 300,
+                    "expected_trade_date": today,
+                    "lot_size": 1,
+                },
+            },
+        ).json()
+        monthly_limit_execution = client.post(
+            f"/api/quant-investment/paper-orders/{second_buy['id']}/simulate",
+            json={"household_id": household_id},
+        )
+
+        hk_instrument = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "TEST-HK",
+                    "name": "示例港股通标的",
+                    "market": "hong_kong_connect",
+                    "asset_class": "equity",
+                    "lot_size": 1,
+                    "buy_fee_rate": 0,
+                    "hong_kong_connect_eligible": False,
+                },
+            },
+        ).json()
+        assert client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": hk_instrument["id"],
+                "data": {"source": "manual", "snapshot_date": today, "bars": [{"date": today, "close": 1}]},
+            },
+        ).status_code == 200
+        hk_order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "hk-ineligible-proposal",
+                    "instrument_id": hk_instrument["id"],
+                    "order_amount": 100,
+                    "estimated_price": 1,
+                    "estimated_quantity": 100,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 100,
+                    "expected_trade_date": today,
+                    "lot_size": 1,
+                },
+            },
+        ).json()
+        hk_execution = client.post(
+            f"/api/quant-investment/paper-orders/{hk_order['id']}/simulate",
+            json={"household_id": household_id},
+        )
+
+        qdii_instrument = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "TEST-QDII.SH",
+                    "name": "示例高溢价 QDII ETF",
+                    "market": "qdii_etf",
+                    "asset_class": "equity",
+                    "lot_size": 1,
+                    "buy_fee_rate": 0,
+                },
+            },
+        ).json()
+        assert client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": qdii_instrument["id"],
+                "data": {
+                    "source": "manual",
+                    "snapshot_date": today,
+                    "bars": [
+                        {
+                            "date": today,
+                            "close": 1.1,
+                            "nav": 1,
+                            "nav_date": today,
+                            "nav_available_date": today,
+                            "premium_rate": 0.1,
+                        }
+                    ],
+                },
+            },
+        ).status_code == 200
+        qdii_order = client.post(
+            "/api/quant-investment/paper-orders",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "proposal_id": "qdii-premium-proposal",
+                    "instrument_id": qdii_instrument["id"],
+                    "order_amount": 110,
+                    "estimated_price": 1.1,
+                    "estimated_quantity": 100,
+                    "estimated_fee": 0,
+                    "cash_contribution_amount": 110,
+                    "expected_trade_date": today,
+                    "lot_size": 1,
+                },
+            },
+        ).json()
+        qdii_execution = client.post(
+            f"/api/quant-investment/paper-orders/{qdii_order['id']}/simulate",
+            json={"household_id": household_id},
+        )
+        fills = client.get(
+            "/api/quant-investment/paper-fills",
+            params={"household_id": household_id},
+        ).json()
+        dispatches = client.get(
+            "/api/quant-investment/broker-order-dispatches",
+            params={"household_id": household_id},
+        ).json()
+
+    assert ungoverned_execution.status_code == 409
+    assert "投资政策" in ungoverned_execution.json()["detail"]
+    assert oversized_execution.status_code == 409
+    assert "单笔" in oversized_execution.json()["detail"]
+    assert first_execution.status_code == 200
+    assert monthly_limit_execution.status_code == 409
+    assert "月累计申购" in monthly_limit_execution.json()["detail"]
+    assert hk_execution.status_code == 409
+    assert "港股通" in hk_execution.json()["detail"]
+    assert qdii_execution.status_code == 409
+    assert "溢价" in qdii_execution.json()["detail"]
+    assert len(fills) == 1
+    assert fills[0]["order_id"] == first_buy["id"]
+    assert len(dispatches) == 1
+    assert dispatches[0]["order_id"] == first_buy["id"]
+
+
+def test_concurrent_paper_buys_reserve_monthly_limit_before_dispatch(tmp_path, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    monkeypatch.setenv("HOUSE_PLANNER_DB", str(tmp_path / "planner.db"))
+    from app import database, main
+    from app.main import app
+
+    database.DB_PATH = database.default_db_path()
+    today = date.today().isoformat()
+    with TestClient(app) as client:
+        household_id = client.get("/api/households").json()[0]["id"]
+        assert client.post(
+            "/api/quant-investment/policies",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "max_single_instrument_ratio": 1,
+                    "max_single_market_ratio": 1,
+                    "max_order_amount": 1000,
+                },
+            },
+        ).status_code == 200
+        instrument = client.post(
+            "/api/quant-investment/instruments",
+            json={
+                "household_id": household_id,
+                "data": {
+                    "symbol": "TEST-CONCURRENT.SH",
+                    "name": "示例并发限额 ETF",
+                    "market": "mainland_etf",
+                    "asset_class": "equity",
+                    "lot_size": 1,
+                    "buy_fee_rate": 0,
+                    "monthly_purchase_limit": 600,
+                },
+            },
+        ).json()
+        assert client.post(
+            "/api/quant-investment/market-snapshots",
+            json={
+                "household_id": household_id,
+                "instrument_id": instrument["id"],
+                "data": {
+                    "source": "manual",
+                    "snapshot_date": today,
+                    "status": "complete",
+                    "bars": [{"date": today, "close": 1}],
+                },
+            },
+        ).status_code == 200
+        orders = [
+            client.post(
+                "/api/quant-investment/paper-orders",
+                json={
+                    "household_id": household_id,
+                    "data": {
+                        "proposal_id": f"concurrent-limit-{suffix}",
+                        "instrument_id": instrument["id"],
+                        "order_amount": 400,
+                        "estimated_price": 1,
+                        "estimated_quantity": 400,
+                        "estimated_fee": 0,
+                        "cash_contribution_amount": 400,
+                        "expected_trade_date": today,
+                        "lot_size": 1,
+                    },
+                },
+            ).json()
+            for suffix in ("a", "b")
+        ]
+
+    initial_validation_barrier = Barrier(2)
+    original_validate = main._validate_paper_fill_before_persist
+
+    def synchronized_validate(**kwargs) -> int:
+        validated_data_version = original_validate(**kwargs)
+        if not kwargs.get("current_dispatch_id"):
+            initial_validation_barrier.wait()
+        return validated_data_version
+
+    monkeypatch.setattr(main, "_validate_paper_fill_before_persist", synchronized_validate)
+
+    def simulate(order_id: str) -> tuple[int, dict]:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/quant-investment/paper-orders/{order_id}/simulate",
+                json={"household_id": household_id},
+            )
+            return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(simulate, [item["id"] for item in orders]))
+
+    with TestClient(app) as client:
+        fills = client.get(
+            "/api/quant-investment/paper-fills",
+            params={"household_id": household_id},
+        ).json()
+        dispatches = client.get(
+            "/api/quant-investment/broker-order-dispatches",
+            params={"household_id": household_id},
+        ).json()
+
+    statuses = [status for status, _body in results]
+    assert set(statuses) <= {200, 409}
+    assert statuses.count(200) <= 1
+    assert statuses.count(409) >= 1
+    assert len(fills) == statuses.count(200)
+    assert sum(item["data"]["gross_amount"] + item["data"]["fee"] for item in fills) <= 600
+    assert all(item["status"] == "acknowledged" for item in dispatches)
+    assert len(dispatches) == len(fills)
 
 
 def test_paper_order_api_rejects_duplicate_client_order_id(tmp_path, monkeypatch) -> None:
@@ -1762,6 +2216,11 @@ def test_paper_order_cancel_is_local_first_atomic_and_idempotent(tmp_path, monke
     database.DB_PATH = database.default_db_path()
     with TestClient(app) as client:
         household_id = client.get("/api/households").json()[0]["id"]
+        filled_instrument = _create_unrestricted_paper_buy_instrument(
+            client,
+            household_id,
+            suffix="cancel-filled",
+        )
         first_order = client.post(
             "/api/quant-investment/paper-orders",
             json={
@@ -1814,7 +2273,7 @@ def test_paper_order_cancel_is_local_first_atomic_and_idempotent(tmp_path, monke
                 "household_id": household_id,
                 "data": {
                     "proposal_id": "cancel-proposal-2",
-                    "instrument_id": "cancel-instrument-2",
+                    "instrument_id": filled_instrument["id"],
                     "order_amount": 1000,
                     "estimated_price": 1,
                     "estimated_quantity": 995,
@@ -2025,6 +2484,41 @@ def test_broker_order_dispatch_is_immutable_and_claimed_once(tmp_path, monkeypat
     assert dispatch.data.attempt_count == 1
     assert dispatch.data.acknowledged_at
     assert dispatch.data.response_data["order"]["client_order_id"] == order.client_order_id
+    assert not database.discard_pending_broker_order_dispatch(
+        first["id"],
+        household_id="household-a",
+    )
+
+    pending_order = order.model_copy(
+        update={
+            "client_order_id": "discard-pending-dispatch-id",
+            "proposal_id": "discard-pending-proposal",
+        }
+    )
+    pending_order_record = database.insert_paper_investment_order(
+        household_id="household-a",
+        proposal_id=pending_order.proposal_id,
+        instrument_id=pending_order.instrument_id,
+        data=pending_order.model_dump(mode="json"),
+    )
+    pending_dispatch, pending_status = database.prepare_broker_order_dispatch(
+        pending_order_record["id"],
+        household_id="household-a",
+        client_order_id=pending_order.client_order_id,
+        adapter="paper",
+        action="submit",
+        request_data={"executed_date": "2026-07-01"},
+    )
+    assert pending_dispatch is not None
+    assert pending_status == "pending"
+    assert database.discard_pending_broker_order_dispatch(
+        pending_dispatch["id"],
+        household_id="household-a",
+    )
+    assert all(
+        item["id"] != pending_dispatch["id"]
+        for item in database.list_broker_order_dispatches(household_id="household-a")
+    )
 
 
 def test_acknowledged_broker_dispatch_recovers_fill_without_resubmission(tmp_path, monkeypatch) -> None:
@@ -2037,13 +2531,18 @@ def test_acknowledged_broker_dispatch_recovers_fill_without_resubmission(tmp_pat
     database.DB_PATH = database.default_db_path()
     with TestClient(app) as client:
         household_id = client.get("/api/households").json()[0]["id"]
+        instrument = _create_unrestricted_paper_buy_instrument(
+            client,
+            household_id,
+            suffix="dispatch-recovery",
+        )
         created = client.post(
             "/api/quant-investment/paper-orders",
             json={
                 "household_id": household_id,
                 "data": {
                     "proposal_id": "recovery-proposal",
-                    "instrument_id": "recovery-instrument",
+                    "instrument_id": instrument["id"],
                     "order_amount": 1000,
                     "estimated_price": 1,
                     "estimated_quantity": 995,
@@ -2120,13 +2619,18 @@ def test_uncertain_broker_dispatch_requires_new_reconciliation_before_retry(tmp_
     database.DB_PATH = database.default_db_path()
     with TestClient(app) as client:
         household_id = client.get("/api/households").json()[0]["id"]
+        instrument = _create_unrestricted_paper_buy_instrument(
+            client,
+            household_id,
+            suffix="dispatch-uncertain",
+        )
         created = client.post(
             "/api/quant-investment/paper-orders",
             json={
                 "household_id": household_id,
                 "data": {
                     "proposal_id": "uncertain-proposal",
-                    "instrument_id": "uncertain-instrument",
+                    "instrument_id": instrument["id"],
                     "order_amount": 1000,
                     "estimated_price": 1,
                     "estimated_quantity": 995,
@@ -2681,18 +3185,12 @@ def test_paper_sell_uses_position_available_on_execution_date(tmp_path, monkeypa
     database.DB_PATH = database.default_db_path()
     with TestClient(app) as client:
         household_id = client.get("/api/households").json()[0]["id"]
-        instrument = client.post(
-            "/api/quant-investment/instruments",
-            json={
-                "household_id": household_id,
-                "data": {
-                    "symbol": "510300.SH",
-                    "name": "示例成交时钟 ETF",
-                    "market": "mainland_etf",
-                    "asset_class": "equity",
-                },
-            },
-        ).json()
+        instrument = _create_unrestricted_paper_buy_instrument(
+            client,
+            household_id,
+            suffix="execution-clock",
+            price_dates=["2026-01-31", "2026-02-01", "2026-02-02"],
+        )
         buy = client.post(
             "/api/quant-investment/paper-orders",
             json={

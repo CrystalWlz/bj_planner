@@ -2754,6 +2754,7 @@ class PaperPortfolioSummary(BaseModel):
     realized_pnl: float
     total_fees: float = Field(ge=0)
     fill_count: int = Field(ge=0)
+    current_month_buy_amounts: dict[str, float] = Field(default_factory=dict)
     current_drawdown: float = Field(0, ge=0, le=1)
     max_drawdown: float = Field(0, ge=0, le=1)
     frozen: bool = False

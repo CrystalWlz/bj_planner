@@ -1083,6 +1083,15 @@ def bump_quant_investment_data_version(household_id: str) -> None:
         _bump_quant_investment_data_version_in_connection(conn, household_id)
 
 
+def get_quant_investment_data_version(household_id: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT data FROM households WHERE id = ?", (household_id,)).fetchone()
+    if row is None:
+        return 0
+    household = _load_json(row["data"])
+    return max(0, int(household.get("quant_investment_data_version") or 0))
+
+
 def _bump_quant_investment_data_version_in_connection(
     conn: sqlite3.Connection,
     household_id: str,
@@ -1491,9 +1500,9 @@ def prepare_broker_order_dispatch(
 ) -> tuple[dict[str, Any] | None, str]:
     if adapter not in {"paper", "qmt"} or action not in {"submit", "cancel"}:
         raise ValueError("不支持的券商适配器或订单动作")
-    timestamp = now_iso()
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        timestamp = now_iso()
         order_row = conn.execute(
             "SELECT data FROM paper_investment_orders WHERE id = ? AND household_id = ?",
             (order_id, household_id),
@@ -1563,6 +1572,7 @@ def claim_broker_order_dispatch(
     client_order_id: str,
     adapter: str,
     action: str,
+    expected_data_version: int | None = None,
 ) -> bool:
     timestamp = now_iso()
     with get_connection() as conn:
@@ -1577,6 +1587,20 @@ def claim_broker_order_dispatch(
         ).fetchone()
         if row is None or str(row["status"]) not in {"pending", "retryable"}:
             return False
+        if expected_data_version is not None:
+            household_row = conn.execute(
+                "SELECT data FROM households WHERE id = ?",
+                (household_id,),
+            ).fetchone()
+            if household_row is None:
+                return False
+            household = _load_json(household_row["data"])
+            current_data_version = max(
+                0,
+                int(household.get("quant_investment_data_version") or 0),
+            )
+            if current_data_version != expected_data_version:
+                return False
         data = _load_json(row["data"])
         data.update(
             {
@@ -1593,6 +1617,26 @@ def claim_broker_order_dispatch(
             WHERE id = ? AND status IN ('pending', 'retryable')
             """,
             (json.dumps(data, ensure_ascii=False), timestamp, row["id"]),
+        )
+        if cursor.rowcount == 1:
+            _bump_quant_investment_data_version_in_connection(conn, household_id)
+    return cursor.rowcount == 1
+
+
+def discard_pending_broker_order_dispatch(
+    record_id: str,
+    *,
+    household_id: str,
+) -> bool:
+    """Release an outbox reservation only when it has never been sent."""
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            DELETE FROM broker_order_dispatches
+            WHERE id = ? AND household_id = ? AND status = 'pending'
+            """,
+            (record_id, household_id),
         )
         if cursor.rowcount == 1:
             _bump_quant_investment_data_version_in_connection(conn, household_id)

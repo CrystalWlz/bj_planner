@@ -21,10 +21,12 @@ from .database import (
     claim_broker_order_dispatch,
     complete_broker_order_dispatch,
     confirm_paper_order_cancel,
+    discard_pending_broker_order_dispatch,
     delete_quant_scoped_record,
     delete_planning_goal_record,
     delete_scenario_record,
     generated_strategies_exist_for_cache,
+    get_quant_investment_data_version,
     get_calculation_cache_payload,
     initialize_database,
     insert_household_record,
@@ -93,6 +95,8 @@ from .strategies.quant_investment import (
     PRE_TRADE_RISK_VERSION,
     SIGNAL_MODEL_VERSION,
     build_quant_monthly_proposal,
+    check_paper_buy_execution,
+    paper_buy_reservations,
 )
 from .planning_context import (
     apply_planning_goal_constraints,
@@ -776,6 +780,7 @@ def _paper_broker_gateway(
     *,
     household_id: str,
     adapter: PaperBrokerAdapter,
+    expected_data_version: int | None = None,
 ) -> LocalFirstBrokerGateway:
     return LocalFirstBrokerGateway(
         adapter,
@@ -796,6 +801,7 @@ def _paper_broker_gateway(
             client_order_id=client_order_id,
             adapter="paper",
             action=action,
+            expected_data_version=expected_data_version if action == "submit" else None,
         ),
         complete_order_action=(
             lambda local_order_id, client_order_id, action, status, response_data, error_message: complete_broker_order_dispatch(
@@ -975,6 +981,8 @@ def get_quant_paper_portfolio(household_id: str) -> PaperPortfolioSummary:
 def _paper_portfolio_for_household(
     household_id: str,
     policy: QuantInvestmentPolicyData | None = None,
+    *,
+    as_of_date: str | None = None,
 ) -> PaperPortfolioSummary:
     instrument_records = list_quant_scoped_records("investment_instruments", household_id=household_id)
     instruments = {
@@ -1006,6 +1014,7 @@ def _paper_portfolio_for_household(
         policy=policy,
         reconciliations=reconciliations,
         broker_dispatches=dispatches,
+        as_of_date=as_of_date,
     )
 
 
@@ -1081,9 +1090,13 @@ def _validate_paper_fill_before_persist(
     household_id: str,
     order: PaperOrderData,
     fill: PaperFillData,
-    fill_records: list[dict],
-) -> None:
-    _instruments, market_snapshots = _quant_snapshot_map(household_id)
+    policy: QuantInvestmentPolicyData | None,
+    current_dispatch_id: str = "",
+) -> int:
+    validated_data_version = get_quant_investment_data_version(household_id)
+    instrument_entries, market_snapshots = _quant_snapshot_map(household_id)
+    instruments = dict(instrument_entries)
+    instrument = instruments.get(order.instrument_id)
     market_snapshot_entry = market_snapshots.get(order.instrument_id)
     if market_snapshot_entry is not None:
         execution_allowed, execution_reason = execution_session_is_allowed(
@@ -1093,6 +1106,7 @@ def _validate_paper_fill_before_persist(
         )
         if not execution_allowed:
             raise HTTPException(status_code=409, detail=execution_reason)
+    fill_records = list_paper_investment_fills(household_id=household_id)
     persisted_fills = [PaperFillRecord.model_validate(item).data for item in fill_records]
     prior_fills = [item for item in persisted_fills if item.executed_date <= fill.executed_date]
     if order.side == "buy" and order.funding_source == "paper_cash":
@@ -1108,6 +1122,54 @@ def _validate_paper_fill_before_persist(
         )
         if fill.executed_quantity > available_quantity + 1e-6:
             raise HTTPException(status_code=409, detail="成交日模拟卖出数量超过当前可用持仓")
+    if order.side == "buy":
+        if policy is None:
+            raise HTTPException(status_code=409, detail="没有可用的量化投资政策，不能模拟新增买入")
+        if instrument is None:
+            raise HTTPException(status_code=409, detail="订单标的不在当前家庭手工标的池中，不能模拟新增买入")
+        if market_snapshot_entry is None:
+            raise HTTPException(status_code=409, detail="订单标的缺少可追溯行情数据集，不能模拟新增买入")
+        portfolio_before = _paper_portfolio_for_household(
+            household_id,
+            policy,
+            as_of_date=fill.executed_date,
+        )
+        month_key = fill.executed_date[:7]
+        monthly_buy_amount_before = sum(
+            item.gross_amount + item.fee
+            for item in prior_fills
+            if item.side == "buy"
+            and item.instrument_id == order.instrument_id
+            and item.executed_date[:7] == month_key
+        )
+        dispatches = list_broker_order_dispatches(household_id=household_id)
+        reservations = paper_buy_reservations(
+            dispatches=[
+                (
+                    str(item["id"]),
+                    str(item["created_at"]),
+                    BrokerOrderDispatchData.model_validate(item["data"]),
+                )
+                for item in dispatches
+            ],
+            instruments=instruments,
+            filled_order_ids={str(item["order_id"]) for item in fill_records},
+            as_of_date=fill.executed_date,
+            current_dispatch_id=current_dispatch_id,
+        )
+        decision = check_paper_buy_execution(
+            instrument_id=order.instrument_id,
+            instrument=instrument,
+            snapshot=market_snapshot_entry[1],
+            fill=fill,
+            policy=policy,
+            portfolio_before=portfolio_before,
+            monthly_buy_amount_before=monthly_buy_amount_before,
+            reservations=reservations,
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=409, detail=decision.reason)
+    return validated_data_version
 
 
 @app.post("/api/quant-investment/paper-orders/{record_id}/simulate", response_model=PaperOrderRecord)
@@ -1165,7 +1227,7 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
                 household_id=payload.household_id,
                 order=order.data,
                 fill=preview_fill,
-                fill_records=fill_records,
+                policy=policy,
             )
             dispatch, dispatch_status = prepare_broker_order_dispatch(
                 record_id,
@@ -1207,20 +1269,37 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if order.data.status == "proposed":
-        _validate_paper_fill_before_persist(
-            household_id=payload.household_id,
-            order=order.data,
-            fill=fill,
-            fill_records=fill_records,
-        )
+        try:
+            validated_data_version = _validate_paper_fill_before_persist(
+                household_id=payload.household_id,
+                order=order.data,
+                fill=fill,
+                policy=policy,
+                current_dispatch_id=str(dispatch["id"]) if dispatch is not None else "",
+            )
+        except HTTPException:
+            if dispatch_status == "pending" and dispatch is not None:
+                discard_pending_broker_order_dispatch(
+                    str(dispatch["id"]),
+                    household_id=payload.household_id,
+                )
+            raise
         if dispatch_status in {"pending", "retryable"}:
             if adapter is None:
                 raise HTTPException(status_code=409, detail="模拟成交适配器尚未准备完成")
-            gateway = _paper_broker_gateway(household_id=payload.household_id, adapter=adapter)
+            gateway = _paper_broker_gateway(
+                household_id=payload.household_id,
+                adapter=adapter,
+                expected_data_version=validated_data_version,
+            )
             try:
                 simulated = gateway.submit(local_order_id=record_id, order=order.data)
             except (RuntimeError, ValueError) as exc:
-                bump_quant_investment_data_version(payload.household_id)
+                if dispatch_status == "pending" and dispatch is not None:
+                    discard_pending_broker_order_dispatch(
+                        str(dispatch["id"]),
+                        household_id=payload.household_id,
+                    )
                 status_code = 422 if isinstance(exc, ValueError) else 409
                 raise HTTPException(status_code=status_code, detail=str(exc)) from exc
             try:
@@ -1231,7 +1310,8 @@ def simulate_quant_paper_order(record_id: str, payload: PaperOrderSimulateReques
                 household_id=payload.household_id,
                 order=order.data,
                 fill=fill,
-                fill_records=fill_records,
+                policy=policy,
+                current_dispatch_id=str(dispatch["id"]) if dispatch is not None else "",
             )
     record, fill_record = record_paper_fill_atomic(
         record_id,

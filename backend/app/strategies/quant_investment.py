@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from math import floor
 from typing import Protocol
@@ -13,9 +13,11 @@ from ..domain.quant_investment import (
     protected_cash_for_quant_investment,
 )
 from ..schemas import (
+    BrokerOrderDispatchData,
     HouseholdData,
     InvestmentInstrumentData,
     InvestmentMarketSnapshotData,
+    PaperFillData,
     PaperOrderData,
     PaperPortfolioSummary,
     QuantInvestmentPolicyData,
@@ -25,7 +27,7 @@ from ..schemas import (
 
 SIGNAL_MODEL_VERSION = "monthly-drawdown-v2"
 PORTFOLIO_CONSTRUCTOR_VERSION = "fixed-35-65-v2"
-PRE_TRADE_RISK_VERSION = "cash-concentration-v4"
+PRE_TRADE_RISK_VERSION = "cash-concentration-v5"
 EXECUTION_PLANNER_VERSION = "paper-lot-slippage-v3"
 
 
@@ -54,6 +56,15 @@ class PreTradeRiskContext:
     existing_market_values: dict[str, float]
     planned_instrument_values: dict[str, float]
     planned_market_values: dict[str, float]
+    monthly_buy_amounts: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PaperBuyReservationContext:
+    instrument_values: dict[str, float] = field(default_factory=dict)
+    market_values: dict[str, float] = field(default_factory=dict)
+    monthly_buy_amounts: dict[str, float] = field(default_factory=dict)
+    contribution_amount: float = 0.0
 
 
 class SignalModel(Protocol):
@@ -174,11 +185,152 @@ class CashAndConcentrationRiskManager:
         market_remaining = max(0.0, total_equity * policy.max_single_market_ratio - market_exposure)
         cap = min(instrument_remaining, market_remaining, policy.max_order_amount)
         if candidate.instrument.monthly_purchase_limit is not None:
-            cap = min(cap, candidate.instrument.monthly_purchase_limit)
+            monthly_remaining = max(
+                0.0,
+                candidate.instrument.monthly_purchase_limit
+                - context.monthly_buy_amounts.get(candidate.instrument_id, 0.0),
+            )
+            cap = min(cap, monthly_remaining)
         amount = min(max(0.0, requested_amount), cap)
         if amount <= 0:
             return TradeRiskDecision(False, 0.0, "订单会使成交后组合触发单标的、单市场或最大订单金额限制。")
         return TradeRiskDecision(True, amount, "通过现金、交易资格、成交后组合集中度和最大订单金额检查。")
+
+
+def check_paper_buy_execution(
+    *,
+    instrument_id: str,
+    instrument: InvestmentInstrumentData,
+    snapshot: InvestmentMarketSnapshotData,
+    fill: PaperFillData,
+    policy: QuantInvestmentPolicyData,
+    portfolio_before: PaperPortfolioSummary,
+    monthly_buy_amount_before: float,
+    reservations: PaperBuyReservationContext | None = None,
+    risk_manager: PreTradeRiskManager | None = None,
+) -> TradeRiskDecision:
+    if fill.side != "buy":
+        return TradeRiskDecision(True, fill.gross_amount, "卖出不受新增买入事前风控限制。")
+    risk_manager = risk_manager or CashAndConcentrationRiskManager()
+    reservations = reservations or PaperBuyReservationContext()
+    existing_market_values: dict[str, float] = {}
+    for position in portfolio_before.positions:
+        existing_market_values[position.market] = (
+            existing_market_values.get(position.market, 0.0) + float(position.market_value)
+        )
+    actual_amount = max(0.0, float(fill.gross_amount + fill.fee))
+    decision = risk_manager.check(
+        QuantInstrumentCandidate(
+            instrument_id=instrument_id,
+            instrument=instrument,
+            snapshot_id="",
+            snapshot=snapshot,
+            price=fill.executed_price,
+            price_date=fill.executed_date,
+            execution_date=fill.executed_date,
+        ),
+        actual_amount,
+        policy,
+        fill.executed_date,
+        PreTradeRiskContext(
+            post_trade_total_equity=max(
+                0.0,
+                float(
+                    portfolio_before.total_equity
+                    + reservations.contribution_amount
+                    + fill.contribution_amount
+                ),
+            ),
+            existing_instrument_values={
+                position.instrument_id: float(position.market_value)
+                for position in portfolio_before.positions
+            },
+            existing_market_values=existing_market_values,
+            planned_instrument_values=reservations.instrument_values,
+            planned_market_values=reservations.market_values,
+            monthly_buy_amounts={
+                instrument_id: (
+                    max(0.0, monthly_buy_amount_before)
+                    + reservations.monthly_buy_amounts.get(instrument_id, 0.0)
+                )
+            },
+        ),
+    )
+    if not decision.allowed:
+        return decision
+    if actual_amount > decision.maximum_amount + 0.01:
+        return TradeRiskDecision(
+            False,
+            decision.maximum_amount,
+            "模拟买入金额超过执行时的单笔、月累计申购或成交后组合集中度上限。",
+        )
+    return TradeRiskDecision(True, actual_amount, "执行时事前风控复核通过。")
+
+
+def paper_buy_reservations(
+    *,
+    dispatches: list[tuple[str, str, BrokerOrderDispatchData]],
+    instruments: dict[str, InvestmentInstrumentData],
+    filled_order_ids: set[str],
+    as_of_date: str,
+    current_dispatch_id: str = "",
+) -> PaperBuyReservationContext:
+    active_statuses = {"pending", "dispatching", "acknowledged", "uncertain", "retryable"}
+    current_key = next(
+        (
+            (created_at, dispatch_id)
+            for dispatch_id, created_at, _dispatch in dispatches
+            if dispatch_id == current_dispatch_id
+        ),
+        None,
+    )
+    instrument_values: dict[str, float] = {}
+    market_values: dict[str, float] = {}
+    monthly_buy_amounts: dict[str, float] = {}
+    contribution_amount = 0.0
+    for dispatch_id, created_at, dispatch in sorted(
+        dispatches,
+        key=lambda item: (item[1], item[0]),
+    ):
+        if dispatch.status not in active_statuses or dispatch.action != "submit":
+            continue
+        if dispatch.order_id in filled_order_ids or dispatch_id == current_dispatch_id:
+            continue
+        if current_key is not None and (created_at, dispatch_id) >= current_key:
+            continue
+        try:
+            order = PaperOrderData.model_validate(dispatch.request_data.get("order"))
+        except (TypeError, ValueError):
+            continue
+        if order.side != "buy":
+            continue
+        intended_date = str(
+            dispatch.request_data.get("executed_date")
+            or order.expected_trade_date
+            or date.today().isoformat()
+        )
+        if intended_date > as_of_date:
+            continue
+        instrument = instruments.get(order.instrument_id)
+        if instrument is None:
+            continue
+        amount = max(0.0, float(order.order_amount))
+        instrument_values[order.instrument_id] = (
+            instrument_values.get(order.instrument_id, 0.0) + amount
+        )
+        market_values[instrument.market] = market_values.get(instrument.market, 0.0) + amount
+        if intended_date[:7] == as_of_date[:7]:
+            monthly_buy_amounts[order.instrument_id] = (
+                monthly_buy_amounts.get(order.instrument_id, 0.0) + amount
+            )
+        if order.funding_source == "external_contribution":
+            contribution_amount += order.cash_contribution_amount or order.order_amount
+    return PaperBuyReservationContext(
+        instrument_values=instrument_values,
+        market_values=market_values,
+        monthly_buy_amounts=monthly_buy_amounts,
+        contribution_amount=contribution_amount,
+    )
 
 
 @dataclass(frozen=True)
@@ -383,6 +535,11 @@ def build_quant_monthly_proposal(
                 existing_market_values=existing_market_values,
                 planned_instrument_values=planned_instrument_values,
                 planned_market_values=planned_market_values,
+                monthly_buy_amounts=(
+                    paper_portfolio.current_month_buy_amounts
+                    if paper_portfolio is not None
+                    else {}
+                ),
             ),
         )
         if not decision.allowed:
@@ -486,6 +643,7 @@ def build_quant_monthly_proposal(
                         existing_market_values=adjusted_existing_market_values,
                         planned_instrument_values=planned_buy_instrument_values,
                         planned_market_values=planned_buy_market_values,
+                        monthly_buy_amounts=paper_portfolio.current_month_buy_amounts,
                     ),
                 )
                 if not decision.allowed:
